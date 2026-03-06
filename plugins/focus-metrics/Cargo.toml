@@ -1,0 +1,13 @@
+[package]
+name = "augur-plugin-focus-metrics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Focus metrics plugin for AugurRS — live focus quality feedback from PSF sigma, FFT sharpness, or astigmatic ratio."
+
+[dependencies]
+augur-core.workspace = true
+augur-plugin-localization = { path = "../localization" }
+egui.workspace = true
+rustfft.workspace = true

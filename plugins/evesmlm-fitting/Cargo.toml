@@ -1,0 +1,16 @@
+[package]
+name = "augur-plugin-evesmlm-fitting"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "eveSMLM fitting plugin for AugurRS — sub-pixel localization of raw-event candidates with multiple fitting backends."
+
+[dependencies]
+augur-core.workspace = true
+augur-plugin-evesmlm-candidates = { path = "../evesmlm-candidates" }
+augur-plugin-localization = { path = "../localization" }
+egui.workspace = true
+levenberg-marquardt = "0.14"
+nalgebra = "0.33"
+num-complex = "0.4"

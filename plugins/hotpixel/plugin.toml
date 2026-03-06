@@ -1,0 +1,12 @@
+[plugin]
+name = "Hotpixel Detection"
+version = "0.1.0"
+description = "Detects persistently noisy pixels live and pushes them into the hardware DEM mask."
+authors = ["Mika Uthmann <muthmann@physik.uni-bielefeld.de>"]
+license = "MIT"
+phase = "FrameOnly"
+domain = "general"
+dependencies = []
+
+[plugin.augur]
+min-version = "0.1.0"

@@ -1,0 +1,12 @@
+[package]
+name = "augur-plugin-evesmlm-candidates"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "eveSMLM candidate finding plugin for AugurRS — DBSCAN, eigenfeature filtering, and frame-based candidate discovery directly from raw events."
+
+[dependencies]
+augur-core.workspace = true
+egui.workspace = true
+nalgebra = "0.33"

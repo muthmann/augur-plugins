@@ -1,0 +1,12 @@
+[plugin]
+name = "My Plugin"
+version = "0.1.0"
+description = "Short description of what this plugin does."
+authors = ["Your Name <you@example.com>"]
+license = "MIT"
+phase = "FrameOnly"             # FrameOnly | RawEvents | DerivedData
+domain = "general"              # general | smlm | biophotonics | robotics | computer-vision
+dependencies = []               # Names of upstream plugins this one requires
+
+[plugin.augur]
+min-version = "0.1.0"          # Minimum augur-rs version this plugin supports

@@ -1,0 +1,11 @@
+[package]
+name = "augur-plugin-localization"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Molecule localization plugin for AugurRS — wavelet-filtered spot detection with sub-pixel Gaussian fitting for SMLM."
+
+[dependencies]
+augur-core.workspace = true
+egui.workspace = true
