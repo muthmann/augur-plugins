@@ -1,5 +1,7 @@
 # Focus Metrics
 
+Runtime plugin. Build `augur-plugin-focus-metrics` as a `cdylib`, then copy `plugin.toml` plus the generated library into `~/.augur/plugins/focus-metrics/`.
+
 Live focus quality monitoring for event-camera imaging. Provides three complementary methods for assessing focus during acquisition, with a rolling history plot and traffic-light quality indicator.
 
 ## Methods
@@ -20,7 +22,7 @@ Live focus quality monitoring for event-camera imaging. Provides three complemen
 
 ## Execution Phase
 
-`DerivedData` — runs after Phase 2 plugins. Consumes `LocalizationResults` published by the Molecule Localization plugin (for Mean PSF sigma and Astigmatic ratio methods). The FFT method operates independently on the preview frame.
+`DerivedData` — runs after Phase 2 plugins. Consumes `LocalizationResults` published on `augur.localization.results` for Mean PSF sigma and Astigmatic ratio. The FFT method operates independently on the preview frame.
 
 ## Published Data
 
@@ -28,4 +30,4 @@ None.
 
 ## Dependencies
 
-Depends on **Molecule Localization** for the Mean PSF sigma and Astigmatic ratio methods. The FFT method has no dependencies.
+None at the manifest level. The Mean PSF sigma and Astigmatic ratio methods require an upstream plugin to publish standard localization results, while the FFT method has no upstream requirement.

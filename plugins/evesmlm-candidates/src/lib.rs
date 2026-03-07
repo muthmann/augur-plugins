@@ -10,12 +10,14 @@ pub mod types;
 
 use std::collections::HashMap;
 
-use augur_core::{
-    analysis::{AnalysisOutput, AnalysisSeverity, AnalysisWarning, Overlay, Pixel},
-    pipeline::{CdEvent, PreviewFrame},
+use augur_plugin_api::{
+    export_plugin, AnalysisSeverity, FfiCdEvent, FfiPixel, HostContext, HostOutput, Plugin,
+    PluginFrame, PluginInput, SettingItem, SettingKind, SettingsSchema, SettingsSection,
+    StatusEntry,
 };
+use serde_json::{json, Value};
 
-pub use types::{CandidateFindingMethod, EveCandidates, EveCluster};
+pub use types::{CandidateFindingMethod, EveCandidates, EveCluster, EveEvent, CTX_EVE_CANDIDATES};
 
 const KERNEL_G1: [f64; 5] = [1.0 / 16.0, 0.25, 3.0 / 8.0, 0.25, 1.0 / 16.0];
 const KERNEL_G2: [f64; 9] = [
@@ -40,11 +42,53 @@ pub enum PolarityMode {
 }
 
 impl PolarityMode {
-    fn include_event(self, event: &CdEvent) -> bool {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Positive => "Positive",
+            Self::Negative => "Negative",
+            Self::Both => "Both",
+        }
+    }
+
+    fn from_index(index: usize) -> Self {
+        match index {
+            0 => Self::Positive,
+            1 => Self::Negative,
+            _ => Self::Both,
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Self::Positive => 0,
+            Self::Negative => 1,
+            Self::Both => 2,
+        }
+    }
+
+    fn include_event(self, event: &EveEvent) -> bool {
         match self {
             Self::Positive => event.polarity,
             Self::Negative => !event.polarity,
             Self::Both => true,
+        }
+    }
+}
+
+impl CandidateFindingMethod {
+    fn from_index(index: usize) -> Self {
+        match index {
+            1 => Self::Eigenfeature,
+            2 => Self::FrameBased,
+            _ => Self::Dbscan,
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Self::Dbscan => 0,
+            Self::Eigenfeature => 1,
+            Self::FrameBased => 2,
         }
     }
 }
@@ -101,63 +145,25 @@ impl Default for EveSmlmCandidatePlugin {
 }
 
 impl EveSmlmCandidatePlugin {
-    pub fn name(&self) -> &str {
-        "EVE Candidate Finding"
-    }
-
-    pub fn description(&self) -> &str {
-        "Candidate finding directly on raw event streams using DBSCAN, eigenfeatures, or a frame-based fallback."
-    }
-
-    pub fn enabled(&self) -> bool {
-        self.enabled
-    }
-
-    pub fn set_enabled(&mut self, enabled: bool) {
-        self.enabled = enabled;
-        if !enabled {
-            self.reset();
-        }
-    }
-
-    pub fn settings(&self) -> &CandidateSettings {
-        &self.settings
-    }
-
-    pub fn settings_mut(&mut self) -> &mut CandidateSettings {
-        &mut self.settings
-    }
-
-    pub fn last_candidate_count(&self) -> usize {
-        self.last_candidate_count
-    }
-
-    pub fn last_event_count(&self) -> usize {
-        self.last_event_count
-    }
-
-    pub fn last_status(&self) -> &str {
-        &self.last_status
-    }
-
-    pub fn analyze_frame(
+    fn analyze_frame(
         &mut self,
-        frame: &PreviewFrame,
-        raw_events: Option<&[CdEvent]>,
-        output: &mut AnalysisOutput,
+        frame: &PluginFrame<'_>,
+        raw_events: &[FfiCdEvent],
+        output: &mut HostOutput<'_>,
     ) -> EveCandidates {
-        let Some(events) = raw_events else {
+        if raw_events.is_empty() {
             self.last_candidate_count = 0;
             self.last_event_count = 0;
             self.last_status = "Raw events are unavailable for this preview frame.".into();
-            output.warnings.push(AnalysisWarning {
-                source: self.name().to_owned(),
-                severity: AnalysisSeverity::Info,
-                message: "EVE candidate finding requires the raw event stream.".into(),
-            });
+            Self::warning(
+                output,
+                AnalysisSeverity::Info,
+                "EVE candidate finding requires the raw event stream.",
+            );
             return empty_candidates(frame, self.settings.finding_method);
-        };
+        }
 
+        let events: Vec<EveEvent> = raw_events.iter().copied().map(EveEvent::from).collect();
         let filtered_events = filter_events_by_polarity(events, self.settings.polarity);
         self.last_event_count = filtered_events.len();
         if filtered_events.is_empty() {
@@ -165,8 +171,8 @@ impl EveSmlmCandidatePlugin {
             self.last_status = "No events passed the configured polarity filter.".into();
             return EveCandidates {
                 clusters: Vec::new(),
-                frame_window_start_us: frame.window_start_us,
-                frame_window_end_us: frame.window_end_us,
+                frame_window_start_us: frame.window_start_us(),
+                frame_window_end_us: frame.window_end_us(),
                 n_events_processed: 0,
                 finding_method: self.settings.finding_method,
             };
@@ -212,22 +218,20 @@ impl EveSmlmCandidatePlugin {
         );
 
         if self.settings.show_overlay && !clusters.is_empty() {
-            output.overlays.push(Overlay::HighlightPixels {
-                pixels: clusters
-                    .iter()
-                    .map(|cluster| Pixel {
-                        x: cluster.centroid_x.round().max(0.0) as u16,
-                        y: cluster.centroid_y.round().max(0.0) as u16,
-                    })
-                    .collect(),
-                color: OVERLAY_COLOR,
-            });
+            let pixels: Vec<FfiPixel> = clusters
+                .iter()
+                .map(|cluster| FfiPixel {
+                    x: cluster.centroid_x.round().max(0.0) as u16,
+                    y: cluster.centroid_y.round().max(0.0) as u16,
+                })
+                .collect();
+            output.add_highlight_pixels(&pixels, OVERLAY_COLOR);
         }
 
         EveCandidates {
             clusters,
-            frame_window_start_us: frame.window_start_us,
-            frame_window_end_us: frame.window_end_us,
+            frame_window_start_us: frame.window_start_us(),
+            frame_window_end_us: frame.window_end_us(),
             n_events_processed: filtered_events.len(),
             finding_method: self.settings.finding_method,
         }
@@ -238,27 +242,322 @@ impl EveSmlmCandidatePlugin {
         self.last_event_count = 0;
         self.last_status = "Waiting for the next preview frame.".into();
     }
+
+    fn parse_usize(value: Value) -> Option<usize> {
+        value.as_u64().and_then(|value| usize::try_from(value).ok())
+    }
+
+    fn warning(output: &mut HostOutput<'_>, severity: AnalysisSeverity, message: &str) {
+        output.add_warning("EVE Candidate Finding", severity, message);
+    }
 }
 
-fn empty_candidates(frame: &PreviewFrame, method: CandidateFindingMethod) -> EveCandidates {
+impl Plugin for EveSmlmCandidatePlugin {
+    fn name(&self) -> &'static str {
+        "EVE Candidate Finding"
+    }
+
+    fn description(&self) -> &'static str {
+        "Candidate finding directly on raw event streams using DBSCAN, eigenfeatures, or a frame-based fallback."
+    }
+
+    fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+        if !enabled {
+            self.reset();
+        }
+    }
+
+    fn reset(&mut self) {
+        EveSmlmCandidatePlugin::reset(self);
+    }
+
+    fn input_kind(&self) -> PluginInput {
+        PluginInput::RawEvents
+    }
+
+    fn process_frame(
+        &mut self,
+        frame: &PluginFrame<'_>,
+        output: &mut HostOutput<'_>,
+        context: &mut HostContext<'_>,
+    ) {
+        let candidates = self.analyze_frame(frame, frame.events(), output);
+        if let Err(err) = context.publish(CTX_EVE_CANDIDATES, &candidates) {
+            Self::warning(
+                output,
+                AnalysisSeverity::Warning,
+                &format!("Publishing EVE candidates failed: {err}"),
+            );
+        }
+    }
+
+    fn settings_schema(&self) -> SettingsSchema {
+        SettingsSchema {
+            sections: vec![
+                SettingsSection {
+                    label: "Candidate finding".into(),
+                    description: Some(
+                        "Cluster raw events directly, or fall back to a wavelet-thresholded accumulation image."
+                            .into(),
+                    ),
+                    default_open: true,
+                    items: vec![
+                        SettingItem {
+                            key: "finding_method".into(),
+                            label: "Method".into(),
+                            tooltip: Some("Choose the clustering backend used to propose emitter candidates.".into()),
+                            kind: SettingKind::Enum {
+                                variants: vec![
+                                    CandidateFindingMethod::Dbscan.label().into(),
+                                    CandidateFindingMethod::Eigenfeature.label().into(),
+                                    CandidateFindingMethod::FrameBased.label().into(),
+                                ],
+                                default: self.settings.finding_method.index(),
+                            },
+                        },
+                        SettingItem {
+                            key: "polarity".into(),
+                            label: "Polarity".into(),
+                            tooltip: Some("Restrict candidate finding to positive, negative, or all events.".into()),
+                            kind: SettingKind::Enum {
+                                variants: vec![
+                                    PolarityMode::Positive.label().into(),
+                                    PolarityMode::Negative.label().into(),
+                                    PolarityMode::Both.label().into(),
+                                ],
+                                default: self.settings.polarity.index(),
+                            },
+                        },
+                        SettingItem {
+                            key: "epsilon_px".into(),
+                            label: "DBSCAN radius".into(),
+                            tooltip: Some("Neighborhood radius in pixels for DBSCAN and the eigenfeature seed step.".into()),
+                            kind: SettingKind::F64Slider {
+                                min: 1.0,
+                                max: 10.0,
+                                default: self.settings.epsilon_px,
+                                suffix: Some(" px".into()),
+                            },
+                        },
+                        SettingItem {
+                            key: "min_events".into(),
+                            label: "Min events".into(),
+                            tooltip: Some("Minimum number of events required for a cluster to be kept.".into()),
+                            kind: SettingKind::I64Slider {
+                                min: 1,
+                                max: 64,
+                                default: i64::try_from(self.settings.min_events).unwrap_or(5),
+                                suffix: None,
+                            },
+                        },
+                        SettingItem {
+                            key: "max_candidates".into(),
+                            label: "Max candidates".into(),
+                            tooltip: Some("Safety cap on the number of candidate clusters published per frame.".into()),
+                            kind: SettingKind::I64Slider {
+                                min: 1,
+                                max: 2048,
+                                default: i64::try_from(self.settings.max_candidates).unwrap_or(512),
+                                suffix: None,
+                            },
+                        },
+                    ],
+                },
+                SettingsSection {
+                    label: "Refinement".into(),
+                    description: Some(
+                        "Frame-based mode and eigenfeature filtering use these thresholds to reject broad or anisotropic clusters."
+                            .into(),
+                    ),
+                    default_open: false,
+                    items: vec![
+                        SettingItem {
+                            key: "max_spatial_extent_px".into(),
+                            label: "Max extent".into(),
+                            tooltip: Some("Largest allowed principal-axis spread for eigenfeature filtering.".into()),
+                            kind: SettingKind::F64Slider {
+                                min: 1.0,
+                                max: 20.0,
+                                default: self.settings.max_spatial_extent_px,
+                                suffix: Some(" px".into()),
+                            },
+                        },
+                        SettingItem {
+                            key: "min_isotropy".into(),
+                            label: "Min isotropy".into(),
+                            tooltip: Some("Minimum lambda2/lambda1 ratio for keeping a DBSCAN seed cluster.".into()),
+                            kind: SettingKind::F64Slider {
+                                min: 0.0,
+                                max: 1.0,
+                                default: self.settings.min_isotropy,
+                                suffix: None,
+                            },
+                        },
+                        SettingItem {
+                            key: "threshold_factor".into(),
+                            label: "Threshold factor".into(),
+                            tooltip: Some("Wavelet threshold multiplier used by the frame-based fallback.".into()),
+                            kind: SettingKind::F64Slider {
+                                min: 0.5,
+                                max: 6.0,
+                                default: self.settings.threshold_factor,
+                                suffix: None,
+                            },
+                        },
+                        SettingItem {
+                            key: "fit_radius_px".into(),
+                            label: "Gather radius".into(),
+                            tooltip: Some("How far the frame-based mode reaches out from a detected maximum when collecting events.".into()),
+                            kind: SettingKind::I64Slider {
+                                min: 1,
+                                max: 16,
+                                default: i64::try_from(self.settings.fit_radius_px).unwrap_or(4),
+                                suffix: Some(" px".into()),
+                            },
+                        },
+                        SettingItem {
+                            key: "show_overlay".into(),
+                            label: "Show overlay".into(),
+                            tooltip: Some("Highlight candidate centroids on the preview.".into()),
+                            kind: SettingKind::Bool {
+                                default: self.settings.show_overlay,
+                            },
+                        },
+                    ],
+                },
+            ],
+        }
+    }
+
+    fn get_setting(&self, key: &str) -> Option<Value> {
+        match key {
+            "finding_method" => Some(json!(self.settings.finding_method.index())),
+            "polarity" => Some(json!(self.settings.polarity.index())),
+            "epsilon_px" => Some(json!(self.settings.epsilon_px)),
+            "min_events" => Some(json!(self.settings.min_events)),
+            "max_spatial_extent_px" => Some(json!(self.settings.max_spatial_extent_px)),
+            "min_isotropy" => Some(json!(self.settings.min_isotropy)),
+            "threshold_factor" => Some(json!(self.settings.threshold_factor)),
+            "fit_radius_px" => Some(json!(self.settings.fit_radius_px)),
+            "max_candidates" => Some(json!(self.settings.max_candidates)),
+            "show_overlay" => Some(json!(self.settings.show_overlay)),
+            _ => None,
+        }
+    }
+
+    fn set_setting(&mut self, key: &str, value: Value) -> Result<(), String> {
+        match key {
+            "finding_method" => {
+                let Some(value) = Self::parse_usize(value) else {
+                    return Err("finding_method must be an integer".into());
+                };
+                self.settings.finding_method = CandidateFindingMethod::from_index(value);
+            }
+            "polarity" => {
+                let Some(value) = Self::parse_usize(value) else {
+                    return Err("polarity must be an integer".into());
+                };
+                self.settings.polarity = PolarityMode::from_index(value);
+            }
+            "epsilon_px" => {
+                let Some(value) = value.as_f64() else {
+                    return Err("epsilon_px must be numeric".into());
+                };
+                self.settings.epsilon_px = value.clamp(1.0, 10.0);
+            }
+            "min_events" => {
+                let Some(value) = Self::parse_usize(value) else {
+                    return Err("min_events must be an integer".into());
+                };
+                self.settings.min_events = value.clamp(1, 64);
+            }
+            "max_spatial_extent_px" => {
+                let Some(value) = value.as_f64() else {
+                    return Err("max_spatial_extent_px must be numeric".into());
+                };
+                self.settings.max_spatial_extent_px = value.clamp(1.0, 20.0);
+            }
+            "min_isotropy" => {
+                let Some(value) = value.as_f64() else {
+                    return Err("min_isotropy must be numeric".into());
+                };
+                self.settings.min_isotropy = value.clamp(0.0, 1.0);
+            }
+            "threshold_factor" => {
+                let Some(value) = value.as_f64() else {
+                    return Err("threshold_factor must be numeric".into());
+                };
+                self.settings.threshold_factor = value.clamp(0.5, 6.0);
+            }
+            "fit_radius_px" => {
+                let Some(value) = Self::parse_usize(value) else {
+                    return Err("fit_radius_px must be an integer".into());
+                };
+                self.settings.fit_radius_px = value.clamp(1, 16);
+            }
+            "max_candidates" => {
+                let Some(value) = Self::parse_usize(value) else {
+                    return Err("max_candidates must be an integer".into());
+                };
+                self.settings.max_candidates = value.clamp(1, 2048);
+            }
+            "show_overlay" => {
+                let Some(value) = value.as_bool() else {
+                    return Err("show_overlay must be a boolean".into());
+                };
+                self.settings.show_overlay = value;
+            }
+            _ => return Err(format!("unknown setting: {key}")),
+        }
+
+        Ok(())
+    }
+
+    fn status_entries(&self) -> Vec<StatusEntry> {
+        vec![
+            StatusEntry::Text(self.last_status.clone()),
+            StatusEntry::LabeledValue {
+                label: "Events".into(),
+                value: self.last_event_count.to_string(),
+                color: None,
+            },
+            StatusEntry::LabeledValue {
+                label: "Candidates".into(),
+                value: self.last_candidate_count.to_string(),
+                color: None,
+            },
+            StatusEntry::LabeledValue {
+                label: "Method".into(),
+                value: self.settings.finding_method.label().into(),
+                color: None,
+            },
+        ]
+    }
+}
+
+fn empty_candidates(frame: &PluginFrame<'_>, method: CandidateFindingMethod) -> EveCandidates {
     EveCandidates {
         clusters: Vec::new(),
-        frame_window_start_us: frame.window_start_us,
-        frame_window_end_us: frame.window_end_us,
+        frame_window_start_us: frame.window_start_us(),
+        frame_window_end_us: frame.window_end_us(),
         n_events_processed: 0,
         finding_method: method,
     }
 }
 
-fn filter_events_by_polarity(events: &[CdEvent], polarity: PolarityMode) -> Vec<CdEvent> {
+fn filter_events_by_polarity(events: Vec<EveEvent>, polarity: PolarityMode) -> Vec<EveEvent> {
     events
-        .iter()
-        .copied()
+        .into_iter()
         .filter(|event| polarity.include_event(event))
         .collect()
 }
 
-fn clusters_from_indices(events: &[CdEvent], cluster_indices: Vec<Vec<usize>>) -> Vec<EveCluster> {
+fn clusters_from_indices(events: &[EveEvent], cluster_indices: Vec<Vec<usize>>) -> Vec<EveCluster> {
     cluster_indices
         .into_iter()
         .filter_map(|indices| {
@@ -315,12 +614,12 @@ fn clusters_from_indices(events: &[CdEvent], cluster_indices: Vec<Vec<usize>>) -
 }
 
 fn frame_based_clusters(
-    frame: &PreviewFrame,
-    events: &[CdEvent],
+    frame: &PluginFrame<'_>,
+    events: &[EveEvent],
     settings: &CandidateSettings,
 ) -> Vec<Vec<usize>> {
-    let width = frame.width as usize;
-    let height = frame.height as usize;
+    let width = frame.width() as usize;
+    let height = frame.height() as usize;
     let image = build_analysis_image(frame, events);
     if image.is_empty() || width < 3 || height < 3 {
         return Vec::new();
@@ -369,14 +668,23 @@ fn frame_based_clusters(
         .collect()
 }
 
-fn build_analysis_image(frame: &PreviewFrame, events: &[CdEvent]) -> Vec<f64> {
-    let mut image = vec![0.0; frame.pixels.len()];
+fn build_analysis_image(frame: &PluginFrame<'_>, events: &[EveEvent]) -> Vec<f64> {
+    let width = frame.width() as usize;
+    let height = frame.height() as usize;
+    if width == 0 || height == 0 {
+        return Vec::new();
+    }
+
+    let mut image = vec![0.0; width * height];
     for event in events {
-        if event.x >= frame.width || event.y >= frame.height {
+        if event.x >= frame.width() || event.y >= frame.height() {
             continue;
         }
-        let index = event.y as usize * frame.width as usize + event.x as usize;
-        let weight = event.timestamp.saturating_sub(frame.window_start_us).max(1) as f64;
+        let index = event.y as usize * width + event.x as usize;
+        let weight = event
+            .timestamp
+            .saturating_sub(frame.window_start_us())
+            .max(1) as f64;
         image[index] += weight;
     }
     image
@@ -474,8 +782,8 @@ fn clamp_index(index: isize, limit: usize) -> usize {
 mod tests {
     use super::*;
 
-    fn event(x: u16, y: u16, polarity: bool, timestamp: u64) -> CdEvent {
-        CdEvent {
+    fn event(x: u16, y: u16, polarity: bool, timestamp: u64) -> EveEvent {
+        EveEvent {
             x,
             y,
             timestamp,
@@ -520,70 +828,110 @@ mod tests {
             event(42, 40, true, 15),
         ]);
 
-        let clusters = dbscan::cluster_event_indices(&events, 1.5, 4);
+        let mut clusters = dbscan::cluster_event_indices(&events, 1.5, 4);
+        clusters.sort_by_key(|cluster| cluster[0]);
         assert_eq!(clusters.len(), 2);
+        assert_eq!(clusters[0].len(), 5);
+        assert_eq!(clusters[1].len(), 5);
     }
 
     #[test]
-    fn dbscan_discards_noise_points() {
+    fn eigenfeature_rejects_line_like_cluster() {
+        let line_events = vec![
+            event(10, 10, true, 1),
+            event(11, 10, true, 2),
+            event(12, 10, true, 3),
+            event(13, 10, true, 4),
+            event(14, 10, true, 5),
+        ];
+        let compact_events = vec![
+            event(20, 20, true, 1),
+            event(20, 21, true, 2),
+            event(21, 20, true, 3),
+            event(21, 21, true, 4),
+            event(22, 20, true, 5),
+        ];
+
+        let mut events = line_events.clone();
+        events.extend(compact_events.clone());
+        let clusters = vec![
+            (0..line_events.len()).collect::<Vec<_>>(),
+            (line_events.len()..events.len()).collect::<Vec<_>>(),
+        ];
+
+        let filtered = eigenfeature::filter_clusters(&events, clusters, 4.0, 0.25);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].len(), compact_events.len());
+    }
+
+    #[test]
+    fn clusters_from_indices_computes_histogram_and_centroid() {
         let events = vec![
             event(10, 10, true, 1),
-            event(20, 20, true, 2),
-            event(30, 30, true, 3),
+            event(10, 10, false, 2),
+            event(11, 10, true, 3),
+            event(10, 11, true, 4),
         ];
 
-        let clusters = dbscan::cluster_event_indices(&events, 1.5, 2);
-        assert!(clusters.is_empty());
+        let clusters = clusters_from_indices(&events, vec![vec![0, 1, 2, 3]]);
+        assert_eq!(clusters.len(), 1);
+        let cluster = &clusters[0];
+        assert_eq!(cluster.event_count(), 4);
+        assert_eq!(cluster.positive_event_count(), 3);
+        assert_eq!(cluster.negative_event_count(), 1);
+        assert_eq!(cluster.pixel_histogram.len(), 3);
+        assert!((cluster.centroid_x - 10.25).abs() < 1e-6);
+        assert!((cluster.centroid_y - 10.25).abs() < 1e-6);
     }
 
     #[test]
-    fn eigenfeature_rejects_elongated_clusters() {
-        let mut events = vec![
-            event(5, 5, true, 1),
-            event(6, 5, true, 2),
-            event(7, 5, true, 3),
-            event(8, 5, true, 4),
-            event(9, 5, true, 5),
-        ];
-        let elongated_indices: Vec<usize> = (0..events.len()).collect();
+    fn build_analysis_image_weights_recent_events_more_strongly() {
+        let events = vec![event(2, 1, true, 10), event(2, 1, true, 20)];
+        let frame = TestFrame {
+            width: 6,
+            height: 4,
+            window_start_us: 5,
+        };
 
-        let circular_offset = events.len();
-        events.extend([
-            event(20, 20, true, 11),
-            event(21, 20, true, 12),
-            event(20, 21, true, 13),
-            event(21, 21, true, 14),
-            event(20, 19, true, 15),
-            event(19, 20, true, 16),
-        ]);
-        let circular_indices: Vec<usize> = (circular_offset..events.len()).collect();
-
-        let filtered = eigenfeature::filter_clusters(
-            &events,
-            vec![elongated_indices, circular_indices.clone()],
-            5.0,
-            0.4,
-        );
-
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0], circular_indices);
+        let image = build_analysis_image(&frame.into_plugin_frame(), &events);
+        let index = 1usize * 6 + 2usize;
+        assert_eq!(image[index], 20.0);
     }
 
     #[test]
-    fn polarity_filter_keeps_the_requested_subset() {
-        let events = vec![
-            event(1, 1, true, 1),
-            event(1, 2, false, 2),
-            event(2, 1, true, 3),
-            event(2, 2, false, 4),
+    fn local_maxima_detects_peaks() {
+        let image = vec![
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 1.0, 0.0, 0.0, 0.0, 1.0, 2.0, 1.0, 0.0, 0.0, 0.0,
+            1.0, 4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
         ];
 
-        let positive = filter_events_by_polarity(&events, PolarityMode::Positive);
-        let negative = filter_events_by_polarity(&events, PolarityMode::Negative);
+        let maxima = find_local_maxima(&image, 5, 5);
+        assert_eq!(maxima.len(), 2);
+        assert!(maxima.iter().any(|(x, y, _)| (*x, *y) == (1, 1)));
+        assert!(maxima.iter().any(|(x, y, _)| (*x, *y) == (3, 3)));
+    }
 
-        assert_eq!(positive.len(), 2);
-        assert!(positive.iter().all(|event| event.polarity));
-        assert_eq!(negative.len(), 2);
-        assert!(negative.iter().all(|event| !event.polarity));
+    struct TestFrame {
+        width: u16,
+        height: u16,
+        window_start_us: u64,
+    }
+
+    impl TestFrame {
+        fn into_plugin_frame(self) -> PluginFrame<'static> {
+            let raw = Box::leak(Box::new(augur_plugin_api::FfiPreviewFrame {
+                width: self.width,
+                height: self.height,
+                pixels: augur_plugin_api::FfiSlice::from_slice(&[] as &[u16]),
+                events: augur_plugin_api::FfiSlice::from_slice(
+                    &[] as &[augur_plugin_api::FfiCdEvent]
+                ),
+                window_start_us: self.window_start_us,
+                window_end_us: self.window_start_us + 1,
+            }));
+            PluginFrame::new(raw)
+        }
     }
 }
+
+export_plugin!(EveSmlmCandidatePlugin);

@@ -1,12 +1,5 @@
-[plugin]
 name = "EVE Post-Processing"
 version = "0.1.0"
 description = "Filter, drift-correct, and evaluate eveSMLM localizations with rolling eNeNA, PSF, and on-time summaries."
-authors = ["Mika Uthmann <muthmann@physik.uni-bielefeld.de>"]
-license = "MIT"
-phase = "DerivedData"
 domain = "smlm"
-dependencies = ["EVE Candidate Fitting"]
-
-[plugin.augur]
-min-version = "0.1.0"
+library = "augur_plugin_evesmlm_postproc"

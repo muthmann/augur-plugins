@@ -1,5 +1,7 @@
 # Hotpixel Detection
 
+Runtime plugin. Build `augur-plugin-hotpixel` as a `cdylib`, then copy `plugin.toml` plus the generated library into `~/.augur/plugins/hotpixel/`.
+
 Detects pixels that fire at abnormally high rates regardless of scene activity. Identified hotpixels can be pushed into the IMX636 hardware DEM (defective event mask) to suppress them before they enter the event stream.
 
 ## How It Works
@@ -20,7 +22,7 @@ The plugin maintains an exponential moving average of per-pixel event counts acr
 
 ## Published Data
 
-None. This plugin writes directly to `AnalysisOutput` (overlays and warnings) and can modify `CameraConfig` through the pixel mask.
+None. This plugin only emits overlays and warnings through the runtime host callbacks.
 
 ## Dependencies
 

@@ -6,8 +6,10 @@ license.workspace = true
 authors.workspace = true
 description = "Focus metrics plugin for AugurRS — live focus quality feedback from PSF sigma, FFT sharpness, or astigmatic ratio."
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
-augur-core.workspace = true
-augur-plugin-localization = { path = "../localization" }
-egui.workspace = true
+augur-plugin-api.workspace = true
 rustfft.workspace = true
+serde_json.workspace = true

@@ -6,6 +6,10 @@ license.workspace = true
 authors.workspace = true
 description = "Hotpixel detection plugin for AugurRS — identifies persistently noisy pixels and pushes them into the hardware DEM mask."
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
 augur-core.workspace = true
-egui.workspace = true
+augur-plugin-api.workspace = true
+serde_json.workspace = true

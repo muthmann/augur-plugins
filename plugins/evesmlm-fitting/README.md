@@ -1,5 +1,7 @@
 # EVE Candidate Fitting
 
+Runtime plugin. Build `augur-plugin-evesmlm-fitting` as a `cdylib`, then copy `plugin.toml` plus the generated library into `~/.augur/plugins/evesmlm-fitting/`.
+
 Sub-pixel localization for eveSMLM candidate clusters. The plugin consumes `EveCandidates`, fits each cluster with one of several estimators, and republishes the results both as EVE-native `EveLocalizationResults` and as `LocalizationResults` for compatibility with downstream plugins such as Focus Metrics.
 
 ## Methods
@@ -29,8 +31,8 @@ Sub-pixel localization for eveSMLM candidate clusters. The plugin consumes `EveC
 
 ## Published Data
 
-- `EveLocalizationResults`
-- `LocalizationResults` for compatibility with plugins expecting the existing localization type
+- `EveLocalizationResults` on `augur.evesmlm.localization_results`
+- `LocalizationResults` on `augur.localization.results` for compatibility with plugins such as Focus Metrics
 
 ## Dependencies
 

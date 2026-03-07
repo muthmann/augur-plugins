@@ -1,5 +1,7 @@
 # EVE Post-Processing
 
+Runtime plugin. Build `augur-plugin-evesmlm-postproc` as a `cdylib`, then copy `plugin.toml` plus the generated library into `~/.augur/plugins/evesmlm-postproc/`.
+
 Post-processing and quality assessment for eveSMLM localization streams. The plugin consumes `EveLocalizationResults`, applies configurable filters, estimates per-frame drift against a rolling reference, and keeps lightweight evaluation summaries for precision, PSF shape, and fluorescent on-time.
 
 ## Pipeline
@@ -29,7 +31,7 @@ Post-processing and quality assessment for eveSMLM localization streams. The plu
 
 ## Published Data
 
-Publishes filtered and drift-corrected `EveLocalizationResults`.
+Publishes filtered and drift-corrected `EveLocalizationResults` on `augur.evesmlm.localization_results`, and republishes standard `LocalizationResults` on `augur.localization.results` for downstream compatibility.
 
 ## Dependencies
 

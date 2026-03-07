@@ -19,10 +19,22 @@ The eveSMLM pipeline is implemented as three focused plugins so each stage can b
 
 `CdEvent` stream -> `EveCandidates` -> `EveLocalizationResults` -> filtered / corrected `EveLocalizationResults`
 
-## Registration
+## Installation
 
-Register the plugins in `augur-gui` in this order:
+Build all three plugins and install them into `~/.augur/plugins/`:
 
-1. `EveSmlmCandidatePlugin`
-2. `EveSmlmFittingPlugin`
-3. `EveSmlmPostProcPlugin`
+```bash
+CARGO_NET_GIT_FETCH_WITH_CLI=true cargo build \
+  -p augur-plugin-evesmlm-candidates \
+  -p augur-plugin-evesmlm-fitting \
+  -p augur-plugin-evesmlm-postproc \
+  --release
+
+for name in evesmlm-candidates evesmlm-fitting evesmlm-postproc; do
+  mkdir -p ~/.augur/plugins/$name
+  cp plugins/$name/plugin.toml ~/.augur/plugins/$name/
+  cp target/release/libaugur_plugin_${name//-/_}.dylib ~/.augur/plugins/$name/
+done
+```
+
+Then open `augur-gui`, go to **Plugins → Scan for New Plugins**, and enable all three. The runtime loader discovers ordering from phase declarations (`RawEvents` then `DerivedData`), so no manual registration order is required.

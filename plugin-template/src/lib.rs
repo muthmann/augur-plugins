@@ -1,71 +1,112 @@
-//! AugurRS Plugin Template
-//!
-//! Copy this crate to start a new plugin. Rename the crate in Cargo.toml,
-//! update plugin.toml with your metadata, and replace this implementation
-//! with your analysis logic.
-//!
-//! See CONTRIBUTING.md in the repository root for the full guide.
+use augur_plugin_api::{
+    export_plugin, FfiPixel, HostContext, HostOutput, Plugin, PluginFrame, SettingItem,
+    SettingKind, SettingsSchema, SettingsSection, StatusEntry,
+};
+use serde_json::{json, Value};
 
-use augur_core::{analysis::AnalysisOutput, pipeline::PreviewFrame};
-
-// Re-export the plugin types your consumers need.
-// For the AnalysisPlugin trait, PluginContext, and PluginInput,
-// these are provided by augur-gui and will be available when your
-// plugin is compiled into the host binary.
-
-/// Plugin state. All mutable state lives here.
 #[derive(Default)]
 pub struct TemplatePlugin {
     enabled: bool,
-    // Add your settings and state fields here.
+    threshold: u16,
+    last_hits: usize,
 }
 
-// NOTE: The AnalysisPlugin trait implementation goes here.
-// Because the trait is defined in augur-gui (not augur-core), the actual
-// `impl AnalysisPlugin for TemplatePlugin` block is written when the plugin
-// is integrated into the augur-gui build. During standalone development,
-// you can write your analysis logic as regular methods on your struct and
-// test them independently.
-//
-// See the existing plugins (hotpixel, roi-grid, localization, focus-metrics)
-// for complete trait implementation examples.
-
-impl TemplatePlugin {
-    /// Plugin name as it appears in the Analysis panel.
-    pub fn name(&self) -> &str {
+impl Plugin for TemplatePlugin {
+    fn name(&self) -> &'static str {
         "Template Plugin"
     }
 
-    /// Short description shown below the plugin name.
-    pub fn description(&self) -> &str {
-        "A starting point for new plugins."
+    fn description(&self) -> &'static str {
+        "A starting point for a runtime-loaded AugurRS plugin."
     }
 
-    pub fn enabled(&self) -> bool {
+    fn enabled(&self) -> bool {
         self.enabled
     }
 
-    /// Core analysis logic. Called once per preview frame when the plugin is enabled.
-    pub fn analyze(&mut self, frame: &PreviewFrame, output: &mut AnalysisOutput) {
-        // Your analysis goes here.
-        // Access frame.pixels (decoded preview), frame.width, frame.height.
-        // Push overlays or warnings into output.
-        let _ = (frame, output);
+    fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
     }
 
-    /// Reset all mutable state. Called when the plugin is disabled or the session restarts.
-    pub fn reset(&mut self) {
-        // Clear your buffers, histories, caches, etc.
+    fn reset(&mut self) {
+        self.last_hits = 0;
+    }
+
+    fn process_frame(
+        &mut self,
+        frame: &PluginFrame<'_>,
+        output: &mut HostOutput<'_>,
+        _context: &mut HostContext<'_>,
+    ) {
+        let mut pixels = Vec::new();
+        for (index, value) in frame.pixels().iter().enumerate() {
+            if *value < self.threshold {
+                continue;
+            }
+            let x = (index % frame.width() as usize) as u16;
+            let y = (index / frame.width() as usize) as u16;
+            pixels.push(FfiPixel { x, y });
+            if pixels.len() >= 256 {
+                break;
+            }
+        }
+
+        self.last_hits = pixels.len();
+        if !pixels.is_empty() {
+            output.add_highlight_pixels(&pixels, [255, 180, 0, 160]);
+        }
+    }
+
+    fn settings_schema(&self) -> SettingsSchema {
+        SettingsSchema {
+            sections: vec![SettingsSection {
+                label: "Detection".into(),
+                description: Some(
+                    "Example declarative setting exposed through the host UI.".into(),
+                ),
+                default_open: true,
+                items: vec![SettingItem {
+                    key: "threshold".into(),
+                    label: "Pixel threshold".into(),
+                    tooltip: Some("Pixels at or above this preview count are highlighted.".into()),
+                    kind: SettingKind::I64Slider {
+                        min: 0,
+                        max: 4_096,
+                        default: i64::from(self.threshold),
+                        suffix: None,
+                    },
+                }],
+            }],
+        }
+    }
+
+    fn get_setting(&self, key: &str) -> Option<Value> {
+        match key {
+            "threshold" => Some(json!(self.threshold)),
+            _ => None,
+        }
+    }
+
+    fn set_setting(&mut self, key: &str, value: Value) -> Result<(), String> {
+        match key {
+            "threshold" => {
+                let Some(value) = value.as_u64() else {
+                    return Err("threshold must be an integer".into());
+                };
+                self.threshold =
+                    u16::try_from(value.clamp(0, 4_096)).expect("clamped threshold fits in u16");
+                Ok(())
+            }
+            _ => Err(format!("unknown setting: {key}")),
+        }
+    }
+
+    fn status_entries(&self) -> Vec<StatusEntry> {
+        vec![StatusEntry::Text(format!(
+            "Last frame: {} highlighted pixels.",
+            self.last_hits
+        ))]
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn template_plugin_default_is_disabled() {
-        let plugin = TemplatePlugin::default();
-        assert!(!plugin.enabled());
-    }
-}
+export_plugin!(TemplatePlugin);

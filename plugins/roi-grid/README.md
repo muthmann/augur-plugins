@@ -1,5 +1,7 @@
 # ROI Grid
 
+This crate remains built into `augur-gui`. It is not part of the runtime-loaded plugin set because the current runtime API does not expose the camera-configuration hooks needed for ROI application.
+
 Partitions the sensor into a grid defined by masked hotpixel positions, then finds the largest rectangular regions that contain no hotpixels. These regions are candidates for the hardware ROI — click "Use as ROI" to apply one directly.
 
 ## How It Works

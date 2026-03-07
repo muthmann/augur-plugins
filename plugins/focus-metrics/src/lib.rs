@@ -1,32 +1,24 @@
-//! Focus Metrics Plugin
-//!
-//! Live focus quality monitoring with three methods:
-//! Mean PSF sigma, FFT high-frequency power, and astigmatic ratio.
-//!
-//! Execution phase: DerivedData
-//! Dependencies: Molecule Localization (for sigma and astigmatic methods)
-//! Published data: None
-
 use std::collections::VecDeque;
 
-use augur_core::{
-    analysis::{AnalysisOutput, AnalysisSeverity, AnalysisWarning},
-    pipeline::PreviewFrame,
+use augur_plugin_api::{
+    export_plugin, AnalysisSeverity, HostContext, HostOutput, LocalizationResults, Plugin,
+    PluginFrame, PluginInput, SettingItem, SettingKind, SettingsSchema, SettingsSection,
+    StatusEntry, CTX_LOCALIZATION_RESULTS,
 };
 use rustfft::{num_complex::Complex32, FftPlanner};
+use serde_json::{json, Value};
 
-// Re-export the localization types this plugin consumes.
-pub use augur_plugin_localization::{Localization, LocalizationResults};
+const NO_DEPENDENCIES: [&str; 0] = [];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FocusMethod {
+enum FocusMethod {
     MeanSigma,
     FftHighFrequency,
     AstigmaticRatio,
 }
 
 impl FocusMethod {
-    pub fn label(self) -> &'static str {
+    fn label(self) -> &'static str {
         match self {
             Self::MeanSigma => "Mean PSF sigma",
             Self::FftHighFrequency => "FFT high frequency",
@@ -34,18 +26,34 @@ impl FocusMethod {
         }
     }
 
-    pub fn lower_is_better(self) -> bool {
+    fn lower_is_better(self) -> bool {
         matches!(self, Self::MeanSigma)
+    }
+
+    fn from_index(index: usize) -> Self {
+        match index {
+            1 => Self::FftHighFrequency,
+            2 => Self::AstigmaticRatio,
+            _ => Self::MeanSigma,
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Self::MeanSigma => 0,
+            Self::FftHighFrequency => 1,
+            Self::AstigmaticRatio => 2,
+        }
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct FocusSettings {
-    pub method: FocusMethod,
-    pub history_depth: usize,
-    pub sigma_min_nm: f64,
-    pub sigma_max_nm: f64,
-    pub nm_per_pixel: f64,
+struct FocusSettings {
+    method: FocusMethod,
+    history_depth: usize,
+    sigma_min_nm: f64,
+    sigma_max_nm: f64,
+    nm_per_pixel: f64,
 }
 
 impl Default for FocusSettings {
@@ -60,7 +68,7 @@ impl Default for FocusSettings {
     }
 }
 
-pub struct FocusMetricsPlugin {
+struct FocusMetricsPlugin {
     enabled: bool,
     settings: FocusSettings,
     history: VecDeque<f64>,
@@ -81,46 +89,7 @@ impl Default for FocusMetricsPlugin {
 }
 
 impl FocusMetricsPlugin {
-    pub fn name(&self) -> &str {
-        "Focus Metrics"
-    }
-
-    pub fn description(&self) -> &str {
-        "Running focus metrics derived from molecule fits or from a frequency-domain sharpness estimate."
-    }
-
-    pub fn enabled(&self) -> bool {
-        self.enabled
-    }
-
-    pub fn set_enabled(&mut self, enabled: bool) {
-        self.enabled = enabled;
-        if !enabled {
-            self.reset();
-        }
-    }
-
-    pub fn settings(&self) -> &FocusSettings {
-        &self.settings
-    }
-
-    pub fn settings_mut(&mut self) -> &mut FocusSettings {
-        &mut self.settings
-    }
-
-    pub fn history(&self) -> &VecDeque<f64> {
-        &self.history
-    }
-
-    pub fn last_metric(&self) -> Option<f64> {
-        self.last_metric
-    }
-
-    pub fn last_status(&self) -> &str {
-        &self.last_status
-    }
-
-    pub fn clear_history(&mut self) {
+    fn clear_history(&mut self) {
         self.history.clear();
         self.last_metric = None;
     }
@@ -136,13 +105,13 @@ impl FocusMetricsPlugin {
     fn filtered_localizations<'a>(
         &self,
         results: &'a LocalizationResults,
-    ) -> Vec<&'a Localization> {
+    ) -> Vec<&'a augur_plugin_api::Localization> {
         results
             .localizations
             .iter()
-            .filter(|l| {
-                let sigma_x_nm = l.sigma_x * self.settings.nm_per_pixel;
-                let sigma_y_nm = l.sigma_y * self.settings.nm_per_pixel;
+            .filter(|localization| {
+                let sigma_x_nm = localization.sigma_x * self.settings.nm_per_pixel;
+                let sigma_y_nm = localization.sigma_y * self.settings.nm_per_pixel;
                 sigma_x_nm >= self.settings.sigma_min_nm
                     && sigma_x_nm <= self.settings.sigma_max_nm
                     && sigma_y_nm >= self.settings.sigma_min_nm
@@ -151,7 +120,7 @@ impl FocusMetricsPlugin {
             .collect()
     }
 
-    pub fn current_metric_label(&self) -> String {
+    fn current_metric_label(&self) -> String {
         match (self.settings.method, self.last_metric) {
             (_, None) => "Current metric: n/a".into(),
             (FocusMethod::MeanSigma, Some(value)) => {
@@ -166,29 +135,25 @@ impl FocusMetricsPlugin {
         }
     }
 
-    pub fn quality_indicator(&self) -> (&'static str, [u8; 3]) {
-        let green = [88, 196, 92];
-        let yellow = [255, 255, 0];
-        let red = [255, 0, 0];
-
+    fn quality_indicator(&self) -> (&'static str, [u8; 3]) {
         let Some(metric) = self.last_metric else {
-            return ("Collecting", yellow);
+            return ("Collecting", [240, 196, 72]);
         };
 
         match self.settings.method {
             FocusMethod::AstigmaticRatio => {
                 let deviation = (metric - 1.0).abs();
                 if deviation <= 0.05 {
-                    ("Good", green)
+                    ("Good", [88, 196, 92])
                 } else if deviation <= 0.12 {
-                    ("Fair", yellow)
+                    ("Fair", [240, 196, 72])
                 } else {
-                    ("Poor", red)
+                    ("Poor", [220, 64, 64])
                 }
             }
             FocusMethod::MeanSigma | FocusMethod::FftHighFrequency => {
                 if self.history.len() < 4 {
-                    return ("Collecting", yellow);
+                    return ("Collecting", [240, 196, 72]);
                 }
                 let min = self.history.iter().copied().fold(f64::INFINITY, f64::min);
                 let max = self
@@ -203,20 +168,21 @@ impl FocusMetricsPlugin {
                     FocusMethod::AstigmaticRatio => unreachable!(),
                 };
                 if normalized >= 0.66 {
-                    ("Good", green)
+                    ("Good", [88, 196, 92])
                 } else if normalized >= 0.33 {
-                    ("Fair", yellow)
+                    ("Fair", [240, 196, 72])
                 } else {
-                    ("Poor", red)
+                    ("Poor", [220, 64, 64])
                 }
             }
         }
     }
 
-    pub fn trend_label(&self) -> &'static str {
+    fn trend_label(&self) -> &'static str {
         if self.history.len() < 6 {
             return "flat";
         }
+
         let history: Vec<f64> = self.history.iter().copied().collect();
         let split = history.len().saturating_sub(3);
         let previous = &history[..split];
@@ -259,31 +225,44 @@ impl FocusMetricsPlugin {
         }
     }
 
-    /// Process one frame using the selected method.
-    /// Pass localization_results = None when the localization plugin is not active.
-    pub fn process_method(
+    fn process_method(
         &mut self,
-        frame: &PreviewFrame,
-        output: &mut AnalysisOutput,
-        localization_results: Option<&LocalizationResults>,
+        frame: &PluginFrame<'_>,
+        output: &mut HostOutput<'_>,
+        context: &mut HostContext<'_>,
     ) {
         match self.settings.method {
             FocusMethod::MeanSigma => {
-                let Some(results) = localization_results else {
-                    self.last_status =
-                        "Enable the Molecule Localization plugin or switch to FFT mode.".into();
-                    output.warnings.push(AnalysisWarning {
-                        source: self.name().to_owned(),
-                        severity: AnalysisSeverity::Info,
-                        message: "Mean PSF sigma requires the Molecule Localization plugin.".into(),
-                    });
-                    return;
+                let results = match context.get::<LocalizationResults>(CTX_LOCALIZATION_RESULTS) {
+                    Ok(Some(results)) => results,
+                    Ok(None) => {
+                        self.last_status =
+                            "Enable an upstream localization plugin or switch to FFT mode.".into();
+                        output.add_warning(
+                            self.name(),
+                            AnalysisSeverity::Info,
+                            "Mean PSF sigma requires localization results from an upstream plugin.",
+                        );
+                        return;
+                    }
+                    Err(err) => {
+                        self.last_status = "Localization results could not be decoded.".into();
+                        output.add_warning(
+                            self.name(),
+                            AnalysisSeverity::Error,
+                            &format!("Failed to decode localization results: {err}"),
+                        );
+                        return;
+                    }
                 };
 
                 let values: Vec<f64> = self
-                    .filtered_localizations(results)
+                    .filtered_localizations(&results)
                     .into_iter()
-                    .map(|l| 0.5 * (l.sigma_x + l.sigma_y) * self.settings.nm_per_pixel)
+                    .map(|localization| {
+                        0.5 * (localization.sigma_x + localization.sigma_y)
+                            * self.settings.nm_per_pixel
+                    })
                     .collect();
                 if values.is_empty() {
                     self.last_status =
@@ -312,26 +291,37 @@ impl FocusMetricsPlugin {
                     "Integrated high-frequency power from the preview FFT ring filter.".into();
             }
             FocusMethod::AstigmaticRatio => {
-                let Some(results) = localization_results else {
-                    self.last_status =
-                        "Enable the Molecule Localization plugin or switch to FFT mode.".into();
-                    output.warnings.push(AnalysisWarning {
-                        source: self.name().to_owned(),
-                        severity: AnalysisSeverity::Info,
-                        message: "Astigmatic ratio requires the Molecule Localization plugin."
-                            .into(),
-                    });
-                    return;
+                let results = match context.get::<LocalizationResults>(CTX_LOCALIZATION_RESULTS) {
+                    Ok(Some(results)) => results,
+                    Ok(None) => {
+                        self.last_status =
+                            "Enable an upstream localization plugin or switch to FFT mode.".into();
+                        output.add_warning(
+                            self.name(),
+                            AnalysisSeverity::Info,
+                            "Astigmatic ratio requires localization results from an upstream plugin.",
+                        );
+                        return;
+                    }
+                    Err(err) => {
+                        self.last_status = "Localization results could not be decoded.".into();
+                        output.add_warning(
+                            self.name(),
+                            AnalysisSeverity::Error,
+                            &format!("Failed to decode localization results: {err}"),
+                        );
+                        return;
+                    }
                 };
 
                 let values: Vec<f64> = self
-                    .filtered_localizations(results)
+                    .filtered_localizations(&results)
                     .into_iter()
-                    .filter_map(|l| {
-                        if l.sigma_y.abs() <= f64::EPSILON {
+                    .filter_map(|localization| {
+                        if localization.sigma_y.abs() <= f64::EPSILON {
                             None
                         } else {
-                            Some(l.sigma_x / l.sigma_y)
+                            Some(localization.sigma_x / localization.sigma_y)
                         }
                     })
                     .collect();
@@ -354,15 +344,201 @@ impl FocusMetricsPlugin {
         }
     }
 
-    pub fn reset(&mut self) {
-        self.clear_history();
-        self.last_status = "Waiting for the next preview frame.".into();
+    fn parse_usize(value: Value) -> Option<usize> {
+        value.as_u64().and_then(|value| usize::try_from(value).ok())
     }
 }
 
-// --- FFT focus metric ---
+impl Plugin for FocusMetricsPlugin {
+    fn name(&self) -> &'static str {
+        "Focus Metrics"
+    }
 
-fn fft_focus_metric(frame: &PreviewFrame) -> Option<f64> {
+    fn description(&self) -> &'static str {
+        "Running focus metrics derived from molecule fits or from a frequency-domain sharpness estimate."
+    }
+
+    fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+        if !enabled {
+            self.reset();
+        }
+    }
+
+    fn reset(&mut self) {
+        self.clear_history();
+        self.last_status = "Waiting for the next preview frame.".into();
+    }
+
+    fn input_kind(&self) -> PluginInput {
+        PluginInput::DerivedData
+    }
+
+    fn dependencies(&self) -> &[&'static str] {
+        &NO_DEPENDENCIES
+    }
+
+    fn process_frame(
+        &mut self,
+        frame: &PluginFrame<'_>,
+        output: &mut HostOutput<'_>,
+        context: &mut HostContext<'_>,
+    ) {
+        self.process_method(frame, output, context);
+    }
+
+    fn settings_schema(&self) -> SettingsSchema {
+        SettingsSchema {
+            sections: vec![SettingsSection {
+                label: "Focus".into(),
+                description: Some(
+                    "Focus quality can be inferred from localization statistics or directly from the preview FFT."
+                        .into(),
+                ),
+                default_open: true,
+                items: vec![
+                    SettingItem {
+                        key: "method".into(),
+                        label: "Method".into(),
+                        tooltip: None,
+                        kind: SettingKind::Enum {
+                            variants: vec![
+                                FocusMethod::MeanSigma.label().into(),
+                                FocusMethod::FftHighFrequency.label().into(),
+                                FocusMethod::AstigmaticRatio.label().into(),
+                            ],
+                            default: self.settings.method.index(),
+                        },
+                    },
+                    SettingItem {
+                        key: "history_depth".into(),
+                        label: "History depth".into(),
+                        tooltip: None,
+                        kind: SettingKind::I64Slider {
+                            min: 16,
+                            max: 360,
+                            default: i64::try_from(self.settings.history_depth).unwrap_or(120),
+                            suffix: None,
+                        },
+                    },
+                    SettingItem {
+                        key: "nm_per_pixel".into(),
+                        label: "Scale [nm/px]".into(),
+                        tooltip: None,
+                        kind: SettingKind::F64Slider {
+                            min: 20.0,
+                            max: 150.0,
+                            default: self.settings.nm_per_pixel,
+                            suffix: None,
+                        },
+                    },
+                    SettingItem {
+                        key: "sigma_min_nm".into(),
+                        label: "Sigma min [nm]".into(),
+                        tooltip: None,
+                        kind: SettingKind::F64Drag {
+                            min: 10.0,
+                            max: 500.0,
+                            speed: 1.0,
+                            default: self.settings.sigma_min_nm,
+                        },
+                    },
+                    SettingItem {
+                        key: "sigma_max_nm".into(),
+                        label: "Sigma max [nm]".into(),
+                        tooltip: None,
+                        kind: SettingKind::F64Drag {
+                            min: 20.0,
+                            max: 800.0,
+                            speed: 1.0,
+                            default: self.settings.sigma_max_nm,
+                        },
+                    },
+                ],
+            }],
+        }
+    }
+
+    fn get_setting(&self, key: &str) -> Option<Value> {
+        match key {
+            "method" => Some(json!(self.settings.method.index())),
+            "history_depth" => Some(json!(self.settings.history_depth)),
+            "sigma_min_nm" => Some(json!(self.settings.sigma_min_nm)),
+            "sigma_max_nm" => Some(json!(self.settings.sigma_max_nm)),
+            "nm_per_pixel" => Some(json!(self.settings.nm_per_pixel)),
+            _ => None,
+        }
+    }
+
+    fn set_setting(&mut self, key: &str, value: Value) -> Result<(), String> {
+        match key {
+            "method" => {
+                let Some(value) = Self::parse_usize(value) else {
+                    return Err("method must be an integer".into());
+                };
+                let method = FocusMethod::from_index(value);
+                if method != self.settings.method {
+                    self.settings.method = method;
+                    self.clear_history();
+                }
+            }
+            "history_depth" => {
+                let Some(value) = Self::parse_usize(value) else {
+                    return Err("history_depth must be an integer".into());
+                };
+                self.settings.history_depth = value.clamp(16, 360);
+                while self.history.len() > self.settings.history_depth {
+                    self.history.pop_front();
+                }
+            }
+            "sigma_min_nm" => {
+                let Some(value) = value.as_f64() else {
+                    return Err("sigma_min_nm must be numeric".into());
+                };
+                self.settings.sigma_min_nm = value.clamp(10.0, 500.0);
+            }
+            "sigma_max_nm" => {
+                let Some(value) = value.as_f64() else {
+                    return Err("sigma_max_nm must be numeric".into());
+                };
+                self.settings.sigma_max_nm = value.clamp(20.0, 800.0);
+            }
+            "nm_per_pixel" => {
+                let Some(value) = value.as_f64() else {
+                    return Err("nm_per_pixel must be numeric".into());
+                };
+                self.settings.nm_per_pixel = value.clamp(20.0, 150.0);
+            }
+            _ => return Err(format!("unknown setting: {key}")),
+        }
+        Ok(())
+    }
+
+    fn status_entries(&self) -> Vec<StatusEntry> {
+        let (quality_label, quality_color) = self.quality_indicator();
+        vec![
+            StatusEntry::Text(self.current_metric_label()),
+            StatusEntry::LabeledValue {
+                label: "Focus quality".into(),
+                value: quality_label.into(),
+                color: Some(quality_color),
+            },
+            StatusEntry::Text(format!("Trend: {}", self.trend_label())),
+            StatusEntry::Text(self.last_status.clone()),
+            StatusEntry::Sparkline {
+                label: "History".into(),
+                values: self.history.iter().copied().collect(),
+                lower_is_better: self.settings.method.lower_is_better(),
+            },
+        ]
+    }
+}
+
+fn fft_focus_metric(frame: &PluginFrame<'_>) -> Option<f64> {
     let (width, height, mut buffer) = downsample_frame(frame, 192);
     if width < 8 || height < 8 {
         return None;
@@ -372,7 +548,7 @@ fn fft_focus_metric(frame: &PreviewFrame) -> Option<f64> {
     for value in &mut buffer {
         *value -= mean;
     }
-    let signal_energy: f32 = buffer.iter().map(|v| v * v).sum();
+    let signal_energy: f32 = buffer.iter().map(|value| value * value).sum();
     if signal_energy <= 1e-6 {
         return None;
     }
@@ -380,7 +556,10 @@ fn fft_focus_metric(frame: &PreviewFrame) -> Option<f64> {
     let mut planner = FftPlanner::<f32>::new();
     let fft_width = planner.plan_fft_forward(width);
     let fft_height = planner.plan_fft_forward(height);
-    let mut spectrum: Vec<Complex32> = buffer.into_iter().map(|v| Complex32::new(v, 0.0)).collect();
+    let mut spectrum: Vec<Complex32> = buffer
+        .into_iter()
+        .map(|value| Complex32::new(value, 0.0))
+        .collect();
 
     for row in 0..height {
         fft_width.process(&mut spectrum[row * width..(row + 1) * width]);
@@ -430,9 +609,9 @@ fn normalized_frequency(index: usize, size: usize) -> f32 {
     centered / half.max(1.0)
 }
 
-fn downsample_frame(frame: &PreviewFrame, max_dim: usize) -> (usize, usize, Vec<f32>) {
-    let width = frame.width as usize;
-    let height = frame.height as usize;
+fn downsample_frame(frame: &PluginFrame<'_>, max_dim: usize) -> (usize, usize, Vec<f32>) {
+    let width = frame.width() as usize;
+    let height = frame.height() as usize;
     let step_x = width.div_ceil(max_dim).max(1);
     let step_y = height.div_ceil(max_dim).max(1);
     let down_width = width.div_ceil(step_x);
@@ -449,7 +628,7 @@ fn downsample_frame(frame: &PreviewFrame, max_dim: usize) -> (usize, usize, Vec<
             let mut count = 0usize;
             for y in src_y0..src_y1 {
                 for x in src_x0..src_x1 {
-                    sum += frame.pixels[y * width + x] as f32;
+                    sum += frame.pixels()[y * width + x] as f32;
                     count += 1;
                 }
             }
@@ -460,25 +639,31 @@ fn downsample_frame(frame: &PreviewFrame, max_dim: usize) -> (usize, usize, Vec<
     (down_width, down_height, output)
 }
 
+export_plugin!(FocusMetricsPlugin);
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use augur_plugin_api::{FfiPreviewFrame, FfiSlice};
 
     #[test]
     fn downsample_preserves_nonzero_signal() {
-        let frame = PreviewFrame {
+        let pixels = {
+            let mut pixels = vec![0u16; 16 * 16];
+            pixels[5 * 16 + 6] = 200;
+            pixels
+        };
+        let frame = FfiPreviewFrame {
             width: 16,
             height: 16,
-            pixels: {
-                let mut pixels = vec![0u16; 16 * 16];
-                pixels[5 * 16 + 6] = 200;
-                pixels
-            },
+            pixels: FfiSlice::from_slice(&pixels),
+            events: FfiSlice::default(),
             window_start_us: 0,
-            window_end_us: 1000,
+            window_end_us: 1_000,
         };
+        let frame = PluginFrame::new(&frame);
 
         let (_w, _h, values) = downsample_frame(&frame, 8);
-        assert!(values.iter().any(|v| *v > 0.0));
+        assert!(values.iter().any(|value| *value > 0.0));
     }
 }

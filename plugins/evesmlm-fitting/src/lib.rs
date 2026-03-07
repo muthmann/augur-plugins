@@ -10,15 +10,19 @@ pub mod phasor;
 pub mod radial_symmetry;
 pub mod types;
 
-use augur_core::{
-    analysis::{AnalysisOutput, AnalysisSeverity, AnalysisWarning, Overlay, Pixel},
-    pipeline::CdEvent,
+use augur_plugin_api::{
+    export_plugin, AnalysisSeverity, FfiSubpixelMarker, HostContext, HostOutput, Localization,
+    LocalizationResults, Plugin, PluginFrame, PluginInput, SettingItem, SettingKind,
+    SettingsSchema, SettingsSection, StatusEntry, CTX_LOCALIZATION_RESULTS,
 };
-pub use augur_plugin_evesmlm_candidates::{CandidateFindingMethod, EveCandidates, EveCluster};
-pub use augur_plugin_localization::{Localization, LocalizationResults};
-pub use types::{EveLocalization, EveLocalizationResults, FitMethod};
+pub use augur_plugin_evesmlm_candidates::{
+    CandidateFindingMethod, EveCandidates, EveCluster, EveEvent, CTX_EVE_CANDIDATES,
+};
+use serde_json::{json, Value};
+pub use types::{EveLocalization, EveLocalizationResults, FitMethod, CTX_EVE_LOCALIZATION_RESULTS};
 
 const OVERLAY_COLOR: [u8; 4] = [60, 220, 140, 220];
+const CANDIDATE_DEPENDENCY: [&str; 1] = ["EVE Candidate Finding"];
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct FitEstimate {
@@ -74,60 +78,20 @@ impl Default for EveSmlmFittingPlugin {
 }
 
 impl EveSmlmFittingPlugin {
-    pub fn name(&self) -> &str {
-        "EVE Candidate Fitting"
-    }
-
-    pub fn description(&self) -> &str {
-        "Sub-pixel localization of raw-event candidates with multiple fitting backends."
-    }
-
-    pub fn enabled(&self) -> bool {
-        self.enabled
-    }
-
-    pub fn set_enabled(&mut self, enabled: bool) {
-        self.enabled = enabled;
-        if !enabled {
-            self.reset();
-        }
-    }
-
-    pub fn settings(&self) -> &FittingSettings {
-        &self.settings
-    }
-
-    pub fn settings_mut(&mut self) -> &mut FittingSettings {
-        &mut self.settings
-    }
-
-    pub fn last_localization_count(&self) -> usize {
-        self.last_localization_count
-    }
-
-    pub fn last_rejection_count(&self) -> usize {
-        self.last_rejection_count
-    }
-
-    pub fn last_status(&self) -> &str {
-        &self.last_status
-    }
-
-    pub fn analyze_candidates(
+    fn analyze_candidates(
         &mut self,
         candidates: Option<&EveCandidates>,
-        output: &mut AnalysisOutput,
+        output: &mut HostOutput<'_>,
     ) -> (EveLocalizationResults, LocalizationResults) {
         let Some(candidates) = candidates else {
             self.last_localization_count = 0;
             self.last_rejection_count = 0;
             self.last_status = "Waiting for EVE Candidate Finding.".into();
-            output.warnings.push(AnalysisWarning {
-                source: self.name().to_owned(),
-                severity: AnalysisSeverity::Info,
-                message: "EVE fitting requires candidate clusters from EVE Candidate Finding."
-                    .into(),
-            });
+            Self::warning(
+                output,
+                AnalysisSeverity::Info,
+                "EVE fitting requires candidate clusters from EVE Candidate Finding.",
+            );
             return (
                 EveLocalizationResults::default(),
                 LocalizationResults::default(),
@@ -188,16 +152,14 @@ impl EveSmlmFittingPlugin {
         );
 
         if self.settings.show_overlay && !localizations.is_empty() {
-            output.overlays.push(Overlay::HighlightPixels {
-                pixels: localizations
-                    .iter()
-                    .map(|localization| Pixel {
-                        x: localization.x.round().max(0.0) as u16,
-                        y: localization.y.round().max(0.0) as u16,
-                    })
-                    .collect(),
-                color: OVERLAY_COLOR,
-            });
+            let markers: Vec<FfiSubpixelMarker> = localizations
+                .iter()
+                .map(|localization| FfiSubpixelMarker {
+                    x: localization.x as f32,
+                    y: localization.y as f32,
+                })
+                .collect();
+            output.add_crosshair_markers(&markers, OVERLAY_COLOR, 5);
         }
 
         let eve_results = EveLocalizationResults {
@@ -214,6 +176,261 @@ impl EveSmlmFittingPlugin {
         self.last_localization_count = 0;
         self.last_rejection_count = 0;
         self.last_status = "Waiting for the next candidate set.".into();
+    }
+
+    fn parse_usize(value: Value) -> Option<usize> {
+        value.as_u64().and_then(|value| usize::try_from(value).ok())
+    }
+
+    fn warning(output: &mut HostOutput<'_>, severity: AnalysisSeverity, message: &str) {
+        output.add_warning("EVE Candidate Fitting", severity, message);
+    }
+}
+
+impl Plugin for EveSmlmFittingPlugin {
+    fn name(&self) -> &'static str {
+        "EVE Candidate Fitting"
+    }
+
+    fn description(&self) -> &'static str {
+        "Sub-pixel localization of raw-event candidates with multiple fitting backends."
+    }
+
+    fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+        if !enabled {
+            self.reset();
+        }
+    }
+
+    fn reset(&mut self) {
+        EveSmlmFittingPlugin::reset(self);
+    }
+
+    fn input_kind(&self) -> PluginInput {
+        PluginInput::DerivedData
+    }
+
+    fn dependencies(&self) -> &[&'static str] {
+        &CANDIDATE_DEPENDENCY
+    }
+
+    fn process_frame(
+        &mut self,
+        _frame: &PluginFrame<'_>,
+        output: &mut HostOutput<'_>,
+        context: &mut HostContext<'_>,
+    ) {
+        let candidates = match context.get::<EveCandidates>(CTX_EVE_CANDIDATES) {
+            Ok(value) => value,
+            Err(err) => {
+                Self::warning(
+                    output,
+                    AnalysisSeverity::Warning,
+                    &format!("Reading EVE candidates failed: {err}"),
+                );
+                None
+            }
+        };
+
+        let (eve_results, compatibility) = self.analyze_candidates(candidates.as_ref(), output);
+        if let Err(err) = context.publish(CTX_EVE_LOCALIZATION_RESULTS, &eve_results) {
+            Self::warning(
+                output,
+                AnalysisSeverity::Warning,
+                &format!("Publishing EVE localizations failed: {err}"),
+            );
+        }
+        if let Err(err) = context.publish(CTX_LOCALIZATION_RESULTS, &compatibility) {
+            Self::warning(
+                output,
+                AnalysisSeverity::Warning,
+                &format!("Publishing localization compatibility results failed: {err}"),
+            );
+        }
+    }
+
+    fn settings_schema(&self) -> SettingsSchema {
+        SettingsSchema {
+            sections: vec![SettingsSection {
+                label: "Fitting".into(),
+                description: Some(
+                    "Estimate sub-pixel emitter positions directly from event-cluster histograms."
+                        .into(),
+                ),
+                default_open: true,
+                items: vec![
+                    SettingItem {
+                        key: "fit_method".into(),
+                        label: "Method".into(),
+                        tooltip: Some(
+                            "Choose the numerical backend used to fit each candidate cluster."
+                                .into(),
+                        ),
+                        kind: SettingKind::Enum {
+                            variants: vec![
+                                FitMethod::LogGaussian.label().into(),
+                                FitMethod::Gaussian.label().into(),
+                                FitMethod::RadialSymmetry.label().into(),
+                                FitMethod::Phasor.label().into(),
+                                FitMethod::MeanXY.label().into(),
+                            ],
+                            default: self.settings.fit_method.index(),
+                        },
+                    },
+                    SettingItem {
+                        key: "nm_per_pixel".into(),
+                        label: "Scale".into(),
+                        tooltip: Some(
+                            "Pixel size used when converting fitted sigmas into nanometers.".into(),
+                        ),
+                        kind: SettingKind::F64Drag {
+                            min: 1.0,
+                            max: 500.0,
+                            speed: 0.5,
+                            default: self.settings.nm_per_pixel,
+                        },
+                    },
+                    SettingItem {
+                        key: "sigma_min_nm".into(),
+                        label: "Sigma min".into(),
+                        tooltip: Some(
+                            "Lower accepted sigma bound for methods that estimate PSF width."
+                                .into(),
+                        ),
+                        kind: SettingKind::F64Slider {
+                            min: 10.0,
+                            max: 500.0,
+                            default: self.settings.sigma_min_nm,
+                            suffix: Some(" nm".into()),
+                        },
+                    },
+                    SettingItem {
+                        key: "sigma_max_nm".into(),
+                        label: "Sigma max".into(),
+                        tooltip: Some(
+                            "Upper accepted sigma bound for methods that estimate PSF width."
+                                .into(),
+                        ),
+                        kind: SettingKind::F64Slider {
+                            min: 10.0,
+                            max: 500.0,
+                            default: self.settings.sigma_max_nm,
+                            suffix: Some(" nm".into()),
+                        },
+                    },
+                    SettingItem {
+                        key: "max_fit_residual".into(),
+                        label: "Max residual".into(),
+                        tooltip: Some(
+                            "Reject localizations whose fit residual exceeds this threshold."
+                                .into(),
+                        ),
+                        kind: SettingKind::F64Drag {
+                            min: 0.0,
+                            max: 10.0,
+                            speed: 0.01,
+                            default: self.settings.max_fit_residual,
+                        },
+                    },
+                    SettingItem {
+                        key: "show_overlay".into(),
+                        label: "Show overlay".into(),
+                        tooltip: Some(
+                            "Draw crosshair markers at accepted localization positions.".into(),
+                        ),
+                        kind: SettingKind::Bool {
+                            default: self.settings.show_overlay,
+                        },
+                    },
+                ],
+            }],
+        }
+    }
+
+    fn get_setting(&self, key: &str) -> Option<Value> {
+        match key {
+            "fit_method" => Some(json!(self.settings.fit_method.index())),
+            "nm_per_pixel" => Some(json!(self.settings.nm_per_pixel)),
+            "sigma_min_nm" => Some(json!(self.settings.sigma_min_nm)),
+            "sigma_max_nm" => Some(json!(self.settings.sigma_max_nm)),
+            "max_fit_residual" => Some(json!(self.settings.max_fit_residual)),
+            "show_overlay" => Some(json!(self.settings.show_overlay)),
+            _ => None,
+        }
+    }
+
+    fn set_setting(&mut self, key: &str, value: Value) -> Result<(), String> {
+        match key {
+            "fit_method" => {
+                let Some(value) = Self::parse_usize(value) else {
+                    return Err("fit_method must be an integer".into());
+                };
+                self.settings.fit_method = FitMethod::from_index(value);
+            }
+            "nm_per_pixel" => {
+                let Some(value) = value.as_f64() else {
+                    return Err("nm_per_pixel must be numeric".into());
+                };
+                self.settings.nm_per_pixel = value.clamp(1.0, 500.0);
+            }
+            "sigma_min_nm" => {
+                let Some(value) = value.as_f64() else {
+                    return Err("sigma_min_nm must be numeric".into());
+                };
+                self.settings.sigma_min_nm = value.clamp(10.0, 500.0);
+                self.settings.sigma_max_nm =
+                    self.settings.sigma_max_nm.max(self.settings.sigma_min_nm);
+            }
+            "sigma_max_nm" => {
+                let Some(value) = value.as_f64() else {
+                    return Err("sigma_max_nm must be numeric".into());
+                };
+                self.settings.sigma_max_nm = value.clamp(10.0, 500.0);
+                self.settings.sigma_min_nm =
+                    self.settings.sigma_min_nm.min(self.settings.sigma_max_nm);
+            }
+            "max_fit_residual" => {
+                let Some(value) = value.as_f64() else {
+                    return Err("max_fit_residual must be numeric".into());
+                };
+                self.settings.max_fit_residual = value.clamp(0.0, 10.0);
+            }
+            "show_overlay" => {
+                let Some(value) = value.as_bool() else {
+                    return Err("show_overlay must be a boolean".into());
+                };
+                self.settings.show_overlay = value;
+            }
+            _ => return Err(format!("unknown setting: {key}")),
+        }
+
+        Ok(())
+    }
+
+    fn status_entries(&self) -> Vec<StatusEntry> {
+        vec![
+            StatusEntry::Text(self.last_status.clone()),
+            StatusEntry::LabeledValue {
+                label: "Accepted".into(),
+                value: self.last_localization_count.to_string(),
+                color: None,
+            },
+            StatusEntry::LabeledValue {
+                label: "Rejected".into(),
+                value: self.last_rejection_count.to_string(),
+                color: None,
+            },
+            StatusEntry::LabeledValue {
+                label: "Method".into(),
+                value: self.settings.fit_method.label().into(),
+                color: None,
+            },
+        ]
     }
 }
 
@@ -237,7 +454,7 @@ fn fit_radius(cluster: &EveCluster, fit: &FitEstimate) -> f64 {
     }
 }
 
-fn estimate_timestamp_us(events: &[CdEvent], x: f64, y: f64, radius: f64) -> u64 {
+fn estimate_timestamp_us(events: &[EveEvent], x: f64, y: f64, radius: f64) -> u64 {
     if events.is_empty() {
         return 0;
     }
@@ -294,8 +511,8 @@ fn to_localization_results(results: &EveLocalizationResults) -> LocalizationResu
 mod tests {
     use super::*;
 
-    fn event(x: u16, y: u16, polarity: bool, timestamp: u64) -> CdEvent {
-        CdEvent {
+    fn event(x: u16, y: u16, polarity: bool, timestamp: u64) -> EveEvent {
+        EveEvent {
             x,
             y,
             timestamp,
@@ -452,3 +669,5 @@ mod tests {
         assert!(gaussian::fit(&cluster).is_none());
     }
 }
+
+export_plugin!(EveSmlmFittingPlugin);

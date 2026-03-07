@@ -2,7 +2,7 @@
 
 # augur-plugins
 
-**The plugin marketplace for [AugurRS](https://github.com/muthmann/augur-rs) — community-maintained live analysis plugins for event cameras.**
+**Runtime-loaded analysis plugins for [AugurRS](https://github.com/muthmann/augur-rs).**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 ![Language](https://img.shields.io/badge/language-Rust-orange)
@@ -11,148 +11,97 @@
 
 ---
 
-This repository is the central home for AugurRS analysis plugins. It serves as both a development workspace and a browsable catalog for community extensions.
+This repository is the home for AugurRS plugin crates, templates, and contribution docs.
 
-AugurRS itself is a general-purpose event camera recorder and live preview tool. Plugins extend it with domain-specific live analysis: signal processing, detection, localization, metrics, custom overlays, or anything else that operates on the preview stream.
+Plugins are no longer compiled into `augur-gui`. A compatible plugin builds as a `cdylib`, ships a `plugin.toml`, and is loaded at runtime from `~/.augur/plugins/`.
 
-## How It Works
+## Runtime Model
 
-Plugins are Rust crates that implement the `AnalysisPlugin` trait defined in [augur-rs](https://github.com/muthmann/augur-rs). They are compiled into the `augur-gui` binary — adding or removing a plugin is a one-line Cargo dependency change plus a one-line registration call.
+Each installed plugin directory contains:
 
-Each plugin runs live alongside the preview stream:
+- `plugin.toml`
+- one platform library (`.dylib`, `.so`, or `.dll`)
 
-```
-Preview frame → [Phase 1: FrameOnly] → [Phase 2: RawEvents] → [Phase 3: DerivedData]
-                     │                       │                        │
-               Hotpixel Detection      Localization            Focus Metrics
-               ROI Grid                                        (reads localization results)
-                                        EVE Candidate Finding   EVE Candidate Fitting
-                                                                 EVE Post-Processing
-```
+The GUI Plugin Manager can scan, enable, disable, and reload plugins without recompiling the host app.
 
-Plugins share typed data through a per-frame **context bus** (`PluginContext`). An upstream plugin publishes results; a downstream plugin consumes them. The phase ordering guarantees that dependencies are satisfied within a single frame.
+## Compatibility Status
 
-## Available Plugins
+All maintained analysis plugins in this repository now target the runtime loader. The only exception is `roi-grid`, which intentionally stays built into `augur-gui` because the current runtime API does not expose camera-configuration mutation.
 
-| Plugin | Phase | Domain | Description |
-|---|---|---|---|
-| **[Hotpixel Detection](plugins/hotpixel/)** | FrameOnly | General | Detects persistently noisy pixels and pushes them into the hardware DEM mask |
-| **[ROI Grid](plugins/roi-grid/)** | FrameOnly | General | Partitions the sensor around masked hotpixels; finds the largest clean capture regions |
-| **[Molecule Localization](plugins/localization/)** | RawEvents | SMLM | Wavelet denoising, center-of-mass seeding, sub-pixel elliptical Gaussian fitting |
-| **[EVE Candidate Finding](plugins/evesmlm-candidates/)** | RawEvents | SMLM | Raw-event clustering for eveSMLM using DBSCAN, eigenfeatures, or a frame-based fallback |
-| **[EVE Candidate Fitting](plugins/evesmlm-fitting/)** | DerivedData | SMLM | Multi-backend sub-pixel fitting of EVE candidate clusters with `LocalizationResults` compatibility |
-| **[EVE Post-Processing](plugins/evesmlm-postproc/)** | DerivedData | SMLM | Filtering, drift correction, eNeNA precision tracking, PSF accumulation, and on-time summaries |
-| **[Focus Metrics](plugins/focus-metrics/)** | DerivedData | Biophotonics | Mean PSF sigma, FFT sharpness, astigmatic ratio — live focus feedback |
+| Plugin | Status | Notes |
+|---|---|---|
+| `hotpixel` | Runtime-compatible | Migrated to `augur-plugin-api` |
+| `localization` | Runtime-compatible | Migrated to `augur-plugin-api` |
+| `focus-metrics` | Runtime-compatible | Consumes any upstream plugin that publishes `augur.localization.results` |
+| `evesmlm-candidates` | Runtime-compatible | Publishes `augur.evesmlm.candidates` |
+| `evesmlm-fitting` | Runtime-compatible | Publishes `augur.evesmlm.localization_results` and standard localization compatibility results |
+| `evesmlm-postproc` | Runtime-compatible | Filters/drift-corrects EVE results and republishes standard localization compatibility results |
+| `roi-grid` | Legacy / built-in | ROI Grid stays built into `augur-gui` for now |
 
-The first two plugins are useful for any event camera workflow. The latter two are purpose-built for single-molecule localization microscopy (SMLM) and biophotonics, but they also serve as full-featured reference implementations for the plugin API.
+Do not copy source trees directly into `~/.augur/plugins/`. Build the plugin first, then copy `plugin.toml` plus the generated `.dylib`, `.so`, or `.dll`.
 
 ## Quick Start
 
-### Using Plugins
+### Build a Runtime Plugin
 
-To include a plugin in your AugurRS build, add it as a dependency of `augur-gui` and register it in the plugin host. See the [Installation Guide](docs/installing-plugins.md) for step-by-step instructions.
+```bash
+cargo build -p augur-plugin-hotpixel --release
+```
 
-### Writing a Plugin
+### Install It
 
-The fastest way to start is to copy the [plugin template](plugin-template/):
+```bash
+mkdir -p ~/.augur/plugins/hotpixel
+cp plugins/hotpixel/plugin.toml ~/.augur/plugins/hotpixel/
+cp target/release/libaugur_plugin_hotpixel.dylib ~/.augur/plugins/hotpixel/
+```
+
+Then open `augur-gui` and use **Plugins → Scan for New Plugins**.
+
+### Build the eveSMLM Runtime Chain
+
+```bash
+CARGO_NET_GIT_FETCH_WITH_CLI=true cargo build \
+  -p augur-plugin-evesmlm-candidates \
+  -p augur-plugin-evesmlm-fitting \
+  -p augur-plugin-evesmlm-postproc \
+  --release
+```
+
+## Writing a Plugin
+
+Start from the template:
 
 ```bash
 cp -r plugin-template plugins/my-plugin
 ```
 
-Then follow the [Plugin Development Guide](CONTRIBUTING.md#writing-a-plugin) to implement the `AnalysisPlugin` trait, choose an execution phase, and wire up the settings UI.
+Then follow [CONTRIBUTING.md](./CONTRIBUTING.md). The new workflow is:
 
-A minimal plugin looks like this:
-
-```rust
-use augur_core::{analysis::AnalysisOutput, config::CameraConfig, pipeline::PreviewFrame};
-
-pub struct MyPlugin {
-    enabled: bool,
-}
-
-impl AnalysisPlugin for MyPlugin {
-    fn name(&self) -> &str { "My Plugin" }
-    fn enabled(&self) -> bool { self.enabled }
-    fn set_enabled(&mut self, enabled: bool) { self.enabled = enabled; }
-
-    fn ui_settings(&mut self, ui: &mut egui::Ui, _config: &mut CameraConfig) -> bool {
-        ui.label("Hello from my plugin!");
-        false
-    }
-
-    fn process_frame(&mut self, frame: &PreviewFrame, output: &mut AnalysisOutput) {
-        // Your analysis logic here
-    }
-
-    fn reset(&mut self) { /* reset state between sessions */ }
-}
-```
+1. implement `augur_plugin_api::Plugin`
+2. export the vtable with `export_plugin!`
+3. define settings via `SettingsSchema`
+4. build a `cdylib`
+5. copy the manifest plus built library into `~/.augur/plugins/<name>/`
 
 ## Repository Structure
 
-```
+```text
 augur-plugins/
 ├── plugins/
-│   ├── hotpixel/            # Each plugin is its own Cargo crate
-│   │   ├── Cargo.toml
-│   │   ├── plugin.toml      # Plugin manifest (metadata, phase, dependencies)
-│   │   ├── README.md
-│   │   └── src/lib.rs
-│   ├── roi-grid/
-│   ├── localization/
-│   ├── evesmlm-candidates/
-│   ├── evesmlm-fitting/
-│   ├── evesmlm-postproc/
-│   └── focus-metrics/
-├── plugin-template/         # Copy this to start a new plugin
+├── plugin-template/
 ├── docs/
-│   ├── features/            # Feature briefs for larger plugin suites
-│   ├── adr/                 # Architecture decision records
-│   ├── plugin-api.md        # API reference
 │   ├── installing-plugins.md
-│   └── architecture.md      # Design overview and comparisons
-├── CONTRIBUTING.md           # How to write and submit plugins
-└── README.md                 # This file
+│   └── plugin-api.md
+├── CONTRIBUTING.md
+└── README.md
 ```
-
-## Plugin Manifest
-
-Every plugin includes a `plugin.toml` manifest that describes it for the catalog:
-
-```toml
-[plugin]
-name = "My Plugin"
-version = "0.1.0"
-description = "One-line summary of what this plugin does."
-authors = ["Your Name <you@example.com>"]
-license = "MIT"
-phase = "FrameOnly"            # FrameOnly | RawEvents | DerivedData
-domain = "general"             # general | smlm | biophotonics | robotics | ...
-dependencies = []              # Names of upstream plugins this one requires
-
-[plugin.augur]
-min-version = "0.1.0"         # Minimum augur-rs version this plugin supports
-```
-
-The manifest is not read at compile time — it exists for documentation, tooling, and future registry automation.
-
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the full guide, including:
-
-- How to write a plugin from scratch
-- How to submit a plugin to this repository
-- Code style and documentation expectations
-- The review process for new plugins
-
-Plugin contributions are welcome from anyone. If you have a live analysis workflow for event cameras — whether in microscopy, robotics, computer vision, or any other domain — this is the place to share it.
 
 ## Related
 
-- [augur-rs](https://github.com/muthmann/augur-rs) — the core camera SDK, streaming pipeline, and plugin runtime
-- [Plugin Architecture](https://github.com/muthmann/augur-rs/blob/main/docs/features/analysis-plugins.md) — API reference in the core repository
-- [eveSMLM Feature Brief](docs/features/evesmlm.md) — overview of the three-plugin EVE pipeline
+- [augur-rs](https://github.com/muthmann/augur-rs) — host application, runtime loader, and `augur-plugin-api`
+- [Plugin Architecture](https://github.com/muthmann/augur-rs/blob/main/docs/features/analysis-plugins.md) — host-side architecture
+- [Dynamic Plugin Loading](https://github.com/muthmann/augur-rs/blob/main/docs/features/dynamic-plugins.md) — install/reload model
 
 ## License
 

@@ -1,12 +1,5 @@
-[plugin]
 name = "Focus Metrics"
 version = "0.1.0"
-description = "Mean PSF sigma, FFT high-frequency power, and astigmatic ratio — live focus feedback for event-camera imaging."
-authors = ["Mika Uthmann <muthmann@physik.uni-bielefeld.de>"]
-license = "MIT"
-phase = "DerivedData"
+description = "Tracks focus quality from localization fits or a frequency-domain sharpness estimate."
 domain = "biophotonics"
-dependencies = ["Molecule Localization"]
-
-[plugin.augur]
-min-version = "0.1.0"
+library = "augur_plugin_focus_metrics"

@@ -1,12 +1,5 @@
-[plugin]
 name = "EVE Candidate Finding"
 version = "0.1.0"
 description = "Cluster raw eveSMLM events into per-emitter candidates using DBSCAN, eigenfeatures, or a frame-based fallback."
-authors = ["Mika Uthmann <muthmann@physik.uni-bielefeld.de>"]
-license = "MIT"
-phase = "RawEvents"
 domain = "smlm"
-dependencies = []
-
-[plugin.augur]
-min-version = "0.1.0"
+library = "augur_plugin_evesmlm_candidates"

@@ -1,5 +1,7 @@
 # EVE Candidate Finding
 
+Runtime plugin. Build `augur-plugin-evesmlm-candidates` as a `cdylib`, then copy `plugin.toml` plus the generated library into `~/.augur/plugins/evesmlm-candidates/`.
+
 Raw-event candidate discovery for eveSMLM. This plugin groups `CdEvent` samples into per-emitter candidate clusters without first collapsing them into a conventional image, which keeps the pipeline aligned with the EVE approach described by Weber et al. (2024).
 
 ## Methods
@@ -31,7 +33,7 @@ Raw-event candidate discovery for eveSMLM. This plugin groups `CdEvent` samples 
 
 ## Published Data
 
-Publishes `EveCandidates` to the `PluginContext`, containing:
+Publishes `EveCandidates` on the context key `augur.evesmlm.candidates`, containing:
 
 - `clusters: Vec<EveCluster>` with raw events, per-pixel histograms, centroid, and bounds
 - `frame_window_start_us`, `frame_window_end_us`

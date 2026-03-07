@@ -1,9 +1,9 @@
 use std::collections::{HashMap, VecDeque};
 
-use augur_core::pipeline::CdEvent;
+use crate::EveEvent;
 
 pub fn cluster_event_indices(
-    events: &[CdEvent],
+    events: &[EveEvent],
     epsilon_px: f64,
     min_events: usize,
 ) -> Vec<Vec<usize>> {
@@ -66,7 +66,7 @@ pub fn cluster_event_indices(
 
 fn region_query(
     event_index: usize,
-    events: &[CdEvent],
+    events: &[EveEvent],
     grid: &HashMap<(i32, i32), Vec<usize>>,
     cell_size: i32,
     epsilon_px: f64,
@@ -96,7 +96,7 @@ fn region_query(
     neighbors
 }
 
-fn cell_key(event: &CdEvent, cell_size: i32) -> (i32, i32) {
+fn cell_key(event: &EveEvent, cell_size: i32) -> (i32, i32) {
     (
         i32::from(event.x) / cell_size.max(1),
         i32::from(event.y) / cell_size.max(1),

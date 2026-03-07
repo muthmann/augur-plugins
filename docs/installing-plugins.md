@@ -1,70 +1,84 @@
-# Installing Plugins
+# Installing Runtime Plugins
 
-AugurRS uses compile-time plugin registration. Plugins are Rust crates that get compiled into the `augur-gui` binary. This guide walks through adding a plugin from this repository to your AugurRS build.
+AugurRS loads plugins at runtime from:
 
-## Prerequisites
-
-- A working [augur-rs](https://github.com/muthmann/augur-rs) checkout that builds successfully
-- This repository cloned alongside it (or accessible via git URL)
-
-Typical directory layout:
-
-```
-your-workspace/
-├── augur-rs/           # The core camera SDK and GUI
-└── augur-plugins/      # This repository
+```text
+~/.augur/plugins/
 ```
 
-## Step 1: Add the Plugin Dependency
+Do not copy source trees into that directory and expect them to load. The GUI needs a compiled dynamic library plus a `plugin.toml`.
 
-Open `augur-rs/augur-gui/Cargo.toml` and add the plugin crate as a dependency.
+## Installed Layout
 
-**From a local checkout:**
-
-```toml
-[dependencies]
-augur-plugin-hotpixel = { path = "../../augur-plugins/plugins/hotpixel" }
+```text
+~/.augur/plugins/
+  hotpixel/
+    plugin.toml
+    libaugur_plugin_hotpixel.dylib
 ```
 
-**From the git repository:**
-
-```toml
-[dependencies]
-augur-plugin-hotpixel = { git = "https://github.com/muthmann/augur-plugins.git" }
-```
-
-## Step 2: Register the Plugin
-
-Open `augur-rs/augur-gui/src/plugins/mod.rs` and add the plugin to the `create_all_plugins()` function:
-
-```rust
-pub fn create_all_plugins() -> Vec<Box<dyn AnalysisPlugin>> {
-    vec![
-        Box::new(augur_plugin_hotpixel::HotpixelPlugin::default()),
-        // ... other plugins ...
-    ]
-}
-```
-
-## Step 3: Build
+## Build a Plugin
 
 ```bash
-cd augur-rs
-cargo build --workspace
+cargo build -p augur-plugin-hotpixel --release
 ```
 
-The plugin is now compiled in and will appear in the Analysis panel when you launch `augur-gui`.
+For the eveSMLM chain:
 
-## Removing a Plugin
+```bash
+CARGO_NET_GIT_FETCH_WITH_CLI=true cargo build \
+  -p augur-plugin-evesmlm-candidates \
+  -p augur-plugin-evesmlm-fitting \
+  -p augur-plugin-evesmlm-postproc \
+  --release
+```
 
-Reverse the process: remove the registration line from `mod.rs` and the dependency from `Cargo.toml`. The application returns to a plain recording tool.
+## Install It
 
-## Using All Plugins
+```bash
+mkdir -p ~/.augur/plugins/hotpixel
+cp plugins/hotpixel/plugin.toml ~/.augur/plugins/hotpixel/
+cp target/release/libaugur_plugin_hotpixel.dylib ~/.augur/plugins/hotpixel/
+```
 
-To include the full plugin suite, add all four plugin crates as dependencies. See the individual plugin READMEs for any crate-specific dependency notes (e.g., `rustfft` for Focus Metrics).
+On Linux, copy the `.so`. On Windows, copy the `.dll`.
+
+Install each plugin into its own directory, for example:
+
+```bash
+mkdir -p ~/.augur/plugins/evesmlm-fitting
+cp plugins/evesmlm-fitting/plugin.toml ~/.augur/plugins/evesmlm-fitting/
+cp target/release/libaugur_plugin_evesmlm_fitting.dylib ~/.augur/plugins/evesmlm-fitting/
+```
+
+## Load It in the GUI
+
+1. Launch `augur-gui`
+2. Open **Plugins**
+3. Click **Scan for New Plugins**
+4. Enable the plugin from **Analysis** or in the Plugin Manager
+
+## Reload During Development
+
+After rebuilding a plugin, use the Plugin Manager **Reload** button instead of restarting the host.
 
 ## Troubleshooting
 
-**Version mismatch:** If the plugin was built against a different version of `augur-core` than your checkout, Cargo will report type conflicts. Ensure both repositories are on compatible versions.
+### “missing field `name`”
 
-**Missing `AnalysisPlugin` trait:** The trait is defined in `augur-gui/src/plugin.rs`. Your plugin crate does not directly depend on `augur-gui` — the trait binding happens when `augur-gui` compiles with your plugin as a dependency and writes the `impl` block in its own `plugins/` module.
+Your `plugin.toml` still uses the old legacy catalog format such as:
+
+```toml
+[plugin]
+name = "..."
+```
+
+Update it to the new runtime format with top-level fields. All maintained runtime plugins in this repository already use that format.
+
+### “no .dylib/.so/.dll found”
+
+You copied a source folder instead of the built library. Build the plugin in `--release` mode and copy the generated dynamic library into the installed plugin directory.
+
+### “loading symbol augur_plugin_vtable failed”
+
+The library still uses the old compile-time plugin API. Port it to `augur-plugin-api::Plugin` and export it with `export_plugin!`.

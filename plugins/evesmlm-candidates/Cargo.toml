@@ -6,7 +6,11 @@ license.workspace = true
 authors.workspace = true
 description = "eveSMLM candidate finding plugin for AugurRS — DBSCAN, eigenfeature filtering, and frame-based candidate discovery directly from raw events."
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
-augur-core.workspace = true
-egui.workspace = true
+augur-plugin-api.workspace = true
 nalgebra = "0.33"
+serde.workspace = true
+serde_json.workspace = true

@@ -6,6 +6,9 @@ license.workspace = true
 authors.workspace = true
 description = "Template for creating new AugurRS analysis plugins."
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
-augur-core.workspace = true
-egui.workspace = true
+augur-plugin-api.workspace = true
+serde_json.workspace = true

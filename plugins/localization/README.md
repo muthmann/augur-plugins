@@ -1,5 +1,7 @@
 # Molecule Localization
 
+Runtime plugin. Build `augur-plugin-localization` as a `cdylib`, then copy `plugin.toml` plus the generated library into `~/.augur/plugins/localization/`.
+
 Sub-pixel molecule localization from the live event camera stream, suitable for single-molecule localization microscopy (SMLM). The plugin implements a wavelet-filtered spot detection pipeline followed by least-squares elliptical Gaussian fitting.
 
 ## Pipeline
@@ -31,12 +33,12 @@ Sub-pixel molecule localization from the live event camera stream, suitable for 
 
 ## Published Data
 
-Publishes `LocalizationResults` to the `PluginContext`, which contains:
+Publishes `LocalizationResults` on the context key `augur.localization.results`, which contains:
 
 - `localizations: Vec<Localization>` — each with x, y, sigma_x, sigma_y, amplitude, background, timestamp_us, fit_error
 - `frame_window_start_us`, `frame_window_end_us` — the time window of the analyzed frame
 
-Downstream plugins (e.g., Focus Metrics) consume this data.
+Downstream plugins (e.g., Focus Metrics and the eveSMLM post-processing chain) consume this data.
 
 ## Dependencies
 

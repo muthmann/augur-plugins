@@ -20,5 +20,8 @@ repository = "https://github.com/muthmann/augur-plugins"
 
 [workspace.dependencies]
 augur-core = { git = "https://github.com/muthmann/augur-rs.git" }
+augur-plugin-api = { git = "https://github.com/muthmann/augur-rs.git" }
 egui = "0.27"
 rustfft = "6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

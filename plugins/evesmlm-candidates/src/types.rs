@@ -1,6 +1,10 @@
-use augur_core::pipeline::CdEvent;
+use augur_plugin_api::FfiCdEvent;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub const CTX_EVE_CANDIDATES: &str = "augur.evesmlm.candidates";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CandidateFindingMethod {
     #[default]
     Dbscan,
@@ -18,12 +22,31 @@ impl CandidateFindingMethod {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EveEvent {
+    pub timestamp: u64,
+    pub x: u16,
+    pub y: u16,
+    pub polarity: bool,
+}
+
+impl From<FfiCdEvent> for EveEvent {
+    fn from(value: FfiCdEvent) -> Self {
+        Self {
+            timestamp: value.timestamp,
+            x: value.x,
+            y: value.y,
+            polarity: value.polarity != 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EveCluster {
     /// Per-pixel event histogram: (x, y, n_positive, n_negative)
     pub pixel_histogram: Vec<(u16, u16, u32, u32)>,
     /// All raw events assigned to this cluster.
-    pub events: Vec<CdEvent>,
+    pub events: Vec<EveEvent>,
     /// Unweighted cluster centroid in pixel coordinates.
     pub centroid_x: f64,
     pub centroid_y: f64,
@@ -65,7 +88,7 @@ impl EveCluster {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct EveCandidates {
     pub clusters: Vec<EveCluster>,
     pub frame_window_start_us: u64,

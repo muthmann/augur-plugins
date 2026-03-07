@@ -16,11 +16,11 @@ Implement the workflow as three plugins:
 2. `augur-plugin-evesmlm-fitting`
 3. `augur-plugin-evesmlm-postproc`
 
-Each plugin owns one analysis concern, publishes typed results through `PluginContext`, and depends only on the immediately preceding stage.
+Each plugin owns one analysis concern, publishes results through `HostContext` under well-known string keys, and depends only on the immediately preceding stage.
 
 ## Consequences
 
 - Researchers can inspect candidate counts separately from fit counts and post-processing rejections.
 - New fitting or post-processing methods can be added without rewriting candidate discovery.
-- The existing `LocalizationResults` type can still be published for compatibility with current downstream plugins.
-- The integration cost in `augur-gui` stays low: one dependency and one registration line per plugin.
+- The standard `CTX_LOCALIZATION_RESULTS` payload is republished by the fitting stage for compatibility with downstream plugins such as Focus Metrics.
+- Each plugin installs independently as a `cdylib` into `~/.augur/plugins/`; no `augur-gui` source changes are needed.

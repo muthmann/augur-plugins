@@ -6,8 +6,11 @@ license.workspace = true
 authors.workspace = true
 description = "eveSMLM post-processing plugin for AugurRS — filtering, drift correction, and evaluation of EVE localization streams."
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
-augur-core.workspace = true
+augur-plugin-api.workspace = true
 augur-plugin-evesmlm-fitting = { path = "../evesmlm-fitting" }
-egui.workspace = true
 nalgebra = "0.33"
+serde_json.workspace = true

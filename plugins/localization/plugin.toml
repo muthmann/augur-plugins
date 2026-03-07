@@ -1,12 +1,5 @@
-[plugin]
 name = "Molecule Localization"
 version = "0.1.0"
-description = "Wavelet denoising, center-of-mass seeding, and sub-pixel elliptical Gaussian fitting — SMLM-grade localization from the live event stream."
-authors = ["Mika Uthmann <muthmann@physik.uni-bielefeld.de>"]
-license = "MIT"
-phase = "RawEvents"
+description = "Wavelet-filtered spot detection with center-of-mass seeding and Gaussian fitting."
 domain = "smlm"
-dependencies = []
-
-[plugin.augur]
-min-version = "0.1.0"
+library = "augur_plugin_localization"

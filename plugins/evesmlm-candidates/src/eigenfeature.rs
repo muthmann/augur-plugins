@@ -1,8 +1,9 @@
-use augur_core::pipeline::CdEvent;
 use nalgebra::Matrix2;
 
+use crate::EveEvent;
+
 pub fn filter_clusters(
-    events: &[CdEvent],
+    events: &[EveEvent],
     clusters: Vec<Vec<usize>>,
     max_spatial_extent_px: f64,
     min_isotropy: f64,
@@ -25,7 +26,7 @@ pub fn filter_clusters(
         .collect()
 }
 
-pub fn cluster_eigenvalues(events: &[CdEvent], indices: &[usize]) -> Option<(f64, f64)> {
+pub fn cluster_eigenvalues(events: &[EveEvent], indices: &[usize]) -> Option<(f64, f64)> {
     if indices.len() < 2 {
         return None;
     }
