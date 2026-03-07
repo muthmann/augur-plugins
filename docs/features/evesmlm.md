@@ -38,3 +38,7 @@ done
 ```
 
 Then open `augur-gui`, go to **Plugins → Scan for New Plugins**, and enable all three. The runtime loader discovers ordering from phase declarations (`RawEvents` then `DerivedData`), so no manual registration order is required.
+
+## References
+
+- Weber, L.M., Martens, K.J.A., Cabriel, C., Gates, J.J., Albecq, M., Vermeulen, F., Hein, K., Izeddin, I., & Endesfelder, U. (2024). "EVE is an open modular data analysis software for event-based localization microscopy." bioRxiv. https://doi.org/10.1101/2024.08.09.607224

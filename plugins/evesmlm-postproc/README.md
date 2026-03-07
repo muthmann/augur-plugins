@@ -39,5 +39,5 @@ Depends on **EVE Candidate Fitting**.
 
 ## References
 
-- Weber et al., "eveSMLM: event-based vision for single molecule localization microscopy," bioRxiv, 2024.
+- Weber et al., "EVE is an open modular data analysis software for event-based localization microscopy," bioRxiv, 2024. https://doi.org/10.1101/2024.08.09.607224
 - Endesfelder et al., "A simple method to estimate the average localization precision of a single-molecule localization microscopy experiment," Histochemistry and Cell Biology, 2014.
