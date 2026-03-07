@@ -40,18 +40,46 @@ impl Plugin for MyPlugin {
 export_plugin!(MyPlugin);
 ```
 
+## Execution Phases
+
+Override `input_kind()` to declare which phase the plugin runs in:
+
+| Phase | When to use |
+|---|---|
+| `FrameOnly` | Overlays, pixel statistics, cheap preview-only analysis. No event materialization. |
+| `RawEvents` | Requires the raw `CdEvent` stream. The pipeline only materialises events when at least one enabled plugin requests them. |
+| `DerivedData` | Consumes results published by an upstream plugin via `HostContext`. Runs after all `FrameOnly` and `RawEvents` plugins. |
+
+Use the earliest phase that satisfies your needs. The default is `FrameOnly`.
+
+## Dependencies
+
+Override `dependencies()` to declare which upstream plugins your plugin requires by name:
+
+```rust
+fn dependencies(&self) -> &[&'static str] {
+    &["Molecule Localization"]
+}
+```
+
+The Plugin Manager uses this list to show dependency relationships. Only declare a hard dependency when the plugin cannot run at all without the named producer. If the plugin degrades gracefully when the upstream payload is absent, prefer a runtime warning instead.
+
 ## Settings
 
 Settings are described by schema, not direct UI code.
 
 Supported item kinds:
 
-- `Bool`
-- `F64Slider`
-- `I64Slider`
-- `F64Drag`
-- `I64Drag`
-- `Enum`
+| Kind | egui widget |
+|---|---|
+| `Bool` | checkbox |
+| `F64Slider` | slider with float range |
+| `I64Slider` | slider with integer range |
+| `F64Drag` | drag value with float range and speed |
+| `I64Drag` | drag value with integer range |
+| `Enum` | row of radio buttons |
+
+All kinds accept optional `suffix` (unit label) and `tooltip` strings.
 
 When a setting changes, `augur-gui` calls `set_setting()` with a JSON value.
 
@@ -70,6 +98,20 @@ Custom shared types must derive `serde::Serialize` and `serde::Deserialize`.
 
 Common built-in keys and types, such as localization results, live in `augur-plugin-api`.
 If you want downstream plugins like Focus Metrics to consume your results, publish the standard `CTX_LOCALIZATION_RESULTS` payload in addition to any plugin-specific data.
+
+## Status Entries
+
+`status_entries()` returns a `Vec<StatusEntry>` rendered below the settings panel. Three variants are available:
+
+- `StatusEntry::Text(String)` — plain label row
+- `StatusEntry::LabeledValue { label, value, color: Option<[u8; 3]> }` — key-value row with optional RGB highlight color
+- `StatusEntry::Sparkline { label, values: Vec<f64>, lower_is_better: bool }` — inline history plot; `lower_is_better` controls the coloring direction
+
+## Panic Safety
+
+`export_plugin!` wraps every vtable call in `std::panic::catch_unwind`. A panic inside a plugin function is caught at the FFI boundary rather than unwinding into host code, which would be undefined behaviour. The host logs the panic and treats the current frame as a no-op for that plugin.
+
+Do not rely on panics for control flow. Use `Result` and return errors through `set_setting()` or warnings through `HostOutput`.
 
 ## Migration from the Old API
 

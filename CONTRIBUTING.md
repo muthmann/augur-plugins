@@ -63,15 +63,19 @@ use augur_plugin_api::export_plugin;
 export_plugin!(MyPlugin);
 ```
 
+`export_plugin!` wraps every vtable call in `std::panic::catch_unwind`, so a panic inside plugin code is caught at the FFI boundary instead of unwinding into `augur-gui`. Use `Result` and warnings for expected error paths; do not rely on panics for control flow.
+
 ### 3. Choose the Execution Phase
 
-Return the right `PluginInput`:
+Return the right `PluginInput` from `input_kind()`:
 
-- `FrameOnly`
-- `RawEvents`
-- `DerivedData`
+| Phase | Use |
+|---|---|
+| `FrameOnly` | Overlays, pixel statistics, cheap preview-only work. No event materialization cost. |
+| `RawEvents` | Requires the raw `CdEvent` stream (e.g. event-domain reconstruction). |
+| `DerivedData` | Reads results published by an upstream plugin via `HostContext`. |
 
-Use the earliest phase that satisfies your needs.
+Use the earliest phase that satisfies your needs. The default is `FrameOnly`.
 
 ### 4. Share Data Through `HostContext`
 
@@ -173,6 +177,14 @@ At minimum:
 - `src/lib.rs`
 
 If the plugin publishes shared data, document the context key and payload type explicitly.
+
+## Host-Side Documentation
+
+The host application, runtime loader, and `augur-plugin-api` crate live in [augur-rs](https://github.com/muthmann/augur-rs). Useful references:
+
+- [Plugin Architecture](https://github.com/muthmann/augur-rs/blob/main/docs/features/analysis-plugins.md) — execution model, context bus, FFI API surface
+- [Dynamic Plugin Loading](https://github.com/muthmann/augur-rs/blob/main/docs/features/dynamic-plugins.md) — manifest format, install layout, troubleshooting
+- [Plugin API Reference](./docs/plugin-api.md) — trait methods, phases, settings, status entries
 
 ## Notes for Local Development
 
