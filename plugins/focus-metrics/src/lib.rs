@@ -8,8 +8,6 @@ use augur_plugin_api::{
 use rustfft::{num_complex::Complex32, FftPlanner};
 use serde_json::{json, Value};
 
-const NO_DEPENDENCIES: [&str; 0] = [];
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FocusMethod {
     MeanSigma,
@@ -74,6 +72,7 @@ struct FocusMetricsPlugin {
     history: VecDeque<f64>,
     last_metric: Option<f64>,
     last_status: String,
+    fft_planner: FftPlanner<f32>,
 }
 
 impl Default for FocusMetricsPlugin {
@@ -84,6 +83,7 @@ impl Default for FocusMetricsPlugin {
             history: VecDeque::new(),
             last_metric: None,
             last_status: "Enable the plugin to monitor focus quality over time.".into(),
+            fft_planner: FftPlanner::new(),
         }
     }
 }
@@ -281,7 +281,7 @@ impl FocusMetricsPlugin {
                 );
             }
             FocusMethod::FftHighFrequency => {
-                let Some(metric) = fft_focus_metric(frame) else {
+                let Some(metric) = fft_focus_metric(frame, &mut self.fft_planner) else {
                     self.last_status =
                         "The preview frame is too sparse for FFT focus estimation.".into();
                     return;
@@ -379,7 +379,7 @@ impl Plugin for FocusMetricsPlugin {
     }
 
     fn dependencies(&self) -> &[&'static str] {
-        &NO_DEPENDENCIES
+        &[]
     }
 
     fn process_frame(
@@ -538,7 +538,7 @@ impl Plugin for FocusMetricsPlugin {
     }
 }
 
-fn fft_focus_metric(frame: &PluginFrame<'_>) -> Option<f64> {
+fn fft_focus_metric(frame: &PluginFrame<'_>, planner: &mut FftPlanner<f32>) -> Option<f64> {
     let (width, height, mut buffer) = downsample_frame(frame, 192);
     if width < 8 || height < 8 {
         return None;
@@ -553,7 +553,6 @@ fn fft_focus_metric(frame: &PluginFrame<'_>) -> Option<f64> {
         return None;
     }
 
-    let mut planner = FftPlanner::<f32>::new();
     let fft_width = planner.plan_fft_forward(width);
     let fft_height = planner.plan_fft_forward(height);
     let mut spectrum: Vec<Complex32> = buffer
@@ -625,14 +624,13 @@ fn downsample_frame(frame: &PluginFrame<'_>, max_dim: usize) -> (usize, usize, V
             let src_x0 = ox * step_x;
             let src_x1 = ((ox + 1) * step_x).min(width);
             let mut sum = 0.0f32;
-            let mut count = 0usize;
             for y in src_y0..src_y1 {
                 for x in src_x0..src_x1 {
                     sum += frame.pixels()[y * width + x] as f32;
-                    count += 1;
                 }
             }
-            output[oy * down_width + ox] = if count == 0 { 0.0 } else { sum / count as f32 };
+            let count = (src_x1 - src_x0) * (src_y1 - src_y0);
+            output[oy * down_width + ox] = sum / count as f32;
         }
     }
 
