@@ -58,6 +58,16 @@ cp target/release/libaugur_plugin_hotpixel.dylib ~/.augur/plugins/hotpixel/
 
 Then open `augur-gui` and use **Plugins → Scan for New Plugins**.
 
+### Install All Built Runtime Plugins
+
+```bash
+./scripts/install-built-plugins.sh --profile release
+```
+
+This scans `plugins/*/plugin.toml`, copies every runtime plugin that already has
+its built library in `target/release/`, and skips unbuilt or non-runtime
+plugins such as `roi-grid`.
+
 ### Build the eveSMLM Runtime Chain
 
 ```bash

@@ -10,8 +10,8 @@ pub mod filtering;
 use std::collections::VecDeque;
 
 use augur_plugin_api::{
-    export_plugin, AnalysisSeverity, FfiSubpixelMarker, HostContext, HostOutput, LocalizationResults,
-    Plugin, PluginFrame, PluginInput, SettingItem, SettingKind, SettingsSchema, SettingsSection,
+    export_plugin, AnalysisSeverity, FfiSubpixelMarker, HostContext, HostOutput, Plugin,
+    PluginFrame, PluginInput, SettingItem, SettingKind, SettingsSchema, SettingsSection,
     StatusEntry, CTX_LOCALIZATION_RESULTS,
 };
 pub use augur_plugin_evesmlm_fitting::{
