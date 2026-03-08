@@ -57,6 +57,7 @@ pub fn cluster_event_indices(
             }
         }
 
+        // Sort so cluster membership is deterministic for the same input event order.
         cluster.sort_unstable();
         clusters.push(cluster);
     }
@@ -97,8 +98,9 @@ fn region_query(
 }
 
 fn cell_key(event: &EveEvent, cell_size: i32) -> (i32, i32) {
+    // cell_size >= 1 is guaranteed by the epsilon_px.max(1.0) clamp in cluster_event_indices.
     (
-        i32::from(event.x) / cell_size.max(1),
-        i32::from(event.y) / cell_size.max(1),
+        i32::from(event.x) / cell_size,
+        i32::from(event.y) / cell_size,
     )
 }

@@ -10,12 +10,13 @@ pub mod filtering;
 use std::collections::VecDeque;
 
 use augur_plugin_api::{
-    export_plugin, AnalysisSeverity, FfiSubpixelMarker, HostContext, HostOutput, Localization,
-    LocalizationResults, Plugin, PluginFrame, PluginInput, SettingItem, SettingKind,
-    SettingsSchema, SettingsSection, StatusEntry, CTX_LOCALIZATION_RESULTS,
+    export_plugin, AnalysisSeverity, FfiSubpixelMarker, HostContext, HostOutput, LocalizationResults,
+    Plugin, PluginFrame, PluginInput, SettingItem, SettingKind, SettingsSchema, SettingsSection,
+    StatusEntry, CTX_LOCALIZATION_RESULTS,
 };
 pub use augur_plugin_evesmlm_fitting::{
-    EveLocalization, EveLocalizationResults, FitMethod, CTX_EVE_LOCALIZATION_RESULTS,
+    to_localization_results, EveLocalization, EveLocalizationResults, FitMethod,
+    CTX_EVE_LOCALIZATION_RESULTS,
 };
 use evaluation::EvaluationState;
 use serde_json::{json, Value};
@@ -540,17 +541,8 @@ impl Plugin for EveSmlmPostProcPlugin {
                 });
             }
 
-            let recent: Vec<f64> = self
-                .evaluation
-                .nn_distances_px
-                .iter()
-                .rev()
-                .take(32)
-                .copied()
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect();
+            let start = self.evaluation.nn_distances_px.len().saturating_sub(32);
+            let recent = self.evaluation.nn_distances_px[start..].to_vec();
             if !recent.is_empty() {
                 entries.push(StatusEntry::Sparkline {
                     label: "NN distances".into(),
@@ -587,27 +579,6 @@ impl Plugin for EveSmlmPostProcPlugin {
         }
 
         entries
-    }
-}
-
-fn to_localization_results(results: &EveLocalizationResults) -> LocalizationResults {
-    LocalizationResults {
-        localizations: results
-            .localizations
-            .iter()
-            .map(|localization| Localization {
-                x: localization.x,
-                y: localization.y,
-                sigma_x: localization.sigma_x,
-                sigma_y: localization.sigma_y,
-                amplitude: 0.0,
-                background: 0.0,
-                timestamp_us: localization.timestamp_us,
-                fit_error: localization.fit_residual,
-            })
-            .collect(),
-        frame_window_start_us: results.frame_window_start_us,
-        frame_window_end_us: results.frame_window_end_us,
     }
 }
 
