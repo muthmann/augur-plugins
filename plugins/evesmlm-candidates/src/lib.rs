@@ -163,8 +163,12 @@ impl EveSmlmCandidatePlugin {
             return empty_candidates(frame, self.settings.finding_method);
         }
 
-        let events: Vec<EveEvent> = raw_events.iter().copied().map(EveEvent::from).collect();
-        let filtered_events = filter_events_by_polarity(events, self.settings.polarity);
+        let filtered_events: Vec<EveEvent> = raw_events
+            .iter()
+            .copied()
+            .map(EveEvent::from)
+            .filter(|event| self.settings.polarity.include_event(event))
+            .collect();
         self.last_event_count = filtered_events.len();
         if filtered_events.is_empty() {
             self.last_candidate_count = 0;
@@ -548,13 +552,6 @@ fn empty_candidates(frame: &PluginFrame<'_>, method: CandidateFindingMethod) -> 
         n_events_processed: 0,
         finding_method: method,
     }
-}
-
-fn filter_events_by_polarity(events: Vec<EveEvent>, polarity: PolarityMode) -> Vec<EveEvent> {
-    events
-        .into_iter()
-        .filter(|event| polarity.include_event(event))
-        .collect()
 }
 
 fn clusters_from_indices(events: &[EveEvent], cluster_indices: Vec<Vec<usize>>) -> Vec<EveCluster> {

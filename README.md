@@ -48,6 +48,16 @@ Do not copy source trees directly into `~/.augur/plugins/`. Build the plugin fir
 cargo build -p augur-plugin-hotpixel --release
 ```
 
+### Build All Runtime Plugins
+
+```bash
+./scripts/build-runtime-plugins.sh --profile release
+```
+
+This builds every runtime plugin crate in `plugins/` and skips non-runtime
+entries such as `roi-grid`. Any arguments after `--` are forwarded to
+`cargo build`.
+
 ### Install It
 
 ```bash
@@ -57,6 +67,23 @@ cp target/release/libaugur_plugin_hotpixel.dylib ~/.augur/plugins/hotpixel/
 ```
 
 Then open `augur-gui` and use **Plugins → Scan for New Plugins**.
+
+### Install All Built Runtime Plugins
+
+```bash
+./scripts/install-built-plugins.sh --profile release
+```
+
+This scans `plugins/*/plugin.toml`, copies every runtime plugin that already has
+its built library in `target/release/`, and skips unbuilt or non-runtime
+plugins such as `roi-grid`.
+
+### Build And Install Everything
+
+```bash
+./scripts/build-runtime-plugins.sh --profile release
+./scripts/install-built-plugins.sh --profile release
+```
 
 ### Build the eveSMLM Runtime Chain
 

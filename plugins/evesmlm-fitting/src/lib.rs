@@ -486,7 +486,7 @@ fn estimate_timestamp_us(events: &[EveEvent], x: f64, y: f64, radius: f64) -> u6
     }
 }
 
-fn to_localization_results(results: &EveLocalizationResults) -> LocalizationResults {
+pub fn to_localization_results(results: &EveLocalizationResults) -> LocalizationResults {
     LocalizationResults {
         localizations: results
             .localizations
