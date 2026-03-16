@@ -107,6 +107,20 @@ If you want downstream plugins like Focus Metrics to consume your results, publi
 - `StatusEntry::LabeledValue { label, value, color: Option<[u8; 3]> }` — key-value row with optional RGB highlight color
 - `StatusEntry::Sparkline { label, values: Vec<f64>, lower_is_better: bool }` — inline history plot; `lower_is_better` controls the coloring direction
 
+## Accumulated Data
+
+Plugins that accumulate results across frames can expose them to the host through `accumulated_localizations()`:
+
+```rust
+fn accumulated_localizations(&self) -> Option<Vec<u8>> {
+    serde_json::to_vec(&my_table).ok()
+}
+```
+
+The method returns serialized `LocalizationTable` bytes. The default implementation returns `None`. The host queries this only when its reconstruction window is open, avoiding per-frame serialization overhead.
+
+`LocalizationTable` and `LocalizationRow` are defined in `augur-plugin-api` and map directly to the ThunderSTORM CSV format for cross-tool compatibility.
+
 ## Panic Safety
 
 `export_plugin!` wraps every vtable call in `std::panic::catch_unwind`. A panic inside a plugin function is caught at the FFI boundary rather than unwinding into host code, which would be undefined behaviour. The host logs the panic and treats the current frame as a no-op for that plugin.
