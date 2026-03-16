@@ -10,6 +10,11 @@ Build every runtime-loaded plugin crate in this repository. Plugins without a
 `library = ...` entry in `plugin.toml` are treated as non-runtime plugins and
 skipped.
 
+If `AUGUR_RS_PATH` is set, or a sibling `../camerSDK` / `../augur-rs` checkout
+exists, the build is patched to use that local AugurRS repo for `augur-core`
+and `augur-plugin-api`. This is useful when plugins depend on unreleased host
+API changes.
+
 Options:
   --profile <name>  Cargo profile to use (default: release)
   --locked          Pass --locked to cargo build
@@ -57,6 +62,28 @@ fi
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/.." && pwd)"
 
+find_local_augur_rs_repo() {
+    local candidate
+
+    if [[ -n "${AUGUR_RS_PATH:-}" ]]; then
+        if [[ -d "${AUGUR_RS_PATH}/.git" ]]; then
+            printf '%s\n' "${AUGUR_RS_PATH}"
+            return 0
+        fi
+        echo "AUGUR_RS_PATH does not point to a git checkout: ${AUGUR_RS_PATH}" >&2
+        exit 1
+    fi
+
+    for candidate in "${repo_root}/../camerSDK" "${repo_root}/../augur-rs"; do
+        if [[ -d "${candidate}/.git" ]]; then
+            printf '%s\n' "${candidate}"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
 packages=()
 skipped_not_runtime=0
 
@@ -99,12 +126,26 @@ fi
 for package in "${packages[@]}"; do
     cmd+=(-p "${package}")
 done
+
+if local_augur_rs_repo="$(find_local_augur_rs_repo)"; then
+    local_augur_rs_url="file://${local_augur_rs_repo}"
+    cmd+=(
+        --config
+        "patch.\"https://github.com/muthmann/augur-rs.git\".augur-core.git=\"${local_augur_rs_url}\""
+        --config
+        "patch.\"https://github.com/muthmann/augur-rs.git\".augur-plugin-api.git=\"${local_augur_rs_url}\""
+    )
+fi
+
 if [[ ${#cargo_args[@]} -gt 0 ]]; then
     cmd+=("${cargo_args[@]}")
 fi
 
 echo "Building ${#packages[@]} runtime plugin(s) with profile ${profile}:"
 printf '  %s\n' "${packages[@]}"
+if [[ -n "${local_augur_rs_repo:-}" ]]; then
+    echo "Using local AugurRS checkout: ${local_augur_rs_repo}"
+fi
 echo
 "${cmd[@]}"
 echo
