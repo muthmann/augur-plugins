@@ -30,7 +30,7 @@ pub(crate) fn fit(cluster: &EveCluster) -> Option<FitEstimate> {
         design[(row, 2)] = weight * *y;
         design[(row, 3)] = weight * x * x;
         design[(row, 4)] = weight * y * y;
-        target[row] = weight * *count;
+        target[row] = weight * count.ln();
     }
 
     let lhs = design.transpose() * &design;
@@ -64,7 +64,7 @@ pub(crate) fn fit(cluster: &EveCluster) -> Option<FitEstimate> {
         .map(|(sample_x, sample_y, count)| {
             let prediction =
                 a + b * sample_x + c * sample_y + d * sample_x.powi(2) + e * sample_y.powi(2);
-            let error = count - prediction;
+            let error = count.ln() - prediction;
             error * error
         })
         .sum::<f64>()

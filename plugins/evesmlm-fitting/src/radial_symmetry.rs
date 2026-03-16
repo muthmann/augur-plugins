@@ -16,6 +16,26 @@ pub(crate) fn fit(cluster: &EveCluster) -> Option<FitEstimate> {
         image[local_y * width + local_x] = f64::from(*positive + *negative);
     }
 
+    // Compute raw gradients via central differences.
+    let grad_width = width - 2;
+    let grad_height = height - 2;
+    let grad_len = grad_width * grad_height;
+    let mut raw_gx = vec![0.0; grad_len];
+    let mut raw_gy = vec![0.0; grad_len];
+    for y in 1..height - 1 {
+        for x in 1..width - 1 {
+            let gi = (y - 1) * grad_width + (x - 1);
+            raw_gx[gi] = 0.5 * (image[y * width + x + 1] - image[y * width + x - 1]);
+            raw_gy[gi] = 0.5 * (image[(y + 1) * width + x] - image[(y - 1) * width + x]);
+        }
+    }
+
+    // Apply 3x3 uniform averaging filter to gradient components to suppress
+    // shot-noise in low-count event histograms (matches the Parthasarathy 2012
+    // reference algorithm used by the Python EVE implementation).
+    let smooth_gx = smooth_3x3(&raw_gx, grad_width, grad_height);
+    let smooth_gy = smooth_3x3(&raw_gy, grad_width, grad_height);
+
     let mut a00 = 0.0;
     let mut a01 = 0.0;
     let mut a11 = 0.0;
@@ -23,15 +43,18 @@ pub(crate) fn fit(cluster: &EveCluster) -> Option<FitEstimate> {
     let mut b1 = 0.0;
     let mut normals = Vec::new();
 
-    for y in 1..height - 1 {
-        for x in 1..width - 1 {
-            let gx = 0.5 * (image[y * width + x + 1] - image[y * width + x - 1]);
-            let gy = 0.5 * (image[(y + 1) * width + x] - image[(y - 1) * width + x]);
+    for gy_idx in 0..grad_height {
+        for gx_idx in 0..grad_width {
+            let gi = gy_idx * grad_width + gx_idx;
+            let gx = smooth_gx[gi];
+            let gy = smooth_gy[gi];
             let weight = gx * gx + gy * gy;
             if weight <= 1e-9 {
                 continue;
             }
 
+            let x = gx_idx + 1; // back to image-local coordinates
+            let y = gy_idx + 1;
             let nx = -gy;
             let ny = gx;
             let px = f64::from(cluster.x_min) + x as f64;
@@ -82,4 +105,27 @@ pub(crate) fn fit(cluster: &EveCluster) -> Option<FitEstimate> {
         sigma_y: 0.0,
         residual,
     })
+}
+
+/// 3×3 uniform averaging filter with zero-padded boundary.
+/// Matches `scipy.ndimage.convolve(data, np.ones((3,3))/9, mode='constant')`:
+/// out-of-bounds samples are treated as 0, divisor is always 9.
+fn smooth_3x3(input: &[f64], width: usize, height: usize) -> Vec<f64> {
+    let mut output = vec![0.0; input.len()];
+    for y in 0..height {
+        for x in 0..width {
+            let mut sum = 0.0;
+            for dy in -1i32..=1 {
+                for dx in -1i32..=1 {
+                    let nx = x as i32 + dx;
+                    let ny = y as i32 + dy;
+                    if nx >= 0 && nx < width as i32 && ny >= 0 && ny < height as i32 {
+                        sum += input[ny as usize * width + nx as usize];
+                    }
+                }
+            }
+            output[y * width + x] = sum / 9.0;
+        }
+    }
+    output
 }
