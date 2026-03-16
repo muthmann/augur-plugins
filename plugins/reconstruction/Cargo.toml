@@ -1,0 +1,15 @@
+[package]
+name = "augur-plugin-reconstruction"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Localization reconstruction plugin for AugurRS — accumulates localization tables for host-side super-resolution rendering and export."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+augur-plugin-api.workspace = true
+serde.workspace = true
+serde_json.workspace = true

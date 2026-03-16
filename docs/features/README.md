@@ -5,3 +5,4 @@ Repository-level feature notes for larger plugin suites and architectural workfl
 ## Available Briefs
 
 - [eveSMLM Pipeline](./evesmlm.md) — candidate finding, fitting, and post-processing as three chainable plugins.
+- [Reconstruction Workflow](./reconstruction.md) — accumulated localization tables rendered and exported by the host.
