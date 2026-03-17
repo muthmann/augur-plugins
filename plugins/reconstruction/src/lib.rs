@@ -1,9 +1,11 @@
 use augur_plugin_api::{
     export_plugin, AnalysisSeverity, HostContext, HostOutput, Localization, LocalizationResults,
-    LocalizationRow, LocalizationTable, Plugin, PluginFrame, PluginInput, SettingItem, SettingKind,
-    SettingsSchema, SettingsSection, StatusEntry, CTX_LOCALIZATION_RESULTS,
+    LocalizationRow, Plugin, PluginFrame, PluginInput, SettingItem, SettingKind, SettingsSchema,
+    SettingsSection, StatusEntry, CTX_LOCALIZATION_RESULTS,
 };
+use serde::Serialize;
 use serde_json::{json, Value};
+use std::collections::VecDeque;
 
 const DEFAULT_NM_PER_PIXEL: f64 = 65.0;
 const DEFAULT_MAX_LOCALIZATIONS: usize = 1_000_000;
@@ -30,10 +32,18 @@ impl Default for ReconstructionSettings {
 pub struct ReconstructionPlugin {
     enabled: bool,
     settings: ReconstructionSettings,
-    table: Vec<LocalizationRow>,
+    table: VecDeque<LocalizationRow>,
     next_id: u64,
     frame_counter: u64,
     sensor_dims: Option<(u16, u16)>,
+}
+
+#[derive(Serialize)]
+struct SerializedLocalizationTable<'a> {
+    rows: &'a VecDeque<LocalizationRow>,
+    nm_per_pixel: f64,
+    sensor_width: u16,
+    sensor_height: u16,
 }
 
 impl ReconstructionPlugin {
@@ -41,14 +51,8 @@ impl ReconstructionPlugin {
         value.as_u64().and_then(|value| usize::try_from(value).ok())
     }
 
-    fn sigma_nm(&self, localization: &Localization) -> f64 {
-        0.5 * (localization.sigma_x + localization.sigma_y) * self.settings.nm_per_pixel
-    }
-
-    fn xy_uncertainty_nm(&self, localization: &Localization) -> f64 {
-        let sigma_mean_px = 0.5 * (localization.sigma_x + localization.sigma_y);
-        let signal = localization.amplitude.abs().max(1.0).sqrt();
-        sigma_mean_px / signal * self.settings.nm_per_pixel
+    fn sigma_mean_px(localization: &Localization) -> f64 {
+        0.5 * (localization.sigma_x + localization.sigma_y)
     }
 
     fn next_frame_number(&mut self) -> u64 {
@@ -57,11 +61,13 @@ impl ReconstructionPlugin {
     }
 
     fn trim_to_cap(&mut self) {
-        if self.table.len() <= self.settings.max_localizations {
-            return;
+        let overflow = self
+            .table
+            .len()
+            .saturating_sub(self.settings.max_localizations);
+        if overflow > 0 {
+            self.table.drain(..overflow);
         }
-        let overflow = self.table.len() - self.settings.max_localizations;
-        self.table.drain(..overflow);
     }
 
     fn localization_row(
@@ -69,15 +75,18 @@ impl ReconstructionPlugin {
         frame_number: u64,
         localization: &Localization,
     ) -> LocalizationRow {
+        let sigma_mean_px = Self::sigma_mean_px(localization);
+        let nm_per_pixel = self.settings.nm_per_pixel;
         let row = LocalizationRow {
             id: self.next_id,
             frame: frame_number,
-            x_nm: localization.x * self.settings.nm_per_pixel,
-            y_nm: localization.y * self.settings.nm_per_pixel,
-            sigma_nm: self.sigma_nm(localization),
+            x_nm: localization.x * nm_per_pixel,
+            y_nm: localization.y * nm_per_pixel,
+            sigma_nm: sigma_mean_px * nm_per_pixel,
             intensity: localization.amplitude,
             offset: localization.background,
-            uncertainty_xy_nm: self.xy_uncertainty_nm(localization),
+            uncertainty_xy_nm: sigma_mean_px / localization.amplitude.abs().max(1.0).sqrt()
+                * nm_per_pixel,
             timestamp_us: localization.timestamp_us,
         };
         self.next_id = self.next_id.saturating_add(1);
@@ -85,9 +94,10 @@ impl ReconstructionPlugin {
     }
 
     fn accumulate_results(&mut self, frame_number: u64, results: &LocalizationResults) {
+        self.table.reserve(results.localizations.len());
         for localization in &results.localizations {
             let row = self.localization_row(frame_number, localization);
-            self.table.push(row);
+            self.table.push_back(row);
         }
         self.trim_to_cap();
     }
@@ -269,7 +279,7 @@ impl Plugin for ReconstructionPlugin {
     }
 
     fn reset(&mut self) {
-        self.table.clear();
+        self.table = VecDeque::new();
         self.next_id = 0;
         self.frame_counter = 0;
         self.sensor_dims = None;
@@ -374,6 +384,7 @@ impl Plugin for ReconstructionPlugin {
                 };
                 self.settings.max_localizations = value.clamp(10_000, 10_000_000);
                 self.trim_to_cap();
+                self.table.shrink_to_fit();
                 Ok(())
             }
             _ => Err(format!("unknown setting: {key}")),
@@ -412,8 +423,8 @@ impl Plugin for ReconstructionPlugin {
             return None;
         }
         let (sensor_width, sensor_height) = self.sensor_dims?;
-        serde_json::to_vec(&LocalizationTable {
-            rows: self.table.clone(),
+        serde_json::to_vec(&SerializedLocalizationTable {
+            rows: &self.table,
             nm_per_pixel: self.settings.nm_per_pixel,
             sensor_width,
             sensor_height,
@@ -427,6 +438,7 @@ export_plugin!(ReconstructionPlugin);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use augur_plugin_api::LocalizationTable;
 
     fn localization() -> Localization {
         Localization {

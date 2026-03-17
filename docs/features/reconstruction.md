@@ -16,6 +16,12 @@ The reconstruction workflow now publishes one accumulated host-view dataset inst
 - the full table window and density reconstruction window read the same dataset id
 - `accumulated_localizations()` remains as a temporary compatibility hook for older hosts during the transition cycle
 
+## Resource Use
+
+- the plugin keeps only a capped FIFO of localization rows in memory
+- cap enforcement avoids shifting the full accumulation buffer on overflow
+- the compatibility hook serializes a borrowed view instead of cloning the full table first
+
 ## Data Flow
 
 `LocalizationResults` -> `augur.localization.accumulated` -> host table window / host density window
