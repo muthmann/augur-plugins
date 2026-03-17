@@ -137,3 +137,6 @@ echo
 echo "Installed ${installed} runtime plugin(s) into ${dest_dir}"
 echo "Skipped ${skipped_not_runtime} non-runtime plugin(s)"
 echo "Skipped ${skipped_not_built} plugin(s) without a built library in ${target_dir}"
+if [[ ${skipped_not_built} -gt 0 ]]; then
+    echo "Hint: run ./scripts/build-runtime-plugins.sh --profile ${profile} before installing."
+fi

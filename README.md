@@ -32,6 +32,7 @@ All maintained analysis plugins in this repository now target the runtime loader
 |---|---|---|
 | `hotpixel` | Runtime-compatible | Migrated to `augur-plugin-api` |
 | `localization` | Runtime-compatible | Migrated to `augur-plugin-api` |
+| `reconstruction` | Runtime-compatible | Exposes accumulated localization tables for host-side reconstruction windows |
 | `focus-metrics` | Runtime-compatible | Consumes any upstream plugin that publishes `augur.localization.results` |
 | `evesmlm-candidates` | Runtime-compatible | Publishes `augur.evesmlm.candidates` |
 | `evesmlm-fitting` | Runtime-compatible | Publishes `augur.evesmlm.localization_results` and standard localization compatibility results |

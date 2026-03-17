@@ -1,0 +1,5 @@
+name = "Localization Reconstruction"
+version = "0.1.0"
+description = "Accumulates localization tables for host-side reconstruction, CSV export, and image export."
+domain = "smlm"
+library = "augur_plugin_reconstruction"

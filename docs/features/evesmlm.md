@@ -5,8 +5,8 @@ The eveSMLM pipeline is implemented as three focused plugins so each stage can b
 ## Stages
 
 1. **EVE Candidate Finding** (`RawEvents`) clusters raw `CdEvent` samples into emitter candidates and publishes `EveCandidates`.
-2. **EVE Candidate Fitting** (`DerivedData`) converts each candidate into one or more sub-pixel localization estimates and republishes both `EveLocalizationResults` and `LocalizationResults`.
-3. **EVE Post-Processing** (`DerivedData`) filters, drift-corrects, and evaluates the fitted localizations.
+2. **EVE Candidate Fitting** (`DerivedData`) converts each candidate into one or more sub-pixel localization estimates, republishes `EveLocalizationResults` and `LocalizationResults`, and exposes the compact host-view dataset `augur.evesmlm.current_localizations`.
+3. **EVE Post-Processing** (`DerivedData`) filters, drift-corrects, and evaluates the fitted localizations, then republishes the same host-view dataset id and view id with the same schema.
 
 ## Why Three Plugins
 
@@ -14,6 +14,13 @@ The eveSMLM pipeline is implemented as three focused plugins so each stage can b
 - Lets researchers compare fitting methods on a fixed candidate set.
 - Allows post-processing to be toggled or replaced without touching candidate generation.
 - Preserves compatibility with existing downstream plugins through `LocalizationResults`.
+
+## Host View Resolution
+
+- The compact EVE localization panel is declared by both fitting and post-processing.
+- The host resolves duplicate ids in plugin execution order.
+- When **EVE Post-Processing** is enabled, it becomes the active provider for the panel view.
+- When post-processing is disabled, the panel falls back automatically to **EVE Candidate Fitting**.
 
 ## Data Flow
 

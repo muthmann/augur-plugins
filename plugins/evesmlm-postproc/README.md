@@ -31,7 +31,11 @@ Post-processing and quality assessment for eveSMLM localization streams. The plu
 
 ## Published Data
 
-Publishes filtered and drift-corrected `EveLocalizationResults` on `augur.evesmlm.localization_results`, and republishes standard `LocalizationResults` on `augur.localization.results` for downstream compatibility.
+Publishes filtered and drift-corrected `EveLocalizationResults` on `augur.evesmlm.localization_results`, republishes standard `LocalizationResults` on `augur.localization.results` for downstream compatibility, and serves the compact host-view dataset `augur.evesmlm.current_localizations`.
+
+## Host View
+
+This plugin deliberately reuses the same dataset id and compact panel view id as `EVE Candidate Fitting`. Because post-processing resolves later in the pipeline, it becomes the active provider whenever it is enabled.
 
 ## Dependencies
 

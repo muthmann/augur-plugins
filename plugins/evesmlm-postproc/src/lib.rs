@@ -10,13 +10,14 @@ pub mod filtering;
 use std::collections::VecDeque;
 
 use augur_plugin_api::{
-    export_plugin, AnalysisSeverity, FfiSubpixelMarker, HostContext, HostOutput, Plugin,
-    PluginFrame, PluginInput, SettingItem, SettingKind, SettingsSchema, SettingsSection,
+    export_plugin, AnalysisSeverity, FfiSubpixelMarker, HostContext, HostOutput, HostViewRegistry,
+    Plugin, PluginFrame, PluginInput, SettingItem, SettingKind, SettingsSchema, SettingsSection,
     StatusEntry, CTX_LOCALIZATION_RESULTS,
 };
 pub use augur_plugin_evesmlm_fitting::{
-    to_localization_results, EveLocalization, EveLocalizationResults, FitMethod,
-    CTX_EVE_LOCALIZATION_RESULTS,
+    current_localizations_dataset, current_localizations_registry, to_localization_results,
+    EveLocalization, EveLocalizationResults, FitMethod, CTX_EVE_LOCALIZATION_RESULTS,
+    CURRENT_LOCALIZATIONS_DATASET_ID,
 };
 use evaluation::EvaluationState;
 use serde_json::{json, Value};
@@ -60,6 +61,7 @@ impl Default for PostProcSettings {
 pub struct EveSmlmPostProcPlugin {
     enabled: bool,
     settings: PostProcSettings,
+    current_results: EveLocalizationResults,
     corrected_history: VecDeque<Vec<(f64, f64)>>,
     evaluation: EvaluationState,
     last_input_count: usize,
@@ -73,6 +75,7 @@ impl Default for EveSmlmPostProcPlugin {
         Self {
             enabled: false,
             settings: PostProcSettings::default(),
+            current_results: EveLocalizationResults::default(),
             corrected_history: VecDeque::new(),
             evaluation: EvaluationState::default(),
             last_input_count: 0,
@@ -175,6 +178,7 @@ impl EveSmlmPostProcPlugin {
     }
 
     pub fn reset(&mut self) {
+        self.current_results = EveLocalizationResults::default();
         self.corrected_history.clear();
         self.evaluation.reset();
         self.last_input_count = 0;
@@ -269,6 +273,7 @@ impl Plugin for EveSmlmPostProcPlugin {
         };
 
         let corrected = self.process_localizations(input.as_ref(), output);
+        self.current_results = corrected.clone();
         if let Err(err) = context.publish(CTX_EVE_LOCALIZATION_RESULTS, &corrected) {
             Self::warning(
                 output,
@@ -579,6 +584,18 @@ impl Plugin for EveSmlmPostProcPlugin {
         }
 
         entries
+    }
+
+    fn host_views(&self) -> HostViewRegistry {
+        current_localizations_registry()
+    }
+
+    fn host_view_dataset(&self, dataset_id: &str) -> Option<Vec<u8>> {
+        if dataset_id != CURRENT_LOCALIZATIONS_DATASET_ID {
+            return None;
+        }
+
+        serde_json::to_vec(&current_localizations_dataset(&self.current_results)).ok()
     }
 }
 

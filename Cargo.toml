@@ -3,6 +3,7 @@ members = [
   "plugins/hotpixel",
   "plugins/roi-grid",
   "plugins/localization",
+  "plugins/reconstruction",
   "plugins/focus-metrics",
   "plugins/evesmlm-candidates",
   "plugins/evesmlm-fitting",

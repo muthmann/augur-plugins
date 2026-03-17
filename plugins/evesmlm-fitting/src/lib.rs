@@ -15,6 +15,11 @@ use augur_plugin_api::{
     LocalizationResults, Plugin, PluginFrame, PluginInput, SettingItem, SettingKind,
     SettingsSchema, SettingsSection, StatusEntry, CTX_LOCALIZATION_RESULTS,
 };
+use augur_plugin_api::{
+    HostDatasetDescriptor, HostDatasetKind, HostViewDescriptor, HostViewKind, HostViewPlacement,
+    HostViewRegistry, TableColumn, TableColumnData, TableColumnValues, TableDatasetV1, TableSchema,
+    TableValueType,
+};
 pub use augur_plugin_evesmlm_candidates::{
     CandidateFindingMethod, EveCandidates, EveCluster, EveEvent, CTX_EVE_CANDIDATES,
 };
@@ -23,6 +28,107 @@ pub use types::{EveLocalization, EveLocalizationResults, FitMethod, CTX_EVE_LOCA
 
 const OVERLAY_COLOR: [u8; 4] = [60, 220, 140, 220];
 const CANDIDATE_DEPENDENCY: [&str; 1] = ["EVE Candidate Finding"];
+pub const CURRENT_LOCALIZATIONS_DATASET_ID: &str = "augur.evesmlm.current_localizations";
+pub const CURRENT_LOCALIZATIONS_VIEW_ID: &str = "augur.evesmlm.current_localizations.compact";
+
+pub fn current_localizations_registry() -> HostViewRegistry {
+    HostViewRegistry {
+        datasets: vec![HostDatasetDescriptor {
+            id: CURRENT_LOCALIZATIONS_DATASET_ID.into(),
+            title: "Current EVE localizations".into(),
+            kind: HostDatasetKind::TableV1(current_localizations_schema()),
+            empty_message: "No EVE localizations in the current frame.".into(),
+        }],
+        views: vec![HostViewDescriptor {
+            id: CURRENT_LOCALIZATIONS_VIEW_ID.into(),
+            title: "Current Localizations".into(),
+            dataset_id: CURRENT_LOCALIZATIONS_DATASET_ID.into(),
+            placement: HostViewPlacement::AnalysisPanel,
+            kind: HostViewKind::CompactTable,
+        }],
+    }
+}
+
+pub fn current_localizations_schema() -> TableSchema {
+    TableSchema {
+        columns: vec![
+            TableColumn {
+                id: "x_px".into(),
+                title: "X (px)".into(),
+                value_type: TableValueType::F64,
+            },
+            TableColumn {
+                id: "y_px".into(),
+                title: "Y (px)".into(),
+                value_type: TableValueType::F64,
+            },
+            TableColumn {
+                id: "sigma_x_px".into(),
+                title: "Sigma X (px)".into(),
+                value_type: TableValueType::F64,
+            },
+            TableColumn {
+                id: "sigma_y_px".into(),
+                title: "Sigma Y (px)".into(),
+                value_type: TableValueType::F64,
+            },
+            TableColumn {
+                id: "n_events".into(),
+                title: "Events".into(),
+                value_type: TableValueType::U64,
+            },
+        ],
+        coordinate_space_2d: None,
+    }
+}
+
+pub fn current_localizations_dataset(results: &EveLocalizationResults) -> TableDatasetV1 {
+    TableDatasetV1::new(vec![
+        TableColumnData {
+            column_id: "x_px".into(),
+            values: TableColumnValues::F64(
+                results.localizations.iter().map(|value| value.x).collect(),
+            ),
+        },
+        TableColumnData {
+            column_id: "y_px".into(),
+            values: TableColumnValues::F64(
+                results.localizations.iter().map(|value| value.y).collect(),
+            ),
+        },
+        TableColumnData {
+            column_id: "sigma_x_px".into(),
+            values: TableColumnValues::F64(
+                results
+                    .localizations
+                    .iter()
+                    .map(|value| value.sigma_x)
+                    .collect(),
+            ),
+        },
+        TableColumnData {
+            column_id: "sigma_y_px".into(),
+            values: TableColumnValues::F64(
+                results
+                    .localizations
+                    .iter()
+                    .map(|value| value.sigma_y)
+                    .collect(),
+            ),
+        },
+        TableColumnData {
+            column_id: "n_events".into(),
+            values: TableColumnValues::U64(
+                results
+                    .localizations
+                    .iter()
+                    .map(|value| value.n_events as u64)
+                    .collect(),
+            ),
+        },
+    ])
+    .expect("current localization columns should stay aligned")
+}
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct FitEstimate {
@@ -59,6 +165,7 @@ impl Default for FittingSettings {
 pub struct EveSmlmFittingPlugin {
     enabled: bool,
     settings: FittingSettings,
+    current_results: EveLocalizationResults,
     last_localization_count: usize,
     last_rejection_count: usize,
     last_status: String,
@@ -69,6 +176,7 @@ impl Default for EveSmlmFittingPlugin {
         Self {
             enabled: false,
             settings: FittingSettings::default(),
+            current_results: EveLocalizationResults::default(),
             last_localization_count: 0,
             last_rejection_count: 0,
             last_status:
@@ -173,6 +281,7 @@ impl EveSmlmFittingPlugin {
     }
 
     pub fn reset(&mut self) {
+        self.current_results = EveLocalizationResults::default();
         self.last_localization_count = 0;
         self.last_rejection_count = 0;
         self.last_status = "Waiting for the next candidate set.".into();
@@ -238,6 +347,7 @@ impl Plugin for EveSmlmFittingPlugin {
         };
 
         let (eve_results, compatibility) = self.analyze_candidates(candidates.as_ref(), output);
+        self.current_results = eve_results.clone();
         if let Err(err) = context.publish(CTX_EVE_LOCALIZATION_RESULTS, &eve_results) {
             Self::warning(
                 output,
@@ -431,6 +541,18 @@ impl Plugin for EveSmlmFittingPlugin {
                 color: None,
             },
         ]
+    }
+
+    fn host_views(&self) -> HostViewRegistry {
+        current_localizations_registry()
+    }
+
+    fn host_view_dataset(&self, dataset_id: &str) -> Option<Vec<u8>> {
+        if dataset_id != CURRENT_LOCALIZATIONS_DATASET_ID {
+            return None;
+        }
+
+        serde_json::to_vec(&current_localizations_dataset(&self.current_results)).ok()
     }
 }
 
@@ -667,6 +789,40 @@ mod tests {
         assert!(mean_xy::fit(&cluster).is_none());
         assert!(log_gaussian::fit(&cluster).is_none());
         assert!(gaussian::fit(&cluster).is_none());
+    }
+
+    #[test]
+    fn host_view_registry_exposes_one_dataset_and_panel_view() {
+        let registry = current_localizations_registry();
+
+        assert_eq!(registry.datasets.len(), 1);
+        assert_eq!(registry.views.len(), 1);
+        assert_eq!(registry.datasets[0].id, CURRENT_LOCALIZATIONS_DATASET_ID);
+        assert_eq!(registry.views[0].id, CURRENT_LOCALIZATIONS_VIEW_ID);
+    }
+
+    #[test]
+    fn host_view_dataset_is_columnar_and_aligned() {
+        let dataset = current_localizations_dataset(&EveLocalizationResults {
+            localizations: vec![EveLocalization {
+                x: 1.5,
+                y: 2.5,
+                sigma_x: 0.7,
+                sigma_y: 0.8,
+                timestamp_us: 10,
+                n_events: 7,
+                polarity_balance: 0.1,
+                fit_residual: 0.02,
+                fit_method: FitMethod::LogGaussian,
+            }],
+            frame_window_start_us: 0,
+            frame_window_end_us: 50,
+        });
+
+        assert_eq!(dataset.row_count(), 1);
+        assert_eq!(dataset.columns.len(), 5);
+        assert_eq!(dataset.columns[0].column_id, "x_px");
+        assert_eq!(dataset.columns[4].column_id, "n_events");
     }
 }
 
