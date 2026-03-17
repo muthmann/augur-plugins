@@ -90,7 +90,16 @@ let upstream = context.get::<MyResults>("my.plugin.results")?;
 
 Declare downstream requirements with `dependencies()` when a downstream plugin truly requires a specific upstream producer. If your plugin can consume any producer of a standard payload such as `CTX_LOCALIZATION_RESULTS`, prefer a runtime warning over a hard name-based dependency.
 
-### 5. Define Declarative Settings
+### 5. Expose Host Views (Optional)
+
+If your plugin produces structured results that the host should render (tables, density maps), implement:
+
+- `host_views()` — return `HostViewRegistry` with dataset and view descriptors
+- `host_view_dataset(dataset_id)` — return serialized `TableDatasetV1` bytes on demand
+
+See [plugin-api.md](./docs/plugin-api.md#host-views) for the full API reference, and `plugins/reconstruction` or `plugins/evesmlm-fitting` for working examples.
+
+### 6. Define Declarative Settings
 
 Plugins no longer render `egui` directly. Instead, expose:
 
@@ -101,7 +110,7 @@ Plugins no longer render `egui` directly. Instead, expose:
 
 See `plugins/hotpixel`, `plugins/localization`, `plugins/focus-metrics`, and the `plugins/evesmlm-*` chain for working examples.
 
-### 6. Write `plugin.toml`
+### 7. Write `plugin.toml`
 
 Use the runtime format:
 
@@ -115,7 +124,7 @@ library = "augur_plugin_my_plugin"
 
 `library` is the library base name without `lib` or the platform extension.
 
-### 7. Build the Plugin
+### 8. Build the Plugin
 
 ```bash
 cargo build -p augur-plugin-my-plugin --release
@@ -127,7 +136,7 @@ That should produce:
 - Linux: `target/release/libaugur_plugin_my_plugin.so`
 - Windows: `target/release/augur_plugin_my_plugin.dll`
 
-### 8. Install It Locally
+### 9. Install It Locally
 
 ```bash
 mkdir -p ~/.augur/plugins/my-plugin
@@ -182,9 +191,10 @@ If the plugin publishes shared data, document the context key and payload type e
 
 The host application, runtime loader, and `augur-plugin-api` crate live in [augur-rs](https://github.com/muthmann/augur-rs). Useful references:
 
-- [Plugin Architecture](https://github.com/muthmann/augur-rs/blob/main/docs/features/analysis-plugins.md) — execution model, context bus, FFI API surface
+- [Plugin Architecture](https://github.com/muthmann/augur-rs/blob/main/docs/features/analysis-plugins.md) — execution model, context bus, FFI API surface, host views
 - [Dynamic Plugin Loading](https://github.com/muthmann/augur-rs/blob/main/docs/features/dynamic-plugins.md) — manifest format, install layout, troubleshooting
-- [Plugin API Reference](./docs/plugin-api.md) — trait methods, phases, settings, status entries
+- [Host View Registry](https://github.com/muthmann/augur-rs/blob/main/docs/features/host-view-registry.md) — generic dataset/view model, resolution rules, ABI v2
+- [Plugin API Reference](./docs/plugin-api.md) — trait methods, phases, settings, status entries, host views
 
 ## Notes for Local Development
 

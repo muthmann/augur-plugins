@@ -57,6 +57,17 @@ Key design properties:
 
 The design draws on the SciJava parameter injection model, but uses explicit string-keyed registration instead of annotation-based classpath scanning.
 
+## Host-View Registry
+
+Plugins can expose structured outputs to the host through a generic dataset/view registry. Instead of adding domain-specific hooks to the FFI surface, plugins declare descriptors that the host renders generically:
+
+- `host_views()` returns `HostViewRegistry` with dataset and view descriptors
+- `host_view_dataset(dataset_id)` returns serialized data on demand
+
+The host owns all rendering (compact tables, table windows, density maps) while plugins own the scientific data. Dataset payloads are fetched lazily. When multiple plugins declare the same descriptor id, later providers override earlier ones in execution order, enabling pipeline stages to share a single view.
+
+See [augur-rs ADR 006](https://github.com/muthmann/augur-rs/blob/main/docs/adr/006-host-view-registry.md) for the full design rationale and [plugin-api.md](./plugin-api.md#host-views) for the API reference.
+
 ## Tradeoffs
 
 | Decision | Benefit | Cost |

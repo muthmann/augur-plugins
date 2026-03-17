@@ -4,19 +4,27 @@ The reconstruction workflow adds a dedicated runtime plugin that accumulates sta
 
 ## Components
 
-1. **Localization Reconstruction** (`DerivedData`) reads `LocalizationResults` from the typed plugin context and stores a capped table of nanometer-space rows.
-2. **`augur-plugin-api` accumulation hook** lets runtime plugins expose that table without re-publishing it into the per-frame context map.
-3. **`augur-gui` reconstruction window** renders the accumulated table into a histogram image and exports ThunderSTORM-style CSV plus PNG/TIFF snapshots.
+1. **Localization Reconstruction** (`DerivedData`) reads `LocalizationResults` from the context bus and stores a capped table of nanometer-space rows.
+2. **Host-view registry** exposes the accumulated table through generic `host_views()` and `host_view_dataset()` methods, so the host renders it without reconstruction-specific GUI code.
+3. **`augur-gui` host views** renders a table window (with CSV export) and a 2D density heatmap from the plugin's declared descriptors.
 
 ## Why The Split Exists
 
 - The plugin owns scientific accumulation logic and stays reusable across hosts.
 - The host owns rendering, file dialogs, image encoding, and viewport state.
-- The per-frame `HostContext` stays lightweight instead of re-serializing the full reconstruction table every frame.
+- Dataset payloads are fetched lazily on demand, so the plugin does not re-serialize the full table every frame.
+
+## Host View Descriptors
+
+The reconstruction plugin declares:
+
+- **Dataset** `augur.localization.accumulated` — a `TableV1` with 9 columns (id, frame, x_nm, y_nm, sigma_nm, intensity, offset, uncertainty_xy_nm, timestamp_us) and optional 2D coordinate space bounds
+- **View** `augur.localization.accumulated.table` — `TableWindow` placement for full table inspection and CSV export
+- **View** `augur.localization.accumulated.density` — `Density2dFromTable` placement for 2D super-resolution density rendering
 
 ## Data Flow
 
-`LocalizationResults` -> `Localization Reconstruction` table -> host reconstruction image / CSV / image export
+`LocalizationResults` -> `Localization Reconstruction` table -> host table window / density map / CSV / image export
 
 ## Installation
 
@@ -34,4 +42,4 @@ cp plugins/reconstruction/plugin.toml ~/.augur/plugins/reconstruction/
 cp target/release/libaugur_plugin_reconstruction.dylib ~/.augur/plugins/reconstruction/
 ```
 
-Then run a matching `augur-gui` build that includes the reconstruction window support.
+Then run a matching `augur-gui` build that includes host-view registry support.
