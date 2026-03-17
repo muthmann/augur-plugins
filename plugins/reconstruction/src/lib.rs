@@ -7,6 +7,9 @@ use serde_json::{json, Value};
 
 const DEFAULT_NM_PER_PIXEL: f64 = 65.0;
 const DEFAULT_MAX_LOCALIZATIONS: usize = 1_000_000;
+const ACCUMULATED_DATASET_ID: &str = "augur.localization.accumulated";
+const LOCALIZATION_TABLE_VIEW_ID: &str = "augur.localization.accumulated.table";
+const RECONSTRUCTION_VIEW_ID: &str = "augur.localization.accumulated.density";
 
 #[derive(Debug, Clone)]
 struct ReconstructionSettings {
@@ -87,6 +90,161 @@ impl ReconstructionPlugin {
             self.table.push(row);
         }
         self.trim_to_cap();
+    }
+
+    fn accumulated_coordinate_space(&self) -> Option<augur_plugin_api::TableCoordinateSpace2d> {
+        let (sensor_width, sensor_height) = self.sensor_dims?;
+        Some(augur_plugin_api::TableCoordinateSpace2d {
+            x_column: "x_nm".into(),
+            y_column: "y_nm".into(),
+            x_min: 0.0,
+            x_max: f64::from(sensor_width) * self.settings.nm_per_pixel,
+            y_min: 0.0,
+            y_max: f64::from(sensor_height) * self.settings.nm_per_pixel,
+        })
+    }
+
+    fn accumulated_schema(&self) -> augur_plugin_api::TableSchema {
+        augur_plugin_api::TableSchema {
+            columns: vec![
+                augur_plugin_api::TableColumn {
+                    id: "id".into(),
+                    title: "ID".into(),
+                    value_type: augur_plugin_api::TableValueType::U64,
+                },
+                augur_plugin_api::TableColumn {
+                    id: "frame".into(),
+                    title: "Frame".into(),
+                    value_type: augur_plugin_api::TableValueType::U64,
+                },
+                augur_plugin_api::TableColumn {
+                    id: "x_nm".into(),
+                    title: "X (nm)".into(),
+                    value_type: augur_plugin_api::TableValueType::F64,
+                },
+                augur_plugin_api::TableColumn {
+                    id: "y_nm".into(),
+                    title: "Y (nm)".into(),
+                    value_type: augur_plugin_api::TableValueType::F64,
+                },
+                augur_plugin_api::TableColumn {
+                    id: "sigma_nm".into(),
+                    title: "Sigma (nm)".into(),
+                    value_type: augur_plugin_api::TableValueType::F64,
+                },
+                augur_plugin_api::TableColumn {
+                    id: "intensity".into(),
+                    title: "Intensity".into(),
+                    value_type: augur_plugin_api::TableValueType::F64,
+                },
+                augur_plugin_api::TableColumn {
+                    id: "offset".into(),
+                    title: "Offset".into(),
+                    value_type: augur_plugin_api::TableValueType::F64,
+                },
+                augur_plugin_api::TableColumn {
+                    id: "uncertainty_xy_nm".into(),
+                    title: "Uncertainty XY (nm)".into(),
+                    value_type: augur_plugin_api::TableValueType::F64,
+                },
+                augur_plugin_api::TableColumn {
+                    id: "timestamp_us".into(),
+                    title: "Timestamp (us)".into(),
+                    value_type: augur_plugin_api::TableValueType::U64,
+                },
+            ],
+            coordinate_space_2d: self.accumulated_coordinate_space(),
+        }
+    }
+
+    fn accumulated_dataset(&self) -> augur_plugin_api::TableDatasetV1 {
+        augur_plugin_api::TableDatasetV1::new(vec![
+            augur_plugin_api::TableColumnData {
+                column_id: "id".into(),
+                values: augur_plugin_api::TableColumnValues::U64(
+                    self.table.iter().map(|row| row.id).collect(),
+                ),
+            },
+            augur_plugin_api::TableColumnData {
+                column_id: "frame".into(),
+                values: augur_plugin_api::TableColumnValues::U64(
+                    self.table.iter().map(|row| row.frame).collect(),
+                ),
+            },
+            augur_plugin_api::TableColumnData {
+                column_id: "x_nm".into(),
+                values: augur_plugin_api::TableColumnValues::F64(
+                    self.table.iter().map(|row| row.x_nm).collect(),
+                ),
+            },
+            augur_plugin_api::TableColumnData {
+                column_id: "y_nm".into(),
+                values: augur_plugin_api::TableColumnValues::F64(
+                    self.table.iter().map(|row| row.y_nm).collect(),
+                ),
+            },
+            augur_plugin_api::TableColumnData {
+                column_id: "sigma_nm".into(),
+                values: augur_plugin_api::TableColumnValues::F64(
+                    self.table.iter().map(|row| row.sigma_nm).collect(),
+                ),
+            },
+            augur_plugin_api::TableColumnData {
+                column_id: "intensity".into(),
+                values: augur_plugin_api::TableColumnValues::F64(
+                    self.table.iter().map(|row| row.intensity).collect(),
+                ),
+            },
+            augur_plugin_api::TableColumnData {
+                column_id: "offset".into(),
+                values: augur_plugin_api::TableColumnValues::F64(
+                    self.table.iter().map(|row| row.offset).collect(),
+                ),
+            },
+            augur_plugin_api::TableColumnData {
+                column_id: "uncertainty_xy_nm".into(),
+                values: augur_plugin_api::TableColumnValues::F64(
+                    self.table.iter().map(|row| row.uncertainty_xy_nm).collect(),
+                ),
+            },
+            augur_plugin_api::TableColumnData {
+                column_id: "timestamp_us".into(),
+                values: augur_plugin_api::TableColumnValues::U64(
+                    self.table.iter().map(|row| row.timestamp_us).collect(),
+                ),
+            },
+        ])
+        .expect("accumulated localization columns should stay aligned")
+    }
+
+    fn host_view_registry(&self) -> augur_plugin_api::HostViewRegistry {
+        augur_plugin_api::HostViewRegistry {
+            datasets: vec![augur_plugin_api::HostDatasetDescriptor {
+                id: ACCUMULATED_DATASET_ID.into(),
+                title: "Accumulated localizations".into(),
+                kind: augur_plugin_api::HostDatasetKind::TableV1(self.accumulated_schema()),
+                empty_message: "No accumulated localizations yet.".into(),
+            }],
+            views: vec![
+                augur_plugin_api::HostViewDescriptor {
+                    id: LOCALIZATION_TABLE_VIEW_ID.into(),
+                    title: "Localization Table".into(),
+                    dataset_id: ACCUMULATED_DATASET_ID.into(),
+                    placement: augur_plugin_api::HostViewPlacement::Window,
+                    kind: augur_plugin_api::HostViewKind::TableWindow,
+                },
+                augur_plugin_api::HostViewDescriptor {
+                    id: RECONSTRUCTION_VIEW_ID.into(),
+                    title: "Reconstruction".into(),
+                    dataset_id: ACCUMULATED_DATASET_ID.into(),
+                    placement: augur_plugin_api::HostViewPlacement::Window,
+                    kind: augur_plugin_api::HostViewKind::Density2dFromTable {
+                        x_column: "x_nm".into(),
+                        y_column: "y_nm".into(),
+                    },
+                },
+            ],
+        }
     }
 }
 
@@ -237,6 +395,18 @@ impl Plugin for ReconstructionPlugin {
         ]
     }
 
+    fn host_views(&self) -> augur_plugin_api::HostViewRegistry {
+        self.host_view_registry()
+    }
+
+    fn host_view_dataset(&self, dataset_id: &str) -> Option<Vec<u8>> {
+        if dataset_id != ACCUMULATED_DATASET_ID {
+            return None;
+        }
+
+        serde_json::to_vec(&self.accumulated_dataset()).ok()
+    }
+
     fn accumulated_localizations(&self) -> Option<Vec<u8>> {
         if self.table.is_empty() {
             return None;
@@ -313,5 +483,45 @@ mod tests {
 
         assert_eq!(plugin.table.len(), 1);
         assert_eq!(plugin.table[0].id, 1);
+    }
+
+    #[test]
+    fn host_view_registry_exposes_one_dataset_and_two_window_views() {
+        let mut plugin = ReconstructionPlugin::default();
+        plugin.sensor_dims = Some((1280, 720));
+
+        let registry = plugin.host_view_registry();
+
+        assert_eq!(registry.datasets.len(), 1);
+        assert_eq!(registry.views.len(), 2);
+        assert_eq!(registry.datasets[0].id, ACCUMULATED_DATASET_ID);
+        assert_eq!(registry.views[0].id, LOCALIZATION_TABLE_VIEW_ID);
+        assert_eq!(registry.views[1].id, RECONSTRUCTION_VIEW_ID);
+    }
+
+    #[test]
+    fn host_view_dataset_uses_the_same_rows_as_compatibility_table() {
+        let mut plugin = ReconstructionPlugin::default();
+        plugin.sensor_dims = Some((1280, 720));
+
+        plugin.accumulate_results(
+            4,
+            &LocalizationResults {
+                localizations: vec![localization()],
+                frame_window_start_us: 0,
+                frame_window_end_us: 0,
+            },
+        );
+
+        let compatibility = plugin
+            .accumulated_localizations()
+            .expect("compatibility payload");
+        let compatibility: LocalizationTable =
+            serde_json::from_slice(&compatibility).expect("compatibility table");
+        let dataset = plugin.accumulated_dataset();
+
+        assert_eq!(compatibility.rows.len(), dataset.row_count());
+        assert_eq!(dataset.columns[0].column_id, "id");
+        assert_eq!(dataset.columns[2].column_id, "x_nm");
     }
 }

@@ -107,19 +107,79 @@ If you want downstream plugins like Focus Metrics to consume your results, publi
 - `StatusEntry::LabeledValue { label, value, color: Option<[u8; 3]> }` — key-value row with optional RGB highlight color
 - `StatusEntry::Sparkline { label, values: Vec<f64>, lower_is_better: bool }` — inline history plot; `lower_is_better` controls the coloring direction
 
-## Accumulated Data
+## Host Views
 
-Plugins that accumulate results across frames can expose them to the host through `accumulated_localizations()`:
+Plugins can declare host-rendered datasets and views through `host_views()` and serve snapshots through `host_view_dataset()`:
 
 ```rust
-fn accumulated_localizations(&self) -> Option<Vec<u8>> {
-    serde_json::to_vec(&my_table).ok()
+fn host_views(&self) -> HostViewRegistry {
+    HostViewRegistry {
+        datasets: vec![HostDatasetDescriptor {
+            id: "example.table".into(),
+            title: "Example Table".into(),
+            kind: HostDatasetKind::TableV1(TableSchema {
+                columns: vec![
+                    TableColumn {
+                        id: "x".into(),
+                        title: "X".into(),
+                        value_type: TableValueType::F64,
+                    },
+                    TableColumn {
+                        id: "y".into(),
+                        title: "Y".into(),
+                        value_type: TableValueType::F64,
+                    },
+                ],
+                coordinate_space_2d: None,
+            }),
+            empty_message: "No rows yet.".into(),
+        }],
+        views: vec![
+            HostViewDescriptor {
+                id: "example.table.compact".into(),
+                title: "Current Rows".into(),
+                dataset_id: "example.table".into(),
+                placement: HostViewPlacement::AnalysisPanel,
+                kind: HostViewKind::CompactTable,
+            },
+            HostViewDescriptor {
+                id: "example.table.window".into(),
+                title: "Example Table".into(),
+                dataset_id: "example.table".into(),
+                placement: HostViewPlacement::Window,
+                kind: HostViewKind::TableWindow,
+            },
+        ],
+    }
+}
+
+fn host_view_dataset(&self, dataset_id: &str) -> Option<Vec<u8>> {
+    if dataset_id != "example.table" {
+        return None;
+    }
+
+    let dataset = TableDatasetV1::new(vec![
+        TableColumnData {
+            column_id: "x".into(),
+            values: TableColumnValues::F64(vec![1.0, 2.0]),
+        },
+        TableColumnData {
+            column_id: "y".into(),
+            values: TableColumnValues::F64(vec![3.0, 4.0]),
+        },
+    ]).ok()?;
+
+    serde_json::to_vec(&dataset).ok()
 }
 ```
 
-The method returns serialized `LocalizationTable` bytes. The default implementation returns `None`. The host queries this only when its reconstruction window is open, avoiding per-frame serialization overhead.
+This keeps plugin-owned scientific state on the plugin side while letting the host render panel sections, read-only windows, CSV export, and density views generically.
 
-`LocalizationTable` and `LocalizationRow` are defined in `augur-plugin-api` and map directly to the ThunderSTORM CSV format for cross-tool compatibility.
+## Compatibility Hook
+
+`accumulated_localizations()` remains available as a deprecated compatibility hook for one transition cycle. New in-tree plugins should use `host_views()` instead.
+
+`LocalizationTable` and `LocalizationRow` are still defined in `augur-plugin-api` and map directly to the ThunderSTORM CSV format for cross-tool compatibility with older hosts.
 
 ## Panic Safety
 

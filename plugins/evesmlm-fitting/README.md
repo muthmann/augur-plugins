@@ -33,6 +33,11 @@ Sub-pixel localization for eveSMLM candidate clusters. The plugin consumes `EveC
 
 - `EveLocalizationResults` on `augur.evesmlm.localization_results`
 - `LocalizationResults` on `augur.localization.results` for compatibility with plugins such as Focus Metrics
+- the compact host-view dataset `augur.evesmlm.current_localizations`
+
+## Host View
+
+The plugin declares the compact analysis-panel view `augur.evesmlm.current_localizations.compact`. If `EVE Post-Processing` is also enabled, the host resolves that same view id to the later post-processing stage instead.
 
 ## Dependencies
 
