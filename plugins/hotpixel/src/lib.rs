@@ -6,8 +6,8 @@ use augur_core::{
     pipeline::PreviewFrame,
 };
 use augur_plugin_api::{
-    export_plugin, AnalysisSeverity, FfiPixel, HostContext, HostOutput, Plugin, PluginFrame,
-    SettingItem, SettingKind, SettingsSchema, SettingsSection, StatusEntry,
+    export_plugin, AnalysisSeverity, EventStoreHandle, FfiPixel, HostContext, HostOutput, Plugin,
+    PluginFrame, SettingItem, SettingKind, SettingsSchema, SettingsSection, StatusEntry,
 };
 use serde_json::{json, Value};
 
@@ -93,6 +93,7 @@ impl Plugin for HotpixelPlugin {
         frame: &PluginFrame<'_>,
         output: &mut HostOutput<'_>,
         _context: &mut HostContext<'_>,
+        _event_store: &EventStoreHandle<'_>,
     ) {
         let preview = Self::build_preview_frame(frame);
         let result = self.detector.process_frame(&preview);

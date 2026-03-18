@@ -32,7 +32,7 @@ Rename the crate, update `plugin.toml`, and add the crate to the workspace `memb
 The plugin trait is now the safe Rust layer over the FFI boundary:
 
 ```rust
-use augur_plugin_api::{HostContext, HostOutput, Plugin, PluginFrame};
+use augur_plugin_api::{EventStoreHandle, HostContext, HostOutput, Plugin, PluginFrame};
 
 #[derive(Default)]
 struct MyPlugin {
@@ -50,8 +50,9 @@ impl Plugin for MyPlugin {
         frame: &PluginFrame<'_>,
         output: &mut HostOutput<'_>,
         context: &mut HostContext<'_>,
+        event_store: &EventStoreHandle<'_>,
     ) {
-        let _ = (frame, output, context);
+        let _ = (frame, output, context, event_store);
     }
 }
 ```
@@ -88,6 +89,13 @@ context.publish(CTX_LOCALIZATION_RESULTS, &results)?;
 let upstream = context.get::<MyResults>("my.plugin.results")?;
 ```
 
+Persistent cross-frame state uses the companion helpers:
+
+```rust
+context.publish_persistent("my.plugin.state", &state)?;
+let state = context.get_persistent::<MyState>("my.plugin.state")?;
+```
+
 Declare downstream requirements with `dependencies()` when a downstream plugin truly requires a specific upstream producer. If your plugin can consume any producer of a standard payload such as `CTX_LOCALIZATION_RESULTS`, prefer a runtime warning over a hard name-based dependency.
 
 ### 5. Define Declarative Settings
@@ -107,7 +115,7 @@ Use the runtime format:
 
 ```toml
 name = "My Plugin"
-version = "0.1.0"
+version = "0.2.0"
 description = "One-line summary visible in the Plugin Manager."
 domain = "general"
 library = "augur_plugin_my_plugin"
@@ -188,6 +196,8 @@ The host application, runtime loader, and `augur-plugin-api` crate live in [augu
 
 ## Notes for Local Development
 
-Until `augur-plugin-api` is published on crates.io, you may want to depend on a local `augur-rs` checkout while iterating. The workspace currently points at the `augur-rs` Git repository because that is the intended long-term dependency source.
+This workspace currently points at the sibling `../augur-rs` checkout so the plugin crates can
+track in-flight host/API branches during coordinated development.
 
-If Cargo cannot authenticate against the Git dependency during local development, building with `CARGO_NET_GIT_FETCH_WITH_CLI=true` or a local `[patch]` for `augur-core` / `augur-plugin-api` is the expected fallback.
+If you need to switch back to the published Git source later, update the workspace dependencies in
+the root `Cargo.toml` or use a local `[patch]` override during migration.

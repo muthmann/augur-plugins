@@ -15,13 +15,13 @@ resolver = "2"
 [workspace.package]
 edition = "2021"
 license = "MIT"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Mika Uthmann <muthmann@physik.uni-bielefeld.de>"]
 repository = "https://github.com/muthmann/augur-plugins"
 
 [workspace.dependencies]
-augur-core = { git = "https://github.com/muthmann/augur-rs.git" }
-augur-plugin-api = { git = "https://github.com/muthmann/augur-rs.git" }
+augur-core = { path = "../augur-rs/augur-core" }
+augur-plugin-api = { path = "../augur-rs/augur-plugin-api" }
 egui = "0.27"
 rustfft = "6"
 serde = { version = "1", features = ["derive"] }

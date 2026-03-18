@@ -1,5 +1,5 @@
 name = "EVE Post-Processing"
-version = "0.1.0"
+version = "0.2.0"
 description = "Filter, drift-correct, and evaluate eveSMLM localizations with rolling eNeNA, PSF, and on-time summaries."
 domain = "smlm"
 library = "augur_plugin_evesmlm_postproc"

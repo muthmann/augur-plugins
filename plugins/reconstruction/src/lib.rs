@@ -1,9 +1,8 @@
 use augur_plugin_api::{
-    export_plugin, AnalysisSeverity, HostContext, HostOutput, Localization, LocalizationResults,
-    LocalizationRow, Plugin, PluginFrame, PluginInput, SettingItem, SettingKind, SettingsSchema,
-    SettingsSection, StatusEntry, CTX_LOCALIZATION_RESULTS,
+    export_plugin, AnalysisSeverity, EventStoreHandle, HostContext, HostOutput, Localization,
+    LocalizationResults, LocalizationRow, Plugin, PluginFrame, PluginInput, SettingItem,
+    SettingKind, SettingsSchema, SettingsSection, StatusEntry, CTX_LOCALIZATION_RESULTS,
 };
-use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::VecDeque;
 
@@ -36,14 +35,6 @@ pub struct ReconstructionPlugin {
     next_id: u64,
     frame_counter: u64,
     sensor_dims: Option<(u16, u16)>,
-}
-
-#[derive(Serialize)]
-struct SerializedLocalizationTable<'a> {
-    rows: &'a VecDeque<LocalizationRow>,
-    nm_per_pixel: f64,
-    sensor_width: u16,
-    sensor_height: u16,
 }
 
 impl ReconstructionPlugin {
@@ -294,6 +285,7 @@ impl Plugin for ReconstructionPlugin {
         frame: &PluginFrame<'_>,
         output: &mut HostOutput<'_>,
         context: &mut HostContext<'_>,
+        _event_store: &EventStoreHandle<'_>,
     ) {
         self.sensor_dims = Some((frame.width(), frame.height()));
         let frame_number = self.next_frame_number();
@@ -417,20 +409,6 @@ impl Plugin for ReconstructionPlugin {
 
         serde_json::to_vec(&self.accumulated_dataset()).ok()
     }
-
-    fn accumulated_localizations(&self) -> Option<Vec<u8>> {
-        if self.table.is_empty() {
-            return None;
-        }
-        let (sensor_width, sensor_height) = self.sensor_dims?;
-        serde_json::to_vec(&SerializedLocalizationTable {
-            rows: &self.table,
-            nm_per_pixel: self.settings.nm_per_pixel,
-            sensor_width,
-            sensor_height,
-        })
-        .ok()
-    }
 }
 
 export_plugin!(ReconstructionPlugin);
@@ -438,7 +416,6 @@ export_plugin!(ReconstructionPlugin);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use augur_plugin_api::LocalizationTable;
 
     fn localization() -> Localization {
         Localization {
@@ -509,31 +486,5 @@ mod tests {
         assert_eq!(registry.datasets[0].id, ACCUMULATED_DATASET_ID);
         assert_eq!(registry.views[0].id, LOCALIZATION_TABLE_VIEW_ID);
         assert_eq!(registry.views[1].id, RECONSTRUCTION_VIEW_ID);
-    }
-
-    #[test]
-    fn host_view_dataset_uses_the_same_rows_as_compatibility_table() {
-        let mut plugin = ReconstructionPlugin::default();
-        plugin.sensor_dims = Some((1280, 720));
-
-        plugin.accumulate_results(
-            4,
-            &LocalizationResults {
-                localizations: vec![localization()],
-                frame_window_start_us: 0,
-                frame_window_end_us: 0,
-            },
-        );
-
-        let compatibility = plugin
-            .accumulated_localizations()
-            .expect("compatibility payload");
-        let compatibility: LocalizationTable =
-            serde_json::from_slice(&compatibility).expect("compatibility table");
-        let dataset = plugin.accumulated_dataset();
-
-        assert_eq!(compatibility.rows.len(), dataset.row_count());
-        assert_eq!(dataset.columns[0].column_id, "id");
-        assert_eq!(dataset.columns[2].column_id, "x_nm");
     }
 }

@@ -7,7 +7,8 @@ The plugin API now lives in the `augur-plugin-api` crate from `augur-rs`.
 - `Plugin`: safe Rust trait implemented by plugin crates
 - `PluginFrame`: borrowed access to preview pixels and optional raw events
 - `HostOutput`: callbacks for overlays and warnings
-- `HostContext`: string-keyed publish/get API for inter-plugin data
+- `HostContext`: per-frame plus persistent string-keyed publish/get API for inter-plugin data
+- `EventStoreHandle`: read-only access to the host-retained decoded event history
 - `SettingsSchema`: declarative settings description
 - `StatusEntry`: read-only status rows and sparklines
 - `export_plugin!`: exports the C vtable expected by `augur-gui`
@@ -15,7 +16,9 @@ The plugin API now lives in the `augur-plugin-api` crate from `augur-rs`.
 ## Minimal Plugin
 
 ```rust
-use augur_plugin_api::{export_plugin, HostContext, HostOutput, Plugin, PluginFrame};
+use augur_plugin_api::{
+    export_plugin, EventStoreHandle, HostContext, HostOutput, Plugin, PluginFrame,
+};
 
 #[derive(Default)]
 struct MyPlugin {
@@ -33,6 +36,7 @@ impl Plugin for MyPlugin {
         _frame: &PluginFrame<'_>,
         _output: &mut HostOutput<'_>,
         _context: &mut HostContext<'_>,
+        _event_store: &EventStoreHandle<'_>,
     ) {
     }
 }
@@ -92,6 +96,13 @@ Example:
 ```rust
 context.publish("my.plugin.results", &results)?;
 let upstream = context.get::<MyResults>("my.plugin.results")?;
+```
+
+Persistent cross-frame state uses the matching helpers:
+
+```rust
+context.publish_persistent("my.plugin.state", &state)?;
+let state = context.get_persistent::<MyState>("my.plugin.state")?;
 ```
 
 Custom shared types must derive `serde::Serialize` and `serde::Deserialize`.
@@ -175,11 +186,18 @@ fn host_view_dataset(&self, dataset_id: &str) -> Option<Vec<u8>> {
 
 This keeps plugin-owned scientific state on the plugin side while letting the host render panel sections, read-only windows, CSV export, and density views generically.
 
-## Compatibility Hook
+## Event History
 
-`accumulated_localizations()` remains available as a deprecated compatibility hook for one transition cycle. New in-tree plugins should use `host_views()` instead.
+`process_frame()` now also receives `event_store: &EventStoreHandle<'_>`. Plugins that need only
+the current frame can ignore it. History-aware plugins can query:
 
-`LocalizationTable` and `LocalizationRow` are still defined in `augur-plugin-api` and map directly to the ThunderSTORM CSV format for cross-tool compatibility with older hosts.
+- `event_store.all_events()`
+- `event_store.events_in_range(start_us, end_us)`
+- `event_store.oldest_timestamp_us()`
+- `event_store.frame_count()`
+
+The host owns retention and enforces a memory budget, so plugin code does not need to maintain its
+own duplicate frame-history buffer unless it wants a custom derived cache.
 
 ## Panic Safety
 
@@ -194,4 +212,5 @@ Replace:
 - `AnalysisPlugin` with `Plugin`
 - direct `egui` calls with `SettingsSchema`
 - typed `PluginContext` exchange with `HostContext`
+- reconstruction-specific compatibility hooks with `host_views()` plus `host_view_dataset()`
 - compile-time registration with `export_plugin!` plus a built `cdylib`

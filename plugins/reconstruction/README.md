@@ -22,8 +22,9 @@ The plugin publishes one dataset, `augur.localization.accumulated`, and two host
 - `Localization Table`
 - `Reconstruction`
 
-Both views read the same accumulated source of truth. `accumulated_localizations()` remains available only as a compatibility hook for older hosts during the transition cycle.
+Both views read the same accumulated source of truth.
 
 ## Compatibility
 
-Requires a matching `augur-gui` / `augur-plugin-api` build that supports the generic host-view registry.
+Requires a matching `augur-gui` / `augur-plugin-api` build that supports the flat v0.2 runtime
+plugin ABI plus the generic host-view registry.

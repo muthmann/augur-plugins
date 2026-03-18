@@ -1,4 +1,4 @@
 name = "ROI Grid"
-version = "0.1.0"
+version = "0.2.0"
 description = "Built-in ROI helper. This crate is not part of the runtime plugin set because the current runtime API cannot mutate camera configuration."
 domain = "general"

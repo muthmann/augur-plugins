@@ -10,9 +10,9 @@ pub mod filtering;
 use std::collections::VecDeque;
 
 use augur_plugin_api::{
-    export_plugin, AnalysisSeverity, FfiSubpixelMarker, HostContext, HostOutput, HostViewRegistry,
-    Plugin, PluginFrame, PluginInput, SettingItem, SettingKind, SettingsSchema, SettingsSection,
-    StatusEntry, CTX_LOCALIZATION_RESULTS,
+    export_plugin, AnalysisSeverity, EventStoreHandle, FfiSubpixelMarker, HostContext, HostOutput,
+    HostViewRegistry, Plugin, PluginFrame, PluginInput, SettingItem, SettingKind, SettingsSchema,
+    SettingsSection, StatusEntry, CTX_LOCALIZATION_RESULTS,
 };
 pub use augur_plugin_evesmlm_fitting::{
     current_localizations_dataset, current_localizations_registry, to_localization_results,
@@ -259,6 +259,7 @@ impl Plugin for EveSmlmPostProcPlugin {
         _frame: &PluginFrame<'_>,
         output: &mut HostOutput<'_>,
         context: &mut HostContext<'_>,
+        _event_store: &EventStoreHandle<'_>,
     ) {
         let input = match context.get::<EveLocalizationResults>(CTX_EVE_LOCALIZATION_RESULTS) {
             Ok(value) => value,
