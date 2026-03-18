@@ -1,5 +1,5 @@
 name = "Focus Metrics"
-version = "0.1.0"
+version = "0.2.0"
 description = "Tracks focus quality from localization fits or a frequency-domain sharpness estimate."
 domain = "biophotonics"
 library = "augur_plugin_focus_metrics"

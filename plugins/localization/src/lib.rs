@@ -1,7 +1,7 @@
 use augur_plugin_api::{
-    export_plugin, AnalysisSeverity, FfiCdEvent, FfiSubpixelMarker, HostContext, HostOutput,
-    Localization, LocalizationResults, Plugin, PluginFrame, PluginInput, SettingItem, SettingKind,
-    SettingsSchema, SettingsSection, StatusEntry, CTX_LOCALIZATION_RESULTS,
+    export_plugin, AnalysisSeverity, EventStoreHandle, FfiCdEvent, FfiSubpixelMarker, HostContext,
+    HostOutput, Localization, LocalizationResults, Plugin, PluginFrame, PluginInput, SettingItem,
+    SettingKind, SettingsSchema, SettingsSection, StatusEntry, CTX_LOCALIZATION_RESULTS,
 };
 use serde_json::{json, Value};
 
@@ -242,6 +242,7 @@ impl Plugin for LocalizationPlugin {
         frame: &PluginFrame<'_>,
         output: &mut HostOutput<'_>,
         context: &mut HostContext<'_>,
+        _event_store: &EventStoreHandle<'_>,
     ) {
         let raw_events = if !context.raw_events().is_empty() {
             Some(context.raw_events())

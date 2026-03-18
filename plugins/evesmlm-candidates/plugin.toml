@@ -1,5 +1,5 @@
 name = "EVE Candidate Finding"
-version = "0.1.0"
+version = "0.2.0"
 description = "Cluster raw eveSMLM events into per-emitter candidates using DBSCAN, eigenfeatures, or a frame-based fallback."
 domain = "smlm"
 library = "augur_plugin_evesmlm_candidates"

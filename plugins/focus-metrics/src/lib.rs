@@ -1,9 +1,9 @@
 use std::collections::VecDeque;
 
 use augur_plugin_api::{
-    export_plugin, AnalysisSeverity, HostContext, HostOutput, LocalizationResults, Plugin,
-    PluginFrame, PluginInput, SettingItem, SettingKind, SettingsSchema, SettingsSection,
-    StatusEntry, CTX_LOCALIZATION_RESULTS,
+    export_plugin, AnalysisSeverity, EventStoreHandle, HostContext, HostOutput,
+    LocalizationResults, Plugin, PluginFrame, PluginInput, SettingItem, SettingKind,
+    SettingsSchema, SettingsSection, StatusEntry, CTX_LOCALIZATION_RESULTS,
 };
 use rustfft::{num_complex::Complex32, FftPlanner};
 use serde_json::{json, Value};
@@ -387,6 +387,7 @@ impl Plugin for FocusMetricsPlugin {
         frame: &PluginFrame<'_>,
         output: &mut HostOutput<'_>,
         context: &mut HostContext<'_>,
+        _event_store: &EventStoreHandle<'_>,
     ) {
         self.process_method(frame, output, context);
     }

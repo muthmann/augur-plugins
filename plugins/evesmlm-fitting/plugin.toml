@@ -1,5 +1,5 @@
 name = "EVE Candidate Fitting"
-version = "0.1.0"
+version = "0.2.0"
 description = "Fit eveSMLM raw-event clusters to sub-pixel emitter positions using log-Gaussian, Gaussian, radial symmetry, phasor, or centroid localization."
 domain = "smlm"
 library = "augur_plugin_evesmlm_fitting"

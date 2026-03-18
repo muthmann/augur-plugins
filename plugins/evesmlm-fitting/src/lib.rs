@@ -11,8 +11,8 @@ pub mod radial_symmetry;
 pub mod types;
 
 use augur_plugin_api::{
-    export_plugin, AnalysisSeverity, FfiSubpixelMarker, HostContext, HostOutput, Localization,
-    LocalizationResults, Plugin, PluginFrame, PluginInput, SettingItem, SettingKind,
+    export_plugin, AnalysisSeverity, EventStoreHandle, FfiSubpixelMarker, HostContext, HostOutput,
+    Localization, LocalizationResults, Plugin, PluginFrame, PluginInput, SettingItem, SettingKind,
     SettingsSchema, SettingsSection, StatusEntry, CTX_LOCALIZATION_RESULTS,
 };
 use augur_plugin_api::{
@@ -333,6 +333,7 @@ impl Plugin for EveSmlmFittingPlugin {
         _frame: &PluginFrame<'_>,
         output: &mut HostOutput<'_>,
         context: &mut HostContext<'_>,
+        _event_store: &EventStoreHandle<'_>,
     ) {
         let candidates = match context.get::<EveCandidates>(CTX_EVE_CANDIDATES) {
             Ok(value) => value,

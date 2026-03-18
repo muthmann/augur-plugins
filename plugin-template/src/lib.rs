@@ -1,6 +1,6 @@
 use augur_plugin_api::{
-    export_plugin, FfiPixel, HostContext, HostOutput, Plugin, PluginFrame, SettingItem,
-    SettingKind, SettingsSchema, SettingsSection, StatusEntry,
+    export_plugin, EventStoreHandle, FfiPixel, HostContext, HostOutput, Plugin, PluginFrame,
+    SettingItem, SettingKind, SettingsSchema, SettingsSection, StatusEntry,
 };
 use serde_json::{json, Value};
 
@@ -37,6 +37,7 @@ impl Plugin for TemplatePlugin {
         frame: &PluginFrame<'_>,
         output: &mut HostOutput<'_>,
         _context: &mut HostContext<'_>,
+        _event_store: &EventStoreHandle<'_>,
     ) {
         let mut pixels = Vec::new();
         for (index, value) in frame.pixels().iter().enumerate() {

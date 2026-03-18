@@ -1,5 +1,5 @@
 name = "Molecule Localization"
-version = "0.1.0"
+version = "0.2.0"
 description = "Wavelet-filtered spot detection with center-of-mass seeding and Gaussian fitting."
 domain = "smlm"
 library = "augur_plugin_localization"

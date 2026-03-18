@@ -1,5 +1,5 @@
 name = "My Plugin"
-version = "0.1.0"
+version = "0.2.0"
 description = "Short description of what this plugin does."
 domain = "general"
 library = "augur_plugin_template"

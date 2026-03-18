@@ -11,9 +11,9 @@ pub mod types;
 use std::collections::HashMap;
 
 use augur_plugin_api::{
-    export_plugin, AnalysisSeverity, FfiCdEvent, FfiPixel, HostContext, HostOutput, Plugin,
-    PluginFrame, PluginInput, SettingItem, SettingKind, SettingsSchema, SettingsSection,
-    StatusEntry,
+    export_plugin, AnalysisSeverity, EventStoreHandle, FfiCdEvent, FfiPixel, HostContext,
+    HostOutput, Plugin, PluginFrame, PluginInput, SettingItem, SettingKind, SettingsSchema,
+    SettingsSection, StatusEntry,
 };
 use serde_json::{json, Value};
 
@@ -289,6 +289,7 @@ impl Plugin for EveSmlmCandidatePlugin {
         frame: &PluginFrame<'_>,
         output: &mut HostOutput<'_>,
         context: &mut HostContext<'_>,
+        _event_store: &EventStoreHandle<'_>,
     ) {
         let candidates = self.analyze_frame(frame, frame.events(), output);
         if let Err(err) = context.publish(CTX_EVE_CANDIDATES, &candidates) {

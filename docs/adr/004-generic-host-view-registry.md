@@ -6,7 +6,10 @@ Accepted
 
 ## Context
 
-The first reconstruction integration added a dedicated `accumulated_localizations()` hook for one host-rendered window. That solved the immediate reconstruction use case, but it kept the host UI coupled to one plugin capability and offered no generic path for panel views or other host-rendered windows.
+The first reconstruction integration added a dedicated reconstruction-specific hook for one
+host-rendered window. That solved the immediate reconstruction use case, but it kept the host UI
+coupled to one plugin capability and offered no generic path for panel views or other
+host-rendered windows.
 
 ## Decision
 
