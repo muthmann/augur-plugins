@@ -710,18 +710,19 @@ mod tests {
     }
 
     #[test]
-    fn log_gaussian_recovers_synthetic_parabola() {
+    fn log_gaussian_recovers_synthetic_gaussian() {
         let x0: f64 = 6.3;
         let y0: f64 = 5.7;
         let sigma_x: f64 = 1.4;
         let sigma_y: f64 = 1.8;
+        let amplitude: f64 = 50.0;
         let mut entries = Vec::new();
         for y in 1..11 {
             for x in 1..11 {
                 let dx = f64::from(x) - x0;
                 let dy = f64::from(y) - y0;
-                let value =
-                    40.0 - dx * dx / (2.0 * sigma_x.powi(2)) - dy * dy / (2.0 * sigma_y.powi(2));
+                let value = amplitude
+                    * (-0.5 * (dx * dx / sigma_x.powi(2) + dy * dy / sigma_y.powi(2))).exp();
                 let count = value.round().max(0.0) as u32;
                 if count > 0 {
                     entries.push((x, y, count));
@@ -730,10 +731,10 @@ mod tests {
         }
 
         let fit = log_gaussian::fit(&cluster_from_histogram(&entries)).unwrap();
-        assert!((fit.x - x0).abs() <= 0.3);
-        assert!((fit.y - y0).abs() <= 0.3);
-        assert!((fit.sigma_x - sigma_x).abs() <= 0.3);
-        assert!((fit.sigma_y - sigma_y).abs() <= 0.3);
+        assert!((fit.x - x0).abs() <= 0.3, "x: {} vs {}", fit.x, x0);
+        assert!((fit.y - y0).abs() <= 0.3, "y: {} vs {}", fit.y, y0);
+        assert!((fit.sigma_x - sigma_x).abs() <= 0.3, "sigma_x: {} vs {}", fit.sigma_x, sigma_x);
+        assert!((fit.sigma_y - sigma_y).abs() <= 0.3, "sigma_y: {} vs {}", fit.sigma_y, sigma_y);
     }
 
     #[test]
