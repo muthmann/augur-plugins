@@ -17,12 +17,13 @@ Live focus quality monitoring for event-camera imaging. Provides three complemen
 | Setting | Default | Description |
 |---|---|---|
 | History depth | `120` | Number of frames for the rolling history plot |
-| Scale | `65.0` nm/px | Pixel size used for nm-based filtering |
 | Sigma range | `100–190` nm | Accepted sigma range for localizations used in metrics |
+
+AugurRS now publishes host-owned calibration on `CTX_GLOBAL_SETTINGS` as `GlobalSettings`. This plugin uses the host `nm_per_pixel` value automatically for sigma-based filtering when it is available, while retaining a hidden fallback for older hosts.
 
 ## Execution Phase
 
-`DerivedData` — runs after Phase 2 plugins. Consumes `LocalizationResults` published on `augur.localization.results` for Mean PSF sigma and Astigmatic ratio. The FFT method operates independently on the preview frame.
+`DerivedData` — runs after upstream plugins. Consumes `LocalizationResults` published on `augur.localization.results` for Mean PSF sigma and Astigmatic ratio. The FFT method operates independently on the preview frame.
 
 ## Published Data
 

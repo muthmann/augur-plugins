@@ -1,7 +1,10 @@
 use augur_plugin_api::{
-    export_plugin, AnalysisSeverity, EventStoreHandle, HostContext, HostOutput, Localization,
-    LocalizationResults, LocalizationRow, Plugin, PluginFrame, PluginInput, SettingItem,
-    SettingKind, SettingsSchema, SettingsSection, StatusEntry, CTX_LOCALIZATION_RESULTS,
+    export_plugin, AnalysisSeverity, EventStoreHandle, GlobalSettings, HostContext, HostOutput,
+    Plugin, PluginFrame, PluginInput, SettingItem, SettingKind, SettingsSchema, SettingsSection,
+    StatusEntry, CTX_GLOBAL_SETTINGS,
+};
+use augur_plugin_types::{
+    Localization, LocalizationResults, LocalizationRow, CTX_LOCALIZATION_RESULTS,
 };
 use serde_json::{json, Value};
 use std::collections::VecDeque;
@@ -35,6 +38,7 @@ pub struct ReconstructionPlugin {
     next_id: u64,
     frame_counter: u64,
     sensor_dims: Option<(u16, u16)>,
+    dataset_generation: u64,
 }
 
 impl ReconstructionPlugin {
@@ -58,6 +62,42 @@ impl ReconstructionPlugin {
             .saturating_sub(self.settings.max_localizations);
         if overflow > 0 {
             self.table.drain(..overflow);
+        }
+    }
+
+    fn bump_dataset_generation(&mut self) {
+        self.dataset_generation = self.dataset_generation.wrapping_add(1);
+    }
+
+    fn apply_nm_per_pixel(&mut self, value: f64) {
+        let new_value = value.clamp(1.0, 500.0);
+        let scale = new_value / self.settings.nm_per_pixel;
+        if (scale - 1.0).abs() <= f64::EPSILON {
+            self.settings.nm_per_pixel = new_value;
+            return;
+        }
+
+        for row in &mut self.table {
+            row.x_nm *= scale;
+            row.y_nm *= scale;
+            row.sigma_nm *= scale;
+            row.uncertainty_xy_nm *= scale;
+        }
+        self.settings.nm_per_pixel = new_value;
+        self.bump_dataset_generation();
+    }
+
+    fn sync_runtime_settings(&mut self, context: &HostContext<'_>, frame: &PluginFrame<'_>) {
+        let globals = context
+            .get::<GlobalSettings>(CTX_GLOBAL_SETTINGS)
+            .ok()
+            .flatten();
+
+        if let Some(globals) = globals {
+            self.apply_nm_per_pixel(globals.nm_per_pixel);
+            self.sensor_dims = Some((globals.sensor_width, globals.sensor_height));
+        } else {
+            self.sensor_dims = Some((frame.width(), frame.height()));
         }
     }
 
@@ -85,12 +125,16 @@ impl ReconstructionPlugin {
     }
 
     fn accumulate_results(&mut self, frame_number: u64, results: &LocalizationResults) {
+        if results.localizations.is_empty() {
+            return;
+        }
         self.table.reserve(results.localizations.len());
         for localization in &results.localizations {
             let row = self.localization_row(frame_number, localization);
             self.table.push_back(row);
         }
         self.trim_to_cap();
+        self.bump_dataset_generation();
     }
 
     fn accumulated_coordinate_space(&self) -> Option<augur_plugin_api::TableCoordinateSpace2d> {
@@ -274,6 +318,7 @@ impl Plugin for ReconstructionPlugin {
         self.next_id = 0;
         self.frame_counter = 0;
         self.sensor_dims = None;
+        self.bump_dataset_generation();
     }
 
     fn input_kind(&self) -> PluginInput {
@@ -287,7 +332,7 @@ impl Plugin for ReconstructionPlugin {
         context: &mut HostContext<'_>,
         _event_store: &EventStoreHandle<'_>,
     ) {
-        self.sensor_dims = Some((frame.width(), frame.height()));
+        self.sync_runtime_settings(context, frame);
         let frame_number = self.next_frame_number();
 
         match context.get::<LocalizationResults>(CTX_LOCALIZATION_RESULTS) {
@@ -312,19 +357,6 @@ impl Plugin for ReconstructionPlugin {
                 default_open: true,
                 items: vec![
                     SettingItem {
-                        key: "nm_per_pixel".into(),
-                        label: "Scale".into(),
-                        tooltip: Some(
-                            "Pixel size used to export localization coordinates in nanometers.".into(),
-                        ),
-                        kind: SettingKind::F64Drag {
-                            min: 1.0,
-                            max: 500.0,
-                            speed: 0.5,
-                            default: DEFAULT_NM_PER_PIXEL,
-                        },
-                    },
-                    SettingItem {
                         key: "max_localizations".into(),
                         label: "Max localizations".into(),
                         tooltip: Some(
@@ -345,7 +377,6 @@ impl Plugin for ReconstructionPlugin {
 
     fn get_setting(&self, key: &str) -> Option<Value> {
         match key {
-            "nm_per_pixel" => Some(json!(self.settings.nm_per_pixel)),
             "max_localizations" => Some(json!(self.settings.max_localizations)),
             _ => None,
         }
@@ -357,17 +388,7 @@ impl Plugin for ReconstructionPlugin {
                 let Some(value) = value.as_f64() else {
                     return Err("nm_per_pixel must be a number".into());
                 };
-                let new_value = value.clamp(1.0, 500.0);
-                let scale = new_value / self.settings.nm_per_pixel;
-                if (scale - 1.0).abs() > f64::EPSILON {
-                    for row in &mut self.table {
-                        row.x_nm *= scale;
-                        row.y_nm *= scale;
-                        row.sigma_nm *= scale;
-                        row.uncertainty_xy_nm *= scale;
-                    }
-                }
-                self.settings.nm_per_pixel = new_value;
+                self.apply_nm_per_pixel(value);
                 Ok(())
             }
             "max_localizations" => {
@@ -377,6 +398,7 @@ impl Plugin for ReconstructionPlugin {
                 self.settings.max_localizations = value.clamp(10_000, 10_000_000);
                 self.trim_to_cap();
                 self.table.shrink_to_fit();
+                self.bump_dataset_generation();
                 Ok(())
             }
             _ => Err(format!("unknown setting: {key}")),
@@ -408,6 +430,14 @@ impl Plugin for ReconstructionPlugin {
         }
 
         serde_json::to_vec(&self.accumulated_dataset()).ok()
+    }
+
+    fn host_view_dataset_generation(&self, dataset_id: &str) -> u64 {
+        if dataset_id == ACCUMULATED_DATASET_ID {
+            self.dataset_generation
+        } else {
+            0
+        }
     }
 }
 

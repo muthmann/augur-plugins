@@ -1,73 +1,109 @@
 # Plugin Architecture
 
-This document describes the design rationale behind the AugurRS plugin system, how it compares to plugin systems in other scientific tools, and the tradeoffs involved.
+This document summarizes how the current AugurRS runtime plugin system maps onto the crates in this repository.
 
-## Design Goals
+For the full host-side contract, use the upstream authoring guide:
 
-1. **Keep `augur-core` domain-free.** The camera SDK knows nothing about microscopy, localization, or any specific analysis domain. All domain logic lives in plugins.
-2. **Runtime loading without recompilation.** Plugins build as `cdylib` crates and are loaded from `~/.augur/plugins/` at startup. Researchers install, enable, or swap a plugin without rebuilding `augur-gui`.
-3. **Familiar to researchers.** The plugin API is designed to feel natural to anyone who has written an ImageJ plugin, a napari extension, or a Micro-Manager device adapter.
-4. **Minimal install overhead.** Installing a plugin is: build the release library, drop it plus a `plugin.toml` into `~/.augur/plugins/<name>/`, and click **Scan for New Plugins**.
+- [`augur-rs/docs/features/plugin-authoring-guide.md`](https://github.com/muthmann/augur-rs/blob/main/docs/features/plugin-authoring-guide.md)
 
-## Runtime Model
+## Repository Role
 
-Plugins are compiled as `cdylib` crates that export a C-compatible vtable via `export_plugin!`. `augur-gui` loads them from:
+- `augur-rs` owns `augur-plugin-api`, the loader, Plugin Manager, host views, and host-owned tools such as hotpixel detection.
+- `augur-plugins` owns the runtime plugin implementations and the template crate used to start new plugins.
+- Shared domain payloads should live in companion crates when multiple plugins need the same types.
+
+## Runtime Packaging
+
+Each installed runtime plugin ships as:
+
+- a `plugin.toml` manifest
+- one platform library (`.dylib`, `.so`, or `.dll`)
+
+Installed layout:
 
 ```text
 ~/.augur/plugins/
-  hotpixel/
+  localization/
     plugin.toml
-    libaugur_plugin_hotpixel.dylib   # .so on Linux, .dll on Windows
+    libaugur_plugin_localization.dylib
 ```
 
-The Plugin Manager in `augur-gui` can scan, enable, disable, and reload plugins without restarting the host application.
+The Plugin Manager can scan, enable, disable, and reload plugins without recompiling `augur-gui`.
 
 ## Execution Model
 
-```
-Preview frame arrives
-    │
-    ├─ Phase 1: FrameOnly plugins (cheap, no event materialization)
-    │     Hotpixel Detection, ROI Grid
-    │
-    ├─ Phase 2: RawEvents plugins (raw CdEvent stream available)
-    │     EVE Candidate Finding
-    │
-    └─ Phase 3: DerivedData plugins (consume upstream results)
-          Localization, EVE Fitting, EVE Post-Processing, Focus Metrics
-```
+Plugins still declare their per-frame phase through `input_kind()`:
 
-The three-phase model ensures that upstream plugins always run before downstream consumers within the same frame. This is conceptually similar to ImageJ2's service ordering and napari's contribution layering, but enforced through `PluginInput` phase declarations rather than runtime annotation scanning.
+1. `FrameOnly`
+2. `RawEvents`
+3. `DerivedData`
 
-## Context Bus
+Current in-tree examples:
 
-`HostContext` is a string-keyed publish/get API that plugins use to exchange JSON-serialized data within a single frame:
+- `RawEvents`: `localization`, `evesmlm-candidates`
+- `DerivedData`: `reconstruction`, `focus-metrics`, `evesmlm-fitting`, `evesmlm-postproc`
 
-```rust
-context.publish(CTX_LOCALIZATION_RESULTS, &results)?;
-let upstream = context.get::<LocalizationResults>(CTX_LOCALIZATION_RESULTS)?;
-```
+Raw-event access and retained history are separate concerns. A plugin may:
 
-Key design properties:
+- request current-frame raw events with `PluginInput::RawEvents`
+- request host-retained history with `PluginCapabilities { retained_event_history: true }`
 
-- String keys are stable across dynamic library boundaries (no `TypeId` mismatch between separately compiled crates)
-- JSON serialization via `serde` keeps the API ABI-safe
-- Well-known keys (e.g. `CTX_LOCALIZATION_RESULTS`) are declared in `augur-plugin-api` so any plugin can publish or consume the standard payload
-- Context is cleared automatically between frames
+This keeps the default host path cheap when no enabled plugin needs retained history.
 
-The design draws on the SciJava parameter injection model, but uses explicit string-keyed registration instead of annotation-based classpath scanning.
+## Shared Data And Global Settings
+
+`HostContext` is the string-keyed JSON bus that plugins use to exchange typed payloads within a frame.
+
+Key properties:
+
+- string keys are stable across dynamic-library boundaries
+- JSON payloads keep the ABI surface small
+- standard shared payloads such as `CTX_LOCALIZATION_RESULTS` can live in companion crates such as `augur-plugin-types`
+- host-owned experiment settings are published on `CTX_GLOBAL_SETTINGS` as `GlobalSettings`
+
+`GlobalSettings` currently includes:
+
+- `nm_per_pixel`
+- `sensor_width`
+- `sensor_height`
+- `acq_time_ms`
+- `event_store_budget_bytes`
+
+New plugins should prefer this shared host contract over duplicating pixel scale or sensor geometry in plugin-local defaults.
+
+## Host Views
+
+Plugins declare host-rendered datasets and views through:
+
+- `host_views()`
+- `host_view_dataset(dataset_id)`
+- optional `host_view_dataset_generation(dataset_id)`
+
+The host owns:
+
+- analysis-panel rendering
+- standalone windows
+- dataset caching
+- exports
+- window state
+
+This repository currently uses that mechanism for:
+
+- reconstruction table and density windows
+- the shared EVE compact localization panel that can be provided by fitting or post-processing
 
 ## Tradeoffs
 
 | Decision | Benefit | Cost |
 |---|---|---|
-| Runtime loading | No recompilation to add/remove plugins | Vtable must remain ABI-stable; mismatched builds will fail to load |
-| Phased execution | Deterministic ordering, no race conditions | Plugins cannot run concurrently within a frame |
-| String-keyed context | Works across independently compiled cdylib boundaries | Publisher and consumer must agree on key strings and payload schema |
-| Separate repository | Core SDK stays clean, plugins are opt-in | Two repositories to manage |
+| Runtime loading | Plugins can be built and installed independently of the host | Host and plugin builds must remain ABI-compatible |
+| String-keyed JSON context | Works cleanly across dynamic-library boundaries | Producer and consumer must agree on key names and payload schema |
+| Declarative host views | Plugins keep scientific state; the host keeps rendering/export UX | Plugin and host must share identical dataset metadata |
+| Host-owned global settings | One source of truth for calibration and runtime settings | Plugins must tolerate `None` when run against older hosts |
 
-## Future Directions
+## Local Authoring Guidance
 
-- **Registry index:** A machine-readable index of available plugins with version and dependency metadata could enable automated resolution and a community hub similar to napari-hub.
-- **Signed plugins:** Cryptographic signing of plugin manifests and libraries for distribution trust.
-- **Hot-patching improvements:** Per-plugin state persistence across reloads, so plugin configuration survives a library swap during development.
+- Start from `plugin-template/`.
+- Keep each plugin focused on one analysis concern.
+- Reuse standard payloads where possible.
+- Document context keys, host views, and any calibration assumptions in the plugin README.

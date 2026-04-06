@@ -1,25 +1,24 @@
 # Contributing to augur-plugins
 
-This repository now targets AugurRS runtime-loaded plugins.
+This repository tracks the dynamic runtime plugin system used by AugurRS.
 
-You do not add crates to `augur-gui` anymore. A compatible plugin builds as a `cdylib`, ships a `plugin.toml`, and is loaded by `augur-gui` from `~/.augur/plugins/`.
+Use the upstream host documentation as the canonical contract:
 
-## What Counts as Compatible
+- [`augur-rs/docs/features/plugin-authoring-guide.md`](https://github.com/muthmann/augur-rs/blob/main/docs/features/plugin-authoring-guide.md)
+- [`augur-rs/docs/features/global-settings-menu.md`](https://github.com/muthmann/augur-rs/blob/main/docs/features/global-settings-menu.md)
 
-A runtime-compatible plugin:
+This document only adds the repo-local workflow and conventions for plugin crates that live here.
 
-- depends on `augur-plugin-api`
-- implements `augur_plugin_api::Plugin`
-- exports `augur_plugin_vtable` via `export_plugin!(MyPlugin)`
-- builds with `crate-type = ["cdylib", "rlib"]`
-- exposes settings through `SettingsSchema` instead of direct `egui`
-- derives `Serialize` and `Deserialize` for any custom payloads published through `HostContext`
+## Repository Scope
 
-If a plugin still implements the old `AnalysisPlugin` trait or expects to be compiled into `augur-gui`, moving its source folder into `~/.augur/plugins/` will not work.
+- Each runtime plugin lives in its own crate under `plugins/`.
+- `plugin-template/` is the starting point for new crates.
+- `augur-rs` owns `augur-plugin-api`, the dynamic loader, the Plugin Manager, host views, and host-owned tools such as hotpixel detection.
+- Shared data types that multiple plugins consume should live in a companion crate when they do not belong in `augur-plugin-api`.
 
-## Writing a New Plugin
+## New Plugin Workflow
 
-### 1. Start From the Template
+### 1. Start from the template
 
 ```bash
 cp -r plugin-template plugins/my-plugin
@@ -28,8 +27,6 @@ cp -r plugin-template plugins/my-plugin
 Rename the crate, update `plugin.toml`, and add the crate to the workspace `members` list in the root `Cargo.toml`.
 
 ### 2. Implement `augur_plugin_api::Plugin`
-
-The plugin trait is now the safe Rust layer over the FFI boundary:
 
 ```rust
 use augur_plugin_api::{EventStoreHandle, HostContext, HostOutput, Plugin, PluginFrame};
@@ -57,59 +54,90 @@ impl Plugin for MyPlugin {
 }
 ```
 
-Export it with:
+Export the runtime vtable with:
 
 ```rust
 use augur_plugin_api::export_plugin;
 export_plugin!(MyPlugin);
 ```
 
-`export_plugin!` wraps every vtable call in `std::panic::catch_unwind`, so a panic inside plugin code is caught at the FFI boundary instead of unwinding into `augur-gui`. Use `Result` and warnings for expected error paths; do not rely on panics for control flow.
+### 3. Choose the execution phase and optional capabilities
 
-### 3. Choose the Execution Phase
-
-Return the right `PluginInput` from `input_kind()`:
+`input_kind()` declares whether the plugin needs:
 
 | Phase | Use |
 |---|---|
-| `FrameOnly` | Overlays, pixel statistics, cheap preview-only work. No event materialization cost. |
-| `RawEvents` | Requires the raw `CdEvent` stream (e.g. event-domain reconstruction). |
-| `DerivedData` | Reads results published by an upstream plugin via `HostContext`. |
+| `FrameOnly` | Preview-only overlays or pixel-domain work |
+| `RawEvents` | Current-frame raw `CdEvent` access |
+| `DerivedData` | Data published by an upstream plugin |
 
-Use the earliest phase that satisfies your needs. The default is `FrameOnly`.
-
-### 4. Share Data Through `HostContext`
-
-Dynamic plugins exchange JSON-serialized data under string keys:
+Retained event history is a separate opt-in:
 
 ```rust
-use augur_plugin_api::CTX_LOCALIZATION_RESULTS;
+use augur_plugin_api::PluginCapabilities;
 
-context.publish(CTX_LOCALIZATION_RESULTS, &results)?;
+fn capabilities(&self) -> PluginCapabilities {
+    PluginCapabilities {
+        retained_event_history: true,
+    }
+}
+```
+
+Use `RawEvents` only when you need current-frame raw events. Use `retained_event_history` only when you need host-retained history.
+
+### 4. Share data through `HostContext`
+
+Dynamic plugins exchange JSON-serialized payloads under string keys:
+
+```rust
+context.publish("my.plugin.results", &results)?;
 let upstream = context.get::<MyResults>("my.plugin.results")?;
 ```
 
-Persistent cross-frame state uses the companion helpers:
+Prefer standard shared payloads such as `CTX_LOCALIZATION_RESULTS` when they exist. Those shared payload types may live in companion crates such as `augur-plugin-types`. Declare `dependencies()` only when your plugin truly cannot operate without a specific upstream producer by name.
+
+Persistent helpers still exist for plugin-owned caches, but they are not a substitute for host-owned experiment settings.
+
+### 5. Read host-owned settings through `GlobalSettings`
+
+AugurRS now publishes shared runtime settings on the normal context bus:
+
+- key: `CTX_GLOBAL_SETTINGS`
+- type: `GlobalSettings`
+
+Example:
 
 ```rust
-context.publish_persistent("my.plugin.state", &state)?;
-let state = context.get_persistent::<MyState>("my.plugin.state")?;
+use augur_plugin_api::{GlobalSettings, CTX_GLOBAL_SETTINGS};
+
+if let Some(globals) = context.get::<GlobalSettings>(CTX_GLOBAL_SETTINGS)? {
+    let nm_per_pixel = globals.nm_per_pixel;
+    let sensor_dims = (globals.sensor_width, globals.sensor_height);
+    let acq_time_ms = globals.acq_time_ms;
+    let event_store_budget = globals.event_store_budget_bytes;
+    let _ = (nm_per_pixel, sensor_dims, acq_time_ms, event_store_budget);
+}
 ```
 
-Declare downstream requirements with `dependencies()` when a downstream plugin truly requires a specific upstream producer. If your plugin can consume any producer of a standard payload such as `CTX_LOCALIZATION_RESULTS`, prefer a runtime warning over a hard name-based dependency.
+Plugins should tolerate `None` when run against an older host build.
 
-### 5. Define Declarative Settings
+For new plugins, prefer `GlobalSettings` over duplicating host-owned values such as pixel scale or sensor geometry in plugin-local defaults.
 
-Plugins no longer render `egui` directly. Instead, expose:
+### 6. Define declarative settings, status, and host views
 
-- `settings_schema() -> SettingsSchema`
+Plugins do not render `egui` directly. Instead, expose:
+
+- `settings_schema()`
 - `get_setting()`
 - `set_setting()`
 - optional `status_entries()`
+- optional `host_views()`
+- optional `host_view_dataset()`
+- optional `host_view_dataset_generation()`
 
-See `plugins/hotpixel`, `plugins/localization`, `plugins/focus-metrics`, and the `plugins/evesmlm-*` chain for working examples.
+The host owns rendering, export, caching, and window state for declared host views.
 
-### 6. Write `plugin.toml`
+### 7. Write `plugin.toml`
 
 Use the runtime format:
 
@@ -123,40 +151,30 @@ library = "augur_plugin_my_plugin"
 
 `library` is the library base name without `lib` or the platform extension.
 
-### 7. Build the Plugin
+### 8. Build and install
 
 ```bash
 cargo build -p augur-plugin-my-plugin --release
-```
-
-That should produce:
-
-- macOS: `target/release/libaugur_plugin_my_plugin.dylib`
-- Linux: `target/release/libaugur_plugin_my_plugin.so`
-- Windows: `target/release/augur_plugin_my_plugin.dll`
-
-### 8. Install It Locally
-
-```bash
 mkdir -p ~/.augur/plugins/my-plugin
 cp plugins/my-plugin/plugin.toml ~/.augur/plugins/my-plugin/
 cp target/release/libaugur_plugin_my_plugin.dylib ~/.augur/plugins/my-plugin/
 ```
 
-Then launch `augur-gui` and use **Plugins → Scan for New Plugins**.
+Then open `augur-gui`, go to **Plugins**, click **Scan for New Plugins**, and enable the plugin.
 
-## Migrating a Legacy Plugin
+## Migrating Older Plugins
 
-If your plugin still uses the old compile-time model, port it with this checklist:
+If you are porting a crate that still assumes the pre-runtime model:
 
-1. Replace the old `AnalysisPlugin` implementation with `augur_plugin_api::Plugin`.
-2. Remove direct `egui` UI code and replace it with `SettingsSchema` plus `status_entries`.
-3. Replace typed `PluginContext` calls with `HostContext` and string keys.
-4. Add `export_plugin!(YourPlugin)`.
-5. Change the crate to `crate-type = ["cdylib", "rlib"]`.
-6. Build the release library and install the compiled artifact into `~/.augur/plugins/<name>/`.
+1. Replace `AnalysisPlugin` with `augur_plugin_api::Plugin`.
+2. Replace typed `PluginContext` exchange with `HostContext` string keys.
+3. Replace direct `egui` settings UI with `SettingsSchema` and `status_entries()`.
+4. Replace special-case host rendering hooks with `host_views()` plus `host_view_dataset()`.
+5. Export the runtime vtable with `export_plugin!(YourPlugin)`.
+6. Build the crate as `crate-type = ["cdylib", "rlib"]`.
+7. Install the compiled artifact into `~/.augur/plugins/<name>/`.
 
-Moving a legacy source folder into `~/.augur/plugins/` is not enough.
+Moving a source folder into `~/.augur/plugins/` is never enough.
 
 ## Testing
 
@@ -173,11 +191,12 @@ Then verify in `augur-gui`:
 - the plugin appears in Plugin Manager
 - enable/disable works
 - settings render correctly
+- host views appear when expected
 - reload works after rebuilding
 
 ## Documentation Expectations
 
-At minimum:
+At minimum, each plugin crate should include:
 
 - `plugin.toml`
 - `README.md`
@@ -186,18 +205,12 @@ At minimum:
 
 If the plugin publishes shared data, document the context key and payload type explicitly.
 
-## Host-Side Documentation
+If you add or materially change a workflow or architecture pattern in this repository, also update:
 
-The host application, runtime loader, and `augur-plugin-api` crate live in [augur-rs](https://github.com/muthmann/augur-rs). Useful references:
+- `docs/features/<feature>.md`
+- `docs/features/README.md`
+- `docs/adr/` when the architecture or public interface changes
 
-- [Plugin Architecture](https://github.com/muthmann/augur-rs/blob/main/docs/features/analysis-plugins.md) — execution model, context bus, FFI API surface
-- [Dynamic Plugin Loading](https://github.com/muthmann/augur-rs/blob/main/docs/features/dynamic-plugins.md) — manifest format, install layout, troubleshooting
-- [Plugin API Reference](./docs/plugin-api.md) — trait methods, phases, settings, status entries
+## Local Development Note
 
-## Notes for Local Development
-
-This workspace currently points at the sibling `../augur-rs` checkout so the plugin crates can
-track in-flight host/API branches during coordinated development.
-
-If you need to switch back to the published Git source later, update the workspace dependencies in
-the root `Cargo.toml` or use a local `[patch]` override during migration.
+This workspace points at the sibling `../augur-rs` checkout so plugin crates can track in-flight host/API branches during coordinated development.

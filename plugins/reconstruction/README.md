@@ -12,8 +12,9 @@ Accumulates standard `LocalizationResults` across frames so a compatible `augur-
 
 | Setting | Default | Description |
 |---|---|---|
-| Scale | `65.0` nm/px | Pixel size used to convert localization coordinates into exported nanometer units |
 | Max localizations | `1_000_000` | Safety cap for the accumulated localization table |
+
+AugurRS now publishes host-owned calibration on `CTX_GLOBAL_SETTINGS` as `GlobalSettings`. This plugin uses the host `nm_per_pixel` value automatically when converting accumulated localizations into nanometer space, while retaining a hidden fallback for older hosts.
 
 ## Host Views
 
@@ -26,5 +27,4 @@ Both views read the same accumulated source of truth.
 
 ## Compatibility
 
-Requires a matching `augur-gui` / `augur-plugin-api` build that supports the flat v0.2 runtime
-plugin ABI plus the generic host-view registry.
+Requires a matching `augur-gui` / `augur-plugin-api` build that supports the current runtime plugin ABI plus the generic host-view registry.

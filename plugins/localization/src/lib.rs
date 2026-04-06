@@ -1,8 +1,9 @@
 use augur_plugin_api::{
-    export_plugin, AnalysisSeverity, EventStoreHandle, FfiCdEvent, FfiSubpixelMarker, HostContext,
-    HostOutput, Localization, LocalizationResults, Plugin, PluginFrame, PluginInput, SettingItem,
-    SettingKind, SettingsSchema, SettingsSection, StatusEntry, CTX_LOCALIZATION_RESULTS,
+    export_plugin, AnalysisSeverity, EventStoreHandle, FfiCdEvent, FfiSubpixelMarker,
+    GlobalSettings, HostContext, HostOutput, Plugin, PluginFrame, PluginInput, SettingItem,
+    SettingKind, SettingsSchema, SettingsSection, StatusEntry, CTX_GLOBAL_SETTINGS,
 };
+use augur_plugin_types::{Localization, LocalizationResults, CTX_LOCALIZATION_RESULTS};
 use serde_json::{json, Value};
 
 const KERNEL_G1: [f64; 5] = [1.0 / 16.0, 0.25, 3.0 / 8.0, 0.25, 1.0 / 16.0];
@@ -71,18 +72,27 @@ impl Default for LocalizationPlugin {
 }
 
 impl LocalizationPlugin {
-    fn sigma_in_range_nm(&self, localization: &Localization) -> bool {
+    fn nm_per_pixel(&self, context: &HostContext<'_>) -> f64 {
+        context
+            .get::<GlobalSettings>(CTX_GLOBAL_SETTINGS)
+            .ok()
+            .flatten()
+            .map(|settings| settings.nm_per_pixel)
+            .unwrap_or(self.settings.nm_per_pixel)
+    }
+
+    fn sigma_in_range_nm(&self, localization: &Localization, nm_per_pixel: f64) -> bool {
         let min_nm = self.settings.sigma_min_nm;
         let max_nm = self.settings.sigma_max_nm;
-        let sigma_x_nm = localization.sigma_x * self.settings.nm_per_pixel;
-        let sigma_y_nm = localization.sigma_y * self.settings.nm_per_pixel;
+        let sigma_x_nm = localization.sigma_x * nm_per_pixel;
+        let sigma_y_nm = localization.sigma_y * nm_per_pixel;
         sigma_x_nm >= min_nm && sigma_x_nm <= max_nm && sigma_y_nm >= min_nm && sigma_y_nm <= max_nm
     }
 
-    fn xy_uncertainty_nm(&self, localization: &Localization) -> f64 {
+    fn xy_uncertainty_nm(&self, localization: &Localization, nm_per_pixel: f64) -> f64 {
         let sigma_mean_px = 0.5 * (localization.sigma_x + localization.sigma_y);
         let signal = localization.amplitude.abs().max(1.0).sqrt();
-        sigma_mean_px / signal * self.settings.nm_per_pixel
+        sigma_mean_px / signal * nm_per_pixel
     }
 
     fn analyze_frame(
@@ -90,6 +100,7 @@ impl LocalizationPlugin {
         frame: &PluginFrame<'_>,
         raw_events: Option<&[FfiCdEvent]>,
         output: &mut HostOutput<'_>,
+        nm_per_pixel: f64,
     ) -> LocalizationResults {
         let image = build_analysis_image(frame, raw_events);
         let width = frame.width() as usize;
@@ -149,10 +160,12 @@ impl LocalizationPlugin {
                 self.settings.fit_radius_px as f64,
             );
 
-            if !self.sigma_in_range_nm(&localization) {
+            if !self.sigma_in_range_nm(&localization, nm_per_pixel) {
                 continue;
             }
-            if self.xy_uncertainty_nm(&localization) > self.settings.max_xy_uncertainty_nm {
+            if self.xy_uncertainty_nm(&localization, nm_per_pixel)
+                > self.settings.max_xy_uncertainty_nm
+            {
                 continue;
             }
             if !localization.fit_error.is_finite() {
@@ -259,7 +272,8 @@ impl Plugin for LocalizationPlugin {
             );
         }
 
-        let results = self.analyze_frame(frame, raw_events, output);
+        let nm_per_pixel = self.nm_per_pixel(context);
+        let results = self.analyze_frame(frame, raw_events, output, nm_per_pixel);
         if let Err(err) = context.publish(CTX_LOCALIZATION_RESULTS, &results) {
             output.add_warning(
                 self.name(),
@@ -308,17 +322,6 @@ impl Plugin for LocalizationPlugin {
                             min: 0.8,
                             max: 3.5,
                             default: self.settings.initial_sigma_px,
-                            suffix: None,
-                        },
-                    },
-                    SettingItem {
-                        key: "nm_per_pixel".into(),
-                        label: "Scale [nm/px]".into(),
-                        tooltip: Some("Used to express sigma and uncertainty filters in nanometers.".into()),
-                        kind: SettingKind::F64Slider {
-                            min: 20.0,
-                            max: 150.0,
-                            default: self.settings.nm_per_pixel,
                             suffix: None,
                         },
                     },
@@ -376,7 +379,6 @@ impl Plugin for LocalizationPlugin {
             "sigma_min_nm" => Some(json!(self.settings.sigma_min_nm)),
             "sigma_max_nm" => Some(json!(self.settings.sigma_max_nm)),
             "max_xy_uncertainty_nm" => Some(json!(self.settings.max_xy_uncertainty_nm)),
-            "nm_per_pixel" => Some(json!(self.settings.nm_per_pixel)),
             "show_overlay" => Some(json!(self.settings.show_overlay)),
             _ => None,
         }

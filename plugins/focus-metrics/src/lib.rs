@@ -1,10 +1,11 @@
 use std::collections::VecDeque;
 
 use augur_plugin_api::{
-    export_plugin, AnalysisSeverity, EventStoreHandle, HostContext, HostOutput,
-    LocalizationResults, Plugin, PluginFrame, PluginInput, SettingItem, SettingKind,
-    SettingsSchema, SettingsSection, StatusEntry, CTX_LOCALIZATION_RESULTS,
+    export_plugin, AnalysisSeverity, EventStoreHandle, GlobalSettings, HostContext, HostOutput,
+    Plugin, PluginFrame, PluginInput, SettingItem, SettingKind, SettingsSchema, SettingsSection,
+    StatusEntry, CTX_GLOBAL_SETTINGS,
 };
+use augur_plugin_types::{Localization, LocalizationResults, CTX_LOCALIZATION_RESULTS};
 use rustfft::{num_complex::Complex32, FftPlanner};
 use serde_json::{json, Value};
 
@@ -89,6 +90,15 @@ impl Default for FocusMetricsPlugin {
 }
 
 impl FocusMetricsPlugin {
+    fn nm_per_pixel(&self, context: &HostContext<'_>) -> f64 {
+        context
+            .get::<GlobalSettings>(CTX_GLOBAL_SETTINGS)
+            .ok()
+            .flatten()
+            .map(|settings| settings.nm_per_pixel)
+            .unwrap_or(self.settings.nm_per_pixel)
+    }
+
     fn clear_history(&mut self) {
         self.history.clear();
         self.last_metric = None;
@@ -105,13 +115,14 @@ impl FocusMetricsPlugin {
     fn filtered_localizations<'a>(
         &self,
         results: &'a LocalizationResults,
-    ) -> Vec<&'a augur_plugin_api::Localization> {
+        nm_per_pixel: f64,
+    ) -> Vec<&'a Localization> {
         results
             .localizations
             .iter()
             .filter(|localization| {
-                let sigma_x_nm = localization.sigma_x * self.settings.nm_per_pixel;
-                let sigma_y_nm = localization.sigma_y * self.settings.nm_per_pixel;
+                let sigma_x_nm = localization.sigma_x * nm_per_pixel;
+                let sigma_y_nm = localization.sigma_y * nm_per_pixel;
                 sigma_x_nm >= self.settings.sigma_min_nm
                     && sigma_x_nm <= self.settings.sigma_max_nm
                     && sigma_y_nm >= self.settings.sigma_min_nm
@@ -231,6 +242,7 @@ impl FocusMetricsPlugin {
         output: &mut HostOutput<'_>,
         context: &mut HostContext<'_>,
     ) {
+        let nm_per_pixel = self.nm_per_pixel(context);
         match self.settings.method {
             FocusMethod::MeanSigma => {
                 let results = match context.get::<LocalizationResults>(CTX_LOCALIZATION_RESULTS) {
@@ -257,11 +269,10 @@ impl FocusMetricsPlugin {
                 };
 
                 let values: Vec<f64> = self
-                    .filtered_localizations(&results)
+                    .filtered_localizations(&results, nm_per_pixel)
                     .into_iter()
                     .map(|localization| {
-                        0.5 * (localization.sigma_x + localization.sigma_y)
-                            * self.settings.nm_per_pixel
+                        0.5 * (localization.sigma_x + localization.sigma_y) * nm_per_pixel
                     })
                     .collect();
                 if values.is_empty() {
@@ -315,7 +326,7 @@ impl FocusMetricsPlugin {
                 };
 
                 let values: Vec<f64> = self
-                    .filtered_localizations(&results)
+                    .filtered_localizations(&results, nm_per_pixel)
                     .into_iter()
                     .filter_map(|localization| {
                         if localization.sigma_y.abs() <= f64::EPSILON {
@@ -427,17 +438,6 @@ impl Plugin for FocusMetricsPlugin {
                         },
                     },
                     SettingItem {
-                        key: "nm_per_pixel".into(),
-                        label: "Scale [nm/px]".into(),
-                        tooltip: None,
-                        kind: SettingKind::F64Slider {
-                            min: 20.0,
-                            max: 150.0,
-                            default: self.settings.nm_per_pixel,
-                            suffix: None,
-                        },
-                    },
-                    SettingItem {
                         key: "sigma_min_nm".into(),
                         label: "Sigma min [nm]".into(),
                         tooltip: None,
@@ -470,7 +470,6 @@ impl Plugin for FocusMetricsPlugin {
             "history_depth" => Some(json!(self.settings.history_depth)),
             "sigma_min_nm" => Some(json!(self.settings.sigma_min_nm)),
             "sigma_max_nm" => Some(json!(self.settings.sigma_max_nm)),
-            "nm_per_pixel" => Some(json!(self.settings.nm_per_pixel)),
             _ => None,
         }
     }
