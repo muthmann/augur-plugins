@@ -13,7 +13,7 @@ This document only adds the repo-local workflow and conventions for plugin crate
 
 - Each runtime plugin lives in its own crate under `plugins/`.
 - `plugin-template/` is the starting point for new crates.
-- `augur-rs` owns `augur-plugin-api`, the dynamic loader, the Plugin Manager, host views, and host-owned tools such as hotpixel detection.
+- `augur-rs` owns `augur-plugin-api`, the dynamic loader, the Plugin Manager, host views, and host-owned built-in tools.
 - Shared data types that multiple plugins consume should live in a companion crate when they do not belong in `augur-plugin-api`.
 
 ## New Plugin Workflow

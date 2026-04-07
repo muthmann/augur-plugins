@@ -19,7 +19,7 @@ Do not copy source trees into that directory. The host needs a compiled dynamic 
 
 On Linux the library ends in `.so`. On Windows it ends in `.dll`.
 
-Host-owned tools such as hotpixel detection are part of `augur-gui` and are not installed from this repository.
+Host-owned built-in tools are part of `augur-gui` and are not installed from this repository.
 
 ## Build One Plugin
 

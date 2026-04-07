@@ -8,7 +8,7 @@ For the full host-side contract, use the upstream authoring guide:
 
 ## Repository Role
 
-- `augur-rs` owns `augur-plugin-api`, the loader, Plugin Manager, host views, and host-owned tools such as hotpixel detection.
+- `augur-rs` owns `augur-plugin-api`, the loader, Plugin Manager, host views, and host-owned built-in tools.
 - `augur-plugins` owns the runtime plugin implementations and the template crate used to start new plugins.
 - Shared domain payloads should live in companion crates when multiple plugins need the same types.
 

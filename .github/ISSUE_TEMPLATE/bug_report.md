@@ -6,7 +6,7 @@ labels: bug
 
 **Plugin**
 
-Which plugin is affected? (e.g. `augur-plugin-hotpixel`)
+Which plugin is affected? (e.g. `augur-plugin-localization`)
 
 **augur-gui version / commit**
 

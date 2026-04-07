@@ -20,6 +20,9 @@ This page summarizes the parts authors working in `augur-plugins` touch most oft
 - `SettingsSchema` / `StatusEntry`
 - `HostViewRegistry`
 - `GlobalSettings`
+- `TableDatasetV1`
+- `Image2dV1`
+- `Series1dV1`
 - `CTX_GLOBAL_SETTINGS`
 
 ## Minimal Plugin
@@ -152,7 +155,24 @@ Common setting kinds include `Bool`, slider/drag values, and `Enum`. The host ow
 
 ## Host Views
 
-Plugins can declare host-rendered datasets and views through `host_views()` and serve snapshots through `host_view_dataset()`:
+Plugins can declare host-rendered datasets and views through `host_views()` and serve snapshots through `host_view_dataset()`.
+
+### Dataset Kinds
+
+- `HostDatasetKind::TableV1`
+- `HostDatasetKind::Image2dV1`
+- `HostDatasetKind::Series1dV1`
+
+### View Kinds
+
+- `HostViewKind::CompactTable`
+- `HostViewKind::TableWindow`
+- `HostViewKind::Density2dFromTable`
+- `HostViewKind::Scatter2dFromTable`
+- `HostViewKind::ImageWindow`
+- `HostViewKind::LineSeriesWindow`
+
+### Example
 
 ```rust
 fn host_views(&self) -> HostViewRegistry {

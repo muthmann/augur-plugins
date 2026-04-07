@@ -24,11 +24,13 @@ Use this repository for the plugin implementations, template crate, and repo-loc
 
 - Each plugin ships as a `plugin.toml` manifest plus one platform library (`.dylib`, `.so`, or `.dll`).
 - `augur-gui` discovers plugins from `~/.augur/plugins/`, loads the exported `augur_plugin_vtable`, and renders settings, status, and host views through the host.
-- Host-owned tools such as hotpixel detection stay in `augur-gui`; they are not runtime plugins in this repository.
+- Host-owned built-in tools stay in `augur-gui`; they are not runtime plugins in this repository.
 - Host-owned experiment settings such as pixel scale, sensor geometry, acquisition time, and EventStore budget are published to plugins as `GlobalSettings` on `augur.global_settings`.
 - Standard shared scientific payloads can also live in companion crates such as `augur-plugin-types`.
 
-## In-Tree Runtime Plugins
+## In-Tree Runtime Plugins (work in progress)
+
+The plugin crates under `plugins/` are under active development and not yet ready for external use. The template crate and documentation are stable references for writing your own plugins.
 
 | Plugin | Phase | Notes |
 |---|---|---|

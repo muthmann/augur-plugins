@@ -24,7 +24,7 @@ Authors updating older docs or plugins also need to account for:
 - `PluginCapabilities { retained_event_history: true }` as the opt-in for host-retained history
 - `GlobalSettings` on `CTX_GLOBAL_SETTINGS` for host-owned pixel scale, geometry, acquisition time, and EventStore budget
 - optional `host_view_dataset_generation()` so the host can invalidate cached datasets only when the provider reports a newer generation
-- the fact that host-owned tools such as hotpixel detection are no longer described as repository plugins
+- the fact that host-owned built-in tools are no longer described as repository plugins
 
 ## Migration Checklist
 
