@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="assets/logo.png" alt="AugurRS" width="120" />
+
 # augur-plugins
 
 **Runtime-loaded analysis plugins, templates, and authoring docs for [AugurRS](https://github.com/muthmann/augur-rs).**
