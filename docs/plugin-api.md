@@ -1,17 +1,29 @@
 # Runtime Plugin API
 
-The plugin API now lives in the `augur-plugin-api` crate from `augur-rs`.
+This repository now follows the runtime-only plugin surface documented in `augur-rs`.
 
-## Main Types
+Use the upstream guide as the canonical contract:
 
-- `Plugin`: safe Rust trait implemented by plugin crates
-- `PluginFrame`: borrowed access to preview pixels and optional raw events
-- `HostOutput`: callbacks for overlays and warnings
-- `HostContext`: per-frame plus persistent string-keyed publish/get API for inter-plugin data
-- `EventStoreHandle`: read-only access to the host-retained decoded event history
-- `SettingsSchema`: declarative settings description
-- `StatusEntry`: read-only status rows and sparklines
-- `export_plugin!`: exports the C vtable expected by `augur-gui`
+- [`augur-rs/docs/features/plugin-authoring-guide.md`](https://github.com/muthmann/augur-rs/blob/main/docs/features/plugin-authoring-guide.md)
+
+This page summarizes the parts authors working in `augur-plugins` touch most often.
+
+## Core Types
+
+- `Plugin`
+- `export_plugin!`
+- `PluginFrame`
+- `HostOutput`
+- `HostContext`
+- `EventStoreHandle`
+- `PluginCapabilities`
+- `SettingsSchema` / `StatusEntry`
+- `HostViewRegistry`
+- `GlobalSettings`
+- `TableDatasetV1`
+- `Image2dV1`
+- `Series1dV1`
+- `CTX_GLOBAL_SETTINGS`
 
 ## Minimal Plugin
 
@@ -44,83 +56,123 @@ impl Plugin for MyPlugin {
 export_plugin!(MyPlugin);
 ```
 
-## Execution Phases
+## Execution Model
 
-Override `input_kind()` to declare which phase the plugin runs in:
+`input_kind()` and retained history are separate concerns.
+
+### Frame input phase
 
 | Phase | When to use |
 |---|---|
-| `FrameOnly` | Overlays, pixel statistics, cheap preview-only analysis. No event materialization. |
-| `RawEvents` | Requires the raw `CdEvent` stream. The pipeline only materialises events when at least one enabled plugin requests them. |
-| `DerivedData` | Consumes results published by an upstream plugin via `HostContext`. Runs after all `FrameOnly` and `RawEvents` plugins. |
+| `FrameOnly` | Preview-only overlays or pixel-domain work |
+| `RawEvents` | Needs current-frame raw `CdEvent` input |
+| `DerivedData` | Consumes data published by an upstream plugin |
 
-Use the earliest phase that satisfies your needs. The default is `FrameOnly`.
+### Optional retained history
 
-## Dependencies
-
-Override `dependencies()` to declare which upstream plugins your plugin requires by name:
+Use `capabilities()` when the plugin needs host-retained event history:
 
 ```rust
-fn dependencies(&self) -> &[&'static str] {
-    &["Molecule Localization"]
+use augur_plugin_api::PluginCapabilities;
+
+fn capabilities(&self) -> PluginCapabilities {
+    PluginCapabilities {
+        retained_event_history: true,
+    }
 }
 ```
 
-The Plugin Manager uses this list to show dependency relationships. Only declare a hard dependency when the plugin cannot run at all without the named producer. If the plugin degrades gracefully when the upstream payload is absent, prefer a runtime warning instead.
-
-## Settings
-
-Settings are described by schema, not direct UI code.
-
-Supported item kinds:
-
-| Kind | egui widget |
-|---|---|
-| `Bool` | checkbox |
-| `F64Slider` | slider with float range |
-| `I64Slider` | slider with integer range |
-| `F64Drag` | drag value with float range and speed |
-| `I64Drag` | drag value with integer range |
-| `Enum` | row of radio buttons |
-
-All kinds accept optional `suffix` (unit label) and `tooltip` strings.
-
-When a setting changes, `augur-gui` calls `set_setting()` with a JSON value.
+`PluginInput::RawEvents` means “give me current-frame raw events.”
+`retained_event_history: true` means “keep the host-owned history buffer available.”
 
 ## Shared Data
 
-Shared data crosses the plugin boundary as JSON bytes under string keys.
-
-Example:
+Plugins exchange JSON-serialized payloads under string keys:
 
 ```rust
 context.publish("my.plugin.results", &results)?;
 let upstream = context.get::<MyResults>("my.plugin.results")?;
 ```
 
-Persistent cross-frame state uses the matching helpers:
+Prefer standard shared payloads such as `CTX_LOCALIZATION_RESULTS` when they exist. The standard localization payload now lives in `augur-plugin-types`. If several plugins need the same domain-specific type, put that type in a companion crate instead of copying it into multiple plugin crates.
+
+Persistent helpers are still available for plugin-owned caches, but shared scientific outputs should normally stay on the per-frame context bus.
+
+## Host-Owned Global Settings
+
+The host now publishes shared runtime settings on the normal context bus:
+
+- key: `CTX_GLOBAL_SETTINGS`
+- type: `GlobalSettings`
+
+Example:
 
 ```rust
-context.publish_persistent("my.plugin.state", &state)?;
-let state = context.get_persistent::<MyState>("my.plugin.state")?;
+use augur_plugin_api::{GlobalSettings, CTX_GLOBAL_SETTINGS};
+
+if let Some(globals) = context.get::<GlobalSettings>(CTX_GLOBAL_SETTINGS)? {
+    let nm_per_pixel = globals.nm_per_pixel;
+    let sensor_width = globals.sensor_width;
+    let sensor_height = globals.sensor_height;
+    let acq_time_ms = globals.acq_time_ms;
+    let event_store_budget_bytes = globals.event_store_budget_bytes;
+    let _ = (
+        nm_per_pixel,
+        sensor_width,
+        sensor_height,
+        acq_time_ms,
+        event_store_budget_bytes,
+    );
+}
 ```
 
-Custom shared types must derive `serde::Serialize` and `serde::Deserialize`.
+New plugins should prefer `GlobalSettings` over duplicating host-owned defaults such as pixel scale or sensor geometry.
 
-Common built-in keys and types, such as localization results, live in `augur-plugin-api`.
-If you want downstream plugins like Focus Metrics to consume your results, publish the standard `CTX_LOCALIZATION_RESULTS` payload in addition to any plugin-specific data.
+Plugins must tolerate `None` when run against an older host build.
 
-## Status Entries
+## Dependencies
 
-`status_entries()` returns a `Vec<StatusEntry>` rendered below the settings panel. Three variants are available:
+Override `dependencies()` only when the plugin truly requires a specific upstream producer by name:
 
-- `StatusEntry::Text(String)` — plain label row
-- `StatusEntry::LabeledValue { label, value, color: Option<[u8; 3]> }` — key-value row with optional RGB highlight color
-- `StatusEntry::Sparkline { label, values: Vec<f64>, lower_is_better: bool }` — inline history plot; `lower_is_better` controls the coloring direction
+```rust
+fn dependencies(&self) -> &[&'static str] {
+    &["EVE Candidate Finding"]
+}
+```
+
+If the plugin can degrade gracefully when an upstream payload is absent, prefer a runtime warning over a hard dependency declaration.
+
+## Settings And Status
+
+Plugins describe settings declaratively through:
+
+- `settings_schema()`
+- `get_setting()`
+- `set_setting()`
+- optional `status_entries()`
+
+Common setting kinds include `Bool`, slider/drag values, and `Enum`. The host owns rendering and persistence of the UI state.
 
 ## Host Views
 
-Plugins can declare host-rendered datasets and views through `host_views()` and serve snapshots through `host_view_dataset()`:
+Plugins can declare host-rendered datasets and views through `host_views()` and serve snapshots through `host_view_dataset()`.
+
+### Dataset Kinds
+
+- `HostDatasetKind::TableV1`
+- `HostDatasetKind::Image2dV1`
+- `HostDatasetKind::Series1dV1`
+
+### View Kinds
+
+- `HostViewKind::CompactTable`
+- `HostViewKind::TableWindow`
+- `HostViewKind::Density2dFromTable`
+- `HostViewKind::Scatter2dFromTable`
+- `HostViewKind::ImageWindow`
+- `HostViewKind::LineSeriesWindow`
+
+### Example
 
 ```rust
 fn host_views(&self) -> HostViewRegistry {
@@ -145,22 +197,13 @@ fn host_views(&self) -> HostViewRegistry {
             }),
             empty_message: "No rows yet.".into(),
         }],
-        views: vec![
-            HostViewDescriptor {
-                id: "example.table.compact".into(),
-                title: "Current Rows".into(),
-                dataset_id: "example.table".into(),
-                placement: HostViewPlacement::AnalysisPanel,
-                kind: HostViewKind::CompactTable,
-            },
-            HostViewDescriptor {
-                id: "example.table.window".into(),
-                title: "Example Table".into(),
-                dataset_id: "example.table".into(),
-                placement: HostViewPlacement::Window,
-                kind: HostViewKind::TableWindow,
-            },
-        ],
+        views: vec![HostViewDescriptor {
+            id: "example.table.compact".into(),
+            title: "Current Rows".into(),
+            dataset_id: "example.table".into(),
+            placement: HostViewPlacement::AnalysisPanel,
+            kind: HostViewKind::CompactTable,
+        }],
     }
 }
 
@@ -182,35 +225,35 @@ fn host_view_dataset(&self, dataset_id: &str) -> Option<Vec<u8>> {
 
     serde_json::to_vec(&dataset).ok()
 }
+
+fn host_view_dataset_generation(&self, dataset_id: &str) -> u64 {
+    if dataset_id == "example.table" { 1 } else { 0 }
+}
 ```
 
-This keeps plugin-owned scientific state on the plugin side while letting the host render panel sections, read-only windows, CSV export, and density views generically.
+`host_view_dataset_generation()` is optional but recommended when the host should invalidate a cached snapshot only after the dataset changes.
+
+The host owns rendering, exports, caching, and window state. Plugins do not render `egui` directly.
 
 ## Event History
 
-`process_frame()` now also receives `event_store: &EventStoreHandle<'_>`. Plugins that need only
-the current frame can ignore it. History-aware plugins can query:
+`process_frame()` always receives `event_store: &EventStoreHandle<'_>`. Plugins that need only the current frame can ignore it. History-aware plugins can query:
 
-- `event_store.all_events()`
-- `event_store.events_in_range(start_us, end_us)`
-- `event_store.oldest_timestamp_us()`
-- `event_store.frame_count()`
+- `frame_count()`
+- `frame(index)`
+- `frames()`
+- `frame_range_for_timestamps(start_us, end_us)`
+- `frames_in_range(start_us, end_us)`
+- `collect_events_in_range(start_us, end_us, out)`
+- `oldest_timestamp_us()`
 
-The host owns retention and enforces a memory budget, so plugin code does not need to maintain its
-own duplicate frame-history buffer unless it wants a custom derived cache.
+## Migration From Older Plugin Code
 
-## Panic Safety
-
-`export_plugin!` wraps every vtable call in `std::panic::catch_unwind`. A panic inside a plugin function is caught at the FFI boundary rather than unwinding into host code, which would be undefined behaviour. The host logs the panic and treats the current frame as a no-op for that plugin.
-
-Do not rely on panics for control flow. Use `Result` and return errors through `set_setting()` or warnings through `HostOutput`.
-
-## Migration from the Old API
-
-Replace:
+When porting older code, replace:
 
 - `AnalysisPlugin` with `Plugin`
-- direct `egui` calls with `SettingsSchema`
 - typed `PluginContext` exchange with `HostContext`
-- reconstruction-specific compatibility hooks with `host_views()` plus `host_view_dataset()`
+- direct `egui` UI code with declarative settings/status
+- special-case host rendering hooks with `host_views()` and `host_view_dataset()`
+- duplicated host-owned calibration values with `GlobalSettings`
 - compile-time registration with `export_plugin!` plus a built `cdylib`

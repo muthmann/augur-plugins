@@ -22,8 +22,9 @@ Post-processing and quality assessment for eveSMLM localization streams. The plu
 | Show eNeNA | `true` | Track nearest-neighbor precision estimate |
 | Show in situ PSF | `true` | Maintain a rolling PSF estimate |
 | Show on-time | `true` | Maintain a greedy fluorescent on-time histogram |
-| Scale | `65.0` nm/px | Convert pixel precision estimates to nm |
 | Show overlay | `true` | Highlight accepted, corrected localizations |
+
+AugurRS now publishes host-owned calibration on `CTX_GLOBAL_SETTINGS` as `GlobalSettings`. This plugin uses the host `nm_per_pixel` value automatically when converting eNeNA-style metrics into nanometers, while retaining a hidden fallback for older hosts.
 
 ## Execution Phase
 

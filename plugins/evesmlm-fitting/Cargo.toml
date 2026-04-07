@@ -11,6 +11,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 augur-plugin-api.workspace = true
+augur-plugin-types.workspace = true
 augur-plugin-evesmlm-candidates = { path = "../evesmlm-candidates" }
 levenberg-marquardt = "0.14"
 nalgebra = "0.33"

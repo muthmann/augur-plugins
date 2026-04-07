@@ -10,15 +10,16 @@ pub mod filtering;
 use std::collections::VecDeque;
 
 use augur_plugin_api::{
-    export_plugin, AnalysisSeverity, EventStoreHandle, FfiSubpixelMarker, HostContext, HostOutput,
-    HostViewRegistry, Plugin, PluginFrame, PluginInput, SettingItem, SettingKind, SettingsSchema,
-    SettingsSection, StatusEntry, CTX_LOCALIZATION_RESULTS,
+    export_plugin, AnalysisSeverity, EventStoreHandle, FfiSubpixelMarker, GlobalSettings,
+    HostContext, HostOutput, HostViewRegistry, Plugin, PluginFrame, PluginInput, SettingItem,
+    SettingKind, SettingsSchema, SettingsSection, StatusEntry, CTX_GLOBAL_SETTINGS,
 };
 pub use augur_plugin_evesmlm_fitting::{
     current_localizations_dataset, current_localizations_registry, to_localization_results,
     EveLocalization, EveLocalizationResults, FitMethod, CTX_EVE_LOCALIZATION_RESULTS,
     CURRENT_LOCALIZATIONS_DATASET_ID,
 };
+use augur_plugin_types::CTX_LOCALIZATION_RESULTS;
 use evaluation::EvaluationState;
 use serde_json::{json, Value};
 
@@ -68,6 +69,7 @@ pub struct EveSmlmPostProcPlugin {
     last_output_count: usize,
     last_drift: (f64, f64),
     last_status: String,
+    dataset_generation: u64,
 }
 
 impl Default for EveSmlmPostProcPlugin {
@@ -83,11 +85,22 @@ impl Default for EveSmlmPostProcPlugin {
             last_drift: (0.0, 0.0),
             last_status: "Enable the plugin to filter and evaluate EVE localization streams."
                 .into(),
+            dataset_generation: 0,
         }
     }
 }
 
 impl EveSmlmPostProcPlugin {
+    fn sync_runtime_settings(&mut self, context: &HostContext<'_>) {
+        if let Some(settings) = context
+            .get::<GlobalSettings>(CTX_GLOBAL_SETTINGS)
+            .ok()
+            .flatten()
+        {
+            self.settings.nm_per_pixel = settings.nm_per_pixel;
+        }
+    }
+
     fn process_localizations(
         &mut self,
         input: Option<&EveLocalizationResults>,
@@ -185,6 +198,7 @@ impl EveSmlmPostProcPlugin {
         self.last_output_count = 0;
         self.last_drift = (0.0, 0.0);
         self.last_status = "Waiting for the next localization batch.".into();
+        self.dataset_generation = self.dataset_generation.wrapping_add(1);
     }
 
     fn push_history(&mut self, corrected: &EveLocalizationResults) {
@@ -261,6 +275,7 @@ impl Plugin for EveSmlmPostProcPlugin {
         context: &mut HostContext<'_>,
         _event_store: &EventStoreHandle<'_>,
     ) {
+        self.sync_runtime_settings(context);
         let input = match context.get::<EveLocalizationResults>(CTX_EVE_LOCALIZATION_RESULTS) {
             Ok(value) => value,
             Err(err) => {
@@ -275,6 +290,7 @@ impl Plugin for EveSmlmPostProcPlugin {
 
         let corrected = self.process_localizations(input.as_ref(), output);
         self.current_results = corrected.clone();
+        self.dataset_generation = self.dataset_generation.wrapping_add(1);
         if let Err(err) = context.publish(CTX_EVE_LOCALIZATION_RESULTS, &corrected) {
             Self::warning(
                 output,
@@ -402,17 +418,6 @@ impl Plugin for EveSmlmPostProcPlugin {
                             },
                         },
                         SettingItem {
-                            key: "nm_per_pixel".into(),
-                            label: "Scale".into(),
-                            tooltip: Some("Pixel size used when converting eNeNA estimates into nanometers.".into()),
-                            kind: SettingKind::F64Drag {
-                                min: 1.0,
-                                max: 500.0,
-                                speed: 0.5,
-                                default: self.settings.nm_per_pixel,
-                            },
-                        },
-                        SettingItem {
                             key: "show_overlay".into(),
                             label: "Show overlay".into(),
                             tooltip: Some("Draw corrected localization markers on the preview.".into()),
@@ -436,7 +441,6 @@ impl Plugin for EveSmlmPostProcPlugin {
             "show_enena" => Some(json!(self.settings.show_enena)),
             "show_insitu_psf" => Some(json!(self.settings.show_insitu_psf)),
             "show_on_time" => Some(json!(self.settings.show_on_time)),
-            "nm_per_pixel" => Some(json!(self.settings.nm_per_pixel)),
             "show_overlay" => Some(json!(self.settings.show_overlay)),
             _ => None,
         }
@@ -597,6 +601,14 @@ impl Plugin for EveSmlmPostProcPlugin {
         }
 
         serde_json::to_vec(&current_localizations_dataset(&self.current_results)).ok()
+    }
+
+    fn host_view_dataset_generation(&self, dataset_id: &str) -> u64 {
+        if dataset_id == CURRENT_LOCALIZATIONS_DATASET_ID {
+            self.dataset_generation
+        } else {
+            0
+        }
     }
 }
 

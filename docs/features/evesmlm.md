@@ -22,6 +22,12 @@ The eveSMLM pipeline is implemented as three focused plugins so each stage can b
 - When **EVE Post-Processing** is enabled, it becomes the active provider for the panel view.
 - When post-processing is disabled, the panel falls back automatically to **EVE Candidate Fitting**.
 
+## Calibration Note
+
+AugurRS now publishes host-owned calibration on `CTX_GLOBAL_SETTINGS` as `GlobalSettings`.
+
+The fitting and post-processing stages now use that host `nm_per_pixel` value automatically when it is available, while retaining a hidden fallback for older hosts that do not publish `GlobalSettings` yet.
+
 ## Data Flow
 
 `CdEvent` stream -> `EveCandidates` -> `EveLocalizationResults` -> filtered / corrected `EveLocalizationResults`

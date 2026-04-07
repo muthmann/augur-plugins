@@ -11,5 +11,6 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 augur-plugin-api.workspace = true
+augur-plugin-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true

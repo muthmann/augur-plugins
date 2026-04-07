@@ -1,13 +1,20 @@
 # Plugin Host Views
 
-`augur-plugin-api` now lets plugins publish host-rendered datasets and views through `host_views()` and `host_view_dataset()` instead of relying on reconstruction-specific host wiring.
+`augur-plugin-api` lets plugins publish host-rendered datasets and views through:
+
+- `host_views()`
+- `host_view_dataset()`
+- optional `host_view_dataset_generation()`
+
+That keeps scientific state in the plugin while letting the host own rendering, export, caching, and window management.
 
 ## What Plugins Can Declare
 
 - datasets with stable ids and explicit schema metadata
 - analysis-panel views rendered by the host
-- window views rendered by the host
-- shared datasets reused by multiple views
+- standalone windows rendered by the host
+- multiple views backed by the same dataset
+- optional generation counters for cache invalidation
 
 ## Current In-Tree Usage
 
@@ -21,6 +28,7 @@ Because the host resolves duplicate ids in plugin execution order, `EVE Post-Pro
 ## Why The Split Matters
 
 - plugins keep scientific accumulation and stage-specific data ownership
-- the host keeps rendering, scrolling, export, and window management
+- the host keeps rendering, export, caching, and window state
 - one dataset can drive multiple host views without duplicate plugin state
-- future localization plugins can reuse the same host-rendered table and density windows by publishing the same dataset contract
+- later-compatible providers can reuse the same dataset/view ids when the metadata matches exactly
+- generation counters let the host skip reloading unchanged datasets

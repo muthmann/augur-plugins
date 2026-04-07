@@ -1,7 +1,5 @@
 [workspace]
 members = [
-  "plugins/hotpixel",
-  "plugins/roi-grid",
   "plugins/localization",
   "plugins/reconstruction",
   "plugins/focus-metrics",
@@ -22,6 +20,7 @@ repository = "https://github.com/muthmann/augur-plugins"
 [workspace.dependencies]
 augur-core = { path = "../augur-rs/augur-core" }
 augur-plugin-api = { path = "../augur-rs/augur-plugin-api" }
+augur-plugin-types = { path = "../augur-rs/augur-plugin-types" }
 egui = "0.27"
 rustfft = "6"
 serde = { version = "1", features = ["derive"] }

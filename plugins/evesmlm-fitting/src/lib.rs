@@ -11,9 +11,9 @@ pub mod radial_symmetry;
 pub mod types;
 
 use augur_plugin_api::{
-    export_plugin, AnalysisSeverity, EventStoreHandle, FfiSubpixelMarker, HostContext, HostOutput,
-    Localization, LocalizationResults, Plugin, PluginFrame, PluginInput, SettingItem, SettingKind,
-    SettingsSchema, SettingsSection, StatusEntry, CTX_LOCALIZATION_RESULTS,
+    export_plugin, AnalysisSeverity, EventStoreHandle, FfiSubpixelMarker, GlobalSettings,
+    HostContext, HostOutput, Plugin, PluginFrame, PluginInput, SettingItem, SettingKind,
+    SettingsSchema, SettingsSection, StatusEntry, CTX_GLOBAL_SETTINGS,
 };
 use augur_plugin_api::{
     HostDatasetDescriptor, HostDatasetKind, HostViewDescriptor, HostViewKind, HostViewPlacement,
@@ -23,6 +23,7 @@ use augur_plugin_api::{
 pub use augur_plugin_evesmlm_candidates::{
     CandidateFindingMethod, EveCandidates, EveCluster, EveEvent, CTX_EVE_CANDIDATES,
 };
+use augur_plugin_types::{Localization, LocalizationResults, CTX_LOCALIZATION_RESULTS};
 use serde_json::{json, Value};
 pub use types::{EveLocalization, EveLocalizationResults, FitMethod, CTX_EVE_LOCALIZATION_RESULTS};
 
@@ -169,6 +170,7 @@ pub struct EveSmlmFittingPlugin {
     last_localization_count: usize,
     last_rejection_count: usize,
     last_status: String,
+    dataset_generation: u64,
 }
 
 impl Default for EveSmlmFittingPlugin {
@@ -181,15 +183,26 @@ impl Default for EveSmlmFittingPlugin {
             last_rejection_count: 0,
             last_status:
                 "Enable the plugin to fit EVE candidate clusters to sub-pixel localizations.".into(),
+            dataset_generation: 0,
         }
     }
 }
 
 impl EveSmlmFittingPlugin {
+    fn nm_per_pixel(&self, context: &HostContext<'_>) -> f64 {
+        context
+            .get::<GlobalSettings>(CTX_GLOBAL_SETTINGS)
+            .ok()
+            .flatten()
+            .map(|settings| settings.nm_per_pixel)
+            .unwrap_or(self.settings.nm_per_pixel)
+    }
+
     fn analyze_candidates(
         &mut self,
         candidates: Option<&EveCandidates>,
         output: &mut HostOutput<'_>,
+        nm_per_pixel: f64,
     ) -> (EveLocalizationResults, LocalizationResults) {
         let Some(candidates) = candidates else {
             self.last_localization_count = 0;
@@ -215,8 +228,8 @@ impl EveSmlmFittingPlugin {
             };
 
             if self.settings.fit_method.produces_sigma() {
-                let sigma_x_nm = fit.sigma_x * self.settings.nm_per_pixel;
-                let sigma_y_nm = fit.sigma_y * self.settings.nm_per_pixel;
+                let sigma_x_nm = fit.sigma_x * nm_per_pixel;
+                let sigma_y_nm = fit.sigma_y * nm_per_pixel;
                 if sigma_x_nm < self.settings.sigma_min_nm
                     || sigma_x_nm > self.settings.sigma_max_nm
                     || sigma_y_nm < self.settings.sigma_min_nm
@@ -285,6 +298,7 @@ impl EveSmlmFittingPlugin {
         self.last_localization_count = 0;
         self.last_rejection_count = 0;
         self.last_status = "Waiting for the next candidate set.".into();
+        self.dataset_generation = self.dataset_generation.wrapping_add(1);
     }
 
     fn parse_usize(value: Value) -> Option<usize> {
@@ -335,6 +349,7 @@ impl Plugin for EveSmlmFittingPlugin {
         context: &mut HostContext<'_>,
         _event_store: &EventStoreHandle<'_>,
     ) {
+        let nm_per_pixel = self.nm_per_pixel(context);
         let candidates = match context.get::<EveCandidates>(CTX_EVE_CANDIDATES) {
             Ok(value) => value,
             Err(err) => {
@@ -347,8 +362,10 @@ impl Plugin for EveSmlmFittingPlugin {
             }
         };
 
-        let (eve_results, compatibility) = self.analyze_candidates(candidates.as_ref(), output);
+        let (eve_results, compatibility) =
+            self.analyze_candidates(candidates.as_ref(), output, nm_per_pixel);
         self.current_results = eve_results.clone();
+        self.dataset_generation = self.dataset_generation.wrapping_add(1);
         if let Err(err) = context.publish(CTX_EVE_LOCALIZATION_RESULTS, &eve_results) {
             Self::warning(
                 output,
@@ -391,19 +408,6 @@ impl Plugin for EveSmlmFittingPlugin {
                                 FitMethod::MeanXY.label().into(),
                             ],
                             default: self.settings.fit_method.index(),
-                        },
-                    },
-                    SettingItem {
-                        key: "nm_per_pixel".into(),
-                        label: "Scale".into(),
-                        tooltip: Some(
-                            "Pixel size used when converting fitted sigmas into nanometers.".into(),
-                        ),
-                        kind: SettingKind::F64Drag {
-                            min: 1.0,
-                            max: 500.0,
-                            speed: 0.5,
-                            default: self.settings.nm_per_pixel,
                         },
                     },
                     SettingItem {
@@ -466,7 +470,6 @@ impl Plugin for EveSmlmFittingPlugin {
     fn get_setting(&self, key: &str) -> Option<Value> {
         match key {
             "fit_method" => Some(json!(self.settings.fit_method.index())),
-            "nm_per_pixel" => Some(json!(self.settings.nm_per_pixel)),
             "sigma_min_nm" => Some(json!(self.settings.sigma_min_nm)),
             "sigma_max_nm" => Some(json!(self.settings.sigma_max_nm)),
             "max_fit_residual" => Some(json!(self.settings.max_fit_residual)),
@@ -554,6 +557,14 @@ impl Plugin for EveSmlmFittingPlugin {
         }
 
         serde_json::to_vec(&current_localizations_dataset(&self.current_results)).ok()
+    }
+
+    fn host_view_dataset_generation(&self, dataset_id: &str) -> u64 {
+        if dataset_id == CURRENT_LOCALIZATIONS_DATASET_ID {
+            self.dataset_generation
+        } else {
+            0
+        }
     }
 }
 
@@ -733,8 +744,18 @@ mod tests {
         let fit = log_gaussian::fit(&cluster_from_histogram(&entries)).unwrap();
         assert!((fit.x - x0).abs() <= 0.3, "x: {} vs {}", fit.x, x0);
         assert!((fit.y - y0).abs() <= 0.3, "y: {} vs {}", fit.y, y0);
-        assert!((fit.sigma_x - sigma_x).abs() <= 0.3, "sigma_x: {} vs {}", fit.sigma_x, sigma_x);
-        assert!((fit.sigma_y - sigma_y).abs() <= 0.3, "sigma_y: {} vs {}", fit.sigma_y, sigma_y);
+        assert!(
+            (fit.sigma_x - sigma_x).abs() <= 0.3,
+            "sigma_x: {} vs {}",
+            fit.sigma_x,
+            sigma_x
+        );
+        assert!(
+            (fit.sigma_y - sigma_y).abs() <= 0.3,
+            "sigma_y: {} vs {}",
+            fit.sigma_y,
+            sigma_y
+        );
     }
 
     #[test]

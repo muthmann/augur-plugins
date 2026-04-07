@@ -22,10 +22,11 @@ Sub-pixel molecule localization from the live event camera stream, suitable for 
 | Wavelet threshold n | `1.5` | Multiplier applied to sigma(F1) for thresholding |
 | Fit radius | `4` px | Radius of the Gaussian fit ROI (4 px = 9x9 window) |
 | Initial sigma | `1.6` px | Starting sigma for the Gaussian fit |
-| Scale | `65.0` nm/px | Pixel size used for nm-based filters |
 | Sigma range | `100–190` nm | Accepted sigma range for valid localizations |
 | Max xy uncertainty | `35.0` nm | Maximum localization uncertainty |
 | Show overlay | `true` | Draw crosshair markers on accepted localizations |
+
+AugurRS now publishes host-owned calibration on `CTX_GLOBAL_SETTINGS` as `GlobalSettings`. This plugin uses the host `nm_per_pixel` value automatically for sigma and uncertainty filters when it is available, while retaining a hidden fallback for older hosts.
 
 ## Execution Phase
 

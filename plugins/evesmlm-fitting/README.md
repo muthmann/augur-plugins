@@ -19,11 +19,12 @@ Sub-pixel localization for eveSMLM candidate clusters. The plugin consumes `EveC
 | Setting | Default | Description |
 |---|---|---|
 | Fit method | `Log-Gaussian` | Candidate fitting backend |
-| Scale | `65.0` nm/px | Pixel size used for sigma filtering |
 | Sigma min | `80.0` nm | Lower accepted sigma bound for sigma-producing methods |
 | Sigma max | `200.0` nm | Upper accepted sigma bound for sigma-producing methods |
 | Max fit residual | `0.5` | Reject fits above this residual |
 | Show overlay | `true` | Highlight accepted localization positions |
+
+AugurRS now publishes host-owned calibration on `CTX_GLOBAL_SETTINGS` as `GlobalSettings`. This plugin uses the host `nm_per_pixel` value automatically for sigma filtering when it is available, while retaining a hidden fallback for older hosts.
 
 ## Execution Phase
 

@@ -1,6 +1,6 @@
 # Reconstruction Workflow
 
-The reconstruction workflow now publishes one accumulated host-view dataset instead of a reconstruction-specific UI hook. That keeps the accumulation logic in the plugin while letting the host render multiple windows from the same source of truth.
+The reconstruction workflow publishes one accumulated host-view dataset instead of a reconstruction-specific UI hook. That keeps the accumulation logic in the plugin while letting the host render multiple windows from the same source of truth.
 
 ## Components
 
@@ -19,6 +19,12 @@ The reconstruction workflow now publishes one accumulated host-view dataset inst
 
 - the plugin keeps only a capped FIFO of localization rows in memory
 - cap enforcement avoids shifting the full accumulation buffer on overflow
+
+## Calibration Note
+
+AugurRS now publishes host-owned calibration on `CTX_GLOBAL_SETTINGS` as `GlobalSettings`.
+
+`Localization Reconstruction` now uses that host `nm_per_pixel` value automatically when it is available, while retaining a hidden fallback for older hosts that do not publish `GlobalSettings` yet.
 
 ## Data Flow
 

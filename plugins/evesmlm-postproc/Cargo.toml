@@ -11,6 +11,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 augur-plugin-api.workspace = true
+augur-plugin-types.workspace = true
 augur-plugin-evesmlm-fitting = { path = "../evesmlm-fitting" }
 nalgebra = "0.33"
 serde_json.workspace = true
