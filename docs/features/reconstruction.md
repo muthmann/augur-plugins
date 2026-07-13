@@ -5,15 +5,26 @@ The reconstruction workflow publishes one accumulated host-view dataset instead 
 ## Components
 
 1. **Localization Reconstruction** (`DerivedData`) reads `LocalizationResults` from `HostContext` and stores a capped nanometer-space accumulation table.
-2. **`host_views()`** declares one dataset, `augur.localization.accumulated`, plus two host-rendered window views:
+2. **`host_views()`** declares one dataset, `augur.localization.accumulated`, plus host-rendered views for:
    - `Localization Table`
    - `Reconstruction`
+   - `Localization Cloud`
 3. **`host_view_dataset()`** serves one columnar `TableV1` snapshot that both windows consume.
 
 ## Source Of Truth
 
 - the reconstruction plugin owns the only accumulated localization state
-- the full table window and density reconstruction window read the same dataset id
+- the full table window, density reconstruction window, and 3D scatter inspection all read the same dataset id
+
+## Investigation Metadata
+
+The accumulated localization dataset now participates directly in the host investigation workspace through:
+
+- stable row ids via `id`
+- `timestamp_us` as the shared time column
+- 2D nanometer coordinates for linked preview/table filtering
+- 3D scatter coordinates using `timestamp_us` on the `z` axis
+- layer/display metadata for default visibility and styling
 
 ## Resource Use
 
@@ -28,7 +39,7 @@ AugurRS now publishes host-owned calibration on `CTX_GLOBAL_SETTINGS` as `Global
 
 ## Data Flow
 
-`LocalizationResults` -> `augur.localization.accumulated` -> host table window / host density window
+`LocalizationResults` -> `augur.localization.accumulated` -> host table window / density window / 3D localization cloud
 
 ## Installation
 

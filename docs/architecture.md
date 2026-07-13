@@ -82,6 +82,7 @@ Plugins declare host-rendered datasets and views through:
 The host owns:
 
 - analysis-panel rendering
+- linked 2D/3D investigation state
 - standalone windows
 - dataset caching
 - exports
@@ -89,8 +90,19 @@ The host owns:
 
 This repository currently uses that mechanism for:
 
-- reconstruction table and density windows
-- the shared EVE compact localization panel that can be provided by fitting or post-processing
+- reconstruction table, density, and 3D localization inspection
+- candidate-stage accepted/rejected raw-event layers for live tuning
+- the shared EVE current-localization datasets that can be provided by fitting or post-processing
+
+For investigation-linked table datasets, the important host-consumed metadata is:
+
+- stable row ids via `row_id_column`
+- 2D and 3D coordinates
+- optional time columns
+- layer ids and semantic labels
+- dataset display metadata for title, default visibility, color, marker shape, and size
+
+Overlays remain useful for supplemental 2D annotations, but the host now treats structured datasets as the primary linking surface.
 
 ## Tradeoffs
 

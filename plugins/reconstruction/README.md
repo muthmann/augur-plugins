@@ -18,12 +18,13 @@ AugurRS now publishes host-owned calibration on `CTX_GLOBAL_SETTINGS` as `Global
 
 ## Host Views
 
-The plugin publishes one dataset, `augur.localization.accumulated`, and two host-rendered window views over that dataset:
+The plugin publishes one dataset, `augur.localization.accumulated`, and three host-rendered views over that dataset:
 
 - `Localization Table`
 - `Reconstruction`
+- `Localization Cloud`
 
-Both views read the same accumulated source of truth.
+The dataset now carries stable row ids, timestamps, nanometer-space 2D coordinates, generic 3D scatter metadata, and layer/display metadata. All views read the same accumulated source of truth.
 
 ## Compatibility
 

@@ -32,11 +32,20 @@ AugurRS now publishes host-owned calibration on `CTX_GLOBAL_SETTINGS` as `Global
 
 ## Published Data
 
-Publishes filtered and drift-corrected `EveLocalizationResults` on `augur.evesmlm.localization_results`, republishes standard `LocalizationResults` on `augur.localization.results` for downstream compatibility, and serves the compact host-view dataset `augur.evesmlm.current_localizations`.
+Publishes filtered and drift-corrected `EveLocalizationResults` on `augur.evesmlm.localization_results`, republishes standard `LocalizationResults` on `augur.localization.results` for downstream compatibility, and serves the shared host-view dataset `augur.evesmlm.current_localizations`.
 
 ## Host View
 
-This plugin deliberately reuses the same dataset id and compact panel view id as `EVE Candidate Fitting`. Because post-processing resolves later in the pipeline, it becomes the active provider whenever it is enabled.
+This plugin deliberately reuses the same dataset id and view ids as `EVE Candidate Fitting`.
+
+The shared current-localizations contract includes:
+
+- stable row ids
+- timestamps
+- 2D and 3D coordinate metadata
+- layer/display metadata
+
+Because post-processing resolves later in the pipeline, it becomes the active provider whenever it is enabled.
 
 ## Dependencies
 

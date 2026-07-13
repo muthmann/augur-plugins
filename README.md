@@ -25,10 +25,26 @@ Use this repository for the plugin implementations, template crate, and repo-loc
 ## Runtime Model
 
 - Each plugin ships as a `plugin.toml` manifest plus one platform library (`.dylib`, `.so`, or `.dll`).
-- `augur-gui` discovers plugins from `~/.augur/plugins/`, loads the exported `augur_plugin_vtable`, and renders settings, status, and host views through the host.
+- `augur-gui` discovers plugins from `~/.augur/plugins/`, loads the exported `augur_plugin_vtable`, and renders settings, status, and linked investigation datasets/views through the host.
 - Host-owned built-in tools stay in `augur-gui`; they are not runtime plugins in this repository.
 - Host-owned experiment settings such as pixel scale, sensor geometry, acquisition time, and EventStore budget are published to plugins as `GlobalSettings` on `augur.global_settings`.
 - Standard shared scientific payloads can also live in companion crates such as `augur-plugin-types`.
+
+## Investigation Workspace Contract
+
+The host now owns a generic linked workspace across:
+
+- 2D preview
+- 3D inspection
+- host-rendered tables
+
+For plugins, that means:
+
+- structured datasets are the primary linking mechanism
+- stable row ids should be provided when possible
+- 2D/3D coordinate metadata should be declared when the plugin has it
+- layer/display metadata should describe visibility, color, marker shape, and size
+- overlays are supplemental annotations, not the primary integration surface
 
 ## In-Tree Runtime Plugins (work in progress)
 
@@ -37,11 +53,11 @@ The plugin crates under `plugins/` are under active development and not yet read
 | Plugin | Phase | Notes |
 |---|---|---|
 | `localization` | `RawEvents` | Wavelet/Gaussian SMLM localization and standard `LocalizationResults` output |
-| `reconstruction` | `DerivedData` | Accumulated localization table plus host-rendered reconstruction windows |
+| `reconstruction` | `DerivedData` | Accumulated localization dataset with stable ids, time metadata, density rendering, and 3D inspection |
 | `focus-metrics` | `DerivedData` | Focus metrics from localization results or FFT preview sharpness |
-| `evesmlm-candidates` | `RawEvents` | Event-domain candidate clustering for eveSMLM |
-| `evesmlm-fitting` | `DerivedData` | Candidate fitting plus EVE and compatibility localization outputs |
-| `evesmlm-postproc` | `DerivedData` | Filtering, drift correction, evaluation, and the later EVE compact view provider |
+| `evesmlm-candidates` | `RawEvents` | Event-domain candidate clustering plus accepted/rejected raw-event investigation layers |
+| `evesmlm-fitting` | `DerivedData` | Candidate fitting plus shared current-localization datasets, stable ids, and linked 3D inspection |
+| `evesmlm-postproc` | `DerivedData` | Filtering, drift correction, evaluation, and the later shared EVE current-localization provider |
 
 `plugin-template/` is the starting point for new plugin crates.
 
@@ -62,6 +78,8 @@ cp target/release/libaugur_plugin_localization.dylib ~/.augur/plugins/localizati
 ```
 
 On Linux, copy the `.so`. On Windows, copy the `.dll`.
+On macOS, prefer `./scripts/install-built-plugins.sh --profile release`; it rewrites the copied
+plugin dylib id so Plugin Manager reloads do not keep pointing at Cargo's build tree.
 
 Then open `augur-gui`, go to **Plugins**, click **Scan for New Plugins**, and enable the plugin.
 
@@ -101,7 +119,8 @@ The current authoring flow is:
 2. export the vtable with `export_plugin!`
 3. choose `input_kind()` and optional `PluginCapabilities`
 4. use `HostContext` for shared payloads, companion crates such as `augur-plugin-types` for reusable payload types, and `CTX_GLOBAL_SETTINGS` for host-owned calibration/settings
-5. declare host-rendered outputs with `host_views()` when needed
+5. declare host-rendered outputs with `host_views()` when needed and populate stable-id / coordinate / layer metadata when the dataset should participate in linked investigation
+   - to expose interactive operations, append `HostActionDescriptor`s to `HostViewRegistry.actions` (scope `Dataset`/`Row`/`Cluster`, optional `param_schema`); consume requests from the persistent context key `CTX_INVESTIGATION_ACTION_REQUESTS`
 6. build a `cdylib`
 7. install `plugin.toml` plus the compiled library into `~/.augur/plugins/<name>/`
 
