@@ -26,8 +26,8 @@ use augur_plugin_api::{
 };
 use serde_json::{json, Value};
 use stage_a_io::{
-    estimate_contrast, AdcCalibration, Command, ContrastEstimate, DeviceEvent, FrameType,
-    IoWorker, StageAClient, StreamIntegrity, WorkerOutput, WorkerRequest,
+    estimate_contrast, AdcCalibration, Command, ContrastEstimate, DeviceEvent, FrameType, IoWorker,
+    StageAClient, StreamIntegrity, WorkerOutput, WorkerRequest,
 };
 
 const WAVEFORM_DATASET_ID: &str = "stage-a-monitor.waveform";
@@ -223,18 +223,16 @@ impl StageAMonitorPlugin {
                         }
                     }
                 }
-                WorkerOutput::Event(DeviceEvent::Data(frame)) => {
-                    match frame.header.frame_type {
-                        FrameType::SamplesU16 => {
-                            if let Some(codes) = frame.samples() {
-                                self.sample_rate_seen_hz = frame.header.sample_rate_hz;
-                                self.push_samples(&codes, frame.header.first_sample_index);
-                            }
+                WorkerOutput::Event(DeviceEvent::Data(frame)) => match frame.header.frame_type {
+                    FrameType::SamplesU16 => {
+                        if let Some(codes) = frame.samples() {
+                            self.sample_rate_seen_hz = frame.header.sample_rate_hz;
+                            self.push_samples(&codes, frame.header.first_sample_index);
                         }
-                        FrameType::Summary | FrameType::Marker | FrameType::Control => {}
-                        FrameType::Unknown(_) => {}
                     }
-                }
+                    FrameType::Summary | FrameType::Marker | FrameType::Control => {}
+                    FrameType::Unknown(_) => {}
+                },
                 WorkerOutput::Event(DeviceEvent::Async { .. }) => {}
                 WorkerOutput::Integrity(integrity) => {
                     self.integrity = integrity;

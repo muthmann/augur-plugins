@@ -403,11 +403,8 @@ impl StageAA1Plugin {
             .get_or_insert(frame.window_start_us());
 
         if self.state == RunState::Reference {
-            if self.reference_counts.len()
-                != frame.width() as usize * frame.height() as usize
-            {
-                self.reference_counts =
-                    vec![0; frame.width() as usize * frame.height() as usize];
+            if self.reference_counts.len() != frame.width() as usize * frame.height() as usize {
+                self.reference_counts = vec![0; frame.width() as usize * frame.height() as usize];
             }
             for event in frame.events() {
                 let idx = event.y as usize * frame.width() as usize + event.x as usize;
@@ -715,8 +712,7 @@ impl StageAA1Plugin {
                 format!(
                     "{}/{} frequencies",
                     engine.results.len(),
-                    engine.results.len()
-                        + if engine.is_finished() { 0 } else { 1 }
+                    engine.results.len() + if engine.is_finished() { 0 } else { 1 }
                 )
             })
             .unwrap_or_else(|| "—".into());
@@ -786,7 +782,9 @@ fn results_json(engine: &SweepEngine) -> Value {
 }
 
 fn run_data_dir() -> PathBuf {
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default();
     home.join(".augur").join("stage-a-runs")
 }
 

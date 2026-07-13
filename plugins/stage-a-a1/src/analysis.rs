@@ -112,8 +112,9 @@ pub fn rayleigh_test(phases: &[f64]) -> RayleighResult {
     let r = (c * c + s * s).sqrt() / n as f64;
     let z = n as f64 * r * r;
     let nf = n as f64;
-    let p = (-z).exp() * (1.0 + (2.0 * z - z * z) / (4.0 * nf)
-        - (24.0 * z - 132.0 * z * z + 76.0 * z.powi(3) - 9.0 * z.powi(4)) / (288.0 * nf * nf));
+    let p = (-z).exp()
+        * (1.0 + (2.0 * z - z * z) / (4.0 * nf)
+            - (24.0 * z - 132.0 * z * z + 76.0 * z.powi(3) - 9.0 * z.powi(4)) / (288.0 * nf * nf));
     RayleighResult {
         n,
         r,
@@ -283,7 +284,8 @@ fn standard_normal_cdf(z: f64) -> f64 {
     let t = 1.0 / (1.0 + 0.327_591_1 * x.abs());
     let poly = t
         * (0.254_829_592
-            + t * (-0.284_496_736 + t * (1.421_413_741 + t * (-1.453_152_027 + t * 1.061_405_429))));
+            + t * (-0.284_496_736
+                + t * (1.421_413_741 + t * (-1.453_152_027 + t * 1.061_405_429))));
     let erf_abs = 1.0 - poly * (-x * x).exp();
     let erf = if x >= 0.0 { erf_abs } else { -erf_abs };
     0.5 * (1.0 + erf)
@@ -297,7 +299,9 @@ pub fn fit_min_depth(points: &[DepthPoint]) -> Option<MinDepthFit> {
     let usable: Vec<DepthPoint> = points
         .iter()
         .copied()
-        .filter(|p| p.a > 0.0 && p.events_per_half_cycle.is_finite() && p.events_per_half_cycle <= 1.5)
+        .filter(|p| {
+            p.a > 0.0 && p.events_per_half_cycle.is_finite() && p.events_per_half_cycle <= 1.5
+        })
         .collect();
     if usable.len() < 3 {
         return None;
@@ -308,7 +312,10 @@ pub fn fit_min_depth(points: &[DepthPoint]) -> Option<MinDepthFit> {
         return None;
     }
 
-    let ln_min = usable.iter().map(|p| p.a.ln()).fold(f64::INFINITY, f64::min);
+    let ln_min = usable
+        .iter()
+        .map(|p| p.a.ln())
+        .fold(f64::INFINITY, f64::min);
     let ln_max = usable
         .iter()
         .map(|p| p.a.ln())

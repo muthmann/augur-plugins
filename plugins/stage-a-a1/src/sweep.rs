@@ -48,7 +48,10 @@ pub struct Measurement {
 #[derive(Debug, Clone, PartialEq)]
 pub enum SweepCommand {
     /// Configure the drive and measure at these settings.
-    Measure { frequency_hz: f64, amplitude_dac: u32 },
+    Measure {
+        frequency_hz: f64,
+        amplitude_dac: u32,
+    },
     /// All frequencies finished.
     Finished,
 }
@@ -139,14 +142,16 @@ impl SweepEngine {
         });
 
         if measurement.detected {
-            self.lowest_detected = Some(
-                self.lowest_detected
-                    .map_or(measurement.amplitude_dac, |d| d.min(measurement.amplitude_dac)),
-            );
+            self.lowest_detected =
+                Some(self.lowest_detected.map_or(measurement.amplitude_dac, |d| {
+                    d.min(measurement.amplitude_dac)
+                }));
         } else {
             self.highest_undetected = Some(
                 self.highest_undetected
-                    .map_or(measurement.amplitude_dac, |d| d.max(measurement.amplitude_dac)),
+                    .map_or(measurement.amplitude_dac, |d| {
+                        d.max(measurement.amplitude_dac)
+                    }),
             );
         }
 
