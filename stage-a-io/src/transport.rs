@@ -111,3 +111,17 @@ impl Transport for MockTransport {
         Ok(())
     }
 }
+
+/// Names of serial ports visible to the OS (empty without the `hardware`
+/// feature). Used by plugins to offer a port picker.
+#[cfg(feature = "hardware")]
+pub fn available_port_names() -> Vec<String> {
+    serialport::available_ports()
+        .map(|ports| ports.into_iter().map(|p| p.port_name).collect())
+        .unwrap_or_default()
+}
+
+#[cfg(not(feature = "hardware"))]
+pub fn available_port_names() -> Vec<String> {
+    Vec::new()
+}

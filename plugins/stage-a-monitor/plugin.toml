@@ -1,0 +1,7 @@
+name = "Stage-A Monitor"
+version = "0.2.0"
+description = "Live Teensy photodiode readout, calibrated optical contrast, and gated manual drive control for Stage-A commissioning."
+domain = "stage-a"
+library = "augur_plugin_stage_a_monitor"
+phase = "frame_only"
+min_augur_version = "1.0.0"
