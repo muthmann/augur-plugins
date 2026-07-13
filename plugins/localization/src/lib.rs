@@ -467,7 +467,7 @@ fn build_analysis_image(frame: &PluginFrame<'_>, raw_events: Option<&[FfiCdEvent
             }
             let idx = event.y as usize * frame.width() as usize + event.x as usize;
             let weight = event
-                .timestamp
+                .timestamp_us()
                 .saturating_sub(frame.window_start_us())
                 .max(1) as f64;
             if event.polarity != 0 {
@@ -807,7 +807,7 @@ fn estimate_timestamp_us(
             continue;
         }
         let weight = 1.0 / (1.0 + dist2);
-        weighted_timestamp += event.timestamp as f64 * weight;
+        weighted_timestamp += event.timestamp_us() as f64 * weight;
         weight_sum += weight;
     }
 

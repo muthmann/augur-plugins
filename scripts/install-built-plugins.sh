@@ -96,6 +96,21 @@ find_library_path() {
     return 1
 }
 
+rewrite_macos_install_name() {
+    local installed_library_path="$1"
+
+    if [[ "$(uname -s)" != "Darwin" ]]; then
+        return 0
+    fi
+
+    if ! command -v install_name_tool >/dev/null 2>&1; then
+        echo "warning: install_name_tool not found; leaving ${installed_library_path} with Cargo's build-path dylib id" >&2
+        return 0
+    fi
+
+    install_name_tool -id "@loader_path/$(basename "${installed_library_path}")" "${installed_library_path}"
+}
+
 library_extension="$(library_extension)"
 mkdir -p "${dest_dir}"
 
@@ -128,7 +143,9 @@ for plugin_dir in "${repo_root}"/plugins/*; do
     install_dir="${dest_dir}/${plugin_id}"
     mkdir -p "${install_dir}"
     cp "${manifest_path}" "${install_dir}/plugin.toml"
-    cp "${library_path}" "${install_dir}/$(basename "${library_path}")"
+    installed_library_path="${install_dir}/$(basename "${library_path}")"
+    cp "${library_path}" "${installed_library_path}"
+    rewrite_macos_install_name "${installed_library_path}"
     echo "Installed ${plugin_id} -> ${install_dir}"
     installed=$((installed + 1))
 done

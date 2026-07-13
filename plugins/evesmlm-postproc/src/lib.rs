@@ -10,14 +10,15 @@ pub mod filtering;
 use std::collections::VecDeque;
 
 use augur_plugin_api::{
-    export_plugin, AnalysisSeverity, EventStoreHandle, FfiSubpixelMarker, GlobalSettings,
-    HostContext, HostOutput, HostViewRegistry, Plugin, PluginFrame, PluginInput, SettingItem,
-    SettingKind, SettingsSchema, SettingsSection, StatusEntry, CTX_GLOBAL_SETTINGS,
+    export_plugin, AnalysisSeverity, EventStoreHandle, FfiColorRgba, FfiMarkerOverlayItem,
+    FfiMarkerShape, GlobalSettings, HostContext, HostOutput, HostViewRegistry, Plugin, PluginFrame,
+    PluginInput, SettingItem, SettingKind, SettingsSchema, SettingsSection, StatusEntry,
+    CTX_GLOBAL_SETTINGS,
 };
 pub use augur_plugin_evesmlm_fitting::{
-    current_localizations_dataset, current_localizations_registry, to_localization_results,
-    EveLocalization, EveLocalizationResults, FitMethod, CTX_EVE_LOCALIZATION_RESULTS,
-    CURRENT_LOCALIZATIONS_DATASET_ID,
+    current_localizations_dataset, current_localizations_registry_for_results, localization_row_id,
+    to_localization_results, EveLocalization, EveLocalizationResults, FitMethod,
+    CTX_EVE_LOCALIZATION_RESULTS, CURRENT_LOCALIZATIONS_DATASET_ID, CURRENT_LOCALIZATIONS_LAYER_ID,
 };
 use augur_plugin_types::CTX_LOCALIZATION_RESULTS;
 use evaluation::EvaluationState;
@@ -63,6 +64,7 @@ pub struct EveSmlmPostProcPlugin {
     enabled: bool,
     settings: PostProcSettings,
     current_results: EveLocalizationResults,
+    sensor_dims: Option<(u16, u16)>,
     corrected_history: VecDeque<Vec<(f64, f64)>>,
     evaluation: EvaluationState,
     last_input_count: usize,
@@ -78,6 +80,7 @@ impl Default for EveSmlmPostProcPlugin {
             enabled: false,
             settings: PostProcSettings::default(),
             current_results: EveLocalizationResults::default(),
+            sensor_dims: None,
             corrected_history: VecDeque::new(),
             evaluation: EvaluationState::default(),
             last_input_count: 0,
@@ -91,13 +94,16 @@ impl Default for EveSmlmPostProcPlugin {
 }
 
 impl EveSmlmPostProcPlugin {
-    fn sync_runtime_settings(&mut self, context: &HostContext<'_>) {
+    fn sync_runtime_settings(&mut self, context: &HostContext<'_>, frame: &PluginFrame<'_>) {
         if let Some(settings) = context
             .get::<GlobalSettings>(CTX_GLOBAL_SETTINGS)
             .ok()
             .flatten()
         {
             self.settings.nm_per_pixel = settings.nm_per_pixel;
+            self.sensor_dims = Some((settings.sensor_width, settings.sensor_height));
+        } else {
+            self.sensor_dims = Some((frame.width(), frame.height()));
         }
     }
 
@@ -159,15 +165,34 @@ impl EveSmlmPostProcPlugin {
         self.evaluation.update(&corrected);
 
         if self.settings.show_overlay && !corrected.localizations.is_empty() {
-            let markers: Vec<FfiSubpixelMarker> = corrected
+            let stable_ids: Vec<String> = corrected
                 .localizations
                 .iter()
-                .map(|localization| FfiSubpixelMarker {
+                .map(|localization| localization_row_id(localization).to_string())
+                .collect();
+            let markers: Vec<FfiMarkerOverlayItem> = corrected
+                .localizations
+                .iter()
+                .zip(stable_ids.iter())
+                .map(|(localization, stable_id)| FfiMarkerOverlayItem {
                     x: localization.x as f32,
                     y: localization.y as f32,
+                    shape: FfiMarkerShape::Cross,
+                    size: 5.5,
+                    color: FfiColorRgba::from_rgba(OVERLAY_COLOR),
+                    timestamp_us: localization.timestamp_us,
+                    has_timestamp: true,
+                    stable_id: stable_id.as_str().into(),
+                    source_dataset_id: CURRENT_LOCALIZATIONS_DATASET_ID.into(),
+                    source_row_id: stable_id.as_str().into(),
                 })
                 .collect();
-            output.add_crosshair_markers(&markers, OVERLAY_COLOR, 4);
+            output.add_marker_overlay(
+                &markers,
+                Some(CURRENT_LOCALIZATIONS_DATASET_ID),
+                Some(CURRENT_LOCALIZATIONS_LAYER_ID),
+                Some(self.name()),
+            );
         }
 
         let mut status = format!(
@@ -192,6 +217,7 @@ impl EveSmlmPostProcPlugin {
 
     pub fn reset(&mut self) {
         self.current_results = EveLocalizationResults::default();
+        self.sensor_dims = None;
         self.corrected_history.clear();
         self.evaluation.reset();
         self.last_input_count = 0;
@@ -270,12 +296,12 @@ impl Plugin for EveSmlmPostProcPlugin {
 
     fn process_frame(
         &mut self,
-        _frame: &PluginFrame<'_>,
+        frame: &PluginFrame<'_>,
         output: &mut HostOutput<'_>,
         context: &mut HostContext<'_>,
         _event_store: &EventStoreHandle<'_>,
     ) {
-        self.sync_runtime_settings(context);
+        self.sync_runtime_settings(context, frame);
         let input = match context.get::<EveLocalizationResults>(CTX_EVE_LOCALIZATION_RESULTS) {
             Ok(value) => value,
             Err(err) => {
@@ -592,7 +618,7 @@ impl Plugin for EveSmlmPostProcPlugin {
     }
 
     fn host_views(&self) -> HostViewRegistry {
-        current_localizations_registry()
+        current_localizations_registry_for_results(&self.current_results, self.sensor_dims)
     }
 
     fn host_view_dataset(&self, dataset_id: &str) -> Option<Vec<u8>> {
@@ -618,11 +644,14 @@ mod tests {
 
     fn localization(x: f64, y: f64, n_events: usize) -> EveLocalization {
         EveLocalization {
+            cluster_id: x.to_bits() ^ y.to_bits(),
             x,
             y,
             sigma_x: 1.2,
             sigma_y: 1.2,
             timestamp_us: 0,
+            span_start_us: 0,
+            span_end_us: 0,
             n_events,
             polarity_balance: 0.0,
             fit_residual: 0.1,
@@ -657,6 +686,22 @@ mod tests {
         let correction = drift_correction::estimate_correction_shift(&reference, &reference, 4);
         assert!(correction.0.abs() <= 0.1);
         assert!(correction.1.abs() <= 0.1);
+    }
+
+    #[test]
+    fn current_localizations_descriptor_matches_fitting() {
+        use augur_plugin_evesmlm_fitting::current_localizations_registry_for_results as fitting_registry;
+        let results = EveLocalizationResults::default();
+        let fitting = fitting_registry(&results, None);
+        let postproc = current_localizations_registry_for_results(&results, None);
+        let fitting_json =
+            serde_json::to_value(&fitting).expect("fitting registry should serialize");
+        let postproc_json =
+            serde_json::to_value(&postproc).expect("postproc registry should serialize");
+        assert_eq!(
+            fitting_json, postproc_json,
+            "postproc must mirror fitting's current_localizations descriptor byte-for-byte",
+        );
     }
 
     #[test]
