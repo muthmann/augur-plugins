@@ -2114,6 +2114,7 @@ mod tests {
                 events: augur_plugin_api::FfiSlice::from_slice(
                     &[] as &[augur_plugin_api::FfiCdEvent]
                 ),
+                external_triggers: augur_plugin_api::FfiSlice::default(),
                 window_start_us: self.window_start_us,
                 window_end_us: self.window_start_us + 1,
             }));
