@@ -2,6 +2,7 @@
 members = [
   "stage-a-io",
   "plugins/stage-a-monitor",
+  "plugins/stage-a-a1",
   "plugins/localization",
   "plugins/reconstruction",
   "plugins/focus-metrics",
