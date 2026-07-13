@@ -1,0 +1,18 @@
+[package]
+name = "stage-a-io"
+description = "Shared Stage-A Teensy I/O: PDA1 wire protocol, serial client, PDQ writer, run sidecars, and the calibrated optical-contrast estimator"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+serialport = { version = "4", optional = true }
+
+[features]
+default = ["hardware"]
+# Real serial-port transport. Disable for pure-analysis / CI builds.
+hardware = ["dep:serialport"]

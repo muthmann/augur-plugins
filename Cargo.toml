@@ -1,5 +1,6 @@
 [workspace]
 members = [
+  "stage-a-io",
   "plugins/localization",
   "plugins/reconstruction",
   "plugins/focus-metrics",
