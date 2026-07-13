@@ -17,9 +17,9 @@ use augur_plugin_api::{
     HostViewDescriptor, HostViewKind, HostViewPlacement, HostViewRegistry, Plugin,
     PluginCapabilities, PluginFrame, PluginInput, PluginStateKind, SettingItem, SettingKind,
     SettingsSchema, SettingsSection, StatusEntry, TableColumn, TableColumnData,
-    TableColumnDisplayEntry, TableColumnDisplayFormat, TableColumnDisplayMetadata, TableColumnValues,
-    TableColumnWidthPriority, TableCoordinateSpace2d, TableCoordinateSpace3d, TableDatasetV1,
-    TableRowProvenance, TableSchema, TableValueType,
+    TableColumnDisplayEntry, TableColumnDisplayFormat, TableColumnDisplayMetadata,
+    TableColumnValues, TableColumnWidthPriority, TableCoordinateSpace2d, TableCoordinateSpace3d,
+    TableDatasetV1, TableRowProvenance, TableSchema, TableValueType,
 };
 use serde_json::{json, Value};
 
@@ -63,8 +63,7 @@ const CANDIDATE_FINDING_PIXELS_DATASET_ID: &str =
 const CANDIDATE_FINDINGS_LAYER_ID: &str = "augur.layer.evesmlm.candidate_findings";
 const CANDIDATE_FINDINGS_COMPACT_VIEW_ID: &str =
     "augur.evesmlm.candidates.candidate_findings.compact";
-const CANDIDATE_FINDINGS_TABLE_VIEW_ID: &str =
-    "augur.evesmlm.candidates.candidate_findings.table";
+const CANDIDATE_FINDINGS_TABLE_VIEW_ID: &str = "augur.evesmlm.candidates.candidate_findings.table";
 const CANDIDATE_FINDING_PIXELS_TABLE_VIEW_ID: &str =
     "augur.evesmlm.candidates.candidate_finding_pixels.table";
 
@@ -248,11 +247,12 @@ impl EveSmlmCandidatePlugin {
         }
 
         let method = self.settings.finding_method;
-        self.findings
-            .extend(clusters.iter().cloned().map(|cluster| CandidateFinding {
-                cluster,
-                method,
-            }));
+        self.findings.extend(
+            clusters
+                .iter()
+                .cloned()
+                .map(|cluster| CandidateFinding { cluster, method }),
+        );
         self.findings_generation = self.findings_generation.wrapping_add(1);
     }
 
