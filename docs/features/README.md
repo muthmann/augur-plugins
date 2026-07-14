@@ -5,6 +5,7 @@ Repository-level feature notes for larger plugin suites, interface migrations, a
 ## Available Briefs
 
 - [Stage-A Calibration Plugins](./stage-a.md) — Teensy-driven Stage-A bench stack: `stage-a-io` shared I/O, commissioning monitor, and the A1 minimum-depth Bode sweep.
+- [Stage-A Function Generator](./stage-a-funcgen.md) — familiarisation plugin: manual sine/square/sawtooth drive with photodiode-measured contrast, firmware-faithful mock, and the reserved waveform-drive protocol fields.
 - [EVE Temporal Diagnostics](./evesmlm-temporal-diagnostics.md) — temporal candidate tracking, boundary overlays, and rejected-fit datasets for the eveSMLM pipeline.
 - [Plugin Authoring Docs Refresh](./plugin-authoring-doc-refresh.md) — repo docs synced to the current runtime-only interface, host views, and `GlobalSettings`.
 - [Plugin Install And Reload](./plugin-install-reload.md) — macOS dylib identity fix so installed plugins do not keep pointing back at Cargo's build tree during reloads.

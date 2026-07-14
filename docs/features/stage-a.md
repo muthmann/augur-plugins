@@ -11,6 +11,7 @@
 AugurRs generic host (camera, RAW, EXT_TRIGGER delivery, execution context — ABI v5)
         │
         ├── stage-a-monitor  — commissioning: live photodiode view, manual control
+        ├── stage-a-funcgen  — familiarisation: manual waveform drive (see stage-a-funcgen.md)
         └── stage-a-a1       — A1 minimum-depth a_min(f) sweep
                  │  (exactly one armed plugin owns the device)
                  ▼
@@ -24,8 +25,9 @@ lives entirely in these removable plugins (ADR 005).
 
 | Crate | Role |
 |---|---|
-| `stage-a-io` | PDA1 wire protocol (fragmentation-tolerant, CRC-resyncing parser), v1 ASCII commands with idempotent sequence retries, bounded background I/O worker, `.pdq` writer, JSON run sidecar, calibrated clipping-guarded optical-contrast estimator, mock controller |
+| `stage-a-io` | PDA1 wire protocol (fragmentation-tolerant, CRC-resyncing parser), v1 ASCII commands with idempotent sequence retries, bounded background I/O worker, `.pdq` writer, JSON run sidecar, calibrated clipping-guarded optical-contrast estimator, firmware-faithful mock controller (0.2.0 surface + opt-in v2 waveform extension) |
 | `plugins/stage-a-monitor` | Live decimated waveform, live `a`, integrity status, gated manual CONFIG/START/STOP + expert drive modal |
+| `plugins/stage-a-funcgen` | Manual waveform drive (sine/square/saw, frequency, DAC depth) with photodiode-measured `a`; in-process mock port for hardware-free familiarisation |
 | `plugins/stage-a-a1` | Phase-locked detection (Rayleigh), hardware/software cycle fiducials, bisection + grid sweep, probit `a_min` fit with CI, hot-pixel mask, PDQ + sidecar + results export |
 
 ## Safety model
@@ -65,7 +67,10 @@ dataset/schema consistency.
 ## Known gaps
 
 - Final Teensy DDS/DAC firmware is blocked on the hardware freeze; the
-  sweep runs against the v1 protocol and the mock meanwhile.
+  sweep and the function generator run against the reserved waveform-drive
+  protocol (`stage-a-controller/docs/features/waveform-drive.md`) and the
+  waveform-extended mock meanwhile — firmware 0.2.0 rejects the drive
+  fields with `unknown_config_field` (feature detection).
 - Marker cycles are protocol-reserved but not yet emitted
   (`stage-a-controller/docs/features/a1-marker-cycles.md`).
 - `stage-a-a2` / `stage-a-a3` plugins are not yet implemented; A2
