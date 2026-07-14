@@ -122,6 +122,8 @@ pub struct StageAA1Plugin {
     reference_counts: Vec<u32>,
     sensor_size: (u16, u16),
     run_id: String,
+    /// CONFIG reply fields exactly as the controller ACKed them (sidecar).
+    last_acked_config: BTreeMap<String, String>,
     pdq: Option<PdqWriter>,
     current_phase_histogram: Option<PhaseHistogram>,
     used_hardware_fiducial: bool,
@@ -159,6 +161,7 @@ impl Default for StageAA1Plugin {
             reference_counts: Vec::new(),
             sensor_size: (0, 0),
             run_id: String::new(),
+            last_acked_config: BTreeMap::new(),
             pdq: None,
             current_phase_histogram: None,
             used_hardware_fiducial: false,
@@ -290,6 +293,7 @@ impl StageAA1Plugin {
                     sidecar.firmware_version = self.firmware.clone();
                     sidecar.adc_calibration = self.calibration.clone();
                     sidecar.configured_sample_rate_hz = self.sample_rate_hz as u32;
+                    sidecar.acked_config = self.last_acked_config.clone();
                     sidecar.trigger_source = if self.used_hardware_fiducial {
                         TriggerSource::DrivePhase0
                     } else {
@@ -321,6 +325,10 @@ impl StageAA1Plugin {
 
     fn send_drive(&mut self, frequency_hz: f64, amplitude_dac: u32, purpose: &str) {
         let freq_mhz = (frequency_hz * 1_000.0).round() as i64;
+        // The firmware only accepts CONFIG from SAFE_IDLE/CONFIGURED, so
+        // every new drive point must stop the running acquisition first
+        // (STOP is idempotent and harmless before the first point).
+        self.queue_command("stop", Command::new("STOP").field("reason", "reconfigure"));
         self.queue_command(
             purpose,
             Command::new("CONFIG")
@@ -346,19 +354,26 @@ impl StageAA1Plugin {
         };
         let outputs = worker.drain_outputs();
         let mut stopped = None;
+        let mut watchdog_fault: Option<String> = None;
         for output in outputs {
             match output {
                 WorkerOutput::Reply { tag, result } => {
                     let purpose = self.in_flight.remove(&tag).unwrap_or_default();
                     match result {
-                        Ok(fields) => {
-                            if purpose == "hello" {
+                        Ok(fields) => match purpose.as_str() {
+                            "hello" => {
                                 self.firmware = fields
                                     .get("firmware")
                                     .cloned()
                                     .unwrap_or_else(|| "unknown".into());
                             }
-                        }
+                            // CONFIG ACKs (drive points) go into the sidecar
+                            // verbatim, per the control-software spec.
+                            "reference" | "sweep" => {
+                                self.last_acked_config = fields;
+                            }
+                            _ => {}
+                        },
                         Err(err) => self.last_error = Some(format!("{purpose}: {err}")),
                     }
                 }
@@ -372,9 +387,26 @@ impl StageAA1Plugin {
                         }
                     }
                 }
-                WorkerOutput::Event(DeviceEvent::Async { .. }) => {}
+                WorkerOutput::Event(DeviceEvent::Async { name, fields }) => {
+                    if name == "FAULT" {
+                        watchdog_fault = Some(
+                            fields
+                                .get("code")
+                                .cloned()
+                                .unwrap_or_else(|| "unknown".into()),
+                        );
+                    }
+                }
                 WorkerOutput::Integrity(integrity) => self.integrity = integrity,
                 WorkerOutput::Stopped { reason } => stopped = Some(reason),
+            }
+        }
+        if let Some(code) = watchdog_fault {
+            // The controller safed itself mid-run; the current point is
+            // invalid and the run cannot silently continue.
+            self.last_error = Some(format!("controller fault: {code} — run aborted"));
+            if matches!(self.state, RunState::Reference | RunState::Sweeping) {
+                self.stop_run("watchdog_fault");
             }
         }
         if let Some(reason) = stopped {

@@ -65,6 +65,11 @@ impl FrameHeader {
         if magic != MAGIC {
             return None;
         }
+        // Unknown protocol versions are corruption, not future frames: the
+        // reference host parser resynchronises past them byte by byte.
+        if bytes[4] != PROTOCOL_VERSION {
+            return None;
+        }
         Some(Self {
             version: bytes[4],
             frame_type: FrameType::from_raw(bytes[5]),
@@ -188,6 +193,29 @@ impl SummaryPayload {
 /// firmware's `crc32Update` loop.
 pub fn crc32(data: &[u8]) -> u32 {
     crc32_update(0xFFFF_FFFF, data) ^ 0xFFFF_FFFF
+}
+
+/// Streaming CRC32 with the same parameters as [`crc32`], for hashing data
+/// that is not held in memory at once (e.g. the PDQ file writer).
+#[derive(Debug, Clone, Copy)]
+pub struct Crc32 {
+    state: u32,
+}
+
+impl Default for Crc32 {
+    fn default() -> Self {
+        Self { state: 0xFFFF_FFFF }
+    }
+}
+
+impl Crc32 {
+    pub fn update(&mut self, data: &[u8]) {
+        self.state = crc32_update(self.state, data);
+    }
+
+    pub fn finalize(self) -> u32 {
+        self.state ^ 0xFFFF_FFFF
+    }
 }
 
 fn crc32_update(mut crc: u32, data: &[u8]) -> u32 {

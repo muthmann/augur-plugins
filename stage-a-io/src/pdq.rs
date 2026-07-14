@@ -11,14 +11,14 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use crate::client::StreamIntegrity;
-use crate::wire::{crc32, Frame};
+use crate::wire::{Crc32, Frame};
 
 pub struct PdqWriter {
     path: PathBuf,
     file: BufWriter<File>,
     frames_written: u64,
     bytes_written: u64,
-    running_crc_bytes: Vec<u8>,
+    running_crc: Crc32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,7 +43,7 @@ impl PdqWriter {
             path,
             frames_written: 0,
             bytes_written: 0,
-            running_crc_bytes: Vec::new(),
+            running_crc: Crc32::default(),
         })
     }
 
@@ -52,7 +52,7 @@ impl PdqWriter {
         self.file.write_all(&bytes)?;
         self.frames_written += 1;
         self.bytes_written += bytes.len() as u64;
-        self.running_crc_bytes.extend_from_slice(&bytes);
+        self.running_crc.update(&bytes);
         Ok(())
     }
 
@@ -60,7 +60,7 @@ impl PdqWriter {
     pub fn finish(mut self, integrity: StreamIntegrity) -> std::io::Result<PdqSummary> {
         self.file.flush()?;
         Ok(PdqSummary {
-            file_crc32: crc32(&self.running_crc_bytes),
+            file_crc32: self.running_crc.finalize(),
             path: self.path,
             frames_written: self.frames_written,
             bytes_written: self.bytes_written,

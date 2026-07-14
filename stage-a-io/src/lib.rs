@@ -31,6 +31,7 @@ pub mod wire;
 
 pub use client::{ClientError, DeviceEvent, StageAClient, StreamIntegrity};
 pub use estimator::{estimate_contrast, AdcCalibration, ContrastEstimate, EstimateError};
+pub use mock::{MockController, MockState, MockWave};
 pub use pdq::{PdqSummary, PdqWriter};
 pub use protocol::{Command, ControlMessage, ProtocolError};
 pub use sidecar::{DetectorLoad, IntegrityRecord, RunSidecar, TriggerSource};

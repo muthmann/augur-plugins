@@ -218,6 +218,15 @@ impl StageAMonitorPlugin {
                     let purpose = self.in_flight.remove(&tag).unwrap_or_default();
                     match result {
                         Ok(fields) => self.handle_reply(&purpose, &fields),
+                        Err(err) if err.contains("unknown_config_field") => {
+                            // Feature detection: firmware 0.2.0 has no
+                            // waveform backend and rejects the reserved v2
+                            // drive fields.
+                            self.last_error = Some(format!(
+                                "{purpose}: firmware has no waveform backend (v1) — drive \
+                                 control needs the mock or the future v2 firmware"
+                            ));
+                        }
                         Err(err) => {
                             self.last_error = Some(format!("{purpose}: {err}"));
                         }
@@ -233,7 +242,23 @@ impl StageAMonitorPlugin {
                     FrameType::Summary | FrameType::Marker | FrameType::Control => {}
                     FrameType::Unknown(_) => {}
                 },
-                WorkerOutput::Event(DeviceEvent::Async { .. }) => {}
+                WorkerOutput::Event(DeviceEvent::Async { name, fields }) => {
+                    if name == "FAULT" {
+                        // Firmware watchdog dropped the controller to
+                        // SAFE_IDLE — reflect it instead of showing a stale
+                        // "acquiring" state.
+                        if self.connection == ConnectionState::Acquiring {
+                            self.connection = ConnectionState::Connected;
+                        }
+                        self.last_error = Some(format!(
+                            "controller fault: {} — dropped to SAFE_IDLE",
+                            fields.get("code").map(String::as_str).unwrap_or("unknown")
+                        ));
+                        if let Some(worker) = &self.worker {
+                            let _ = worker.try_send(WorkerRequest::SetPinging(false));
+                        }
+                    }
+                }
                 WorkerOutput::Integrity(integrity) => {
                     self.integrity = integrity;
                 }

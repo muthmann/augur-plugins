@@ -189,9 +189,19 @@ impl<T: Transport> StageAClient<T> {
 
         match frame.header.frame_type {
             FrameType::Control => {
-                // Control payloads are handled by take_reply / async queue;
-                // keep the raw frame so replies can be matched later.
-                self.pending_events.push(DeviceEvent::Data(frame));
+                // Classify control payloads immediately so async notices
+                // (e.g. the watchdog `!FAULT`) surface through poll_events
+                // even when no request is in flight. Replies stay queued as
+                // raw frames for take_reply to match by sequence.
+                match frame.control_text().map(ControlMessage::parse) {
+                    Some(Ok(ControlMessage::Async { name, fields })) => {
+                        self.pending_events
+                            .push(DeviceEvent::Async { name, fields });
+                    }
+                    Some(Ok(_)) => self.pending_events.push(DeviceEvent::Data(frame)),
+                    // Non-UTF8 or malformed control payload: corruption.
+                    _ => self.integrity.skipped_bytes += frame.payload.len() as u64,
+                }
             }
             _ => self.pending_events.push(DeviceEvent::Data(frame)),
         }
@@ -230,16 +240,10 @@ impl<T: Transport> StageAClient<T> {
                 }) if reply_seq == sequence => {
                     result = Some(Err(ClientError::Device { code, detail }));
                 }
-                Ok(ControlMessage::Async { name, fields }) => {
-                    remaining.push(DeviceEvent::Async { name, fields });
-                }
-                // Stale replies to earlier (retried) sequences are dropped;
-                // malformed control payloads count as corruption.
-                Ok(_) => {}
-                Err(_) => {
-                    self.integrity.crc_failures += 0; // parse failure, not CRC
-                    self.integrity.skipped_bytes += frame.payload.len() as u64;
-                }
+                // Stale replies to earlier (retried) sequences are dropped.
+                // Async / malformed payloads never reach here — accept_frame
+                // classifies them before queueing.
+                _ => {}
             }
         }
         self.pending_events = remaining;
@@ -285,14 +289,17 @@ mod tests {
         // The controller swallows the first reply; the client must resend the
         // identical sequence and accept the cached second reply. The mock
         // panics if a retried sequence re-executes the operation.
-        let handle = std::thread::spawn(move || controller.serve_n_commands(2));
+        let handle = std::thread::spawn(move || {
+            controller.serve_n_commands(2);
+            controller
+        });
         let reply = client
             .request(&Command::new("STATUS"))
             .expect("retried STATUS succeeds");
-        handle.join().expect("mock thread joins");
+        let controller = handle.join().expect("mock thread joins");
 
         assert_eq!(reply.get("state").map(String::as_str), Some("SAFE_IDLE"));
-        assert_eq!(reply.get("executions").map(String::as_str), Some("1"));
+        assert_eq!(controller.executions(), 1);
     }
 
     #[test]
@@ -304,14 +311,41 @@ mod tests {
 
         let handle = std::thread::spawn(move || controller.serve_n_commands(1));
         let err = client
-            .request(&Command::new("CONFIG").field("mode", "A9"))
+            .request(
+                &Command::new("CONFIG")
+                    .field("mode", "A9")
+                    .field("rate_hz", 20_000),
+            )
             .expect_err("invalid mode is rejected");
         handle.join().expect("mock thread joins");
 
         match err {
-            ClientError::Device { code, .. } => assert_eq!(code, "BAD_MODE"),
+            ClientError::Device { code, detail } => {
+                assert_eq!(code, "RANGE");
+                assert_eq!(detail, "invalid_mode");
+            }
             other => panic!("expected device error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn watchdog_fault_surfaces_as_async_event_without_a_request_in_flight() {
+        let link = MockLink::new();
+        let mut controller = MockController::new(link.device_end());
+        let mut client =
+            StageAClient::new(link.host_end()).with_reply_timeout(Duration::from_millis(100));
+
+        controller.emit_watchdog_fault();
+        let events = client.poll_events().expect("poll");
+        match events.as_slice() {
+            [DeviceEvent::Async { name, fields }] => {
+                assert_eq!(name, "FAULT");
+                assert_eq!(fields.get("code").map(String::as_str), Some("WATCHDOG"));
+                assert_eq!(fields.get("state").map(String::as_str), Some("SAFE_IDLE"));
+            }
+            other => panic!("expected one async FAULT event, got {other:?}"),
+        }
+        assert!(client.integrity().is_clean());
     }
 
     #[test]
