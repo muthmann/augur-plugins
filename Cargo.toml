@@ -1,9 +1,8 @@
 [workspace]
 members = [
   "stage-a-io",
-  "plugins/stage-a-monitor",
-  "plugins/stage-a-a1",
-  "plugins/stage-a-funcgen",
+  "plugins/stage-a-modulation",
+  "plugins/stage-a-photodiode",
   "plugins/localization",
   "plugins/reconstruction",
   "plugins/focus-metrics",
@@ -29,3 +28,4 @@ egui = "0.27"
 rustfft = "6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serialport = "4"

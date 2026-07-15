@@ -1,10 +1,10 @@
 [package]
-name = "augur-plugin-stage-a-monitor"
+name = "augur-plugin-stage-a-modulation"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Stage-A commissioning monitor: live photodiode readout, calibrated optical contrast, and gated manual Teensy drive control."
+description = "Stage-A laser modulation control: one capped power slider plus constant/sine/square drive of the Teensy DAC (J23), applied immediately."
 
 [lib]
 crate-type = ["cdylib", "rlib"]

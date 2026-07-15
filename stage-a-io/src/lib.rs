@@ -1,7 +1,8 @@
 //! # stage-a-io
 //!
-//! Shared research-owned I/O library for the Stage-A camera-calibration
-//! plugins (`stage-a-monitor`, `stage-a-a1`, `stage-a-a2`, `stage-a-a3`).
+//! Shared research-owned I/O library for the Stage-A bench plugins
+//! (currently `stage-a-modulation`; the future A1–A3 experiment plugins
+//! build on it too — see ADR 006).
 //!
 //! Scope, per the Stage-A control-software specification:
 //! - the v1 ASCII command grammar and PDA1 binary frame format (wire-

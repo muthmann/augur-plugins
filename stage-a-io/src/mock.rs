@@ -1,12 +1,13 @@
 //! Mock Stage-A controller for tests and hardware-free plugin development.
 //!
-//! Mirrors firmware 0.2.0 (`stage-a-controller/src/main.cpp`) faithfully:
-//! the same verbs (`HELLO`, `STATUS`, `CONFIG`, `START`, `STOP`, `PING`),
-//! the same state machine (`SAFE_IDLE` → `CONFIGURED` → `RUNNING`), the
-//! same error codes/details (`PROTOCOL`, `RANGE`, `STATE`, `SYNTAX`,
+//! Mirrors firmware 0.3.0 (`stage-a-controller/src/main.cpp`) faithfully:
+//! the same verbs (`HELLO`, `STATUS`, `CONFIG`, `START`, `STOP`, `PING`,
+//! `MOD`), the same state machine (`SAFE_IDLE` → `CONFIGURED` → `RUNNING`),
+//! the same error codes/details (`PROTOCOL`, `RANGE`, `STATE`, `SYNTAX`,
 //! `VERB`), the same single-entry idempotent reply cache, and rejection of
 //! unknown `CONFIG` fields — which is the host's feature-detection
-//! mechanism, so it must never be papered over here.
+//! mechanism, so it must never be papered over here. `MOD` is set-and-hold
+//! exactly like the firmware: `STOP` does not touch the modulation state.
 //!
 //! [`MockController::with_waveform_extension`] additionally models the
 //! *proposed* v2 waveform firmware (`stage-a-controller/docs/features/`
@@ -24,6 +25,9 @@ pub const MOCK_MAX_RATE_HZ: u32 = 100_000;
 pub const MOCK_MAX_BLOCK_SAMPLES: u32 = 256;
 /// Proposed v2 waveform ceiling (matches the drive UI bound: 200 kHz).
 pub const MOCK_MAX_FREQ_MHZ: u32 = 200_000_000;
+/// Firmware 0.3.0 `MOD` frequency window (`board_config.h`).
+pub const MOCK_MOD_MIN_FREQ_MHZ: u32 = 10;
+pub const MOCK_MOD_MAX_FREQ_MHZ: u32 = 2_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MockState {
@@ -111,6 +115,12 @@ pub struct MockController<T: Transport> {
     out_sequence: u32,
     line_buffer: Vec<u8>,
     sample_index: u64,
+    // Firmware 0.3.0 MOD state (set-and-hold, independent of acquisition).
+    mod_wave: &'static str,
+    mod_level: u32,
+    mod_min: u32,
+    mod_freq_mhz: u32,
+    mod_code: u32,
     /// Synthetic optics for [`MockController::emit_configured_block`]:
     /// photodiode code = dark + span * sin²(π/2 · drive/4095).
     pub synth_dark_code: f64,
@@ -134,6 +144,11 @@ impl<T: Transport> MockController<T> {
             out_sequence: 0,
             line_buffer: Vec::new(),
             sample_index: 0,
+            mod_wave: "OFF",
+            mod_level: 0,
+            mod_min: 0,
+            mod_freq_mhz: 0,
+            mod_code: 0,
             synth_dark_code: 40.0,
             synth_span_codes: 3_800.0,
             synth_center: 2_048.0,
@@ -273,19 +288,20 @@ impl<T: Transport> MockController<T> {
                     return format!("-{sequence} ERR code=PROTOCOL detail=requires_v1");
                 }
                 let capabilities = if self.waveform_extension {
-                    " capabilities=A1,A2,A3,WAVE"
+                    " capabilities=MOD,PDSTREAM,WAVE"
                 } else {
-                    ""
+                    " capabilities=MOD,PDSTREAM"
                 };
                 format!(
-                    "+{sequence} OK protocol=1 firmware=0.2.0-mock board=MOCK adc_bits=12 \
+                    "+{sequence} OK protocol=1 firmware=0.3.0-mock board=MOCK adc_bits=12 \
                      max_rate_hz={MOCK_MAX_RATE_HZ} dac=AD5628 dac_bus=SPI1 dac_cs=29 \
-                     dac_channel=1.4 dac_address=3{capabilities}"
+                     dac_channel=1.4 dac_address=3 pd_pin=A4{capabilities}"
                 )
             }
             "STATUS" => format!(
                 "+{sequence} OK state={} mode={} rate_hz={} block_samples={} raw={} summary={} \
-                 sample_index={} dropped=0 marker_drops=0 dac=1.4/3 code=0",
+                 sample_index={} dropped=0 marker_drops=0 dac=1.4/3 code={} mod_wave={} \
+                 mod_level={} mod_min={} mod_freq_mhz={}",
                 self.state.name(),
                 self.config.mode,
                 self.config.rate_hz,
@@ -293,8 +309,14 @@ impl<T: Transport> MockController<T> {
                 u8::from(self.config.raw),
                 u8::from(self.config.summary),
                 self.sample_index,
+                self.mod_code,
+                self.mod_wave,
+                self.mod_level,
+                self.mod_min,
+                self.mod_freq_mhz,
             ),
             "CONFIG" => self.execute_config(fields, sequence),
+            "MOD" => self.execute_mod(fields, sequence),
             "START" => {
                 if self.state != MockState::Configured {
                     return format!("-{sequence} ERR code=STATE detail=configure_before_start");
@@ -400,6 +422,86 @@ impl<T: Transport> MockController<T> {
             self.config.block_samples,
             u8::from(self.config.raw),
             u8::from(self.config.summary),
+        )
+    }
+
+    /// Firmware 0.3.0 `MOD` handler: same field grammar, validation order,
+    /// error details, and reply shape as `main.cpp`.
+    fn execute_mod(&mut self, fields: &[(String, String)], sequence: u32) -> String {
+        let err = |code: &str, detail: &str| format!("-{sequence} ERR code={code} detail={detail}");
+        let mut wave: Option<&'static str> = None;
+        let mut level = 0_u32;
+        let mut saw_level = false;
+        let mut min_level = 0_u32;
+        let mut freq_mhz = 0_u32;
+        let mut saw_freq = false;
+        for (key, value) in fields {
+            match key.as_str() {
+                "wave" => {
+                    wave = Some(match value.as_str() {
+                        "OFF" => "OFF",
+                        "CONST" => "CONST",
+                        "SINE" => "SINE",
+                        "SQUARE" => "SQUARE",
+                        _ => return err("RANGE", "invalid_wave"),
+                    });
+                }
+                "level" => match value.parse::<u32>() {
+                    Ok(parsed) if parsed <= 4_095 => {
+                        level = parsed;
+                        saw_level = true;
+                    }
+                    _ => return err("RANGE", "invalid_level"),
+                },
+                "min" => match value.parse::<u32>() {
+                    Ok(parsed) if parsed <= 4_095 => min_level = parsed,
+                    _ => return err("RANGE", "invalid_min"),
+                },
+                "freq_mhz" => match value.parse::<u32>() {
+                    Ok(parsed) => {
+                        freq_mhz = parsed;
+                        saw_freq = true;
+                    }
+                    _ => return err("RANGE", "invalid_freq_mhz"),
+                },
+                _ => return err("SYNTAX", "unknown_mod_field"),
+            }
+        }
+        let Some(wave) = wave else {
+            return err("SYNTAX", "wave_required");
+        };
+        let periodic = wave == "SINE" || wave == "SQUARE";
+        if wave != "OFF" && !saw_level {
+            return err("SYNTAX", "level_required");
+        }
+        if periodic && !saw_freq {
+            return err("SYNTAX", "freq_mhz_required");
+        }
+        if min_level > level {
+            return err("RANGE", "min_above_level");
+        }
+        if periodic && !(MOCK_MOD_MIN_FREQ_MHZ..=MOCK_MOD_MAX_FREQ_MHZ).contains(&freq_mhz) {
+            return err("RANGE", "mod_rejected");
+        }
+        if wave == "OFF" {
+            level = 0;
+            min_level = 0;
+            freq_mhz = 0;
+        }
+        self.mod_wave = wave;
+        self.mod_level = level;
+        self.mod_min = if wave == "CONST" { level } else { min_level };
+        self.mod_freq_mhz = if periodic { freq_mhz } else { 0 };
+        // Same initial output as the firmware engine: CONST/OFF hold level,
+        // square starts low, sine starts at the center.
+        self.mod_code = match wave {
+            "SQUARE" => self.mod_min,
+            "SINE" => (self.mod_min + self.mod_level) / 2,
+            _ => level,
+        };
+        format!(
+            "+{sequence} OK mod_wave={} mod_level={} mod_min={} mod_freq_mhz={} code={}",
+            self.mod_wave, self.mod_level, self.mod_min, self.mod_freq_mhz, self.mod_code
         )
     }
 
@@ -615,20 +717,64 @@ mod tests {
     }
 
     #[test]
-    fn hello_requires_protocol_v1_and_advertises_capabilities_only_with_extension() {
+    fn hello_requires_protocol_v1_and_advertises_capabilities() {
         let link = MockLink::new();
         let mut host = link.host_end();
         let mut controller = MockController::new(link.device_end());
         request(&mut controller, "@1 HELLO");
         assert!(last_control_text(&mut host).contains("code=PROTOCOL detail=requires_v1"));
         request(&mut controller, "@2 HELLO protocol=1");
-        assert!(!last_control_text(&mut host).contains("capabilities"));
+        assert!(last_control_text(&mut host).contains("capabilities=MOD,PDSTREAM"));
 
         let link = MockLink::new();
         let mut host = link.host_end();
         let mut controller = MockController::new(link.device_end()).with_waveform_extension();
         request(&mut controller, "@1 HELLO protocol=1");
-        assert!(last_control_text(&mut host).contains("capabilities=A1,A2,A3,WAVE"));
+        assert!(last_control_text(&mut host).contains("capabilities=MOD,PDSTREAM,WAVE"));
+    }
+
+    #[test]
+    fn mod_command_validates_and_holds_across_stop() {
+        let link = MockLink::new();
+        let mut host = link.host_end();
+        let mut controller = MockController::new(link.device_end());
+
+        // Validation mirrors the firmware error details.
+        request(&mut controller, "@1 MOD level=1000");
+        assert!(last_control_text(&mut host).contains("code=SYNTAX detail=wave_required"));
+        request(&mut controller, "@2 MOD wave=SINE level=1000");
+        assert!(last_control_text(&mut host).contains("code=SYNTAX detail=freq_mhz_required"));
+        request(
+            &mut controller,
+            "@3 MOD wave=SQUARE level=100 min=200 freq_mhz=1000",
+        );
+        assert!(last_control_text(&mut host).contains("code=RANGE detail=min_above_level"));
+        request(
+            &mut controller,
+            "@4 MOD wave=SINE level=1000 freq_mhz=99000000",
+        );
+        assert!(last_control_text(&mut host).contains("code=RANGE detail=mod_rejected"));
+
+        // CONST applies immediately; STATUS echoes it; STOP does not clear it.
+        request(&mut controller, "@5 MOD wave=CONST level=1234");
+        assert!(last_control_text(&mut host)
+            .contains("mod_wave=CONST mod_level=1234 mod_min=1234 mod_freq_mhz=0 code=1234"));
+        request(&mut controller, "@6 STOP");
+        request(&mut controller, "@7 STATUS");
+        let status = last_control_text(&mut host);
+        assert!(status.contains("code=1234"), "{status}");
+        assert!(status.contains("mod_wave=CONST"), "{status}");
+
+        // Square starts at the min threshold; OFF drops to zero.
+        request(
+            &mut controller,
+            "@8 MOD wave=SQUARE level=2000 min=500 freq_mhz=10000",
+        );
+        assert!(last_control_text(&mut host)
+            .contains("mod_wave=SQUARE mod_level=2000 mod_min=500 mod_freq_mhz=10000 code=500"));
+        request(&mut controller, "@9 MOD wave=OFF");
+        assert!(last_control_text(&mut host)
+            .contains("mod_wave=OFF mod_level=0 mod_min=0 mod_freq_mhz=0 code=0"));
     }
 
     #[test]

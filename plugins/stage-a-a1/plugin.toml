@@ -1,7 +1,0 @@
-name = "Stage-A A1 Min-Depth"
-version = "0.2.0"
-description = "Event-native Bode calibration: a_min(f) via phase-locked detection, drive bisection, and probit fitting."
-domain = "stage-a"
-library = "augur_plugin_stage_a_a1"
-phase = "raw_events"
-min_augur_version = "1.0.0"

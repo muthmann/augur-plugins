@@ -1,10 +1,10 @@
 [package]
-name = "augur-plugin-stage-a-a1"
+name = "augur-plugin-stage-a-photodiode"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Stage-A A1 event-native Bode calibration: minimum-depth a_min(f) sweep with phase-locked detection."
+description = "Stage-A photodiode readout (SMA5/pin 18/A4) from the Teensy stream port: raw values or excitation power I_exc = I_tot - I_pd."
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -12,4 +12,4 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 augur-plugin-api.workspace = true
 serde_json.workspace = true
-stage-a-io = { path = "../../stage-a-io" }
+serialport.workspace = true

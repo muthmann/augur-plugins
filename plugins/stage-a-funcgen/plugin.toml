@@ -1,7 +1,0 @@
-name = "Stage-A Function Generator"
-version = "0.2.0"
-description = "Manual Pockels-cell drive control (sine/square/sawtooth, frequency, DAC amplitude) with the resulting optical contrast always measured from the photodiode."
-domain = "stage-a"
-library = "augur_plugin_stage_a_funcgen"
-phase = "frame_only"
-min_augur_version = "1.0.0"

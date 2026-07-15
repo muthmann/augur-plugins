@@ -1,0 +1,7 @@
+name = "Stage-A Modulation"
+version = "0.3.0"
+description = "Laser modulation control: capped power slider plus constant/sine/square drive of the Teensy DAC (J23), applied immediately."
+domain = "stage-a"
+library = "augur_plugin_stage_a_modulation"
+phase = "frame_only"
+min_augur_version = "1.0.0"
