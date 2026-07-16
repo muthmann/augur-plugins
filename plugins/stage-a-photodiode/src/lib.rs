@@ -1,11 +1,13 @@
 //! Stage-A photodiode readout.
 //!
-//! Reads the free-running ASCII stream the `stage-a-controller` firmware
-//! (0.3.0+, `USB_DUAL_SERIAL`) emits on its **second** USB serial port:
-//! one `PD code=<mean> n=<reads> t_ms=<millis>` line every 20 ms from the
-//! photodiode on board SMA5 → Teensy pin 18 / A4. The port carries no
+//! Reads the free-running PDA1 binary frame stream the `stage-a-controller`
+//! firmware (0.4.0+, `USB_DUAL_SERIAL`) emits on its **second** USB serial
+//! port: `SamplesU16` frames at `pd_stream_rate_hz` (20 kSa/s default) from
+//! the photodiode on board SMA5 → Teensy pin 18 / A4. The port carries no
 //! commands, so opening it is side-effect free; the command port is owned by
-//! `stage-a-modulation`.
+//! `stage-a-modulation`. While a command-port acquisition runs the firmware
+//! mirrors its blocks here (flag 0x0001) — every rate change or sample-index
+//! jump is treated as a segment restart.
 //!
 //! Two display modes:
 //! - **RAW**: the ADC code and its voltage (`V = code · 3.3 / 4095`);
@@ -13,6 +15,11 @@
 //!   path and sees the light removed from the beam, `I_pd = I_tot − I_exc`.
 //!   Given the user-set reference `I_tot` (in photodiode volts), the plugin
 //!   shows `I_exc = I_tot − V_pd`.
+//!
+//! The chart decimates the visible window into min/mean/max envelope buckets
+//! and overlays a moving average whose window is either a fixed sample count
+//! or — for modulated signals — one full period of a user-given frequency,
+//! which makes the mean independent of the modulation phase.
 
 use std::collections::VecDeque;
 use std::io::Read;
@@ -29,6 +36,7 @@ use augur_plugin_api::{
     TableSchema, TableValueType,
 };
 use serde_json::{json, Value};
+use stage_a_io::{FrameParser, ParseEvent};
 
 const SERIES_DATASET_ID: &str = "stage-a-photodiode.series";
 const SERIES_VIEW_ID: &str = "stage-a-photodiode.series.view";
@@ -37,8 +45,17 @@ const STATUS_VIEW_ID: &str = "stage-a-photodiode.status.view";
 
 const ADC_FULL_SCALE_VOLTS: f64 = 3.3;
 const ADC_MAX_CODE: f64 = 4_095.0;
-/// Ring capacity: > 2.5 minutes at the firmware's 50 lines/s.
-const RING_CAPACITY: usize = 8_192;
+/// Longest raw history kept, in seconds of samples at the active stream rate.
+const RING_SECONDS: f64 = 130.0;
+/// Absolute sample cap guarding against absurd advertised rates (8 MiB of
+/// codes at most).
+const RING_MAX_SAMPLES: usize = 4_000_000;
+/// Envelope buckets per rendered chart line; keeps the plot payload bounded
+/// no matter how many raw samples the window covers.
+const MAX_PLOT_BUCKETS: usize = 1_000;
+/// The firmware's default stream rate; the mock mirrors it.
+const MOCK_RATE_HZ: u32 = 20_000;
+const MOCK_BLOCK_SAMPLES: usize = 256;
 
 fn code_to_volts(code: f64) -> f64 {
     code * ADC_FULL_SCALE_VOLTS / ADC_MAX_CODE
@@ -65,45 +82,56 @@ impl Mode {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct PdSample {
-    t_ms: u64,
-    code: f64,
-}
-
-/// Parses one firmware stream line: `PD code=<f> n=<u> t_ms=<u>`.
-fn parse_pd_line(line: &str) -> Option<PdSample> {
-    let rest = line.trim().strip_prefix("PD ")?;
-    let mut code = None;
-    let mut t_ms = None;
-    for token in rest.split_ascii_whitespace() {
-        let (key, value) = token.split_once('=')?;
-        match key {
-            "code" => code = value.parse::<f64>().ok(),
-            "t_ms" => t_ms = value.parse::<u64>().ok(),
-            "n" => {}
-            _ => return None,
-        }
-    }
-    Some(PdSample {
-        t_ms: t_ms?,
-        code: code?.clamp(0.0, ADC_MAX_CODE),
-    })
-}
-
 #[derive(Default)]
 struct SharedState {
-    samples: VecDeque<PdSample>,
-    latest: Option<PdSample>,
+    /// Sample rate of the current segment (from the frame headers).
+    rate_hz: u32,
+    /// Device sample index of `samples.front()` within the current segment.
+    ring_first_index: u64,
+    samples: VecDeque<u16>,
+    latest: Option<u16>,
+    /// Cumulative firmware-side drop counter (latest header value).
+    device_dropped: u32,
+    crc_failures: u64,
+    resync_bytes: u64,
+    /// Segment restarts observed (rate changes, index jumps, reconnects).
+    segments: u64,
     error: Option<String>,
 }
 
 impl SharedState {
-    fn push(&mut self, sample: PdSample) {
-        self.latest = Some(sample);
-        self.samples.push_back(sample);
-        while self.samples.len() > RING_CAPACITY {
-            self.samples.pop_front();
+    fn ring_capacity(rate_hz: u32) -> usize {
+        ((f64::from(rate_hz.max(1)) * RING_SECONDS) as usize).min(RING_MAX_SAMPLES)
+    }
+
+    /// Ingests one `SamplesU16` frame. Any discontinuity — rate change,
+    /// sample-index jump (drops, acquisition handover), reconnect — restarts
+    /// the ring: within a segment `index / rate` is a consistent time base.
+    fn ingest(&mut self, first_index: u64, rate_hz: u32, device_dropped: u32, codes: &[u16]) {
+        if codes.is_empty() {
+            return;
+        }
+        let expected = self.ring_first_index + self.samples.len() as u64;
+        let continuous =
+            !self.samples.is_empty() && rate_hz == self.rate_hz && first_index == expected;
+        if !continuous {
+            if !self.samples.is_empty() {
+                self.segments += 1;
+            }
+            self.samples.clear();
+            self.ring_first_index = first_index;
+            self.rate_hz = rate_hz;
+        }
+        self.samples.extend(codes.iter().copied());
+        self.latest = codes.last().copied();
+        self.device_dropped = device_dropped;
+        let excess = self
+            .samples
+            .len()
+            .saturating_sub(Self::ring_capacity(rate_hz));
+        if excess > 0 {
+            self.samples.drain(..excess);
+            self.ring_first_index += excess as u64;
         }
     }
 }
@@ -128,7 +156,7 @@ impl Reader {
         let thread_stop = Arc::clone(&stop);
         let join = std::thread::Builder::new()
             .name("stage-a-photodiode".into())
-            .spawn(move || read_lines(port, &shared, &generation, &thread_stop))
+            .spawn(move || read_frames(port, &shared, &generation, &thread_stop))
             .expect("spawning the photodiode reader thread must succeed");
         Ok(Self {
             stop,
@@ -136,7 +164,8 @@ impl Reader {
         })
     }
 
-    /// Hardware-free source: synthesizes a slow sine around 1 V at 50 Hz.
+    /// Hardware-free source: synthesizes a noisy 5 Hz sine around 1 V in
+    /// firmware-sized blocks at the firmware's default stream rate.
     fn spawn_mock(shared: Arc<Mutex<SharedState>>, generation: Arc<AtomicU64>) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
@@ -144,18 +173,24 @@ impl Reader {
             .name("stage-a-photodiode-mock".into())
             .spawn(move || {
                 let start = Instant::now();
+                let mut next_index: u64 = 0;
                 while !thread_stop.load(Ordering::Relaxed) {
-                    let t = start.elapsed().as_secs_f64();
-                    let volts = 1.0 + 0.5 * (2.0 * std::f64::consts::PI * 0.2 * t).sin();
-                    let sample = PdSample {
-                        t_ms: (t * 1_000.0) as u64,
-                        code: volts * ADC_MAX_CODE / ADC_FULL_SCALE_VOLTS,
-                    };
-                    if let Ok(mut state) = shared.lock() {
-                        state.push(sample);
+                    let target = (start.elapsed().as_secs_f64() * f64::from(MOCK_RATE_HZ)) as u64;
+                    let mut produced = false;
+                    while next_index + MOCK_BLOCK_SAMPLES as u64 <= target {
+                        let codes: Vec<u16> = (0..MOCK_BLOCK_SAMPLES)
+                            .map(|i| mock_code(next_index + i as u64))
+                            .collect();
+                        if let Ok(mut state) = shared.lock() {
+                            state.ingest(next_index, MOCK_RATE_HZ, 0, &codes);
+                        }
+                        next_index += MOCK_BLOCK_SAMPLES as u64;
+                        produced = true;
                     }
-                    generation.fetch_add(1, Ordering::Relaxed);
-                    std::thread::sleep(Duration::from_millis(20));
+                    if produced {
+                        generation.fetch_add(1, Ordering::Relaxed);
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
                 }
             })
             .expect("spawning the mock photodiode thread must succeed");
@@ -164,6 +199,17 @@ impl Reader {
             join: Some(join),
         }
     }
+}
+
+/// Deterministic mock sample: 1 V ± 0.5 V sine at 5 Hz plus ~20 mV of hash
+/// noise, so the moving-average indicator has something to smooth.
+fn mock_code(index: u64) -> u16 {
+    let t = index as f64 / f64::from(MOCK_RATE_HZ);
+    let mut hash = index.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    hash ^= hash >> 33;
+    let noise = (hash as f64 / u64::MAX as f64) - 0.5;
+    let volts = 1.0 + 0.5 * (2.0 * std::f64::consts::PI * 5.0 * t).sin() + 0.04 * noise;
+    (volts * ADC_MAX_CODE / ADC_FULL_SCALE_VOLTS).clamp(0.0, ADC_MAX_CODE) as u16
 }
 
 impl Drop for Reader {
@@ -175,14 +221,14 @@ impl Drop for Reader {
     }
 }
 
-fn read_lines(
+fn read_frames(
     mut port: Box<dyn serialport::SerialPort>,
     shared: &Mutex<SharedState>,
     generation: &AtomicU64,
     stop: &AtomicBool,
 ) {
-    let mut line_buffer: Vec<u8> = Vec::with_capacity(256);
-    let mut buf = [0_u8; 512];
+    let mut parser = FrameParser::default();
+    let mut buf = [0_u8; 4_096];
     while !stop.load(Ordering::Relaxed) {
         let read = match port.read(&mut buf) {
             Ok(0) => continue,
@@ -197,22 +243,38 @@ fn read_lines(
                 return;
             }
         };
-        line_buffer.extend_from_slice(&buf[..read]);
-        // Never let garbage (e.g. the wrong, binary port) grow the buffer.
-        if line_buffer.len() > 4_096 {
-            line_buffer.clear();
-        }
-        while let Some(pos) = line_buffer.iter().position(|&b| b == b'\n') {
-            let line: Vec<u8> = line_buffer.drain(..=pos).collect();
-            let Ok(text) = std::str::from_utf8(&line) else {
-                continue;
-            };
-            if let Some(sample) = parse_pd_line(text) {
-                if let Ok(mut state) = shared.lock() {
-                    state.push(sample);
+        parser.extend(&buf[..read]);
+        let mut changed = false;
+        while let Some(event) = parser.next_event() {
+            match event {
+                ParseEvent::Frame(frame) => {
+                    let Some(codes) = frame.samples() else {
+                        continue; // Control/summary frames are not expected here.
+                    };
+                    if let Ok(mut state) = shared.lock() {
+                        state.ingest(
+                            frame.header.first_sample_index,
+                            frame.header.sample_rate_hz,
+                            frame.header.dropped_samples,
+                            &codes,
+                        );
+                    }
+                    changed = true;
                 }
-                generation.fetch_add(1, Ordering::Relaxed);
+                ParseEvent::Corruption {
+                    skipped_bytes,
+                    crc_failures,
+                } => {
+                    if let Ok(mut state) = shared.lock() {
+                        state.resync_bytes += skipped_bytes as u64;
+                        state.crc_failures += crc_failures as u64;
+                    }
+                    changed = true;
+                }
             }
+        }
+        if changed {
+            generation.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -229,6 +291,8 @@ pub struct StageAPhotodiodePlugin {
     mode: Mode,
     reference_volts: f64,
     window_s: f64,
+    avg_samples: usize,
+    avg_sync_freq_hz: f64,
 }
 
 impl Default for StageAPhotodiodePlugin {
@@ -244,6 +308,8 @@ impl Default for StageAPhotodiodePlugin {
             mode: Mode::Raw,
             reference_volts: 3.3,
             window_s: 10.0,
+            avg_samples: 4,
+            avg_sync_freq_hz: 0.0,
         }
     }
 }
@@ -302,58 +368,210 @@ impl StageAPhotodiodePlugin {
         }
     }
 
+    /// Moving-average window in samples: either the fixed sample count or,
+    /// when a sync frequency is set, one full period of that frequency —
+    /// which makes the mean independent of the modulation phase.
+    fn avg_window_samples(&self, rate_hz: u32) -> usize {
+        if self.avg_sync_freq_hz > 0.0 && rate_hz > 0 {
+            (f64::from(rate_hz) / self.avg_sync_freq_hz)
+                .round()
+                .max(1.0) as usize
+        } else {
+            self.avg_samples.max(1)
+        }
+    }
+
+    /// Mean of the newest `avg_window_samples` codes (fewer while filling).
+    fn current_average_code(&self, state: &SharedState) -> Option<f64> {
+        if state.samples.is_empty() {
+            return None;
+        }
+        let window = self
+            .avg_window_samples(state.rate_hz)
+            .min(state.samples.len());
+        let start = state.samples.len() - window;
+        let sum: u64 = state.samples.range(start..).map(|&c| u64::from(c)).sum();
+        Some(sum as f64 / window as f64)
+    }
+
     fn series_dataset(&self) -> Series1dV1 {
-        let (points, y_label) = match self.shared.lock() {
-            Ok(state) => {
-                let latest_ms = state.latest.map_or(0, |s| s.t_ms);
-                let window_ms = (self.window_s.max(0.5) * 1_000.0) as u64;
-                let cutoff = latest_ms.saturating_sub(window_ms);
-                let points: Vec<Series1dPoint> = state
-                    .samples
-                    .iter()
-                    .filter(|s| s.t_ms >= cutoff)
-                    .map(|s| Series1dPoint {
-                        x: (s.t_ms as f64 - latest_ms as f64) / 1_000.0,
-                        y: self.display_volts(s.code),
-                    })
-                    .collect();
-                let label = match self.mode {
-                    Mode::Raw => "photodiode [V]",
-                    Mode::Excitation => "excitation I_tot − I_pd [V]",
-                };
-                (points, label)
-            }
-            Err(_) => (Vec::new(), "photodiode [V]"),
+        let y_label = match self.mode {
+            Mode::Raw => "photodiode [V]",
+            Mode::Excitation => "excitation I_tot − I_pd [V]",
         };
+        let trace_name = match self.mode {
+            Mode::Raw => "photodiode",
+            Mode::Excitation => "excitation",
+        };
+        let empty = |label: &str| Series1dV1 {
+            x_label: "time before now [s]".into(),
+            y_label: label.into(),
+            lines: vec![Series1dLine {
+                name: trace_name.into(),
+                points: Vec::new(),
+            }],
+        };
+        let Ok(state) = self.shared.lock() else {
+            return empty(y_label);
+        };
+        let total = state.samples.len();
+        if total == 0 || state.rate_hz == 0 {
+            return empty(y_label);
+        }
+        let rate = f64::from(state.rate_hz);
+
+        let visible = ((self.window_s.max(0.001) * rate) as usize)
+            .max(2)
+            .min(total);
+        let start = total - visible;
+        let latest_x_index = state.ring_first_index + total as u64 - 1;
+        let bucket_len = visible.div_ceil(MAX_PLOT_BUCKETS).max(1);
+        let decimating = bucket_len > 1;
+
+        let avg_window = self.avg_window_samples(state.rate_hz);
+        let avg_enabled = avg_window > 1;
+        // Prime the running sum with up to `avg_window − 1` samples that
+        // precede the visible slice, so the average is correct from the
+        // first visible point on.
+        let prime_start = start.saturating_sub(avg_window - 1);
+        let mut avg_sum: u64 = 0;
+        let mut avg_count: usize = 0;
+        for &code in state.samples.range(prime_start..start) {
+            avg_sum += u64::from(code);
+            avg_count += 1;
+        }
+
+        let mut mean_points = Vec::with_capacity(MAX_PLOT_BUCKETS + 1);
+        let mut min_points = Vec::with_capacity(if decimating { MAX_PLOT_BUCKETS + 1 } else { 0 });
+        let mut max_points = Vec::with_capacity(if decimating { MAX_PLOT_BUCKETS + 1 } else { 0 });
+        let mut avg_points = Vec::with_capacity(if avg_enabled { MAX_PLOT_BUCKETS + 1 } else { 0 });
+
+        let mut bucket_min = u16::MAX;
+        let mut bucket_max = u16::MIN;
+        let mut bucket_sum: u64 = 0;
+        let mut bucket_n: usize = 0;
+        for (offset, &code) in state.samples.range(start..).enumerate() {
+            let i = start + offset;
+            bucket_min = bucket_min.min(code);
+            bucket_max = bucket_max.max(code);
+            bucket_sum += u64::from(code);
+            bucket_n += 1;
+            if avg_enabled {
+                avg_sum += u64::from(code);
+                avg_count += 1;
+                if avg_count > avg_window {
+                    avg_sum -= u64::from(state.samples[i - avg_window]);
+                    avg_count -= 1;
+                }
+            }
+            if bucket_n == bucket_len || i == total - 1 {
+                let x = (state.ring_first_index + i as u64) as f64 / rate
+                    - latest_x_index as f64 / rate;
+                mean_points.push(Series1dPoint {
+                    x,
+                    y: self.display_volts(bucket_sum as f64 / bucket_n as f64),
+                });
+                if decimating {
+                    // EXCITATION inverts the axis, so min/max swap roles.
+                    let (low, high) = (
+                        self.display_volts(f64::from(bucket_min)),
+                        self.display_volts(f64::from(bucket_max)),
+                    );
+                    min_points.push(Series1dPoint {
+                        x,
+                        y: low.min(high),
+                    });
+                    max_points.push(Series1dPoint {
+                        x,
+                        y: low.max(high),
+                    });
+                }
+                if avg_enabled {
+                    avg_points.push(Series1dPoint {
+                        x,
+                        y: self.display_volts(avg_sum as f64 / avg_count as f64),
+                    });
+                }
+                bucket_min = u16::MAX;
+                bucket_max = u16::MIN;
+                bucket_sum = 0;
+                bucket_n = 0;
+            }
+        }
+
+        let mut lines = vec![Series1dLine {
+            name: trace_name.into(),
+            points: mean_points,
+        }];
+        if decimating {
+            lines.push(Series1dLine {
+                name: "min".into(),
+                points: min_points,
+            });
+            lines.push(Series1dLine {
+                name: "max".into(),
+                points: max_points,
+            });
+        }
+        if avg_enabled {
+            lines.push(Series1dLine {
+                name: format!("avg ({avg_window} spl)"),
+                points: avg_points,
+            });
+        }
         Series1dV1 {
             x_label: "time before now [s]".into(),
             y_label: y_label.into(),
-            lines: vec![Series1dLine {
-                name: match self.mode {
-                    Mode::Raw => "photodiode".into(),
-                    Mode::Excitation => "excitation".into(),
-                },
-                points,
-            }],
+            lines,
         }
     }
 
     fn status_dataset(&self) -> TableDatasetV1 {
-        let (latest, stream_error) = match self.shared.lock() {
-            Ok(state) => (state.latest, state.error.clone()),
-            Err(_) => (None, None),
+        let (latest, rate_hz, average, integrity, stream_error) = match self.shared.lock() {
+            Ok(state) => (
+                state.latest,
+                state.rate_hz,
+                self.current_average_code(&state),
+                format!(
+                    "drops={} crc={} resync={} segments={}",
+                    state.device_dropped, state.crc_failures, state.resync_bytes, state.segments
+                ),
+                state.error.clone(),
+            ),
+            Err(_) => (None, 0, None, String::new(), None),
         };
-        let state = if self.connected() {
+        let state_text = if self.connected() {
             format!("reading ({})", self.port_hint)
         } else {
             "disconnected".into()
         };
+        let rate_text = if rate_hz > 0 {
+            format!("{rate_hz} Sa/s")
+        } else {
+            "—".into()
+        };
         let (code_text, value_text) = match latest {
             Some(sample) => (
-                format!("{:.1}", sample.code),
-                format!("{:.4} V", self.display_volts(sample.code)),
+                format!("{sample}"),
+                format!("{:.4} V", self.display_volts(f64::from(sample))),
             ),
             None => ("—".into(), "—".into()),
+        };
+        let avg_text = match average {
+            Some(code) => {
+                let window = self.avg_window_samples(rate_hz);
+                format!(
+                    "{:.4} V ({} spl ≈ {:.2} ms)",
+                    self.display_volts(code),
+                    window,
+                    if rate_hz > 0 {
+                        window as f64 * 1_000.0 / f64::from(rate_hz)
+                    } else {
+                        0.0
+                    }
+                )
+            }
+            None => "—".into(),
         };
         let error = stream_error
             .or_else(|| self.last_error.clone())
@@ -364,10 +582,13 @@ impl StageAPhotodiodePlugin {
         };
         TableDatasetV1 {
             columns: vec![
-                text_column("state", state),
+                text_column("state", state_text),
                 text_column("mode", self.mode.name().to_owned()),
+                text_column("rate", rate_text),
                 text_column("code", code_text),
                 text_column("value", value_text),
+                text_column("avg", avg_text),
+                text_column("integrity", integrity),
                 text_column("error", error),
             ],
         }
@@ -383,8 +604,11 @@ impl StageAPhotodiodePlugin {
             columns: vec![
                 column("state", "State"),
                 column("mode", "Mode"),
+                column("rate", "Rate"),
                 column("code", "ADC code"),
                 column("value", "Value"),
+                column("avg", "Moving avg"),
+                column("integrity", "Integrity"),
                 column("error", "Last error"),
             ],
             ..TableSchema::default()
@@ -405,8 +629,9 @@ fn serial_ports() -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Finds the Teensy stream port: the dual-serial firmware free-runs `PD`
-/// lines on exactly one of the enumerated ports, so listen briefly on each.
+/// Finds the Teensy stream port: the dual-serial firmware free-runs PDA1
+/// `SamplesU16` frames on exactly one of the enumerated ports, so listen
+/// briefly on each.
 fn resolve_auto_port() -> Result<String, String> {
     let candidates = serial_ports();
     if candidates.is_empty() {
@@ -418,12 +643,14 @@ fn resolve_auto_port() -> Result<String, String> {
         }
     }
     Err(format!(
-        "no port streamed PD lines within 500 ms (tried {})",
+        "no port streamed PDA1 sample frames within 500 ms (tried {})",
         candidates.join(", ")
     ))
 }
 
-/// True when `path` produces a parsable `PD …` line within the probe window.
+/// True when `path` produces a CRC-clean `SamplesU16` frame within the probe
+/// window. The command port emits frames too, but only control replies and
+/// acquisition data — unsolicited sample frames identify the stream port.
 fn probe_pd_stream(path: &str) -> bool {
     let Ok(mut port) = serialport::new(path, 115_200)
         .timeout(Duration::from_millis(100))
@@ -432,20 +659,18 @@ fn probe_pd_stream(path: &str) -> bool {
         return false;
     };
     let deadline = Instant::now() + Duration::from_millis(500);
-    let mut collected: Vec<u8> = Vec::new();
-    let mut buf = [0_u8; 512];
+    let mut parser = FrameParser::default();
+    let mut buf = [0_u8; 4_096];
     while Instant::now() < deadline {
         match port.read(&mut buf) {
             Ok(read) if read > 0 => {
-                collected.extend_from_slice(&buf[..read]);
-                if String::from_utf8_lossy(&collected)
-                    .lines()
-                    .any(|line| parse_pd_line(line).is_some())
-                {
-                    return true;
-                }
-                if collected.len() > 8_192 {
-                    collected.drain(..4_096);
+                parser.extend(&buf[..read]);
+                while let Some(event) = parser.next_event() {
+                    if let ParseEvent::Frame(frame) = event {
+                        if frame.samples().is_some() {
+                            return true;
+                        }
+                    }
                 }
             }
             Ok(_) => {}
@@ -511,7 +736,7 @@ impl Plugin for StageAPhotodiodePlugin {
     }
 
     fn description(&self) -> &'static str {
-        "Live photodiode readout (SMA5/pin 18/A4) from the Teensy stream port: raw values or excitation power I_exc = I_tot − I_pd with a user-set reference."
+        "Live photodiode readout (SMA5/pin 18/A4) from the Teensy PDA1 stream port at the full stream rate: raw values or excitation power I_exc = I_tot − I_pd with a user-set reference."
     }
 
     fn enabled(&self) -> bool {
@@ -561,9 +786,10 @@ impl Plugin for StageAPhotodiodePlugin {
             sections: vec![SettingsSection {
                 label: "Photodiode readout".into(),
                 description: Some(
-                    "Reads the free-running PD stream on the Teensy's SECOND serial port. \
-                     EXCITATION shows I_exc = I_tot − I_pd: the diode sits behind the PBS and \
-                     sees the light removed from the excitation beam."
+                    "Reads the free-running PDA1 sample stream on the Teensy's SECOND serial \
+                     port (firmware 0.4.0+, 20 kSa/s default). EXCITATION shows \
+                     I_exc = I_tot − I_pd: the diode sits behind the PBS and sees the light \
+                     removed from the excitation beam."
                         .into(),
                 ),
                 default_open: true,
@@ -573,8 +799,8 @@ impl Plugin for StageAPhotodiodePlugin {
                         label: "Port".into(),
                         tooltip: Some(
                             "auto (recommended) listens on the attached usbmodem ports and \
-                             picks the one streaming PD lines — the Teensy stream port; \
-                             mock = synthetic data"
+                             picks the one streaming PDA1 sample frames — the Teensy stream \
+                             port; mock = synthetic data"
                                 .into(),
                         ),
                         kind: SettingKind::Enum {
@@ -621,12 +847,46 @@ impl Plugin for StageAPhotodiodePlugin {
                     SettingItem {
                         key: "window_s".into(),
                         label: "Chart window".into(),
-                        tooltip: Some("Seconds of history shown in the live chart".into()),
+                        tooltip: Some(
+                            "Seconds of history shown in the live chart. Short windows \
+                             (≤ 50 ms) resolve individual modulation cycles at 20 kSa/s."
+                                .into(),
+                        ),
                         kind: SettingKind::F64Drag {
-                            min: 1.0,
+                            min: 0.01,
                             max: 120.0,
-                            speed: 1.0,
+                            speed: 0.05,
                             default: self.window_s,
+                        },
+                    },
+                    SettingItem {
+                        key: "avg_samples".into(),
+                        label: "Average window".into(),
+                        tooltip: Some(
+                            "Moving-average window in samples (1 = off). Ignored while \
+                              'Average sync frequency' is set."
+                                .into(),
+                        ),
+                        kind: SettingKind::I64Drag {
+                            min: 1,
+                            max: 1_000_000,
+                            default: self.avg_samples as i64,
+                        },
+                    },
+                    SettingItem {
+                        key: "avg_sync_freq_hz".into(),
+                        label: "Average sync frequency".into(),
+                        tooltip: Some(
+                            "0 = off. When set to the modulation frequency (Hz), the moving \
+                             average spans exactly one full period (window = rate / f), so the \
+                             mean level no longer depends on the modulation phase."
+                                .into(),
+                        ),
+                        kind: SettingKind::F64Drag {
+                            min: 0.0,
+                            max: 100_000.0,
+                            speed: 1.0,
+                            default: self.avg_sync_freq_hz,
                         },
                     },
                 ],
@@ -655,6 +915,8 @@ impl Plugin for StageAPhotodiodePlugin {
             }
             "reference_volts" => Some(json!(self.reference_volts)),
             "window_s" => Some(json!(self.window_s)),
+            "avg_samples" => Some(json!(self.avg_samples)),
+            "avg_sync_freq_hz" => Some(json!(self.avg_sync_freq_hz)),
             _ => None,
         }
     }
@@ -690,7 +952,17 @@ impl Plugin for StageAPhotodiodePlugin {
             }
             "window_s" => {
                 let seconds = value.as_f64().ok_or("window_s must be a number")?;
-                self.window_s = seconds.clamp(1.0, 120.0);
+                self.window_s = seconds.clamp(0.01, 120.0);
+                Ok(())
+            }
+            "avg_samples" => {
+                let samples = value.as_i64().ok_or("avg_samples must be an integer")?;
+                self.avg_samples = samples.clamp(1, 1_000_000) as usize;
+                Ok(())
+            }
+            "avg_sync_freq_hz" => {
+                let freq = value.as_f64().ok_or("avg_sync_freq_hz must be a number")?;
+                self.avg_sync_freq_hz = freq.clamp(0.0, 100_000.0);
                 Ok(())
             }
             _ => Err(format!("unknown setting: {key}")),
@@ -699,28 +971,45 @@ impl Plugin for StageAPhotodiodePlugin {
 
     fn status_entries(&self) -> Vec<StatusEntry> {
         let mut entries = Vec::new();
-        let (latest, stream_error) = match self.shared.lock() {
-            Ok(state) => (state.latest, state.error.clone()),
-            Err(_) => (None, None),
+        let (latest, rate_hz, average, stream_error) = match self.shared.lock() {
+            Ok(state) => (
+                state.latest,
+                state.rate_hz,
+                self.current_average_code(&state),
+                state.error.clone(),
+            ),
+            Err(_) => (None, 0, None, None),
         };
         entries.push(StatusEntry::Text(if self.connected() {
-            format!("Photodiode: reading ({})", self.port_hint)
+            if rate_hz > 0 {
+                format!("Photodiode: reading ({}) @ {rate_hz} Sa/s", self.port_hint)
+            } else {
+                format!("Photodiode: reading ({})", self.port_hint)
+            }
         } else {
             "Photodiode: disconnected".into()
         }));
         if let Some(sample) = latest {
             match self.mode {
                 Mode::Raw => entries.push(StatusEntry::Text(format!(
-                    "PD: code={:.1} ({:.4} V)",
-                    sample.code,
-                    code_to_volts(sample.code)
+                    "PD: code={sample} ({:.4} V)",
+                    code_to_volts(f64::from(sample))
                 ))),
                 Mode::Excitation => entries.push(StatusEntry::Text(format!(
                     "Excitation: {:.4} V (I_tot={:.3} V, PD={:.4} V)",
-                    self.display_volts(sample.code),
+                    self.display_volts(f64::from(sample)),
                     self.reference_volts,
-                    code_to_volts(sample.code)
+                    code_to_volts(f64::from(sample))
                 ))),
+            }
+        }
+        if let Some(average) = average {
+            let window = self.avg_window_samples(rate_hz);
+            if window > 1 {
+                entries.push(StatusEntry::Text(format!(
+                    "Avg ({window} spl): {:.4} V",
+                    self.display_volts(average)
+                )));
             }
         }
         if let Some(error) = stream_error.or_else(|| self.last_error.clone()) {
@@ -790,19 +1079,164 @@ export_plugin!(StageAPhotodiodePlugin);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use stage_a_io::{Frame, FrameHeader, FrameType};
+
+    fn sample_frame(sequence: u32, first_index: u64, rate_hz: u32, codes: &[u16]) -> Vec<u8> {
+        let payload: Vec<u8> = codes.iter().flat_map(|c| c.to_le_bytes()).collect();
+        Frame::build(
+            FrameHeader {
+                version: stage_a_io::wire::PROTOCOL_VERSION,
+                frame_type: FrameType::SamplesU16,
+                flags: 0,
+                sequence,
+                payload_bytes: 0,
+                first_sample_index: first_index,
+                sample_rate_hz: rate_hz,
+                dropped_samples: 0,
+                crc32: 0,
+            },
+            payload,
+        )
+        .to_bytes()
+    }
+
+    fn ingest_bytes(state: &mut SharedState, bytes: &[u8]) {
+        let mut parser = FrameParser::default();
+        parser.extend(bytes);
+        while let Some(event) = parser.next_event() {
+            match event {
+                ParseEvent::Frame(frame) => {
+                    let codes = frame.samples().expect("sample frame");
+                    state.ingest(
+                        frame.header.first_sample_index,
+                        frame.header.sample_rate_hz,
+                        frame.header.dropped_samples,
+                        &codes,
+                    );
+                }
+                ParseEvent::Corruption { .. } => panic!("clean test stream"),
+            }
+        }
+    }
 
     #[test]
-    fn parses_firmware_stream_lines() {
-        let sample = parse_pd_line("PD code=1042.3 n=16 t_ms=123456\n").expect("valid line");
-        assert!((sample.code - 1042.3).abs() < 1e-9);
-        assert_eq!(sample.t_ms, 123_456);
+    fn ingests_contiguous_frames_and_restarts_on_gaps() {
+        let mut state = SharedState::default();
+        ingest_bytes(&mut state, &sample_frame(0, 0, 20_000, &[1, 2, 3, 4]));
+        ingest_bytes(&mut state, &sample_frame(1, 4, 20_000, &[5, 6]));
+        assert_eq!(state.samples.len(), 6);
+        assert_eq!(state.ring_first_index, 0);
+        assert_eq!(state.segments, 0);
+        assert_eq!(state.latest, Some(6));
 
-        assert!(parse_pd_line("garbage").is_none());
-        assert!(parse_pd_line("PD code=abc n=16 t_ms=1").is_none());
-        assert!(parse_pd_line("PD code=10 n=16").is_none(), "t_ms required");
-        // Codes are clamped into the 12-bit range.
-        let clamped = parse_pd_line("PD code=9999 n=1 t_ms=5").expect("parses");
-        assert_eq!(clamped.code, ADC_MAX_CODE);
+        // A sample-index jump (dropped block, acquisition handover) restarts
+        // the segment instead of silently misaligning the time base.
+        ingest_bytes(&mut state, &sample_frame(2, 100, 20_000, &[7, 8]));
+        assert_eq!(state.samples.len(), 2);
+        assert_eq!(state.ring_first_index, 100);
+        assert_eq!(state.segments, 1);
+
+        // So does a rate change (mirrored acquisition at another rate).
+        ingest_bytes(&mut state, &sample_frame(3, 102, 50_000, &[9]));
+        assert_eq!(state.samples.len(), 1);
+        assert_eq!(state.rate_hz, 50_000);
+        assert_eq!(state.segments, 2);
+    }
+
+    #[test]
+    fn ring_is_bounded_by_duration() {
+        let mut state = SharedState::default();
+        let rate = 1_000; // capacity = 130_000 samples
+        let cap = SharedState::ring_capacity(rate);
+        let block: Vec<u16> = (0..1_000).map(|i| (i % 4_096) as u16).collect();
+        let mut index = 0_u64;
+        for _ in 0..(cap / block.len() + 5) {
+            state.ingest(index, rate, 0, &block);
+            index += block.len() as u64;
+        }
+        assert_eq!(state.samples.len(), cap);
+        assert_eq!(
+            state.ring_first_index + state.samples.len() as u64,
+            index,
+            "eviction keeps indexes aligned"
+        );
+        assert_eq!(state.segments, 0, "eviction is not a discontinuity");
+    }
+
+    #[test]
+    fn moving_average_window_follows_the_sync_frequency() {
+        let mut plugin = StageAPhotodiodePlugin::default();
+        assert_eq!(plugin.avg_window_samples(20_000), 4, "sample default");
+        plugin
+            .set_setting("avg_samples", json!(16))
+            .expect("valid setting");
+        assert_eq!(plugin.avg_window_samples(20_000), 16);
+        // One full period of a 2 kHz modulation at 20 kSa/s = 10 samples.
+        plugin
+            .set_setting("avg_sync_freq_hz", json!(2_000.0))
+            .expect("valid setting");
+        assert_eq!(plugin.avg_window_samples(20_000), 10);
+        // Faster than the sample rate clamps to a single sample.
+        plugin
+            .set_setting("avg_sync_freq_hz", json!(50_000.0))
+            .expect("valid setting");
+        assert_eq!(plugin.avg_window_samples(20_000), 1);
+    }
+
+    #[test]
+    fn current_average_uses_the_newest_window() {
+        let plugin = StageAPhotodiodePlugin::default(); // window = 4 samples
+        let mut state = SharedState::default();
+        state.ingest(0, 20_000, 0, &[0, 0, 0, 0, 100, 200, 300, 400]);
+        let average = plugin.current_average_code(&state).expect("has samples");
+        assert!((average - 250.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn series_dataset_decimates_with_envelope_and_average() {
+        let mut plugin = StageAPhotodiodePlugin::default();
+        plugin.set_setting("window_s", json!(120.0)).unwrap();
+        plugin.set_setting("avg_samples", json!(50)).unwrap();
+        {
+            let mut state = plugin.shared.lock().unwrap();
+            let codes: Vec<u16> = (0..40_000_u32).map(|i| (i % 4_000) as u16).collect();
+            state.ingest(0, 20_000, 0, &codes);
+        }
+        let series = plugin.series_dataset();
+        let names: Vec<&str> = series.lines.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(names, ["photodiode", "min", "max", "avg (50 spl)"]);
+        for line in &series.lines {
+            assert!(
+                line.points.len() <= MAX_PLOT_BUCKETS + 1,
+                "{} has {} points",
+                line.name,
+                line.points.len()
+            );
+            assert!(!line.points.is_empty());
+        }
+        // min ≤ mean ≤ max, and x is "seconds before now" ending at 0.
+        let (mean, min, max) = (&series.lines[0], &series.lines[1], &series.lines[2]);
+        for ((m, lo), hi) in mean.points.iter().zip(&min.points).zip(&max.points) {
+            assert!(lo.y <= m.y + 1e-9 && m.y <= hi.y + 1e-9);
+        }
+        let last_x = mean.points.last().unwrap().x;
+        assert!(last_x.abs() < 1e-9, "trace ends at now, got {last_x}");
+    }
+
+    #[test]
+    fn short_windows_render_raw_samples_without_envelope() {
+        let mut plugin = StageAPhotodiodePlugin::default();
+        plugin.set_setting("window_s", json!(0.01)).unwrap(); // 200 samples at 20 kSa/s
+        plugin.set_setting("avg_samples", json!(1)).unwrap(); // average off
+        {
+            let mut state = plugin.shared.lock().unwrap();
+            let codes: Vec<u16> = (0..1_000_u32).map(|i| (i % 4_000) as u16).collect();
+            state.ingest(0, 20_000, 0, &codes);
+        }
+        let series = plugin.series_dataset();
+        let names: Vec<&str> = series.lines.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(names, ["photodiode"], "no envelope, no average");
+        assert_eq!(series.lines[0].points.len(), 200);
     }
 
     #[test]
@@ -820,12 +1254,15 @@ mod tests {
 
     #[test]
     fn mock_reader_fills_the_ring_and_series() {
-        let mut plugin = StageAPhotodiodePlugin::default();
+        let mut plugin = StageAPhotodiodePlugin {
+            port_hint: "mock".into(),
+            ..Default::default()
+        };
         plugin.connect();
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             let count = plugin.shared.lock().unwrap().samples.len();
-            if count >= 5 {
+            if count >= MOCK_BLOCK_SAMPLES {
                 break;
             }
             assert!(Instant::now() < deadline, "mock reader produced no data");
@@ -833,6 +1270,7 @@ mod tests {
         }
         let series = plugin.series_dataset();
         assert!(!series.lines[0].points.is_empty());
+        assert_eq!(plugin.shared.lock().unwrap().rate_hz, MOCK_RATE_HZ);
         let generation = plugin.generation.load(Ordering::Relaxed);
         assert!(generation > 1);
         plugin.disconnect();
@@ -861,18 +1299,5 @@ mod tests {
             .set_setting("mode", json!("RAW"))
             .expect("name accepted");
         assert_eq!(plugin.mode, Mode::Raw);
-    }
-
-    #[test]
-    fn ring_is_bounded() {
-        let mut state = SharedState::default();
-        for i in 0..(RING_CAPACITY + 100) {
-            state.push(PdSample {
-                t_ms: i as u64,
-                code: 1.0,
-            });
-        }
-        assert_eq!(state.samples.len(), RING_CAPACITY);
-        assert_eq!(state.latest.unwrap().t_ms, (RING_CAPACITY + 99) as u64);
     }
 }

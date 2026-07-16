@@ -6,6 +6,7 @@
 
 use std::io;
 use std::sync::{Arc, Mutex};
+#[cfg(feature = "hardware")]
 use std::time::Duration;
 
 pub trait Transport: Send {

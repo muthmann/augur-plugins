@@ -1,5 +1,5 @@
 name = "Stage-A Photodiode"
-version = "0.3.0"
+version = "0.4.0"
 description = "Live photodiode readout (SMA5/pin 18/A4) from the Teensy stream port: raw values or excitation power I_exc = I_tot - I_pd."
 domain = "stage-a"
 library = "augur_plugin_stage_a_photodiode"

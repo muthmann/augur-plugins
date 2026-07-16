@@ -6,7 +6,7 @@ Repository-level feature notes for larger plugin suites, interface migrations, a
 
 - [Stage-A Bench Stack](./stage-a.md) — Teensy-driven Stage-A bench: two serial ports, two minimal plugins, and the shared `stage-a-io` library.
 - [Stage-A Modulation](./stage-a-modulation.md) — capped power slider + constant/sine/square laser-modulation drive on the command port, applied immediately.
-- [Stage-A Photodiode](./stage-a-photodiode.md) — live SMA5/A4 photodiode readout from the stream port: raw values or excitation power `I_exc = I_tot − I_pd`.
+- [Stage-A Photodiode](./stage-a-photodiode.md) — live SMA5/A4 photodiode readout from the PDA1 stream port at 20 kSa/s with envelope decimation and a period-synced moving average: raw values or excitation power `I_exc = I_tot − I_pd`.
 - [EVE Temporal Diagnostics](./evesmlm-temporal-diagnostics.md) — temporal candidate tracking, boundary overlays, and rejected-fit datasets for the eveSMLM pipeline.
 - [Plugin Authoring Docs Refresh](./plugin-authoring-doc-refresh.md) — repo docs synced to the current runtime-only interface, host views, and `GlobalSettings`.
 - [Plugin Install And Reload](./plugin-install-reload.md) — macOS dylib identity fix so installed plugins do not keep pointing back at Cargo's build tree during reloads.
