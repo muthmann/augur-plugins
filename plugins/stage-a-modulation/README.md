@@ -14,13 +14,14 @@ Controls the laser modulation input (Hermit J23, `DAC1.4`) through the Teensy **
 - The panel shows the modulation and live DAC code the **board reports** (from the `MOD` reply and
   a 2 Hz `STATUS` poll), not just what was commanded.
 
-## Actions
+## Connecting
 
-- **Connect / Disconnect** — open/close the command port. Connecting never changes the output;
-  only changes made while connected are transferred.
-- **Output OFF** — sends `MOD wave=OFF` (DAC code 0). Needed because the firmware output is
-  **set-and-hold**: disconnecting, closing the GUI, or a crash leaves the last modulation running
-  (`stage-a-controller` ADR 002).
+- **Connect** is a checkbox in the plugin settings — it opens/closes the command port and works
+  **without a running camera** (device I/O lives in a plugin-owned thread, independent of the
+  host's frame-driven plugin passes). Connecting never changes the output; only changes made
+  while connected are transferred.
+- **Output off = power slider at 0.** The firmware output is **set-and-hold**: disconnecting,
+  closing the GUI, or a crash leaves the last modulation running (`stage-a-controller` ADR 002).
 
 ## Ports
 
@@ -29,5 +30,5 @@ connects to the one that answers `HELLO` — that is always the Teensy command p
 photodiode stream port. Explicit ports remain selectable; `mock` runs an in-process simulated
 controller for hardware-free testing.
 
-Hardware commands only flow while the host execution context allows effects (live capture);
-otherwise the connection is torn down and the panel shows the lock reason.
+Replaying a recording disconnects the plugin defensively; live control itself needs no
+capture session.

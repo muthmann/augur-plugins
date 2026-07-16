@@ -20,12 +20,14 @@ board *reports* (`MOD` reply + 2 Hz `STATUS` poll), not merely the commanded val
 
 - Owns the Teensy **command port** exclusively (one owner per port, ADR 006). The photodiode
   stream port belongs to `stage-a-photodiode`.
-- Uses `stage-a-io` (`StageAClient`, `IoWorker`, `Command`) for framing, idempotent retries, and
-  the bounded background I/O thread; `process_frame()` never blocks on serial.
-- Fail-closed effects gate: the connection only exists while the host execution context allows
-  hardware effects.
+- Uses `stage-a-io` (`StageAClient`, `Command`) for framing and idempotent retries; slider drags
+  coalesce into a single pending command the device thread drains.
+- **Frame-independent**: connecting is a checkbox setting and all serial I/O lives in a
+  plugin-owned device thread, because the host only calls `process_frame()` while camera frames
+  flow — bench control must work with no camera attached. `process_frame()` only disconnects
+  defensively in replay mode.
 - Firmware output is **set-and-hold** (`stage-a-controller` ADR 002): disconnecting does not stop
-  the modulation. The explicit **Output OFF** action sends `MOD wave=OFF`.
+  the modulation. The power slider at 0 is the off switch.
 - Safety invariants enforced plugin-side: `level ≤ max_level`, `min_level ≤ level`; the firmware
   waveform peaks at `level` by construction.
 - `mock` port runs the firmware-faithful `MockController` in-process for hardware-free tests.

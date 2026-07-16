@@ -23,7 +23,8 @@ Two modes:
 - Owns the Teensy **stream port** exclusively (ADR 006); the port carries no commands, so the
   plugin is read-only by construction and needs no protocol library — it depends only on
   `serialport` and parses one line format.
-- Same fail-closed effects gate as the other stage-a plugins for consistent device handling.
+- **Frame-independent**: connecting is a checkbox setting; the reader thread and all views
+  work with no camera attached (the host only calls `process_frame()` while frames flow).
 - Garbage on the port (e.g. the binary command port picked by mistake) parses to nothing and is
   bounded — it can neither grow memory nor produce fake values.
 - `mock` port synthesizes a slow sine for hardware-free testing.

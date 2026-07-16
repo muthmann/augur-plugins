@@ -31,10 +31,12 @@ control plugin's connection.
    mock — the mock now models firmware 0.3.0's `MOD` verb). The A1/A2/A3 experiment plugins will
    build on it again when the bench reaches that stage; the estimator/pdq/sidecar modules remain
    for that purpose even though no current plugin uses them.
-4. **Immediate transfer replaces the Apply-action pattern** in `stage-a-modulation`: setting
-   changes are sent to the device as they happen (the operator's explicit request), still behind
-   the fail-closed execution-context gate. The firmware output is set-and-hold; the explicit
-   "Output OFF" action is the only stop.
+4. **Immediate transfer replaces the Apply-action pattern**, and **all device control is
+   settings-driven** (connect checkbox, slider changes sent as they happen). Host actions and
+   the per-frame effects gate are unsuitable here: the host only runs `process_frame()` while
+   camera frames flow, but the bench must work with no camera attached (amended 2026-07-16).
+   Replay mode still disconnects the modulation plugin defensively. The firmware output is
+   set-and-hold; the power slider at 0 is the off switch.
 
 ## Consequences
 

@@ -22,12 +22,11 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use augur_plugin_api::{
-    export_plugin, EventStoreHandle, HostActionDescriptor, HostActionRequestQueue, HostActionScope,
-    HostContext, HostDatasetDescriptor, HostDatasetKind, HostOutput, HostViewDescriptor,
-    HostViewKind, HostViewPlacement, HostViewRegistry, Plugin, PluginFrame, Series1dLine,
-    Series1dPoint, Series1dV1, SettingItem, SettingKind, SettingsSchema, SettingsSection,
-    StatusEntry, TableColumn, TableColumnData, TableColumnValues, TableDatasetV1, TableSchema,
-    TableValueType, CTX_INVESTIGATION_ACTION_REQUESTS,
+    export_plugin, EventStoreHandle, HostContext, HostDatasetDescriptor, HostDatasetKind,
+    HostOutput, HostViewDescriptor, HostViewKind, HostViewPlacement, HostViewRegistry, Plugin,
+    PluginFrame, Series1dLine, Series1dPoint, Series1dV1, SettingItem, SettingKind, SettingsSchema,
+    SettingsSection, StatusEntry, TableColumn, TableColumnData, TableColumnValues, TableDatasetV1,
+    TableSchema, TableValueType,
 };
 use serde_json::{json, Value};
 
@@ -35,9 +34,6 @@ const SERIES_DATASET_ID: &str = "stage-a-photodiode.series";
 const SERIES_VIEW_ID: &str = "stage-a-photodiode.series.view";
 const STATUS_DATASET_ID: &str = "stage-a-photodiode.status";
 const STATUS_VIEW_ID: &str = "stage-a-photodiode.status.view";
-
-const ACTION_CONNECT: &str = "stage-a-photodiode.connect";
-const ACTION_DISCONNECT: &str = "stage-a-photodiode.disconnect";
 
 const ADC_FULL_SCALE_VOLTS: f64 = 3.3;
 const ADC_MAX_CODE: f64 = 4_095.0;
@@ -226,14 +222,13 @@ pub struct StageAPhotodiodePlugin {
     reader: Option<Reader>,
     shared: Arc<Mutex<SharedState>>,
     generation: Arc<AtomicU64>,
-    effects_blocked_reason: Option<String>,
     last_error: Option<String>,
     // -- settings --
+    connect_requested: bool,
     port_hint: String,
     mode: Mode,
     reference_volts: f64,
     window_s: f64,
-    consumed_action_ids: Vec<u64>,
 }
 
 impl Default for StageAPhotodiodePlugin {
@@ -243,13 +238,12 @@ impl Default for StageAPhotodiodePlugin {
             reader: None,
             shared: Arc::new(Mutex::new(SharedState::default())),
             generation: Arc::new(AtomicU64::new(1)),
-            effects_blocked_reason: None,
             last_error: None,
-            port_hint: "mock".into(),
+            connect_requested: false,
+            port_hint: "auto".into(),
             mode: Mode::Raw,
             reference_volts: 3.3,
             window_s: 10.0,
-            consumed_action_ids: Vec::new(),
         }
     }
 }
@@ -287,7 +281,10 @@ impl StageAPhotodiodePlugin {
         };
         match Reader::spawn_serial(path, Arc::clone(&self.shared), Arc::clone(&self.generation)) {
             Ok(reader) => self.reader = Some(reader),
-            Err(err) => self.last_error = Some(err),
+            Err(err) => {
+                self.last_error = Some(err);
+                self.connect_requested = false;
+            }
         }
         self.generation.fetch_add(1, Ordering::Relaxed);
     }
@@ -303,29 +300,6 @@ impl StageAPhotodiodePlugin {
             Mode::Raw => code_to_volts(code),
             Mode::Excitation => self.reference_volts - code_to_volts(code),
         }
-    }
-
-    fn consume_actions(&mut self, context: &HostContext<'_>) -> Vec<String> {
-        let Ok(Some(queue)) =
-            context.get::<HostActionRequestQueue>(CTX_INVESTIGATION_ACTION_REQUESTS)
-        else {
-            return Vec::new();
-        };
-        let mut consumed = Vec::new();
-        for request in queue.requests {
-            if self.consumed_action_ids.contains(&request.request_id) {
-                continue;
-            }
-            if !request.action_id.starts_with("stage-a-photodiode.") {
-                continue;
-            }
-            self.consumed_action_ids.push(request.request_id);
-            if self.consumed_action_ids.len() > 256 {
-                self.consumed_action_ids.remove(0);
-            }
-            consumed.push(request.action_id);
-        }
-        consumed
     }
 
     fn series_dataset(&self) -> Series1dV1 {
@@ -369,10 +343,10 @@ impl StageAPhotodiodePlugin {
             Ok(state) => (state.latest, state.error.clone()),
             Err(_) => (None, None),
         };
-        let state = match (&self.effects_blocked_reason, self.connected()) {
-            (Some(reason), _) => format!("locked ({reason})"),
-            (None, false) => "disconnected".into(),
-            (None, true) => format!("reading ({})", self.port_hint),
+        let state = if self.connected() {
+            format!("reading ({})", self.port_hint)
+        } else {
+            "disconnected".into()
         };
         let (code_text, value_text) = match latest {
             Some(sample) => (
@@ -547,6 +521,7 @@ impl Plugin for StageAPhotodiodePlugin {
     fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
         if !enabled {
+            self.connect_requested = false;
             self.disconnect();
         }
     }
@@ -562,31 +537,12 @@ impl Plugin for StageAPhotodiodePlugin {
         &mut self,
         _frame: &PluginFrame<'_>,
         _output: &mut HostOutput<'_>,
-        context: &mut HostContext<'_>,
+        _context: &mut HostContext<'_>,
         _event_store: &EventStoreHandle<'_>,
     ) {
-        // The stream port is read-only, but device access still follows the
-        // same fail-closed gate as every stage-a plugin.
-        let execution = context.execution();
-        if !execution.hardware_effects_allowed() {
-            self.effects_blocked_reason = Some(format!(
-                "hardware effects not allowed in {:?}",
-                execution.mode
-            ));
-            if self.reader.is_some() {
-                self.disconnect();
-            }
-            return;
-        }
-        self.effects_blocked_reason = None;
-
-        for action_id in self.consume_actions(context) {
-            match action_id.as_str() {
-                ACTION_CONNECT => self.connect(),
-                ACTION_DISCONNECT => self.disconnect(),
-                _ => {}
-            }
-        }
+        // Reading is settings-driven (connect checkbox) and works without
+        // camera frames; the stream port carries no commands, so no replay
+        // teardown is needed either.
     }
 
     fn settings_schema(&self) -> SettingsSchema {
@@ -624,6 +580,16 @@ impl Plugin for StageAPhotodiodePlugin {
                         kind: SettingKind::Enum {
                             variants: port_variants,
                             default: port_default,
+                        },
+                    },
+                    SettingItem {
+                        key: "connect".into(),
+                        label: "Connect".into(),
+                        tooltip: Some(
+                            "Opens/closes the stream port (read-only, no camera required).".into(),
+                        ),
+                        kind: SettingKind::Bool {
+                            default: self.connect_requested,
                         },
                     },
                     SettingItem {
@@ -679,6 +645,7 @@ impl Plugin for StageAPhotodiodePlugin {
                     .unwrap_or(0);
                 Some(json!(index))
             }
+            "connect" => Some(json!(self.connect_requested)),
             "mode" => {
                 let index = Mode::VARIANTS
                     .iter()
@@ -696,6 +663,16 @@ impl Plugin for StageAPhotodiodePlugin {
         match key {
             "port" => {
                 self.port_hint = variant_path(&enum_choice(&value, &port_variants())?).to_owned();
+                Ok(())
+            }
+            "connect" => {
+                let requested = value.as_bool().ok_or("connect must be a boolean")?;
+                self.connect_requested = requested;
+                if requested {
+                    self.connect();
+                } else {
+                    self.disconnect();
+                }
                 Ok(())
             }
             "mode" => {
@@ -722,9 +699,6 @@ impl Plugin for StageAPhotodiodePlugin {
 
     fn status_entries(&self) -> Vec<StatusEntry> {
         let mut entries = Vec::new();
-        if let Some(reason) = &self.effects_blocked_reason {
-            entries.push(StatusEntry::Text(format!("Hardware locked: {reason}")));
-        }
         let (latest, stream_error) = match self.shared.lock() {
             Ok(state) => (state.latest, state.error.clone()),
             Err(_) => (None, None),
@@ -756,14 +730,6 @@ impl Plugin for StageAPhotodiodePlugin {
     }
 
     fn host_views(&self) -> HostViewRegistry {
-        let action = |id: &str, title: &str| HostActionDescriptor {
-            id: id.into(),
-            title: title.into(),
-            scope: HostActionScope::Dataset {
-                dataset_id: STATUS_DATASET_ID.into(),
-            },
-            param_schema: None,
-        };
         HostViewRegistry {
             datasets: vec![
                 HostDatasetDescriptor {
@@ -799,10 +765,7 @@ impl Plugin for StageAPhotodiodePlugin {
                     kind: HostViewKind::CompactTable,
                 },
             ],
-            actions: vec![
-                action(ACTION_CONNECT, "Connect"),
-                action(ACTION_DISCONNECT, "Disconnect"),
-            ],
+            actions: Vec::new(),
         }
     }
 

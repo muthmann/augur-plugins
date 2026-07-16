@@ -6,45 +6,41 @@
 //! with frequency and a lower threshold for the periodic modes — and every
 //! accepted change is transferred to the Teensy immediately, no Apply button.
 //!
-//! The plugin owns the Teensy **command port** (the first of the two CDC
-//! ports the dual-serial firmware enumerates; the photodiode stream port is
-//! owned by `stage-a-photodiode`). The firmware output is set-and-hold:
-//! disconnecting does NOT switch the modulation off — use the "Output OFF"
-//! action (ADR 002 in `stage-a-controller`).
+//! **Frame-independent by design.** The host only calls `process_frame()`
+//! while camera frames flow, so nothing here depends on it: connecting is a
+//! checkbox *setting* (settings arrive from the UI thread at any time), a
+//! dedicated device thread owns the serial client, and slider changes are
+//! coalesced into a pending-command slot that thread drains. The bench works
+//! with no camera attached. `process_frame()` only tears the connection down
+//! defensively in replay mode.
 //!
-//! Safety contract:
-//! - devices open only when the execution context allows hardware effects;
-//!   anything else tears the connection down (fail closed);
-//! - the level slider cannot exceed the max-level cap, and the firmware
-//!   output can never exceed the slider (square/sine peak at `level`);
-//! - `process_frame()` only drains the bounded I/O worker queues.
+//! The plugin owns the Teensy **command port**; the photodiode stream port is
+//! owned by `stage-a-photodiode`. The firmware output is set-and-hold
+//! (`stage-a-controller` ADR 002): disconnecting does NOT switch the
+//! modulation off — drag the power slider to 0 to drive 0 V.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use augur_plugin_api::{
-    export_plugin, EventStoreHandle, HostActionDescriptor, HostActionRequestQueue, HostActionScope,
-    HostContext, HostDatasetDescriptor, HostDatasetKind, HostOutput, HostViewDescriptor,
-    HostViewKind, HostViewPlacement, HostViewRegistry, Plugin, PluginFrame, SettingItem,
-    SettingKind, SettingsSchema, SettingsSection, StatusEntry, TableColumn, TableColumnData,
-    TableColumnValues, TableDatasetV1, TableSchema, TableValueType,
-    CTX_INVESTIGATION_ACTION_REQUESTS,
+    export_plugin, EventStoreHandle, ExecutionMode, HostContext, HostDatasetDescriptor,
+    HostDatasetKind, HostOutput, HostViewDescriptor, HostViewKind, HostViewPlacement,
+    HostViewRegistry, Plugin, PluginFrame, SettingItem, SettingKind, SettingsSchema,
+    SettingsSection, StatusEntry, TableColumn, TableColumnData, TableColumnValues, TableDatasetV1,
+    TableSchema, TableValueType,
 };
 use serde_json::{json, Value};
-use stage_a_io::{Command, IoWorker, MockController, StageAClient, WorkerOutput, WorkerRequest};
+use stage_a_io::{Command, MockController, StageAClient, Transport};
 
 const STATUS_DATASET_ID: &str = "stage-a-modulation.status";
 const STATUS_VIEW_ID: &str = "stage-a-modulation.status.view";
 
-const ACTION_CONNECT: &str = "stage-a-modulation.connect";
-const ACTION_DISCONNECT: &str = "stage-a-modulation.disconnect";
-const ACTION_OUTPUT_OFF: &str = "stage-a-modulation.output-off";
-
 const MAX_DAC_CODE: i64 = 4_095;
 const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const DEVICE_LOOP_TICK: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -70,6 +66,41 @@ impl Mode {
 
     fn is_periodic(self) -> bool {
         !matches!(self, Self::Const)
+    }
+}
+
+/// State the device thread reports back for the UI (status entries, table).
+#[derive(Default)]
+struct DeviceState {
+    connected: bool,
+    firmware: String,
+    board_code: Option<i64>,
+    board_mod: String,
+    last_error: Option<String>,
+}
+
+/// Everything shared between the plugin (UI thread) and the device thread.
+struct SharedLink {
+    state: Mutex<DeviceState>,
+    /// Latest not-yet-sent command; newer settings overwrite older ones so
+    /// slider drags coalesce instead of queueing.
+    pending: Mutex<Option<Command>>,
+    stop: AtomicBool,
+    generation: AtomicU64,
+}
+
+impl SharedLink {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(DeviceState::default()),
+            pending: Mutex::new(None),
+            stop: AtomicBool::new(false),
+            generation: AtomicU64::new(1),
+        }
+    }
+
+    fn bump(&self) {
+        self.generation.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -113,125 +144,200 @@ impl Drop for MockService {
     }
 }
 
+/// Handle to the running device thread; dropping it stops the thread.
+struct DeviceLink {
+    shared: Arc<SharedLink>,
+    join: Option<JoinHandle<()>>,
+    _mock: Option<MockService>,
+}
+
+impl Drop for DeviceLink {
+    fn drop(&mut self) {
+        self.shared.stop.store(true, Ordering::Relaxed);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+/// Device thread: HELLO once, then drain the pending command slot and poll
+/// STATUS. All serial I/O lives here — the UI thread never blocks.
+fn run_device<T: Transport>(mut client: StageAClient<T>, shared: Arc<SharedLink>) {
+    match client.request(&Command::new("HELLO").field("protocol", 1)) {
+        Ok(fields) => {
+            let mut state = shared.state.lock().expect("device state lock");
+            state.connected = true;
+            state.firmware = fields
+                .get("firmware")
+                .cloned()
+                .unwrap_or_else(|| "unknown".into());
+            let has_mod = fields
+                .get("capabilities")
+                .is_some_and(|caps| caps.split(',').any(|c| c == "MOD"));
+            state.last_error = (!has_mod).then(|| {
+                "firmware has no MOD capability — flash stage-a-controller 0.3.0+".to_owned()
+            });
+        }
+        Err(err) => {
+            let mut state = shared.state.lock().expect("device state lock");
+            state.connected = false;
+            state.last_error = Some(format!("HELLO failed: {err}"));
+            shared.bump();
+            return;
+        }
+    }
+    shared.bump();
+
+    let mut last_status = Instant::now() - STATUS_POLL_INTERVAL;
+    while !shared.stop.load(Ordering::Relaxed) {
+        let pending = shared.pending.lock().expect("pending lock").take();
+        if let Some(command) = pending {
+            let result = client.request(&command);
+            apply_reply(&shared, "MOD", result);
+        } else if last_status.elapsed() >= STATUS_POLL_INTERVAL {
+            last_status = Instant::now();
+            let result = client.request(&Command::new("STATUS"));
+            apply_reply(&shared, "STATUS", result);
+        } else {
+            std::thread::sleep(DEVICE_LOOP_TICK);
+        }
+    }
+
+    let mut state = shared.state.lock().expect("device state lock");
+    state.connected = false;
+    shared.bump();
+}
+
+fn apply_reply(
+    shared: &SharedLink,
+    purpose: &str,
+    result: Result<BTreeMap<String, String>, stage_a_io::ClientError>,
+) {
+    let mut state = shared.state.lock().expect("device state lock");
+    match result {
+        Ok(fields) => {
+            if let Some(code) = fields.get("code").and_then(|v| v.parse::<i64>().ok()) {
+                state.board_code = Some(code);
+            }
+            if let Some(wave) = fields.get("mod_wave") {
+                let level = fields.get("mod_level").map(String::as_str).unwrap_or("?");
+                let min = fields.get("mod_min").map(String::as_str).unwrap_or("?");
+                let freq_mhz = fields
+                    .get("mod_freq_mhz")
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .unwrap_or(0.0);
+                state.board_mod = if wave == "SINE" || wave == "SQUARE" {
+                    format!("{wave} {min}..{level} @ {:.3} Hz", freq_mhz / 1_000.0)
+                } else {
+                    format!("{wave} level={level}")
+                };
+            }
+            if purpose == "MOD" {
+                state.last_error = None;
+            }
+        }
+        Err(err) => state.last_error = Some(format!("{purpose}: {err}")),
+    }
+    drop(state);
+    shared.bump();
+}
+
 pub struct StageAModulationPlugin {
     enabled: bool,
-    // -- device --
-    worker: Option<IoWorker>,
-    mock_service: Option<MockService>,
-    connected: bool,
-    firmware: String,
-    next_tag: u64,
-    in_flight: BTreeMap<u64, String>,
-    last_error: Option<String>,
-    effects_blocked_reason: Option<String>,
-    last_status_poll: Instant,
+    link: Option<DeviceLink>,
+    shared: Arc<SharedLink>,
     // -- settings (every accepted change is sent immediately) --
+    connect_requested: bool,
     port_hint: String,
     max_level: i64,
     level: i64,
     min_level: i64,
     mode: Mode,
     frequency_hz: f64,
-    dirty: bool,
-    // -- board-reported state (from MOD replies and STATUS polls) --
-    board_code: Option<i64>,
-    board_mod: String,
-    dataset_generation: u64,
-    consumed_action_ids: Vec<u64>,
+    last_error: Option<String>,
 }
 
 impl Default for StageAModulationPlugin {
     fn default() -> Self {
         Self {
             enabled: false,
-            worker: None,
-            mock_service: None,
-            connected: false,
-            firmware: String::new(),
-            next_tag: 1,
-            in_flight: BTreeMap::new(),
-            last_error: None,
-            effects_blocked_reason: None,
-            last_status_poll: Instant::now(),
-            port_hint: "mock".into(),
+            link: None,
+            shared: Arc::new(SharedLink::new()),
+            connect_requested: false,
+            port_hint: "auto".into(),
             max_level: MAX_DAC_CODE,
             level: 0,
             min_level: 0,
             mode: Mode::Const,
             frequency_hz: 10.0,
-            dirty: false,
-            board_code: None,
-            board_mod: "—".into(),
-            dataset_generation: 0,
-            consumed_action_ids: Vec::new(),
+            last_error: None,
         }
     }
 }
 
 impl StageAModulationPlugin {
-    fn bump_generation(&mut self) {
-        self.dataset_generation = self.dataset_generation.wrapping_add(1);
-    }
-
-    fn queue_command(&mut self, purpose: &str, command: Command) {
-        let Some(worker) = &self.worker else {
-            self.last_error = Some(format!("{purpose}: no device connection"));
-            return;
-        };
-        let tag = self.next_tag;
-        self.next_tag += 1;
-        match worker.try_send(WorkerRequest::Send { tag, command }) {
-            Ok(()) => {
-                self.in_flight.insert(tag, purpose.to_owned());
-            }
-            Err(err) => self.last_error = Some(format!("{purpose}: {err}")),
-        }
-    }
-
     fn connect(&mut self) {
-        if self.worker.is_some() {
+        if self.link.is_some() {
             return;
         }
+        self.last_error = None;
+        *self.shared.state.lock().expect("device state lock") = DeviceState::default();
+        *self.shared.pending.lock().expect("pending lock") = None;
+        self.shared.stop.store(false, Ordering::Relaxed);
+        self.shared.bump();
+
+        let shared = Arc::clone(&self.shared);
+        let spawn = |name: &str, f: Box<dyn FnOnce() + Send>| {
+            std::thread::Builder::new()
+                .name(name.to_owned())
+                .spawn(f)
+                .expect("spawning the device thread must succeed")
+        };
         if self.port_hint == "mock" {
-            let (service, client) = MockService::spawn();
-            self.mock_service = Some(service);
-            self.worker = Some(IoWorker::spawn(client));
-            self.last_error = None;
+            let (mock, client) = MockService::spawn();
+            let join = spawn(
+                "stage-a-modulation-device",
+                Box::new(move || run_device(client, shared)),
+            );
+            self.link = Some(DeviceLink {
+                shared: Arc::clone(&self.shared),
+                join: Some(join),
+                _mock: Some(mock),
+            });
         } else {
             match open_serial(&self.port_hint) {
                 Ok(client) => {
-                    self.worker = Some(IoWorker::spawn(client));
-                    self.last_error = None;
+                    let join = spawn(
+                        "stage-a-modulation-device",
+                        Box::new(move || run_device(client, shared)),
+                    );
+                    self.link = Some(DeviceLink {
+                        shared: Arc::clone(&self.shared),
+                        join: Some(join),
+                        _mock: None,
+                    });
                 }
                 Err(err) => {
                     self.last_error = Some(err);
-                    return;
+                    self.connect_requested = false;
                 }
             }
         }
-        // Connecting never drives the output: only changes made while
-        // connected are transferred.
-        self.dirty = false;
-        self.queue_command("hello", Command::new("HELLO").field("protocol", 1));
-        self.bump_generation();
+        // Connecting never drives the output (set-and-hold firmware); only
+        // changes made while connected are transferred.
     }
 
-    fn disconnect(&mut self, reason: &str) {
-        if let Some(worker) = self.worker.take() {
-            worker.shutdown(reason);
-        }
-        self.mock_service = None;
-        self.connected = false;
-        self.firmware.clear();
-        self.in_flight.clear();
-        self.board_code = None;
-        self.board_mod = "—".into();
-        self.bump_generation();
+    fn disconnect(&mut self) {
+        self.link = None; // Drop stops and joins the device thread.
+        self.shared.bump();
     }
 
-    /// One MOD command carrying the complete current drive settings.
+    /// Queues one MOD command carrying the complete current drive settings;
+    /// newer changes overwrite queued ones (drag coalescing).
     fn send_modulation(&mut self) {
-        self.dirty = false;
+        if self.link.is_none() {
+            return;
+        }
         let level = self.level.clamp(0, self.max_level);
         let mut command = Command::new("MOD")
             .field("wave", self.mode.name())
@@ -242,103 +348,16 @@ impl StageAModulationPlugin {
                 .field("min", self.min_level.clamp(0, level))
                 .field("freq_mhz", freq_mhz);
         }
-        self.queue_command("mod", command);
+        *self.shared.pending.lock().expect("pending lock") = Some(command);
     }
 
-    fn output_off(&mut self) {
-        self.dirty = false;
-        self.queue_command("mod", Command::new("MOD").field("wave", "OFF"));
-    }
-
-    fn drain_worker(&mut self) {
-        let Some(worker) = &self.worker else {
-            return;
-        };
-        let outputs = worker.drain_outputs();
-        if outputs.is_empty() {
-            return;
-        }
-        let mut stopped: Option<String> = None;
-        for output in outputs {
-            match output {
-                WorkerOutput::Reply { tag, result } => {
-                    let purpose = self.in_flight.remove(&tag).unwrap_or_default();
-                    match result {
-                        Ok(fields) => self.handle_reply(&purpose, &fields),
-                        Err(err) => self.last_error = Some(format!("{purpose}: {err}")),
-                    }
-                }
-                WorkerOutput::Event(_) | WorkerOutput::Integrity(_) => {}
-                WorkerOutput::Stopped { reason } => stopped = Some(reason),
-            }
-        }
-        if let Some(reason) = stopped {
-            self.worker = None;
-            self.mock_service = None;
-            self.connected = false;
-            self.last_error = Some(format!("device connection ended: {reason}"));
-        }
-        self.bump_generation();
-    }
-
-    fn handle_reply(&mut self, purpose: &str, fields: &BTreeMap<String, String>) {
-        if purpose == "hello" {
-            self.firmware = fields
-                .get("firmware")
-                .cloned()
-                .unwrap_or_else(|| "unknown".into());
-            self.connected = true;
-            let has_mod = fields
-                .get("capabilities")
-                .is_some_and(|caps| caps.split(',').any(|c| c == "MOD"));
-            if !has_mod {
-                self.last_error =
-                    Some("firmware has no MOD capability — flash stage-a-controller 0.3.0+".into());
-            }
-        }
-        // MOD replies and STATUS polls both carry code= and mod_* fields.
-        if let Some(code) = fields.get("code").and_then(|v| v.parse::<i64>().ok()) {
-            self.board_code = Some(code);
-        }
-        if let Some(wave) = fields.get("mod_wave") {
-            let level = fields.get("mod_level").map(String::as_str).unwrap_or("?");
-            let min = fields.get("mod_min").map(String::as_str).unwrap_or("?");
-            let freq_mhz = fields
-                .get("mod_freq_mhz")
-                .and_then(|v| v.parse::<f64>().ok())
-                .unwrap_or(0.0);
-            self.board_mod = if wave == "SINE" || wave == "SQUARE" {
-                format!("{wave} {min}..{level} @ {:.3} Hz", freq_mhz / 1_000.0)
-            } else {
-                format!("{wave} level={level}")
-            };
-        }
-        if purpose == "mod" {
-            self.last_error = None;
-        }
-    }
-
-    fn consume_actions(&mut self, context: &HostContext<'_>) -> Vec<String> {
-        let Ok(Some(queue)) =
-            context.get::<HostActionRequestQueue>(CTX_INVESTIGATION_ACTION_REQUESTS)
-        else {
-            return Vec::new();
-        };
-        let mut consumed = Vec::new();
-        for request in queue.requests {
-            if self.consumed_action_ids.contains(&request.request_id) {
-                continue;
-            }
-            if !request.action_id.starts_with("stage-a-modulation.") {
-                continue;
-            }
-            self.consumed_action_ids.push(request.request_id);
-            if self.consumed_action_ids.len() > 256 {
-                self.consumed_action_ids.remove(0);
-            }
-            consumed.push(request.action_id);
-        }
-        consumed
+    #[cfg(test)]
+    fn device_connected(&self) -> bool {
+        self.shared
+            .state
+            .lock()
+            .map(|state| state.connected)
+            .unwrap_or(false)
     }
 
     fn commanded_summary(&self) -> String {
@@ -356,25 +375,39 @@ impl StageAModulationPlugin {
     }
 
     fn status_dataset(&self) -> TableDatasetV1 {
-        let state = match (&self.effects_blocked_reason, self.connected) {
-            (Some(reason), _) => format!("locked ({reason})"),
-            (None, false) => "disconnected".into(),
-            (None, true) => format!("connected ({})", self.firmware),
+        let state = self.shared.state.lock().expect("device state lock");
+        let connection = if state.connected {
+            format!("connected ({})", state.firmware)
+        } else if self.connect_requested {
+            "connecting…".into()
+        } else {
+            "disconnected".into()
         };
-        let board_code = self
+        let board_code = state
             .board_code
             .map_or_else(|| "—".into(), |code| code.to_string());
+        let error = state
+            .last_error
+            .clone()
+            .or_else(|| self.last_error.clone())
+            .unwrap_or_default();
+        let board_mod = if state.board_mod.is_empty() {
+            "—".to_owned()
+        } else {
+            state.board_mod.clone()
+        };
+        drop(state);
         let text_column = |id: &str, value: String| TableColumnData {
             column_id: id.to_owned(),
             values: TableColumnValues::String(vec![value]),
         };
         TableDatasetV1 {
             columns: vec![
-                text_column("state", state),
+                text_column("state", connection),
                 text_column("commanded", self.commanded_summary()),
-                text_column("board_mod", self.board_mod.clone()),
+                text_column("board_mod", board_mod),
                 text_column("board_code", board_code),
-                text_column("error", self.last_error.clone().unwrap_or_default()),
+                text_column("error", error),
             ],
         }
     }
@@ -452,7 +485,7 @@ fn serial_ports() -> Vec<String> {
 /// their USB label (e.g. "(Teensyduino Dual Serial)") for recognisability;
 /// only the leading path is the value.
 fn port_variants() -> Vec<String> {
-    let mut variants = vec!["mock".to_owned(), "auto".to_owned()];
+    let mut variants = vec!["auto".to_owned(), "mock".to_owned()];
     for (name, label) in stage_a_io::transport::available_ports_with_labels() {
         if !(name.contains("cu.usbmodem") || name.contains("ttyACM")) {
             continue;
@@ -501,13 +534,12 @@ impl Plugin for StageAModulationPlugin {
     fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
         if !enabled {
-            self.disconnect("plugin disabled");
+            self.connect_requested = false;
+            self.disconnect();
         }
     }
 
-    fn reset(&mut self) {
-        self.bump_generation();
-    }
+    fn reset(&mut self) {}
 
     fn process_frame(
         &mut self,
@@ -516,38 +548,14 @@ impl Plugin for StageAModulationPlugin {
         context: &mut HostContext<'_>,
         _event_store: &EventStoreHandle<'_>,
     ) {
-        // Fail closed: without live-capture effects the connection is torn
-        // down and no command leaves the plugin.
-        let execution = context.execution();
-        if !execution.hardware_effects_allowed() {
-            self.effects_blocked_reason = Some(format!(
-                "hardware effects not allowed in {:?}",
-                execution.mode
-            ));
-            if self.worker.is_some() {
-                self.disconnect("execution context revoked effects");
-            }
-            return;
+        // Control is settings-driven and works without camera frames. The
+        // only frame-pass policy: replaying a recording must never keep a
+        // hardware connection alive.
+        if context.execution().mode == ExecutionMode::Replay && self.link.is_some() {
+            self.connect_requested = false;
+            self.disconnect();
+            self.last_error = Some("disconnected: replay mode".into());
         }
-        self.effects_blocked_reason = None;
-
-        for action_id in self.consume_actions(context) {
-            match action_id.as_str() {
-                ACTION_CONNECT => self.connect(),
-                ACTION_DISCONNECT => self.disconnect("operator"),
-                ACTION_OUTPUT_OFF => self.output_off(),
-                _ => {}
-            }
-        }
-
-        if self.dirty && self.connected {
-            self.send_modulation();
-        }
-        if self.connected && self.last_status_poll.elapsed() >= STATUS_POLL_INTERVAL {
-            self.last_status_poll = Instant::now();
-            self.queue_command("status", Command::new("STATUS"));
-        }
-        self.drain_worker();
     }
 
     fn settings_schema(&self) -> SettingsSchema {
@@ -566,9 +574,10 @@ impl Plugin for StageAModulationPlugin {
             sections: vec![SettingsSection {
                 label: "Laser modulation".into(),
                 description: Some(
-                    "Every change is sent to the Teensy immediately. The output never exceeds \
-                     the power slider, and the slider never exceeds the max limit. The firmware \
-                     holds the output when the plugin disconnects — use Output OFF to drive 0."
+                    "Tick Connect, then every change is sent to the Teensy immediately — no \
+                     camera required. The output never exceeds the power slider, the slider \
+                     never exceeds the max limit. The firmware holds the output when \
+                     disconnected; drag the slider to 0 to drive 0 V."
                         .into(),
                 ),
                 default_open: true,
@@ -588,11 +597,23 @@ impl Plugin for StageAModulationPlugin {
                         },
                     },
                     SettingItem {
+                        key: "connect".into(),
+                        label: "Connect".into(),
+                        tooltip: Some(
+                            "Opens/closes the command port. Connecting never changes the \
+                             output; disconnecting leaves it held (set-and-hold firmware)."
+                                .into(),
+                        ),
+                        kind: SettingKind::Bool {
+                            default: self.connect_requested,
+                        },
+                    },
+                    SettingItem {
                         key: "level".into(),
                         label: "Power (DAC code)".into(),
                         tooltip: Some(
                             "Output level in DAC codes; peak value for sine/square. \
-                             Capped by the max limit below."
+                             Capped by the max limit below. 0 = output off."
                                 .into(),
                         ),
                         kind: SettingKind::I64Slider {
@@ -667,6 +688,7 @@ impl Plugin for StageAModulationPlugin {
                     .unwrap_or(0);
                 Some(json!(index))
             }
+            "connect" => Some(json!(self.connect_requested)),
             "level" => Some(json!(self.level)),
             "max_level" => Some(json!(self.max_level)),
             "mode" => {
@@ -688,6 +710,16 @@ impl Plugin for StageAModulationPlugin {
                 self.port_hint = variant_path(&enum_choice(&value, &port_variants())?).to_owned();
                 Ok(())
             }
+            "connect" => {
+                let requested = value.as_bool().ok_or("connect must be a boolean")?;
+                self.connect_requested = requested;
+                if requested {
+                    self.connect();
+                } else {
+                    self.disconnect();
+                }
+                Ok(())
+            }
             "level" => {
                 self.level = value
                     .as_i64()
@@ -696,7 +728,7 @@ impl Plugin for StageAModulationPlugin {
                 if self.min_level > self.level {
                     self.min_level = self.level;
                 }
-                self.dirty = true;
+                self.send_modulation();
                 Ok(())
             }
             "max_level" => {
@@ -707,7 +739,7 @@ impl Plugin for StageAModulationPlugin {
                 // Lowering the cap below the current level lowers the output.
                 if self.level > self.max_level {
                     self.level = self.max_level;
-                    self.dirty = true;
+                    self.send_modulation();
                 }
                 if self.min_level > self.max_level {
                     self.min_level = self.max_level;
@@ -720,14 +752,14 @@ impl Plugin for StageAModulationPlugin {
                 let name = enum_choice(&value, &mode_names)?;
                 self.mode = Mode::from_name(&name)
                     .ok_or_else(|| format!("unknown mode: {name} (CONST/SINE/SQUARE)"))?;
-                self.dirty = true;
+                self.send_modulation();
                 Ok(())
             }
             "frequency_hz" => {
                 let hz = value.as_f64().ok_or("frequency_hz must be a number")?;
                 self.frequency_hz = hz.clamp(0.01, 2_000.0);
                 if self.mode.is_periodic() {
-                    self.dirty = true;
+                    self.send_modulation();
                 }
                 Ok(())
             }
@@ -737,7 +769,7 @@ impl Plugin for StageAModulationPlugin {
                     .ok_or("min_level must be an integer")?
                     .clamp(0, self.level);
                 if self.mode.is_periodic() {
-                    self.dirty = true;
+                    self.send_modulation();
                 }
                 Ok(())
             }
@@ -747,35 +779,27 @@ impl Plugin for StageAModulationPlugin {
 
     fn status_entries(&self) -> Vec<StatusEntry> {
         let mut entries = Vec::new();
-        if let Some(reason) = &self.effects_blocked_reason {
-            entries.push(StatusEntry::Text(format!("Hardware locked: {reason}")));
-        }
-        entries.push(StatusEntry::Text(if self.connected {
-            format!("Modulation: connected ({})", self.firmware)
+        let state = self.shared.state.lock().expect("device state lock");
+        entries.push(StatusEntry::Text(if state.connected {
+            format!("Modulation: connected ({})", state.firmware)
+        } else if self.connect_requested {
+            "Modulation: connecting…".into()
         } else {
             "Modulation: disconnected".into()
         }));
-        if let Some(code) = self.board_code {
+        if let Some(code) = state.board_code {
             entries.push(StatusEntry::Text(format!(
                 "Board: code={code} ({})",
-                self.board_mod
+                state.board_mod
             )));
         }
-        if let Some(error) = &self.last_error {
+        if let Some(error) = state.last_error.clone().or_else(|| self.last_error.clone()) {
             entries.push(StatusEntry::Text(format!("Error: {error}")));
         }
         entries
     }
 
     fn host_views(&self) -> HostViewRegistry {
-        let action = |id: &str, title: &str| HostActionDescriptor {
-            id: id.into(),
-            title: title.into(),
-            scope: HostActionScope::Dataset {
-                dataset_id: STATUS_DATASET_ID.into(),
-            },
-            param_schema: None,
-        };
         HostViewRegistry {
             datasets: vec![HostDatasetDescriptor {
                 id: STATUS_DATASET_ID.into(),
@@ -792,11 +816,7 @@ impl Plugin for StageAModulationPlugin {
                 placement: HostViewPlacement::AnalysisPanel,
                 kind: HostViewKind::CompactTable,
             }],
-            actions: vec![
-                action(ACTION_CONNECT, "Connect"),
-                action(ACTION_DISCONNECT, "Disconnect"),
-                action(ACTION_OUTPUT_OFF, "Output OFF"),
-            ],
+            actions: Vec::new(),
         }
     }
 
@@ -809,7 +829,7 @@ impl Plugin for StageAModulationPlugin {
 
     fn host_view_dataset_generation(&self, dataset_id: &str) -> u64 {
         match dataset_id {
-            STATUS_DATASET_ID => self.dataset_generation.max(1),
+            STATUS_DATASET_ID => self.shared.generation.load(Ordering::Relaxed).max(1),
             _ => 0,
         }
     }
@@ -817,7 +837,7 @@ impl Plugin for StageAModulationPlugin {
 
 impl Drop for StageAModulationPlugin {
     fn drop(&mut self) {
-        self.disconnect("plugin destroyed");
+        self.disconnect();
     }
 }
 
@@ -827,14 +847,13 @@ export_plugin!(StageAModulationPlugin);
 mod tests {
     use super::*;
 
-    fn drain_until<F: FnMut(&mut StageAModulationPlugin) -> bool>(
-        plugin: &mut StageAModulationPlugin,
+    fn wait_until<F: Fn(&StageAModulationPlugin) -> bool>(
+        plugin: &StageAModulationPlugin,
         timeout: Duration,
-        mut done: F,
+        done: F,
     ) {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
-            plugin.drain_worker();
             if done(plugin) {
                 return;
             }
@@ -843,25 +862,31 @@ mod tests {
         panic!("condition not reached within {timeout:?}");
     }
 
-    /// Slider change → MOD sent immediately → board echoes the code.
-    #[test]
-    fn level_change_transfers_immediately_and_board_code_is_shown() {
-        let mut plugin = StageAModulationPlugin::default();
-        plugin.connect();
-        drain_until(&mut plugin, Duration::from_secs(2), |p| p.connected);
-        assert_eq!(plugin.firmware, "0.3.0-mock");
+    fn board_code(plugin: &StageAModulationPlugin) -> Option<i64> {
+        plugin.shared.state.lock().unwrap().board_code
+    }
 
-        plugin
-            .set_setting("level", json!(1234))
-            .expect("level accepted");
-        assert!(plugin.dirty);
-        plugin.send_modulation();
-        drain_until(&mut plugin, Duration::from_secs(2), |p| {
-            p.board_code == Some(1234)
+    /// Connect checkbox → slider change → MOD sent by the device thread →
+    /// board echoes the code. No process_frame involved anywhere.
+    #[test]
+    fn level_change_transfers_without_frames() {
+        let mut plugin = StageAModulationPlugin::default();
+        plugin.set_setting("port", json!("mock")).unwrap();
+        plugin.set_setting("connect", json!(true)).unwrap();
+        wait_until(&plugin, Duration::from_secs(2), |p| p.device_connected());
+        assert_eq!(
+            plugin.shared.state.lock().unwrap().firmware,
+            "0.3.0-mock".to_owned()
+        );
+
+        plugin.set_setting("level", json!(1234)).unwrap();
+        wait_until(&plugin, Duration::from_secs(2), |p| {
+            board_code(p) == Some(1234)
         });
-        assert!(!plugin.dirty);
-        assert!(plugin.last_error.is_none(), "{:?}", plugin.last_error);
-        plugin.disconnect("test done");
+        assert!(plugin.shared.state.lock().unwrap().last_error.is_none());
+
+        plugin.set_setting("connect", json!(false)).unwrap();
+        assert!(!plugin.device_connected());
     }
 
     /// The max cap bounds the slider, and lowering it re-sends a lower level.
@@ -874,7 +899,6 @@ mod tests {
 
         plugin.set_setting("max_level", json!(500)).unwrap();
         assert_eq!(plugin.level, 500, "lowering the cap lowers the level");
-        assert!(plugin.dirty, "the lowered level must be transferred");
 
         let schema = plugin.settings_schema();
         let level_item = schema.sections[0]
@@ -888,28 +912,36 @@ mod tests {
         }
     }
 
-    /// Square drive with min threshold reaches the mock and starts at min.
+    /// Square drive with min threshold reaches the mock and starts at min;
+    /// slider to 0 drives the output to 0.
     #[test]
     fn square_with_min_threshold_round_trips() {
         let mut plugin = StageAModulationPlugin::default();
-        plugin.connect();
-        drain_until(&mut plugin, Duration::from_secs(2), |p| p.connected);
+        plugin.set_setting("port", json!("mock")).unwrap();
+        plugin.set_setting("connect", json!(true)).unwrap();
+        wait_until(&plugin, Duration::from_secs(2), |p| p.device_connected());
 
         plugin.set_setting("level", json!(2000)).unwrap();
-        plugin.set_setting("mode", json!("SQUARE")).unwrap();
         plugin.set_setting("frequency_hz", json!(10.0)).unwrap();
         plugin.set_setting("min_level", json!(500)).unwrap();
-        plugin.send_modulation();
-        drain_until(&mut plugin, Duration::from_secs(2), |p| {
-            p.board_code == Some(500)
+        plugin.set_setting("mode", json!("SQUARE")).unwrap();
+        wait_until(&plugin, Duration::from_secs(2), |p| {
+            board_code(p) == Some(500)
         });
-        assert!(plugin.board_mod.contains("SQUARE 500..2000"));
+        assert!(plugin
+            .shared
+            .state
+            .lock()
+            .unwrap()
+            .board_mod
+            .contains("SQUARE 500..2000"));
 
-        plugin.output_off();
-        drain_until(&mut plugin, Duration::from_secs(2), |p| {
-            p.board_code == Some(0)
+        plugin.set_setting("mode", json!("CONST")).unwrap();
+        plugin.set_setting("level", json!(0)).unwrap();
+        wait_until(&plugin, Duration::from_secs(2), |p| {
+            board_code(p) == Some(0)
         });
-        plugin.disconnect("test done");
+        plugin.set_setting("connect", json!(false)).unwrap();
     }
 
     /// The host settings UI exchanges enum values as indices into the
@@ -923,11 +955,11 @@ mod tests {
             .expect("index accepted");
         assert_eq!(plugin.mode, Mode::Square);
         assert_eq!(plugin.get_setting("mode"), Some(json!(2)));
-        // Port: index 1 = "auto" (variants start with mock, auto).
+        // Port: index 1 = "mock" (variants start with auto, mock).
         plugin
             .set_setting("port", json!(1))
             .expect("index accepted");
-        assert_eq!(plugin.port_hint, "auto");
+        assert_eq!(plugin.port_hint, "mock");
         assert_eq!(plugin.get_setting("port"), Some(json!(1)));
         // Out-of-range indices are visible errors, not silent no-ops.
         assert!(plugin.set_setting("mode", json!(99)).is_err());
