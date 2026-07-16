@@ -420,6 +420,29 @@ fn serial_ports() -> Vec<String> {
         .collect()
 }
 
+/// The exact variant list the settings schema shows for the port enum — the
+/// host exchanges enum settings as indices into this list.
+fn port_variants() -> Vec<String> {
+    let mut variants = vec!["mock".to_owned(), "auto".to_owned()];
+    variants.extend(serial_ports());
+    variants
+}
+
+/// Host enum widgets send the selected index; string names are also accepted
+/// (tests, saved configs).
+fn enum_choice(value: &Value, variants: &[String]) -> Result<String, String> {
+    if let Some(index) = value.as_u64() {
+        return variants
+            .get(usize::try_from(index).map_err(|_| "index out of range".to_owned())?)
+            .cloned()
+            .ok_or_else(|| format!("enum index {index} out of range"));
+    }
+    value
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| "expected an enum index or name".to_owned())
+}
+
 impl Plugin for StageAModulationPlugin {
     fn name(&self) -> &'static str {
         "Stage-A Modulation"
@@ -486,8 +509,7 @@ impl Plugin for StageAModulationPlugin {
     }
 
     fn settings_schema(&self) -> SettingsSchema {
-        let mut port_variants = vec!["mock".to_owned(), "auto".to_owned()];
-        port_variants.extend(serial_ports());
+        let port_variants = port_variants();
         let port_default = port_variants
             .iter()
             .position(|p| *p == self.port_hint)
@@ -593,10 +615,24 @@ impl Plugin for StageAModulationPlugin {
 
     fn get_setting(&self, key: &str) -> Option<Value> {
         match key {
-            "port" => Some(json!(self.port_hint)),
+            // Enum settings are exchanged as indices into the schema's
+            // variant list (see the host settings UI).
+            "port" => {
+                let index = port_variants()
+                    .iter()
+                    .position(|p| *p == self.port_hint)
+                    .unwrap_or(0);
+                Some(json!(index))
+            }
             "level" => Some(json!(self.level)),
             "max_level" => Some(json!(self.max_level)),
-            "mode" => Some(json!(self.mode.name())),
+            "mode" => {
+                let index = Mode::VARIANTS
+                    .iter()
+                    .position(|m| *m == self.mode)
+                    .unwrap_or(0);
+                Some(json!(index))
+            }
             "frequency_hz" => Some(json!(self.frequency_hz)),
             "min_level" => Some(json!(self.min_level)),
             _ => None,
@@ -606,7 +642,7 @@ impl Plugin for StageAModulationPlugin {
     fn set_setting(&mut self, key: &str, value: Value) -> Result<(), String> {
         match key {
             "port" => {
-                self.port_hint = value.as_str().ok_or("port must be a string")?.to_owned();
+                self.port_hint = enum_choice(&value, &port_variants())?;
                 Ok(())
             }
             "level" => {
@@ -636,8 +672,10 @@ impl Plugin for StageAModulationPlugin {
                 Ok(())
             }
             "mode" => {
-                let name = value.as_str().ok_or("mode must be a string")?;
-                self.mode = Mode::from_name(name)
+                let mode_names: Vec<String> =
+                    Mode::VARIANTS.iter().map(|m| m.name().to_owned()).collect();
+                let name = enum_choice(&value, &mode_names)?;
+                self.mode = Mode::from_name(&name)
                     .ok_or_else(|| format!("unknown mode: {name} (CONST/SINE/SQUARE)"))?;
                 self.dirty = true;
                 Ok(())
@@ -829,6 +867,32 @@ mod tests {
             p.board_code == Some(0)
         });
         plugin.disconnect("test done");
+    }
+
+    /// The host settings UI exchanges enum values as indices into the
+    /// schema's variant list (radio buttons send `json!(index)`).
+    #[test]
+    fn enum_settings_round_trip_as_indices() {
+        let mut plugin = StageAModulationPlugin::default();
+        // Mode: index 2 = SQUARE in the schema's variant order.
+        plugin
+            .set_setting("mode", json!(2))
+            .expect("index accepted");
+        assert_eq!(plugin.mode, Mode::Square);
+        assert_eq!(plugin.get_setting("mode"), Some(json!(2)));
+        // Port: index 1 = "auto" (variants start with mock, auto).
+        plugin
+            .set_setting("port", json!(1))
+            .expect("index accepted");
+        assert_eq!(plugin.port_hint, "auto");
+        assert_eq!(plugin.get_setting("port"), Some(json!(1)));
+        // Out-of-range indices are visible errors, not silent no-ops.
+        assert!(plugin.set_setting("mode", json!(99)).is_err());
+        // String names keep working (tests, saved configs).
+        plugin
+            .set_setting("mode", json!("SINE"))
+            .expect("name accepted");
+        assert_eq!(plugin.mode, Mode::Sine);
     }
 
     /// min_level can never exceed the level.
