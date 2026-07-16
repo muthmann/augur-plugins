@@ -125,3 +125,40 @@ pub fn available_port_names() -> Vec<String> {
 pub fn available_port_names() -> Vec<String> {
     Vec::new()
 }
+
+/// Port names plus a human-readable USB label (manufacturer/product) where
+/// the OS provides one — e.g. `("/dev/cu.usbmodem…", Some("Teensyduino Dual
+/// Serial"))`. Lets port pickers show which entry is the Teensy.
+#[cfg(feature = "hardware")]
+pub fn available_ports_with_labels() -> Vec<(String, Option<String>)> {
+    serialport::available_ports()
+        .map(|ports| {
+            ports
+                .into_iter()
+                .map(|p| {
+                    let label = match p.port_type {
+                        serialport::SerialPortType::UsbPort(info) => {
+                            match (info.manufacturer, info.product) {
+                                (Some(manufacturer), Some(product))
+                                    if !product.starts_with(&manufacturer) =>
+                                {
+                                    Some(format!("{manufacturer} {product}"))
+                                }
+                                (_, Some(product)) => Some(product),
+                                (Some(manufacturer), None) => Some(manufacturer),
+                                (None, None) => None,
+                            }
+                        }
+                        _ => None,
+                    };
+                    (p.port_name, label)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(not(feature = "hardware"))]
+pub fn available_ports_with_labels() -> Vec<(String, Option<String>)> {
+    Vec::new()
+}

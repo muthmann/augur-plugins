@@ -448,11 +448,26 @@ fn serial_ports() -> Vec<String> {
 }
 
 /// The exact variant list the settings schema shows for the port enum — the
-/// host exchanges enum settings as indices into this list.
+/// host exchanges enum settings as indices into this list. Real ports carry
+/// their USB label (e.g. "(Teensyduino Dual Serial)") for recognisability;
+/// only the leading path is the value.
 fn port_variants() -> Vec<String> {
     let mut variants = vec!["mock".to_owned(), "auto".to_owned()];
-    variants.extend(serial_ports());
+    for (name, label) in stage_a_io::transport::available_ports_with_labels() {
+        if !(name.contains("cu.usbmodem") || name.contains("ttyACM")) {
+            continue;
+        }
+        variants.push(match label {
+            Some(label) => format!("{name} ({label})"),
+            None => name,
+        });
+    }
     variants
+}
+
+/// The path part of a port variant; the parenthesised USB label is display-only.
+fn variant_path(variant: &str) -> &str {
+    variant.split_whitespace().next().unwrap_or(variant)
 }
 
 /// Host enum widgets send the selected index; string names are also accepted
@@ -539,7 +554,7 @@ impl Plugin for StageAModulationPlugin {
         let port_variants = port_variants();
         let port_default = port_variants
             .iter()
-            .position(|p| *p == self.port_hint)
+            .position(|p| variant_path(p) == self.port_hint)
             .unwrap_or(0);
         let mode_variants: Vec<String> =
             Mode::VARIANTS.iter().map(|m| m.name().to_owned()).collect();
@@ -648,7 +663,7 @@ impl Plugin for StageAModulationPlugin {
             "port" => {
                 let index = port_variants()
                     .iter()
-                    .position(|p| *p == self.port_hint)
+                    .position(|p| variant_path(p) == self.port_hint)
                     .unwrap_or(0);
                 Some(json!(index))
             }
@@ -670,7 +685,7 @@ impl Plugin for StageAModulationPlugin {
     fn set_setting(&mut self, key: &str, value: Value) -> Result<(), String> {
         match key {
             "port" => {
-                self.port_hint = enum_choice(&value, &port_variants())?;
+                self.port_hint = variant_path(&enum_choice(&value, &port_variants())?).to_owned();
                 Ok(())
             }
             "level" => {

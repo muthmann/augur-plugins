@@ -488,8 +488,32 @@ fn probe_pd_stream(path: &str) -> bool {
 /// host exchanges enum settings as indices into this list.
 fn port_variants() -> Vec<String> {
     let mut variants = vec!["mock".to_owned(), "auto".to_owned()];
-    variants.extend(serial_ports());
+    for port in serialport::available_ports().unwrap_or_default() {
+        if !(port.port_name.contains("cu.usbmodem") || port.port_name.contains("ttyACM")) {
+            continue;
+        }
+        let label = match port.port_type {
+            serialport::SerialPortType::UsbPort(info) => match (info.manufacturer, info.product) {
+                (Some(manufacturer), Some(product)) if !product.starts_with(&manufacturer) => {
+                    Some(format!("{manufacturer} {product}"))
+                }
+                (_, Some(product)) => Some(product),
+                (Some(manufacturer), None) => Some(manufacturer),
+                (None, None) => None,
+            },
+            _ => None,
+        };
+        variants.push(match label {
+            Some(label) => format!("{} ({label})", port.port_name),
+            None => port.port_name,
+        });
+    }
     variants
+}
+
+/// The path part of a port variant; the parenthesised USB label is display-only.
+fn variant_path(variant: &str) -> &str {
+    variant.split_whitespace().next().unwrap_or(variant)
 }
 
 /// Host enum widgets send the selected index; string names are also accepted
@@ -569,7 +593,7 @@ impl Plugin for StageAPhotodiodePlugin {
         let port_variants = port_variants();
         let port_default = port_variants
             .iter()
-            .position(|p| *p == self.port_hint)
+            .position(|p| variant_path(p) == self.port_hint)
             .unwrap_or(0);
         let mode_variants: Vec<String> =
             Mode::VARIANTS.iter().map(|m| m.name().to_owned()).collect();
@@ -651,7 +675,7 @@ impl Plugin for StageAPhotodiodePlugin {
             "port" => {
                 let index = port_variants()
                     .iter()
-                    .position(|p| *p == self.port_hint)
+                    .position(|p| variant_path(p) == self.port_hint)
                     .unwrap_or(0);
                 Some(json!(index))
             }
@@ -671,7 +695,7 @@ impl Plugin for StageAPhotodiodePlugin {
     fn set_setting(&mut self, key: &str, value: Value) -> Result<(), String> {
         match key {
             "port" => {
-                self.port_hint = enum_choice(&value, &port_variants())?;
+                self.port_hint = variant_path(&enum_choice(&value, &port_variants())?).to_owned();
                 Ok(())
             }
             "mode" => {
