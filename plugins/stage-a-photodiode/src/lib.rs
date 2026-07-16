@@ -275,11 +275,10 @@ impl StageAPhotodiodePlugin {
             return;
         }
         let path = if self.port_hint == "auto" {
-            match serial_ports().into_iter().next() {
-                Some(path) => path,
-                None => {
-                    self.last_error =
-                        Some("no USB serial device found (looked for usbmodem/ttyACM)".into());
+            match resolve_auto_port() {
+                Ok(path) => path,
+                Err(err) => {
+                    self.last_error = Some(err);
                     return;
                 }
             }
@@ -425,10 +424,64 @@ fn serial_ports() -> Vec<String> {
             ports
                 .into_iter()
                 .map(|p| p.port_name)
-                .filter(|name| name.contains("usbmodem") || name.contains("ttyACM"))
+                // macOS lists each device twice; use the callout (cu.*) node only.
+                .filter(|name| name.contains("cu.usbmodem") || name.contains("ttyACM"))
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Finds the Teensy stream port: the dual-serial firmware free-runs `PD`
+/// lines on exactly one of the enumerated ports, so listen briefly on each.
+fn resolve_auto_port() -> Result<String, String> {
+    let candidates = serial_ports();
+    if candidates.is_empty() {
+        return Err("no USB serial device found (looked for usbmodem/ttyACM)".to_owned());
+    }
+    for path in &candidates {
+        if probe_pd_stream(path) {
+            return Ok(path.clone());
+        }
+    }
+    Err(format!(
+        "no port streamed PD lines within 500 ms (tried {})",
+        candidates.join(", ")
+    ))
+}
+
+/// True when `path` produces a parsable `PD …` line within the probe window.
+fn probe_pd_stream(path: &str) -> bool {
+    let Ok(mut port) = serialport::new(path, 115_200)
+        .timeout(Duration::from_millis(100))
+        .open()
+    else {
+        return false;
+    };
+    let deadline = Instant::now() + Duration::from_millis(500);
+    let mut collected: Vec<u8> = Vec::new();
+    let mut buf = [0_u8; 512];
+    while Instant::now() < deadline {
+        match port.read(&mut buf) {
+            Ok(read) if read > 0 => {
+                collected.extend_from_slice(&buf[..read]);
+                if String::from_utf8_lossy(&collected)
+                    .lines()
+                    .any(|line| parse_pd_line(line).is_some())
+                {
+                    return true;
+                }
+                if collected.len() > 8_192 {
+                    collected.drain(..4_096);
+                }
+            }
+            Ok(_) => {}
+            Err(err)
+                if err.kind() == std::io::ErrorKind::TimedOut
+                    || err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return false,
+        }
+    }
+    false
 }
 
 /// The exact variant list the settings schema shows for the port enum — the
@@ -539,8 +592,9 @@ impl Plugin for StageAPhotodiodePlugin {
                         key: "port".into(),
                         label: "Port".into(),
                         tooltip: Some(
-                            "Teensy stream port (the SECOND usbmodem port); mock = synthetic \
-                             data, auto = first device"
+                            "auto (recommended) listens on the attached usbmodem ports and \
+                             picks the one streaming PD lines — the Teensy stream port; \
+                             mock = synthetic data"
                                 .into(),
                         ),
                         kind: SettingKind::Enum {

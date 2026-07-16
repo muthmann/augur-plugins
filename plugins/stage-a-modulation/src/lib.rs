@@ -399,24 +399,51 @@ impl StageAModulationPlugin {
 }
 
 fn open_serial(port_hint: &str) -> Result<StageAClient<stage_a_io::SerialTransport>, String> {
-    let path = if port_hint == "auto" {
-        serial_ports()
-            .into_iter()
-            .next()
-            .ok_or_else(|| "no USB serial device found (looked for usbmodem/ttyACM)".to_owned())?
-    } else {
-        port_hint.to_owned()
-    };
+    if port_hint == "auto" {
+        // The dual-serial Teensy enumerates two ports and only the command
+        // port answers HELLO — probe until one does.
+        let candidates = serial_ports();
+        if candidates.is_empty() {
+            return Err("no USB serial device found (looked for usbmodem/ttyACM)".to_owned());
+        }
+        let mut failures = Vec::new();
+        for path in &candidates {
+            match probe_command_port(path) {
+                // Restore the client's default reply timeout after probing.
+                Ok(client) => return Ok(client.with_reply_timeout(Duration::from_millis(500))),
+                Err(err) => failures.push(format!("{path}: {err}")),
+            }
+        }
+        return Err(format!(
+            "no Teensy command port answered HELLO ({})",
+            failures.join("; ")
+        ));
+    }
+    open_path(port_hint)
+}
+
+fn open_path(path: &str) -> Result<StageAClient<stage_a_io::SerialTransport>, String> {
     let transport =
-        stage_a_io::SerialTransport::open(&path, 115_200, std::time::Duration::from_millis(20))
+        stage_a_io::SerialTransport::open(path, 115_200, std::time::Duration::from_millis(20))
             .map_err(|err| err.to_string())?;
     Ok(StageAClient::new(transport))
+}
+
+/// Opens `path` and sends HELLO with a short timeout: only the Teensy
+/// command port replies (the photodiode stream port never answers).
+fn probe_command_port(path: &str) -> Result<StageAClient<stage_a_io::SerialTransport>, String> {
+    let mut client = open_path(path)?.with_reply_timeout(Duration::from_millis(300));
+    client
+        .request(&Command::new("HELLO").field("protocol", 1))
+        .map_err(|err| err.to_string())?;
+    Ok(client)
 }
 
 fn serial_ports() -> Vec<String> {
     stage_a_io::transport::available_port_names()
         .into_iter()
-        .filter(|name| name.contains("usbmodem") || name.contains("ttyACM"))
+        // macOS lists each device twice; use the callout (cu.*) node only.
+        .filter(|name| name.contains("cu.usbmodem") || name.contains("ttyACM"))
         .collect()
 }
 
@@ -535,8 +562,9 @@ impl Plugin for StageAModulationPlugin {
                         key: "port".into(),
                         label: "Port".into(),
                         tooltip: Some(
-                            "Teensy command port (the FIRST of the two usbmodem ports); \
-                             mock = in-process simulated controller, auto = first device"
+                            "auto (recommended) probes the attached usbmodem ports and picks \
+                             the one that answers HELLO — the Teensy command port; \
+                             mock = in-process simulated controller"
                                 .into(),
                         ),
                         kind: SettingKind::Enum {

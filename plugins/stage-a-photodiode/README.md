@@ -20,6 +20,7 @@ read-only by construction; the command port belongs to `stage-a-modulation`.
 
 ## Ports
 
-Select the Teensy *stream* port (the second `usbmodem` port). Picking the command port by mistake
-is harmless: its binary frames simply parse to nothing (no values appear) — switch to the other
-port. `mock` generates a synthetic slow sine for hardware-free testing.
+**Use `auto` (default recommendation):** it listens briefly on every attached usbmodem/ttyACM
+device and connects to the one actually streaming `PD` lines — that is always the Teensy stream
+port. Picking the command port manually by mistake is harmless: its binary frames parse to
+nothing (no values appear). `mock` generates a synthetic slow sine for hardware-free testing.

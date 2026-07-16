@@ -24,10 +24,10 @@ Controls the laser modulation input (Hermit J23, `DAC1.4`) through the Teensy **
 
 ## Ports
 
-Select the Teensy *command* port (binary protocol), not the photodiode stream port. `mock` runs an
-in-process simulated controller for hardware-free testing; `auto` picks the first
-usbmodem/ttyACM device. If you picked the wrong physical port, HELLO simply times out — pick the
-other one.
+**Use `auto` (default recommendation):** it probes every attached usbmodem/ttyACM device and
+connects to the one that answers `HELLO` — that is always the Teensy command port, never the
+photodiode stream port. Explicit ports remain selectable; `mock` runs an in-process simulated
+controller for hardware-free testing.
 
 Hardware commands only flow while the host execution context allows effects (live capture);
 otherwise the connection is torn down and the panel shows the lock reason.
