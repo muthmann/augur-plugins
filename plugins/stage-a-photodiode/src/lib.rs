@@ -54,9 +54,12 @@ const ADC_MAX_CODE: f64 = 4_095.0;
 /// (user-settable 1–130 s).
 const DEFAULT_CACHE_SECONDS: f64 = 20.0;
 const MAX_CACHE_SECONDS: f64 = 130.0;
-/// Absolute sample cap guarding against absurd advertised rates (8 MiB of
-/// codes at most).
-const RING_MAX_SAMPLES: usize = 4_000_000;
+/// Absolute sample cap: 16 M samples = 32 s at the firmware's 500 kSa/s
+/// stream rate (32 MiB of codes + ~2 MiB of summary cells).
+const RING_MAX_SAMPLES: usize = 16_000_000;
+/// Raw samples per incremental summary cell (min/max/sum), the unit both
+/// chart decimation and the moving average combine instead of raw rescans.
+const SUMMARY_CELL: usize = 64;
 /// Envelope buckets per rendered chart line; keeps the plot payload bounded
 /// no matter how many raw samples the window covers.
 const MAX_PLOT_BUCKETS: usize = 1_000;
@@ -130,6 +133,11 @@ struct SharedState {
     /// Device sample index of `samples.front()` within the current segment.
     ring_first_index: u64,
     samples: VecDeque<u16>,
+    /// Incremental 64:1 summaries: `cells[i]` covers deque offsets
+    /// `[i·CELL, (i+1)·CELL)`. Kept aligned by evicting whole cells, so the
+    /// chart and moving average never rescan the raw window — at 500 kSa/s a
+    /// full-window rescan per repaint would not be viable.
+    cells: VecDeque<SummaryCell>,
     latest: Option<u16>,
     /// Cumulative firmware-side drop counter (latest header value).
     device_dropped: u32,
@@ -142,12 +150,39 @@ struct SharedState {
     error: Option<String>,
 }
 
+/// min/max/sum over exactly [`SUMMARY_CELL`] consecutive raw samples.
+#[derive(Clone, Copy)]
+struct SummaryCell {
+    min: u16,
+    max: u16,
+    sum: u32,
+}
+
+/// Accumulated min/max/sum/count over an arbitrary sample range.
+#[derive(Clone, Copy)]
+struct RangeSummary {
+    min: u16,
+    max: u16,
+    sum: u64,
+    count: usize,
+}
+
+impl RangeSummary {
+    fn mean(&self) -> f64 {
+        if self.count == 0 {
+            return 0.0;
+        }
+        self.sum as f64 / self.count as f64
+    }
+}
+
 impl Default for SharedState {
     fn default() -> Self {
         Self {
             rate_hz: 0,
             ring_first_index: 0,
             samples: VecDeque::new(),
+            cells: VecDeque::new(),
             latest: None,
             device_dropped: 0,
             crc_failures: 0,
@@ -179,20 +214,90 @@ impl SharedState {
                 self.segments += 1;
             }
             self.samples.clear();
+            self.cells.clear();
             self.ring_first_index = first_index;
             self.rate_hz = rate_hz;
         }
         self.samples.extend(codes.iter().copied());
         self.latest = codes.last().copied();
         self.device_dropped = device_dropped;
+
+        // Summarize every newly completed cell.
+        while (self.cells.len() + 1) * SUMMARY_CELL <= self.samples.len() {
+            let start = self.cells.len() * SUMMARY_CELL;
+            let mut cell = SummaryCell {
+                min: u16::MAX,
+                max: u16::MIN,
+                sum: 0,
+            };
+            for &code in self.samples.range(start..start + SUMMARY_CELL) {
+                cell.min = cell.min.min(code);
+                cell.max = cell.max.max(code);
+                cell.sum += u32::from(code);
+            }
+            self.cells.push_back(cell);
+        }
+
+        // Evict whole cells only, keeping the cell/offset alignment intact;
+        // the ring may exceed its capacity by up to one cell.
         let excess = self
             .samples
             .len()
             .saturating_sub(self.ring_capacity(rate_hz));
-        if excess > 0 {
-            self.samples.drain(..excess);
-            self.ring_first_index += excess as u64;
+        let evict_cells = excess / SUMMARY_CELL;
+        if evict_cells > 0 {
+            let evict = evict_cells * SUMMARY_CELL;
+            self.samples.drain(..evict);
+            self.cells.drain(..evict_cells);
+            self.ring_first_index += evict as u64;
         }
+    }
+
+    /// min/max/sum over deque offsets `[start, end)`, combining whole
+    /// summary cells with raw samples at the edges: O(range/64 + 128)
+    /// instead of O(range).
+    fn range_summary(&self, start: usize, end: usize) -> RangeSummary {
+        let end = end.min(self.samples.len());
+        let mut summary = RangeSummary {
+            min: u16::MAX,
+            max: u16::MIN,
+            sum: 0,
+            count: 0,
+        };
+        if start >= end {
+            return summary;
+        }
+        summary.count = end - start;
+        let covered = self.cells.len() * SUMMARY_CELL;
+        let mut i = start;
+
+        // Raw head up to the next cell boundary.
+        let head_end = (i.div_ceil(SUMMARY_CELL) * SUMMARY_CELL)
+            .min(end)
+            .min(covered.max(i));
+        if head_end > i {
+            for &code in self.samples.range(i..head_end) {
+                summary.min = summary.min.min(code);
+                summary.max = summary.max.max(code);
+                summary.sum += u64::from(code);
+            }
+            i = head_end;
+        }
+        // Whole cells.
+        while i + SUMMARY_CELL <= end.min(covered) {
+            let cell = self.cells[i / SUMMARY_CELL];
+            summary.min = summary.min.min(cell.min);
+            summary.max = summary.max.max(cell.max);
+            summary.sum += u64::from(cell.sum);
+            i += SUMMARY_CELL;
+        }
+        // Raw tail (past the last whole cell in range, or past `covered`).
+        for &code in self.samples.range(i..end) {
+            summary.min = summary.min.min(code);
+            summary.max = summary.max.max(code);
+            summary.sum += u64::from(code);
+        }
+        summary
     }
 }
 
@@ -736,8 +841,7 @@ impl StageAPhotodiodePlugin {
             .avg_window_samples(state.rate_hz)
             .min(state.samples.len());
         let start = state.samples.len() - window;
-        let sum: u64 = state.samples.range(start..).map(|&c| u64::from(c)).sum();
-        Some(sum as f64 / window as f64)
+        Some(state.range_summary(start, state.samples.len()).mean())
     }
 
     fn series_dataset(&self) -> Series1dV1 {
@@ -777,76 +881,55 @@ impl StageAPhotodiodePlugin {
 
         let avg_window = self.avg_window_samples(state.rate_hz);
         let avg_enabled = avg_window > 1;
-        // Prime the running sum with up to `avg_window − 1` samples that
-        // precede the visible slice, so the average is correct from the
-        // first visible point on.
-        let prime_start = start.saturating_sub(avg_window - 1);
-        let mut avg_sum: u64 = 0;
-        let mut avg_count: usize = 0;
-        for &code in state.samples.range(prime_start..start) {
-            avg_sum += u64::from(code);
-            avg_count += 1;
-        }
 
         let mut mean_points = Vec::with_capacity(MAX_PLOT_BUCKETS + 1);
         let mut min_points = Vec::with_capacity(if decimating { MAX_PLOT_BUCKETS + 1 } else { 0 });
         let mut max_points = Vec::with_capacity(if decimating { MAX_PLOT_BUCKETS + 1 } else { 0 });
         let mut avg_points = Vec::with_capacity(if avg_enabled { MAX_PLOT_BUCKETS + 1 } else { 0 });
 
-        let mut bucket_min = u16::MAX;
-        let mut bucket_max = u16::MIN;
-        let mut bucket_sum: u64 = 0;
-        let mut bucket_n: usize = 0;
-        for (offset, &code) in state.samples.range(start..).enumerate() {
-            let i = start + offset;
-            bucket_min = bucket_min.min(code);
-            bucket_max = bucket_max.max(code);
-            bucket_sum += u64::from(code);
-            bucket_n += 1;
-            if avg_enabled {
-                avg_sum += u64::from(code);
-                avg_count += 1;
-                if avg_count > avg_window {
-                    avg_sum -= u64::from(state.samples[i - avg_window]);
-                    avg_count -= 1;
-                }
-            }
-            if bucket_n == bucket_len || i == total - 1 {
-                let device_t = (state.ring_first_index + i as u64) as f64 / rate;
-                let x = match self.time_axis {
-                    TimeAxis::BeforeNow => device_t - latest_x_index as f64 / rate,
-                    TimeAxis::Segment => device_t,
-                };
-                mean_points.push(Series1dPoint {
+        // Every bucket (and every moving-average window) is combined from
+        // the incremental summary cells plus raw edge samples — the cost per
+        // rebuild is O(buckets · window/64), independent of the raw rate.
+        let mut bucket_start = start;
+        while bucket_start < total {
+            let bucket_end = (bucket_start + bucket_len).min(total);
+            let last = bucket_end - 1;
+            let bucket = state.range_summary(bucket_start, bucket_end);
+            let device_t = (state.ring_first_index + last as u64) as f64 / rate;
+            let x = match self.time_axis {
+                TimeAxis::BeforeNow => device_t - latest_x_index as f64 / rate,
+                TimeAxis::Segment => device_t,
+            };
+            mean_points.push(Series1dPoint {
+                x,
+                y: self.display_volts(bucket.mean()),
+            });
+            if decimating {
+                // EXCITATION inverts the axis, so min/max swap roles.
+                let (low, high) = (
+                    self.display_volts(f64::from(bucket.min)),
+                    self.display_volts(f64::from(bucket.max)),
+                );
+                min_points.push(Series1dPoint {
                     x,
-                    y: self.display_volts(bucket_sum as f64 / bucket_n as f64),
+                    y: low.min(high),
                 });
-                if decimating {
-                    // EXCITATION inverts the axis, so min/max swap roles.
-                    let (low, high) = (
-                        self.display_volts(f64::from(bucket_min)),
-                        self.display_volts(f64::from(bucket_max)),
-                    );
-                    min_points.push(Series1dPoint {
-                        x,
-                        y: low.min(high),
-                    });
-                    max_points.push(Series1dPoint {
-                        x,
-                        y: low.max(high),
-                    });
-                }
-                if avg_enabled {
-                    avg_points.push(Series1dPoint {
-                        x,
-                        y: self.display_volts(avg_sum as f64 / avg_count as f64),
-                    });
-                }
-                bucket_min = u16::MAX;
-                bucket_max = u16::MIN;
-                bucket_sum = 0;
-                bucket_n = 0;
+                max_points.push(Series1dPoint {
+                    x,
+                    y: low.max(high),
+                });
             }
+            if avg_enabled {
+                // Trailing window ending at this bucket's last sample; may
+                // reach before the visible slice (fewer while filling).
+                let window_start = (last + 1).saturating_sub(avg_window);
+                let window = state.range_summary(window_start, last + 1);
+                avg_points.push(Series1dPoint {
+                    x,
+                    y: self.display_volts(window.mean()),
+                });
+            }
+            bucket_start = bucket_end;
         }
 
         let mut lines = vec![Series1dLine {
@@ -1835,11 +1918,21 @@ mod tests {
             state.ingest(index, rate, 0, &block);
             index += block.len() as u64;
         }
-        assert_eq!(state.samples.len(), cap);
+        // Whole-cell eviction may leave up to one summary cell of slack.
+        assert!(
+            state.samples.len() >= cap && state.samples.len() < cap + SUMMARY_CELL,
+            "len {} vs cap {cap}",
+            state.samples.len()
+        );
         assert_eq!(
             state.ring_first_index + state.samples.len() as u64,
             index,
             "eviction keeps indexes aligned"
+        );
+        assert_eq!(
+            state.ring_first_index % SUMMARY_CELL as u64,
+            0,
+            "eviction preserves cell alignment"
         );
         assert_eq!(state.segments, 0, "eviction is not a discontinuity");
     }
@@ -1955,6 +2048,62 @@ mod tests {
         let generation = plugin.generation.load(Ordering::Relaxed);
         assert!(generation > 1);
         plugin.disconnect();
+    }
+
+    /// The summary cells must agree exactly with a naive raw scan for
+    /// arbitrary ranges, including after whole-cell eviction.
+    #[test]
+    fn range_summary_matches_naive_scans() {
+        let mut state = SharedState {
+            cache_seconds: 1.0, // capacity 1000 at rate 1000 → forces eviction
+            ..SharedState::default()
+        };
+        let mut hash: u64 = 0x243F_6A88_85A3_08D3;
+        let mut next = || {
+            hash ^= hash << 13;
+            hash ^= hash >> 7;
+            hash ^= hash << 17;
+            (hash % 4_096) as u16
+        };
+        let mut index = 0_u64;
+        for _ in 0..7 {
+            let block: Vec<u16> = (0..333).map(|_| next()).collect();
+            state.ingest(index, 1_000, 0, &block);
+            index += block.len() as u64;
+        }
+        assert!(state.samples.len() <= 1_000 + SUMMARY_CELL, "evicted");
+        assert!(!state.cells.is_empty());
+
+        let len = state.samples.len();
+        for (start, end) in [
+            (0, len),
+            (0, 1),
+            (1, SUMMARY_CELL),
+            (SUMMARY_CELL - 1, SUMMARY_CELL + 1),
+            (7, 500),
+            (130, 131),
+            (len - 3, len),
+            (len / 3, 2 * len / 3),
+        ] {
+            let summary = state.range_summary(start, end);
+            let raw: Vec<u16> = state.samples.range(start..end).copied().collect();
+            assert_eq!(summary.count, raw.len(), "count for {start}..{end}");
+            assert_eq!(
+                summary.min,
+                raw.iter().copied().min().unwrap(),
+                "min for {start}..{end}"
+            );
+            assert_eq!(
+                summary.max,
+                raw.iter().copied().max().unwrap(),
+                "max for {start}..{end}"
+            );
+            assert_eq!(
+                summary.sum,
+                raw.iter().map(|&c| u64::from(c)).sum::<u64>(),
+                "sum for {start}..{end}"
+            );
+        }
     }
 
     #[test]
@@ -2126,7 +2275,12 @@ mod tests {
             let first = i * 1_000;
             state.ingest(first, 1_000, 0, &block);
         }
-        assert_eq!(state.samples.len(), 2_000);
+        // Whole-cell eviction may leave up to one summary cell of slack.
+        assert!(
+            state.samples.len() >= 2_000 && state.samples.len() < 2_000 + SUMMARY_CELL,
+            "len {}",
+            state.samples.len()
+        );
     }
 
     /// The host settings UI exchanges enum values as indices into the
