@@ -22,12 +22,15 @@
 //! which makes the mean independent of the modulation phase.
 
 use std::collections::VecDeque;
-use std::io::Read;
+use std::fs::File;
+use std::io::{BufWriter, Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use augur_plugin_api::PathDialogKind;
 use augur_plugin_api::{
     export_plugin, EventStoreHandle, HostContext, HostDatasetDescriptor, HostDatasetKind,
     HostOutput, HostViewDescriptor, HostViewKind, HostViewPlacement, HostViewRegistry, Plugin,
@@ -36,7 +39,7 @@ use augur_plugin_api::{
     TableSchema, TableValueType,
 };
 use serde_json::{json, Value};
-use stage_a_io::{FrameParser, ParseEvent};
+use stage_a_io::{FrameParser, ParseEvent, PdqWriter, StreamIntegrity};
 
 const SERIES_DATASET_ID: &str = "stage-a-photodiode.series";
 const SERIES_VIEW_ID: &str = "stage-a-photodiode.series.view";
@@ -45,8 +48,10 @@ const STATUS_VIEW_ID: &str = "stage-a-photodiode.status.view";
 
 const ADC_FULL_SCALE_VOLTS: f64 = 3.3;
 const ADC_MAX_CODE: f64 = 4_095.0;
-/// Longest raw history kept, in seconds of samples at the active stream rate.
-const RING_SECONDS: f64 = 130.0;
+/// Default monitor cache, in seconds of samples at the active stream rate
+/// (user-settable 1–130 s).
+const DEFAULT_CACHE_SECONDS: f64 = 20.0;
+const MAX_CACHE_SECONDS: f64 = 130.0;
 /// Absolute sample cap guarding against absurd advertised rates (8 MiB of
 /// codes at most).
 const RING_MAX_SAMPLES: usize = 4_000_000;
@@ -82,7 +87,6 @@ impl Mode {
     }
 }
 
-#[derive(Default)]
 struct SharedState {
     /// Sample rate of the current segment (from the frame headers).
     rate_hz: u32,
@@ -96,12 +100,31 @@ struct SharedState {
     resync_bytes: u64,
     /// Segment restarts observed (rate changes, index jumps, reconnects).
     segments: u64,
+    /// Monitor-cache length driving ring eviction (user setting).
+    cache_seconds: f64,
     error: Option<String>,
 }
 
+impl Default for SharedState {
+    fn default() -> Self {
+        Self {
+            rate_hz: 0,
+            ring_first_index: 0,
+            samples: VecDeque::new(),
+            latest: None,
+            device_dropped: 0,
+            crc_failures: 0,
+            resync_bytes: 0,
+            segments: 0,
+            cache_seconds: DEFAULT_CACHE_SECONDS,
+            error: None,
+        }
+    }
+}
+
 impl SharedState {
-    fn ring_capacity(rate_hz: u32) -> usize {
-        ((f64::from(rate_hz.max(1)) * RING_SECONDS) as usize).min(RING_MAX_SAMPLES)
+    fn ring_capacity(&self, rate_hz: u32) -> usize {
+        ((f64::from(rate_hz.max(1)) * self.cache_seconds) as usize).clamp(2, RING_MAX_SAMPLES)
     }
 
     /// Ingests one `SamplesU16` frame. Any discontinuity — rate change,
@@ -128,12 +151,72 @@ impl SharedState {
         let excess = self
             .samples
             .len()
-            .saturating_sub(Self::ring_capacity(rate_hz));
+            .saturating_sub(self.ring_capacity(rate_hz));
         if excess > 0 {
             self.samples.drain(..excess);
             self.ring_first_index += excess as u64;
         }
     }
+}
+
+/// One active disk recording: every clean `SamplesU16` frame is appended
+/// verbatim to a `.pdq` file; `stop` writes the JSON sidecar next to it.
+struct RecordingSink {
+    writer: PdqWriter,
+    pdq_path: PathBuf,
+    started_slug: String,
+    samples_written: u64,
+    write_error: Option<String>,
+    /// Integrity counters at recording start, so the sidecar reports deltas
+    /// for exactly the recorded span.
+    start_crc_failures: u64,
+    start_resync_bytes: u64,
+    start_device_dropped: u32,
+    start_segments: u64,
+}
+
+type SharedRecording = Arc<Mutex<Option<RecordingSink>>>;
+
+fn record_frame(recording: &SharedRecording, frame: &stage_a_io::Frame, samples: usize) {
+    let Ok(mut slot) = recording.lock() else {
+        return;
+    };
+    let Some(sink) = slot.as_mut() else {
+        return;
+    };
+    if sink.write_error.is_some() {
+        return;
+    }
+    match sink.writer.write_frame(frame) {
+        Ok(()) => sink.samples_written += samples as u64,
+        Err(err) => sink.write_error = Some(format!("recording write failed: {err}")),
+    }
+}
+
+/// `YYYYmmdd_HHMMSS` in UTC without a date-time dependency (Howard Hinnant's
+/// civil-from-days algorithm).
+fn timestamp_slug() -> String {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let days = (seconds / 86_400) as i64;
+    let (secs_of_day, z) = ((seconds % 86_400) as u32, days + 719_468);
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { year + 1 } else { year };
+    format!(
+        "{year:04}{month:02}{day:02}_{:02}{:02}{:02}",
+        secs_of_day / 3_600,
+        (secs_of_day / 60) % 60,
+        secs_of_day % 60
+    )
 }
 
 /// Background reader owning the stream port (or the mock generator).
@@ -147,6 +230,7 @@ impl Reader {
         path: String,
         shared: Arc<Mutex<SharedState>>,
         generation: Arc<AtomicU64>,
+        recording: SharedRecording,
     ) -> Result<Self, String> {
         let port = serialport::new(&path, 115_200)
             .timeout(Duration::from_millis(50))
@@ -156,7 +240,7 @@ impl Reader {
         let thread_stop = Arc::clone(&stop);
         let join = std::thread::Builder::new()
             .name("stage-a-photodiode".into())
-            .spawn(move || read_frames(port, &shared, &generation, &thread_stop))
+            .spawn(move || read_frames(port, &shared, &generation, &recording, &thread_stop))
             .expect("spawning the photodiode reader thread must succeed");
         Ok(Self {
             stop,
@@ -166,7 +250,11 @@ impl Reader {
 
     /// Hardware-free source: synthesizes a noisy 5 Hz sine around 1 V in
     /// firmware-sized blocks at the firmware's default stream rate.
-    fn spawn_mock(shared: Arc<Mutex<SharedState>>, generation: Arc<AtomicU64>) -> Self {
+    fn spawn_mock(
+        shared: Arc<Mutex<SharedState>>,
+        generation: Arc<AtomicU64>,
+        recording: SharedRecording,
+    ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
         let join = std::thread::Builder::new()
@@ -174,6 +262,7 @@ impl Reader {
             .spawn(move || {
                 let start = Instant::now();
                 let mut next_index: u64 = 0;
+                let mut sequence: u32 = 0;
                 while !thread_stop.load(Ordering::Relaxed) {
                     let target = (start.elapsed().as_secs_f64() * f64::from(MOCK_RATE_HZ)) as u64;
                     let mut produced = false;
@@ -181,6 +270,14 @@ impl Reader {
                         let codes: Vec<u16> = (0..MOCK_BLOCK_SAMPLES)
                             .map(|i| mock_code(next_index + i as u64))
                             .collect();
+                        // Recordings capture real wire frames; synthesize the
+                        // identical framing so mock recordings parse the same.
+                        record_frame(
+                            &recording,
+                            &mock_sample_frame(sequence, next_index, &codes),
+                            codes.len(),
+                        );
+                        sequence = sequence.wrapping_add(1);
                         if let Ok(mut state) = shared.lock() {
                             state.ingest(next_index, MOCK_RATE_HZ, 0, &codes);
                         }
@@ -199,6 +296,24 @@ impl Reader {
             join: Some(join),
         }
     }
+}
+
+fn mock_sample_frame(sequence: u32, first_index: u64, codes: &[u16]) -> stage_a_io::Frame {
+    let payload: Vec<u8> = codes.iter().flat_map(|c| c.to_le_bytes()).collect();
+    stage_a_io::Frame::build(
+        stage_a_io::FrameHeader {
+            version: stage_a_io::wire::PROTOCOL_VERSION,
+            frame_type: stage_a_io::FrameType::SamplesU16,
+            flags: 0,
+            sequence,
+            payload_bytes: 0,
+            first_sample_index: first_index,
+            sample_rate_hz: MOCK_RATE_HZ,
+            dropped_samples: 0,
+            crc32: 0,
+        },
+        payload,
+    )
 }
 
 /// Deterministic mock sample: 1 V ± 0.5 V sine at 5 Hz plus ~20 mV of hash
@@ -225,6 +340,7 @@ fn read_frames(
     mut port: Box<dyn serialport::SerialPort>,
     shared: &Mutex<SharedState>,
     generation: &AtomicU64,
+    recording: &SharedRecording,
     stop: &AtomicBool,
 ) {
     let mut parser = FrameParser::default();
@@ -251,6 +367,7 @@ fn read_frames(
                     let Some(codes) = frame.samples() else {
                         continue; // Control/summary frames are not expected here.
                     };
+                    record_frame(recording, &frame, codes.len());
                     if let Ok(mut state) = shared.lock() {
                         state.ingest(
                             frame.header.first_sample_index,
@@ -284,7 +401,10 @@ pub struct StageAPhotodiodePlugin {
     reader: Option<Reader>,
     shared: Arc<Mutex<SharedState>>,
     generation: Arc<AtomicU64>,
+    recording: SharedRecording,
     last_error: Option<String>,
+    /// One-line feedback about the most recent save/recording action.
+    last_save_note: Option<String>,
     // -- settings --
     connect_requested: bool,
     port_hint: String,
@@ -293,6 +413,7 @@ pub struct StageAPhotodiodePlugin {
     window_s: f64,
     avg_samples: usize,
     avg_sync_freq_hz: f64,
+    data_dir: String,
 }
 
 impl Default for StageAPhotodiodePlugin {
@@ -302,7 +423,9 @@ impl Default for StageAPhotodiodePlugin {
             reader: None,
             shared: Arc::new(Mutex::new(SharedState::default())),
             generation: Arc::new(AtomicU64::new(1)),
+            recording: Arc::new(Mutex::new(None)),
             last_error: None,
+            last_save_note: None,
             connect_requested: false,
             port_hint: "auto".into(),
             mode: Mode::Raw,
@@ -310,6 +433,7 @@ impl Default for StageAPhotodiodePlugin {
             window_s: 10.0,
             avg_samples: 4,
             avg_sync_freq_hz: 0.0,
+            data_dir: String::new(),
         }
     }
 }
@@ -331,6 +455,7 @@ impl StageAPhotodiodePlugin {
             self.reader = Some(Reader::spawn_mock(
                 Arc::clone(&self.shared),
                 Arc::clone(&self.generation),
+                Arc::clone(&self.recording),
             ));
             return;
         }
@@ -345,7 +470,12 @@ impl StageAPhotodiodePlugin {
         } else {
             self.port_hint.clone()
         };
-        match Reader::spawn_serial(path, Arc::clone(&self.shared), Arc::clone(&self.generation)) {
+        match Reader::spawn_serial(
+            path,
+            Arc::clone(&self.shared),
+            Arc::clone(&self.generation),
+            Arc::clone(&self.recording),
+        ) {
             Ok(reader) => self.reader = Some(reader),
             Err(err) => {
                 self.last_error = Some(err);
@@ -358,6 +488,183 @@ impl StageAPhotodiodePlugin {
     fn disconnect(&mut self) {
         self.reader = None; // Drop joins the thread.
         self.generation.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn recording_active(&self) -> bool {
+        self.recording
+            .lock()
+            .map(|slot| slot.is_some())
+            .unwrap_or(false)
+    }
+
+    fn resolved_data_dir(&self) -> Result<PathBuf, String> {
+        if self.data_dir.trim().is_empty() {
+            return Err("set the data directory first (Data section)".into());
+        }
+        Ok(PathBuf::from(self.data_dir.trim()))
+    }
+
+    fn start_recording(&mut self) -> Result<(), String> {
+        if self.recording_active() {
+            return Ok(());
+        }
+        let dir = self.resolved_data_dir()?;
+        let slug = timestamp_slug();
+        let pdq_path = dir.join(format!("pd_rec_{slug}.pdq"));
+        let writer = PdqWriter::create(&pdq_path)
+            .map_err(|err| format!("creating {} failed: {err}", pdq_path.display()))?;
+        let (crc, resync, dropped, segments) = match self.shared.lock() {
+            Ok(state) => (
+                state.crc_failures,
+                state.resync_bytes,
+                state.device_dropped,
+                state.segments,
+            ),
+            Err(_) => (0, 0, 0, 0),
+        };
+        let sink = RecordingSink {
+            writer,
+            pdq_path: pdq_path.clone(),
+            started_slug: slug,
+            samples_written: 0,
+            write_error: None,
+            start_crc_failures: crc,
+            start_resync_bytes: resync,
+            start_device_dropped: dropped,
+            start_segments: segments,
+        };
+        if let Ok(mut slot) = self.recording.lock() {
+            *slot = Some(sink);
+        }
+        self.last_save_note = Some(format!("recording → {}", pdq_path.display()));
+        Ok(())
+    }
+
+    fn stop_recording(&mut self) -> Result<(), String> {
+        let Some(sink) = self.recording.lock().ok().and_then(|mut slot| slot.take()) else {
+            return Ok(());
+        };
+        let (rate_hz, crc, resync, dropped, segments) = match self.shared.lock() {
+            Ok(state) => (
+                state.rate_hz,
+                state.crc_failures,
+                state.resync_bytes,
+                state.device_dropped,
+                state.segments,
+            ),
+            Err(_) => (0, 0, 0, 0, 0),
+        };
+        let integrity = StreamIntegrity {
+            skipped_bytes: resync.saturating_sub(sink.start_resync_bytes),
+            crc_failures: crc.saturating_sub(sink.start_crc_failures),
+            sequence_gaps: segments.saturating_sub(sink.start_segments),
+            dropped_samples: u64::from(dropped.saturating_sub(sink.start_device_dropped)),
+        };
+        let write_error = sink.write_error.clone();
+        let started = sink.started_slug.clone();
+        let samples = sink.samples_written;
+        let summary = sink
+            .writer
+            .finish(integrity)
+            .map_err(|err| format!("finishing recording failed: {err}"))?;
+        let sidecar = json!({
+            "kind": "recording",
+            "started_utc": started,
+            "stopped_utc": timestamp_slug(),
+            "port": self.port_hint,
+            "sample_rate_hz": rate_hz,
+            "samples_written": samples,
+            "pdq_path": summary.path,
+            "pdq_frames": summary.frames_written,
+            "pdq_bytes": summary.bytes_written,
+            "pdq_crc32": summary.file_crc32,
+            "adc": { "bits": 12, "full_scale_volts": ADC_FULL_SCALE_VOLTS },
+            "display_mode": self.mode.name(),
+            "reference_volts": self.reference_volts,
+            "integrity": {
+                "resync_bytes": summary.integrity.skipped_bytes,
+                "crc_failures": summary.integrity.crc_failures,
+                "segment_restarts": summary.integrity.sequence_gaps,
+                "device_dropped_samples": summary.integrity.dropped_samples,
+            },
+            "valid": summary.valid && write_error.is_none(),
+            "write_error": write_error,
+        });
+        let sidecar_path = sink.pdq_path.with_extension("json");
+        write_json(&sidecar_path, &sidecar)?;
+        self.last_save_note = Some(format!(
+            "saved recording {} ({} samples)",
+            sink.pdq_path.display(),
+            samples
+        ));
+        Ok(())
+    }
+
+    /// Dumps the current monitor cache (ring) as CSV + JSON sidecar. Raw
+    /// codes and raw volts only — mode/reference land in the sidecar so
+    /// EXCITATION values stay derivable without baking display state into
+    /// the data.
+    fn save_cache_snapshot(&mut self) -> Result<(), String> {
+        let dir = self.resolved_data_dir()?;
+        let slug = timestamp_slug();
+        let csv_path = dir.join(format!("pd_cache_{slug}.csv"));
+        let state = self
+            .shared
+            .lock()
+            .map_err(|_| "photodiode state lock poisoned".to_owned())?;
+        if state.samples.is_empty() || state.rate_hz == 0 {
+            return Err("no samples cached yet".into());
+        }
+        std::fs::create_dir_all(&dir)
+            .map_err(|err| format!("creating {} failed: {err}", dir.display()))?;
+        let file = File::create(&csv_path)
+            .map_err(|err| format!("creating {} failed: {err}", csv_path.display()))?;
+        let mut writer = BufWriter::new(file);
+        let rate = f64::from(state.rate_hz);
+        writeln!(writer, "sample_index,t_s,code,volts")
+            .map_err(|err| format!("writing CSV failed: {err}"))?;
+        for (offset, &code) in state.samples.iter().enumerate() {
+            let index = state.ring_first_index + offset as u64;
+            writeln!(
+                writer,
+                "{index},{:.9},{code},{:.6}",
+                index as f64 / rate,
+                code_to_volts(f64::from(code))
+            )
+            .map_err(|err| format!("writing CSV failed: {err}"))?;
+        }
+        writer
+            .flush()
+            .map_err(|err| format!("writing CSV failed: {err}"))?;
+
+        let sidecar = json!({
+            "kind": "cache_snapshot",
+            "created_utc": slug,
+            "port": self.port_hint,
+            "sample_rate_hz": state.rate_hz,
+            "samples": state.samples.len(),
+            "first_sample_index": state.ring_first_index,
+            "cache_seconds": state.cache_seconds,
+            "csv_path": csv_path,
+            "adc": { "bits": 12, "full_scale_volts": ADC_FULL_SCALE_VOLTS },
+            "display_mode": self.mode.name(),
+            "reference_volts": self.reference_volts,
+            "time_base": "t_s = sample_index / sample_rate_hz, device clock, segment-relative",
+            "integrity": {
+                "resync_bytes": state.resync_bytes,
+                "crc_failures": state.crc_failures,
+                "segment_restarts": state.segments,
+                "device_dropped_samples": state.device_dropped,
+            },
+        });
+        let sample_count = state.samples.len();
+        drop(state);
+        write_json(&csv_path.with_extension("json"), &sidecar)?;
+        self.last_save_note = Some(format!(
+            "saved cache {} ({sample_count} samples)",
+            csv_path.display()
+        ));
+        Ok(())
     }
 
     /// Value shown for one sample under the current mode, in volts.
@@ -616,6 +923,12 @@ impl StageAPhotodiodePlugin {
     }
 }
 
+fn write_json(path: &Path, value: &Value) -> Result<(), String> {
+    let bytes = serde_json::to_vec_pretty(value)
+        .map_err(|err| format!("serializing sidecar failed: {err}"))?;
+    std::fs::write(path, bytes).map_err(|err| format!("writing {} failed: {err}", path.display()))
+}
+
 fn serial_ports() -> Vec<String> {
     serialport::available_ports()
         .map(|ports| {
@@ -747,6 +1060,11 @@ impl Plugin for StageAPhotodiodePlugin {
         self.enabled = enabled;
         if !enabled {
             self.connect_requested = false;
+            // Finalize an active recording so the .pdq/.json pair is complete
+            // even when the plugin is disabled mid-run.
+            if let Err(err) = self.stop_recording() {
+                self.last_error = Some(err);
+            }
             self.disconnect();
         }
     }
@@ -783,114 +1101,184 @@ impl Plugin for StageAPhotodiodePlugin {
             .position(|m| *m == self.mode)
             .unwrap_or(0);
         SettingsSchema {
-            sections: vec![SettingsSection {
-                label: "Photodiode readout".into(),
-                description: Some(
-                    "Reads the free-running PDA1 sample stream on the Teensy's SECOND serial \
+            sections: vec![
+                SettingsSection {
+                    label: "Photodiode readout".into(),
+                    description: Some(
+                        "Reads the free-running PDA1 sample stream on the Teensy's SECOND serial \
                      port (firmware 0.4.0+, 20 kSa/s default). EXCITATION shows \
                      I_exc = I_tot − I_pd: the diode sits behind the PBS and sees the light \
                      removed from the excitation beam."
-                        .into(),
-                ),
-                default_open: true,
-                items: vec![
-                    SettingItem {
-                        key: "port".into(),
-                        label: "Port".into(),
-                        tooltip: Some(
-                            "auto (recommended) listens on the attached usbmodem ports and \
+                            .into(),
+                    ),
+                    default_open: true,
+                    items: vec![
+                        SettingItem {
+                            key: "port".into(),
+                            label: "Port".into(),
+                            tooltip: Some(
+                                "auto (recommended) listens on the attached usbmodem ports and \
                              picks the one streaming PDA1 sample frames — the Teensy stream \
                              port; mock = synthetic data"
-                                .into(),
-                        ),
-                        kind: SettingKind::Enum {
-                            variants: port_variants,
-                            default: port_default,
+                                    .into(),
+                            ),
+                            kind: SettingKind::Enum {
+                                variants: port_variants,
+                                default: port_default,
+                            },
                         },
-                    },
-                    SettingItem {
-                        key: "connect".into(),
-                        label: "Connect".into(),
-                        tooltip: Some(
-                            "Opens/closes the stream port (read-only, no camera required).".into(),
-                        ),
-                        kind: SettingKind::Bool {
-                            default: self.connect_requested,
+                        SettingItem {
+                            key: "connect".into(),
+                            label: "Connect".into(),
+                            tooltip: Some(
+                                "Opens/closes the stream port (read-only, no camera required)."
+                                    .into(),
+                            ),
+                            kind: SettingKind::Bool {
+                                default: self.connect_requested,
+                            },
                         },
-                    },
-                    SettingItem {
-                        key: "mode".into(),
-                        label: "Mode".into(),
-                        tooltip: Some(
-                            "RAW: ADC code and volts as measured. EXCITATION: I_tot − I_pd".into(),
-                        ),
-                        kind: SettingKind::Enum {
-                            variants: mode_variants,
-                            default: mode_default,
+                        SettingItem {
+                            key: "mode".into(),
+                            label: "Mode".into(),
+                            tooltip: Some(
+                                "RAW: ADC code and volts as measured. EXCITATION: I_tot − I_pd"
+                                    .into(),
+                            ),
+                            kind: SettingKind::Enum {
+                                variants: mode_variants,
+                                default: mode_default,
+                            },
                         },
-                    },
-                    SettingItem {
-                        key: "reference_volts".into(),
-                        label: "Reference I_tot".into(),
-                        tooltip: Some(
-                            "Total power reference for EXCITATION mode, in photodiode volts: \
+                        SettingItem {
+                            key: "reference_volts".into(),
+                            label: "Reference I_tot".into(),
+                            tooltip: Some(
+                                "Total power reference for EXCITATION mode, in photodiode volts: \
                              the PD reading with the full beam diverted into the diode"
-                                .into(),
-                        ),
-                        kind: SettingKind::F64Drag {
-                            min: 0.0,
-                            max: ADC_FULL_SCALE_VOLTS,
-                            speed: 0.01,
-                            default: self.reference_volts,
+                                    .into(),
+                            ),
+                            kind: SettingKind::F64Drag {
+                                min: 0.0,
+                                max: ADC_FULL_SCALE_VOLTS,
+                                speed: 0.01,
+                                default: self.reference_volts,
+                            },
                         },
-                    },
-                    SettingItem {
-                        key: "window_s".into(),
-                        label: "Chart window".into(),
-                        tooltip: Some(
-                            "Seconds of history shown in the live chart. Short windows \
+                        SettingItem {
+                            key: "window_s".into(),
+                            label: "Chart window".into(),
+                            tooltip: Some(
+                                "Seconds of history shown in the live chart. Short windows \
                              (≤ 50 ms) resolve individual modulation cycles at 20 kSa/s."
-                                .into(),
-                        ),
-                        kind: SettingKind::F64Drag {
-                            min: 0.01,
-                            max: 120.0,
-                            speed: 0.05,
-                            default: self.window_s,
+                                    .into(),
+                            ),
+                            kind: SettingKind::F64Drag {
+                                min: 0.01,
+                                max: 120.0,
+                                speed: 0.05,
+                                default: self.window_s,
+                            },
                         },
-                    },
-                    SettingItem {
-                        key: "avg_samples".into(),
-                        label: "Average window".into(),
-                        tooltip: Some(
-                            "Moving-average window in samples (1 = off). Ignored while \
+                        SettingItem {
+                            key: "avg_samples".into(),
+                            label: "Average window".into(),
+                            tooltip: Some(
+                                "Moving-average window in samples (1 = off). Ignored while \
                               'Average sync frequency' is set."
-                                .into(),
-                        ),
-                        kind: SettingKind::I64Drag {
-                            min: 1,
-                            max: 1_000_000,
-                            default: self.avg_samples as i64,
+                                    .into(),
+                            ),
+                            kind: SettingKind::I64Drag {
+                                min: 1,
+                                max: 1_000_000,
+                                default: self.avg_samples as i64,
+                            },
                         },
-                    },
-                    SettingItem {
-                        key: "avg_sync_freq_hz".into(),
-                        label: "Average sync frequency".into(),
-                        tooltip: Some(
-                            "0 = off. When set to the modulation frequency (Hz), the moving \
+                        SettingItem {
+                            key: "avg_sync_freq_hz".into(),
+                            label: "Average sync frequency".into(),
+                            tooltip: Some(
+                                "0 = off. When set to the modulation frequency (Hz), the moving \
                              average spans exactly one full period (window = rate / f), so the \
                              mean level no longer depends on the modulation phase."
-                                .into(),
-                        ),
-                        kind: SettingKind::F64Drag {
-                            min: 0.0,
-                            max: 100_000.0,
-                            speed: 1.0,
-                            default: self.avg_sync_freq_hz,
+                                    .into(),
+                            ),
+                            kind: SettingKind::F64Drag {
+                                min: 0.0,
+                                max: 100_000.0,
+                                speed: 1.0,
+                                default: self.avg_sync_freq_hz,
+                            },
                         },
-                    },
-                ],
-            }],
+                    ],
+                },
+                SettingsSection {
+                    label: "Data".into(),
+                    description: Some(
+                        "Monitor cache and disk recording. The cache always holds the last \
+                     N seconds; recording tees every incoming frame to a .pdq file \
+                     (+ JSON sidecar) so length is disk-bound. CSV/PDQ store raw codes \
+                     and raw volts on the device clock; mode and reference go into the \
+                     sidecar."
+                            .into(),
+                    ),
+                    default_open: false,
+                    items: vec![
+                        SettingItem {
+                            key: "data_dir".into(),
+                            label: "Data directory".into(),
+                            tooltip: Some(
+                                "Where recordings and cache snapshots are written.".into(),
+                            ),
+                            kind: SettingKind::Path {
+                                dialog: PathDialogKind::Directory,
+                                default: self.data_dir.clone(),
+                            },
+                        },
+                        SettingItem {
+                            key: "cache_s".into(),
+                            label: "Cache length".into(),
+                            tooltip: Some(
+                                "Seconds of raw samples kept in memory for the chart and \
+                             cache snapshots."
+                                    .into(),
+                            ),
+                            kind: SettingKind::F64Drag {
+                                min: 1.0,
+                                max: MAX_CACHE_SECONDS,
+                                speed: 1.0,
+                                default: self
+                                    .shared
+                                    .lock()
+                                    .map(|state| state.cache_seconds)
+                                    .unwrap_or(DEFAULT_CACHE_SECONDS),
+                            },
+                        },
+                        SettingItem {
+                            key: "record".into(),
+                            label: "Record to disk".into(),
+                            tooltip: Some(
+                                "Start/stop appending every incoming sample frame to \
+                             pd_rec_<timestamp>.pdq; stopping writes the JSON sidecar."
+                                    .into(),
+                            ),
+                            kind: SettingKind::Bool {
+                                default: self.recording_active(),
+                            },
+                        },
+                        SettingItem {
+                            key: "save_snapshot".into(),
+                            label: "Save cache snapshot".into(),
+                            tooltip: Some(
+                                "Write the current cache as pd_cache_<timestamp>.csv \
+                             (+ JSON sidecar)."
+                                    .into(),
+                            ),
+                            kind: SettingKind::Button,
+                        },
+                    ],
+                },
+            ],
         }
     }
 
@@ -917,6 +1305,15 @@ impl Plugin for StageAPhotodiodePlugin {
             "window_s" => Some(json!(self.window_s)),
             "avg_samples" => Some(json!(self.avg_samples)),
             "avg_sync_freq_hz" => Some(json!(self.avg_sync_freq_hz)),
+            "data_dir" => Some(json!(self.data_dir)),
+            "cache_s" => Some(json!(self
+                .shared
+                .lock()
+                .map(|state| state.cache_seconds)
+                .unwrap_or(DEFAULT_CACHE_SECONDS))),
+            "record" => Some(json!(self.recording_active())),
+            // Momentary trigger: never reports as pressed.
+            "save_snapshot" => Some(json!(false)),
             _ => None,
         }
     }
@@ -965,6 +1362,45 @@ impl Plugin for StageAPhotodiodePlugin {
                 self.avg_sync_freq_hz = freq.clamp(0.0, 100_000.0);
                 Ok(())
             }
+            "data_dir" => {
+                self.data_dir = value
+                    .as_str()
+                    .ok_or("data_dir must be a string")?
+                    .to_owned();
+                Ok(())
+            }
+            "cache_s" => {
+                let seconds = value.as_f64().ok_or("cache_s must be a number")?;
+                if let Ok(mut state) = self.shared.lock() {
+                    state.cache_seconds = seconds.clamp(1.0, MAX_CACHE_SECONDS);
+                }
+                Ok(())
+            }
+            "record" => {
+                let requested = value.as_bool().ok_or("record must be a boolean")?;
+                // Failures surface through status entries (like `connect`),
+                // so a missing data directory doesn't read as a broken UI.
+                let result = if requested {
+                    self.start_recording()
+                } else {
+                    self.stop_recording()
+                };
+                if let Err(err) = result {
+                    self.last_error = Some(err);
+                } else {
+                    self.last_error = None;
+                }
+                self.generation.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            "save_snapshot" => {
+                match self.save_cache_snapshot() {
+                    Ok(()) => self.last_error = None,
+                    Err(err) => self.last_error = Some(err),
+                }
+                self.generation.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
             _ => Err(format!("unknown setting: {key}")),
         }
     }
@@ -1011,6 +1447,25 @@ impl Plugin for StageAPhotodiodePlugin {
                     self.display_volts(average)
                 )));
             }
+        }
+        if self.recording_active() {
+            let (samples, path) = self
+                .recording
+                .lock()
+                .ok()
+                .and_then(|slot| {
+                    slot.as_ref()
+                        .map(|sink| (sink.samples_written, sink.pdq_path.display().to_string()))
+                })
+                .unwrap_or((0, String::new()));
+            let seconds = if rate_hz > 0 {
+                samples as f64 / f64::from(rate_hz)
+            } else {
+                0.0
+            };
+            entries.push(StatusEntry::Text(format!("● REC {seconds:.1} s → {path}")));
+        } else if let Some(note) = &self.last_save_note {
+            entries.push(StatusEntry::Text(note.clone()));
         }
         if let Some(error) = stream_error.or_else(|| self.last_error.clone()) {
             entries.push(StatusEntry::Text(format!("Error: {error}")));
@@ -1146,8 +1601,9 @@ mod tests {
     #[test]
     fn ring_is_bounded_by_duration() {
         let mut state = SharedState::default();
-        let rate = 1_000; // capacity = 130_000 samples
-        let cap = SharedState::ring_capacity(rate);
+        let rate = 1_000; // capacity = cache_seconds (20 s default) × rate
+        let cap = state.ring_capacity(rate);
+        assert_eq!(cap, 20_000, "default cache is 20 s");
         let block: Vec<u16> = (0..1_000).map(|i| (i % 4_096) as u16).collect();
         let mut index = 0_u64;
         for _ in 0..(cap / block.len() + 5) {
@@ -1274,6 +1730,122 @@ mod tests {
         let generation = plugin.generation.load(Ordering::Relaxed);
         assert!(generation > 1);
         plugin.disconnect();
+    }
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "stage-a-photodiode-{tag}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    #[test]
+    fn cache_snapshot_writes_csv_and_sidecar() {
+        let dir = temp_dir("snapshot");
+        let mut plugin = StageAPhotodiodePlugin::default();
+        plugin
+            .set_setting("data_dir", json!(dir.display().to_string()))
+            .unwrap();
+        {
+            let mut state = plugin.shared.lock().unwrap();
+            state.ingest(10, 20_000, 0, &[100, 200, 300]);
+        }
+        plugin.set_setting("save_snapshot", json!(true)).unwrap();
+        assert!(plugin.last_error.is_none(), "{:?}", plugin.last_error);
+
+        let mut csv_files: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|ext| ext == "csv"))
+            .collect();
+        assert_eq!(csv_files.len(), 1);
+        let csv_path = csv_files.pop().unwrap();
+        let csv = std::fs::read_to_string(&csv_path).unwrap();
+        let mut lines = csv.lines();
+        assert_eq!(lines.next(), Some("sample_index,t_s,code,volts"));
+        let first = lines.next().unwrap();
+        assert!(first.starts_with("10,0.000500000,100,"), "{first}");
+        assert_eq!(csv.lines().count(), 4, "header + 3 samples");
+
+        let sidecar: Value =
+            serde_json::from_slice(&std::fs::read(csv_path.with_extension("json")).unwrap())
+                .unwrap();
+        assert_eq!(sidecar["kind"], "cache_snapshot");
+        assert_eq!(sidecar["sample_rate_hz"], 20_000);
+        assert_eq!(sidecar["samples"], 3);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn snapshot_without_data_dir_reports_an_error() {
+        let mut plugin = StageAPhotodiodePlugin::default();
+        plugin.set_setting("save_snapshot", json!(true)).unwrap();
+        assert!(plugin
+            .last_error
+            .as_deref()
+            .is_some_and(|err| err.contains("data directory")));
+    }
+
+    #[test]
+    fn recording_tees_frames_to_pdq_and_writes_a_sidecar() {
+        let dir = temp_dir("recording");
+        let mut plugin = StageAPhotodiodePlugin::default();
+        plugin
+            .set_setting("data_dir", json!(dir.display().to_string()))
+            .unwrap();
+        plugin.set_setting("record", json!(true)).unwrap();
+        assert!(plugin.recording_active());
+        assert_eq!(plugin.get_setting("record"), Some(json!(true)));
+
+        // The reader thread path: every parsed frame is teed to the sink.
+        let frame = mock_sample_frame(0, 0, &[1, 2, 3, 4]);
+        record_frame(&plugin.recording, &frame, 4);
+        {
+            let mut state = plugin.shared.lock().unwrap();
+            state.ingest(0, MOCK_RATE_HZ, 0, &[1, 2, 3, 4]);
+        }
+
+        plugin.set_setting("record", json!(false)).unwrap();
+        assert!(!plugin.recording_active());
+        assert!(plugin.last_error.is_none(), "{:?}", plugin.last_error);
+
+        let pdq_path: std::path::PathBuf = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| p.extension().is_some_and(|ext| ext == "pdq"))
+            .expect("pdq written");
+        assert_eq!(std::fs::read(&pdq_path).unwrap(), frame.to_bytes());
+
+        let sidecar: Value =
+            serde_json::from_slice(&std::fs::read(pdq_path.with_extension("json")).unwrap())
+                .unwrap();
+        assert_eq!(sidecar["kind"], "recording");
+        assert_eq!(sidecar["samples_written"], 4);
+        assert_eq!(sidecar["pdq_frames"], 1);
+        assert_eq!(sidecar["valid"], true);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cache_length_setting_drives_ring_capacity() {
+        let mut plugin = StageAPhotodiodePlugin::default();
+        plugin.set_setting("cache_s", json!(2.0)).unwrap();
+        assert_eq!(plugin.get_setting("cache_s"), Some(json!(2.0)));
+        let mut state = plugin.shared.lock().unwrap();
+        assert_eq!(state.ring_capacity(1_000), 2_000);
+        let block: Vec<u16> = vec![1; 1_000];
+        for i in 0..5_u64 {
+            let first = i * 1_000;
+            state.ingest(first, 1_000, 0, &block);
+        }
+        assert_eq!(state.samples.len(), 2_000);
     }
 
     /// The host settings UI exchanges enum values as indices into the
