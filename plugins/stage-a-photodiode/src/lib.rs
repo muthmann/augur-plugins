@@ -42,6 +42,8 @@ use serde_json::{json, Value};
 use stage_a_io::{FrameParser, ParseEvent, PdqWriter, StreamIntegrity};
 
 const SERIES_DATASET_ID: &str = "stage-a-photodiode.series";
+const SPECTRUM_DATASET_ID: &str = "stage-a-photodiode.spectrum";
+const SPECTRUM_VIEW_ID: &str = "stage-a-photodiode.spectrum.view";
 const SERIES_VIEW_ID: &str = "stage-a-photodiode.series.view";
 const STATUS_DATASET_ID: &str = "stage-a-photodiode.status";
 const STATUS_VIEW_ID: &str = "stage-a-photodiode.status.view";
@@ -58,6 +60,10 @@ const RING_MAX_SAMPLES: usize = 4_000_000;
 /// Envelope buckets per rendered chart line; keeps the plot payload bounded
 /// no matter how many raw samples the window covers.
 const MAX_PLOT_BUCKETS: usize = 1_000;
+/// Spectrum FFT window bounds: 16384 samples ≈ 0.8 s at 20 kSa/s
+/// (Δf ≈ 1.2 Hz); below 256 samples a spectrum is not meaningful.
+const SPECTRUM_MIN_SAMPLES: usize = 256;
+const SPECTRUM_MAX_SAMPLES: usize = 16_384;
 /// The firmware's default stream rate; the mock mirrors it.
 const MOCK_RATE_HZ: u32 = 20_000;
 const MOCK_BLOCK_SAMPLES: usize = 256;
@@ -84,6 +90,37 @@ impl Mode {
 
     fn from_name(name: &str) -> Option<Self> {
         Self::VARIANTS.into_iter().find(|m| m.name() == name)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimeAxis {
+    /// Scrolling view: x = seconds before the newest sample (ends at 0).
+    BeforeNow,
+    /// Fixed view: x = seconds since the segment start on the device clock —
+    /// a frozen plot reads as absolute positions, not implied motion.
+    Segment,
+}
+
+impl TimeAxis {
+    const VARIANTS: [TimeAxis; 2] = [TimeAxis::BeforeNow, TimeAxis::Segment];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::BeforeNow => "BEFORE NOW",
+            Self::Segment => "SEGMENT TIME",
+        }
+    }
+
+    fn from_name(name: &str) -> Option<Self> {
+        Self::VARIANTS.into_iter().find(|axis| axis.name() == name)
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::BeforeNow => "time before now [s]",
+            Self::Segment => "segment time [s]",
+        }
     }
 }
 
@@ -413,6 +450,7 @@ pub struct StageAPhotodiodePlugin {
     window_s: f64,
     avg_samples: usize,
     avg_sync_freq_hz: f64,
+    time_axis: TimeAxis,
     data_dir: String,
 }
 
@@ -433,6 +471,7 @@ impl Default for StageAPhotodiodePlugin {
             window_s: 10.0,
             avg_samples: 4,
             avg_sync_freq_hz: 0.0,
+            time_axis: TimeAxis::BeforeNow,
             data_dir: String::new(),
         }
     }
@@ -710,8 +749,9 @@ impl StageAPhotodiodePlugin {
             Mode::Raw => "photodiode",
             Mode::Excitation => "excitation",
         };
+        let x_label = self.time_axis.label();
         let empty = |label: &str| Series1dV1 {
-            x_label: "time before now [s]".into(),
+            x_label: x_label.into(),
             y_label: label.into(),
             lines: vec![Series1dLine {
                 name: trace_name.into(),
@@ -772,8 +812,11 @@ impl StageAPhotodiodePlugin {
                 }
             }
             if bucket_n == bucket_len || i == total - 1 {
-                let x = (state.ring_first_index + i as u64) as f64 / rate
-                    - latest_x_index as f64 / rate;
+                let device_t = (state.ring_first_index + i as u64) as f64 / rate;
+                let x = match self.time_axis {
+                    TimeAxis::BeforeNow => device_t - latest_x_index as f64 / rate,
+                    TimeAxis::Segment => device_t,
+                };
                 mean_points.push(Series1dPoint {
                     x,
                     y: self.display_volts(bucket_sum as f64 / bucket_n as f64),
@@ -827,9 +870,89 @@ impl StageAPhotodiodePlugin {
             });
         }
         Series1dV1 {
-            x_label: "time before now [s]".into(),
+            x_label: x_label.into(),
             y_label: y_label.into(),
             lines,
+        }
+    }
+
+    /// Amplitude spectrum of the newest power-of-two window of raw samples
+    /// (Hann-windowed radix-2 FFT). Only computed while the spectrum window
+    /// is open — it has Window placement, and the host fetches datasets of
+    /// closed windows never.
+    fn spectrum_dataset(&self) -> Series1dV1 {
+        let empty = Series1dV1 {
+            x_label: "frequency [Hz]".into(),
+            y_label: "amplitude [V]".into(),
+            lines: vec![Series1dLine {
+                name: "spectrum".into(),
+                points: Vec::new(),
+            }],
+        };
+        let Ok(state) = self.shared.lock() else {
+            return empty;
+        };
+        let total = state.samples.len();
+        if total < SPECTRUM_MIN_SAMPLES || state.rate_hz == 0 {
+            return empty;
+        }
+        let available = total.min(SPECTRUM_MAX_SAMPLES);
+        let n = if available.is_power_of_two() {
+            available
+        } else {
+            available.next_power_of_two() >> 1
+        };
+        let start = total - n;
+        let mut real: Vec<f64> = state
+            .samples
+            .range(start..)
+            .map(|&code| code_to_volts(f64::from(code)))
+            .collect();
+        let rate = f64::from(state.rate_hz);
+        drop(state);
+
+        let mean = real.iter().sum::<f64>() / n as f64;
+        // Hann window (coherent gain 0.5) on the demeaned signal.
+        for (i, value) in real.iter_mut().enumerate() {
+            let w = 0.5 * (1.0 - (2.0 * std::f64::consts::PI * i as f64 / (n as f64 - 1.0)).cos());
+            *value = (*value - mean) * w;
+        }
+        let mut imag = vec![0.0_f64; n];
+        fft_radix2(&mut real, &mut imag);
+
+        // One-sided amplitude: 2·|X|/(N·0.5); decimate bins by max-hold so
+        // narrow peaks survive the plot budget.
+        let bins = n / 2;
+        let bucket = bins.div_ceil(MAX_PLOT_BUCKETS).max(1);
+        let mut points = Vec::with_capacity(bins.div_ceil(bucket));
+        let mut peak = 0.0_f64;
+        let mut peak_freq = 0.0_f64;
+        let mut in_bucket = 0_usize;
+        for k in 1..bins {
+            let amplitude = 2.0 * (real[k] * real[k] + imag[k] * imag[k]).sqrt() / (n as f64 * 0.5);
+            let freq = k as f64 * rate / n as f64;
+            if amplitude > peak {
+                peak = amplitude;
+                peak_freq = freq;
+            }
+            in_bucket += 1;
+            if in_bucket == bucket || k == bins - 1 {
+                points.push(Series1dPoint {
+                    x: peak_freq,
+                    y: peak,
+                });
+                peak = 0.0;
+                peak_freq = freq;
+                in_bucket = 0;
+            }
+        }
+        Series1dV1 {
+            x_label: "frequency [Hz]".into(),
+            y_label: "amplitude [V]".into(),
+            lines: vec![Series1dLine {
+                name: format!("spectrum ({n} spl, Δf {:.2} Hz)", rate / n as f64),
+                points,
+            }],
         }
     }
 
@@ -920,6 +1043,51 @@ impl StageAPhotodiodePlugin {
             ],
             ..TableSchema::default()
         }
+    }
+}
+
+/// In-place iterative radix-2 Cooley–Tukey FFT. Lengths must be powers of
+/// two; sized for the spectrum window (≤ 16384), where it runs in well under
+/// a millisecond.
+fn fft_radix2(real: &mut [f64], imag: &mut [f64]) {
+    let n = real.len();
+    debug_assert!(n.is_power_of_two() && imag.len() == n);
+    // Bit-reversal permutation.
+    let mut j = 0_usize;
+    for i in 1..n {
+        let mut bit = n >> 1;
+        while j & bit != 0 {
+            j ^= bit;
+            bit >>= 1;
+        }
+        j |= bit;
+        if i < j {
+            real.swap(i, j);
+            imag.swap(i, j);
+        }
+    }
+    let mut len = 2_usize;
+    while len <= n {
+        let angle = -2.0 * std::f64::consts::PI / len as f64;
+        let (step_r, step_i) = (angle.cos(), angle.sin());
+        for start in (0..n).step_by(len) {
+            let (mut w_r, mut w_i) = (1.0_f64, 0.0_f64);
+            for k in start..start + len / 2 {
+                let (even_r, even_i) = (real[k], imag[k]);
+                let (odd_r, odd_i) = (
+                    real[k + len / 2] * w_r - imag[k + len / 2] * w_i,
+                    real[k + len / 2] * w_i + imag[k + len / 2] * w_r,
+                );
+                real[k] = even_r + odd_r;
+                imag[k] = even_i + odd_i;
+                real[k + len / 2] = even_r - odd_r;
+                imag[k + len / 2] = even_i - odd_i;
+                let next_r = w_r * step_r - w_i * step_i;
+                w_i = w_r * step_i + w_i * step_r;
+                w_r = next_r;
+            }
+        }
+        len <<= 1;
     }
 }
 
@@ -1210,6 +1378,26 @@ impl Plugin for StageAPhotodiodePlugin {
                                 default: self.avg_sync_freq_hz,
                             },
                         },
+                        SettingItem {
+                            key: "time_axis".into(),
+                            label: "Time axis".into(),
+                            tooltip: Some(
+                                "BEFORE NOW scrolls (x ends at 0); SEGMENT TIME shows absolute \
+                                 seconds on the device clock — better for frozen plots and \
+                                 cursor measurements."
+                                    .into(),
+                            ),
+                            kind: SettingKind::Enum {
+                                variants: TimeAxis::VARIANTS
+                                    .iter()
+                                    .map(|axis| axis.name().to_owned())
+                                    .collect(),
+                                default: TimeAxis::VARIANTS
+                                    .iter()
+                                    .position(|axis| *axis == self.time_axis)
+                                    .unwrap_or(0),
+                            },
+                        },
                     ],
                 },
                 SettingsSection {
@@ -1305,6 +1493,13 @@ impl Plugin for StageAPhotodiodePlugin {
             "window_s" => Some(json!(self.window_s)),
             "avg_samples" => Some(json!(self.avg_samples)),
             "avg_sync_freq_hz" => Some(json!(self.avg_sync_freq_hz)),
+            "time_axis" => {
+                let index = TimeAxis::VARIANTS
+                    .iter()
+                    .position(|axis| *axis == self.time_axis)
+                    .unwrap_or(0);
+                Some(json!(index))
+            }
             "data_dir" => Some(json!(self.data_dir)),
             "cache_s" => Some(json!(self
                 .shared
@@ -1360,6 +1555,16 @@ impl Plugin for StageAPhotodiodePlugin {
             "avg_sync_freq_hz" => {
                 let freq = value.as_f64().ok_or("avg_sync_freq_hz must be a number")?;
                 self.avg_sync_freq_hz = freq.clamp(0.0, 100_000.0);
+                Ok(())
+            }
+            "time_axis" => {
+                let names: Vec<String> = TimeAxis::VARIANTS
+                    .iter()
+                    .map(|axis| axis.name().to_owned())
+                    .collect();
+                let name = enum_choice(&value, &names)?;
+                self.time_axis = TimeAxis::from_name(&name)
+                    .ok_or_else(|| format!("unknown time axis: {name}"))?;
                 Ok(())
             }
             "data_dir" => {
@@ -1485,6 +1690,16 @@ impl Plugin for StageAPhotodiodePlugin {
                     relations: Vec::new(),
                 },
                 HostDatasetDescriptor {
+                    id: SPECTRUM_DATASET_ID.into(),
+                    title: "Photodiode spectrum".into(),
+                    kind: HostDatasetKind::Series1dV1,
+                    empty_message: "Not enough samples for a spectrum yet — connect the stream \
+                                    port and wait a moment."
+                        .into(),
+                    display: None,
+                    relations: Vec::new(),
+                },
+                HostDatasetDescriptor {
                     id: STATUS_DATASET_ID.into(),
                     title: "Photodiode readout".into(),
                     kind: HostDatasetKind::TableV1(self.status_schema()),
@@ -1498,6 +1713,13 @@ impl Plugin for StageAPhotodiodePlugin {
                     id: SERIES_VIEW_ID.into(),
                     title: "Photodiode".into(),
                     dataset_id: SERIES_DATASET_ID.into(),
+                    placement: HostViewPlacement::Window,
+                    kind: HostViewKind::LineSeriesWindow,
+                },
+                HostViewDescriptor {
+                    id: SPECTRUM_VIEW_ID.into(),
+                    title: "PD Spectrum".into(),
+                    dataset_id: SPECTRUM_DATASET_ID.into(),
                     placement: HostViewPlacement::Window,
                     kind: HostViewKind::LineSeriesWindow,
                 },
@@ -1516,6 +1738,7 @@ impl Plugin for StageAPhotodiodePlugin {
     fn host_view_dataset(&self, dataset_id: &str) -> Option<Vec<u8>> {
         match dataset_id {
             SERIES_DATASET_ID => serde_json::to_vec(&self.series_dataset()).ok(),
+            SPECTRUM_DATASET_ID => serde_json::to_vec(&self.spectrum_dataset()).ok(),
             STATUS_DATASET_ID => serde_json::to_vec(&self.status_dataset()).ok(),
             _ => None,
         }
@@ -1523,7 +1746,9 @@ impl Plugin for StageAPhotodiodePlugin {
 
     fn host_view_dataset_generation(&self, dataset_id: &str) -> u64 {
         match dataset_id {
-            SERIES_DATASET_ID | STATUS_DATASET_ID => self.generation.load(Ordering::Relaxed).max(1),
+            SERIES_DATASET_ID | SPECTRUM_DATASET_ID | STATUS_DATASET_ID => {
+                self.generation.load(Ordering::Relaxed).max(1)
+            }
             _ => 0,
         }
     }
@@ -1730,6 +1955,62 @@ mod tests {
         let generation = plugin.generation.load(Ordering::Relaxed);
         assert!(generation > 1);
         plugin.disconnect();
+    }
+
+    #[test]
+    fn spectrum_finds_a_synthesized_tone() {
+        let plugin = StageAPhotodiodePlugin::default();
+        let rate = 20_000_u32;
+        // 1 kHz, 0.4 V amplitude around 1 V — well inside the ADC range.
+        let codes: Vec<u16> = (0..16_384_u64)
+            .map(|i| {
+                let t = i as f64 / f64::from(rate);
+                let volts = 1.0 + 0.4 * (2.0 * std::f64::consts::PI * 1_000.0 * t).sin();
+                (volts * ADC_MAX_CODE / ADC_FULL_SCALE_VOLTS) as u16
+            })
+            .collect();
+        plugin.shared.lock().unwrap().ingest(0, rate, 0, &codes);
+        let spectrum = plugin.spectrum_dataset();
+        let points = &spectrum.lines[0].points;
+        assert!(!points.is_empty());
+        let peak = points
+            .iter()
+            .max_by(|a, b| a.y.partial_cmp(&b.y).unwrap())
+            .unwrap();
+        assert!(
+            (peak.x - 1_000.0).abs() < 5.0,
+            "peak at {} Hz, expected 1 kHz",
+            peak.x
+        );
+        assert!(
+            (peak.y - 0.4).abs() < 0.05,
+            "peak amplitude {} V, expected ≈0.4 V",
+            peak.y
+        );
+    }
+
+    #[test]
+    fn segment_time_axis_uses_absolute_device_time() {
+        let mut plugin = StageAPhotodiodePlugin::default();
+        plugin.set_setting("avg_samples", json!(1)).unwrap();
+        plugin
+            .set_setting("time_axis", json!("SEGMENT TIME"))
+            .unwrap();
+        {
+            let mut state = plugin.shared.lock().unwrap();
+            state.ingest(40_000, 20_000, 0, &[1, 2, 3, 4]);
+        }
+        let series = plugin.series_dataset();
+        assert_eq!(series.x_label, "segment time [s]");
+        let first = series.lines[0].points.first().unwrap();
+        // Sample index 40_000 at 20 kSa/s = 2 s into the segment.
+        assert!((first.x - 2.0).abs() < 1e-6, "got {}", first.x);
+        // Default mode still ends at zero.
+        plugin
+            .set_setting("time_axis", json!("BEFORE NOW"))
+            .unwrap();
+        let series = plugin.series_dataset();
+        assert!(series.lines[0].points.last().unwrap().x.abs() < 1e-9);
     }
 
     fn temp_dir(tag: &str) -> std::path::PathBuf {
