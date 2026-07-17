@@ -28,9 +28,9 @@ use std::time::{Duration, Instant};
 use augur_plugin_api::{
     export_plugin, EventStoreHandle, ExecutionMode, HostContext, HostDatasetDescriptor,
     HostDatasetKind, HostOutput, HostViewDescriptor, HostViewKind, HostViewPlacement,
-    HostViewRegistry, Plugin, PluginFrame, SettingItem, SettingKind, SettingsSchema,
-    SettingsSection, StatusEntry, TableColumn, TableColumnData, TableColumnValues, TableDatasetV1,
-    TableSchema, TableValueType,
+    HostViewRegistry, PathDialogKind, Plugin, PluginFrame, SettingItem, SettingKind,
+    SettingsSchema, SettingsSection, StatusEntry, TableColumn, TableColumnData, TableColumnValues,
+    TableDatasetV1, TableSchema, TableValueType,
 };
 use serde_json::{json, Value};
 use stage_a_io::{Command, MockController, StageAClient, Transport};
@@ -242,10 +242,197 @@ fn apply_reply(
     shared.bump();
 }
 
+/// One validated protocol step: the exact MOD command plus how long to hold
+/// it before advancing.
+#[derive(Debug, Clone, PartialEq)]
+struct ProtocolStep {
+    duration: Duration,
+    command: Command,
+    summary: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ProtocolProgress {
+    loops: usize,
+    total_steps: usize,
+    /// 1-based while running.
+    loop_index: usize,
+    step_index: usize,
+    summary: String,
+    finished: bool,
+    stopped: bool,
+}
+
+/// Running protocol executor; dropping it stops the thread. Commands go
+/// through the same coalescing pending slot the device thread drains, so the
+/// executor never touches the serial port itself.
+struct ProtocolRun {
+    stop: Arc<AtomicBool>,
+    join: Option<JoinHandle<()>>,
+    progress: Arc<Mutex<ProtocolProgress>>,
+}
+
+impl Drop for ProtocolRun {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+/// Parses the TOML protocol format:
+///
+/// ```toml
+/// loops = 2                # optional, default 1
+/// [[steps]]
+/// duration_s = 5.0
+/// wave = "SINE"            # OFF | CONST | SINE | SQUARE
+/// level = 2000             # required unless OFF
+/// min = 0                  # optional, periodic only
+/// frequency_hz = 100.0     # required for SINE/SQUARE (0.01–2000)
+/// ```
+fn parse_protocol(text: &str) -> Result<(Vec<ProtocolStep>, usize), String> {
+    let table: toml::Table = text
+        .parse()
+        .map_err(|err| format!("protocol is not valid TOML: {err}"))?;
+    let loops = match table.get("loops") {
+        None => 1,
+        Some(value) => {
+            let loops = value.as_integer().ok_or("loops must be an integer")?;
+            if !(1..=10_000).contains(&loops) {
+                return Err("loops must be between 1 and 10000".into());
+            }
+            loops as usize
+        }
+    };
+    let raw_steps = table
+        .get("steps")
+        .and_then(|value| value.as_array())
+        .ok_or("protocol needs at least one [[steps]] entry")?;
+    if raw_steps.is_empty() {
+        return Err("protocol needs at least one [[steps]] entry".into());
+    }
+
+    let mut steps = Vec::with_capacity(raw_steps.len());
+    for (index, raw) in raw_steps.iter().enumerate() {
+        let step = raw
+            .as_table()
+            .ok_or_else(|| format!("step {} must be a table", index + 1))?;
+        let context = |msg: &str| format!("step {}: {msg}", index + 1);
+
+        let duration_s = step
+            .get("duration_s")
+            .and_then(|value| value.as_float().or(value.as_integer().map(|v| v as f64)))
+            .ok_or_else(|| context("duration_s is required"))?;
+        if !(0.001..=3_600.0).contains(&duration_s) {
+            return Err(context("duration_s must be between 0.001 and 3600"));
+        }
+        let wave = step
+            .get("wave")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| context("wave is required (OFF/CONST/SINE/SQUARE)"))?
+            .to_uppercase();
+
+        let (command, summary) = if wave == "OFF" {
+            (
+                Command::new("MOD").field("wave", "OFF"),
+                format!("OFF for {duration_s} s"),
+            )
+        } else {
+            let mode = Mode::from_name(&wave)
+                .ok_or_else(|| context("wave must be OFF, CONST, SINE, or SQUARE"))?;
+            let level = step
+                .get("level")
+                .and_then(|value| value.as_integer())
+                .ok_or_else(|| context("level is required"))?;
+            if !(0..=MAX_DAC_CODE).contains(&level) {
+                return Err(context("level must be between 0 and 4095"));
+            }
+            let mut command = Command::new("MOD")
+                .field("wave", mode.name())
+                .field("level", level);
+            let summary;
+            if mode.is_periodic() {
+                let frequency_hz = step
+                    .get("frequency_hz")
+                    .and_then(|value| value.as_float().or(value.as_integer().map(|v| v as f64)))
+                    .ok_or_else(|| context("frequency_hz is required for SINE/SQUARE"))?;
+                if !(0.01..=2_000.0).contains(&frequency_hz) {
+                    return Err(context("frequency_hz must be between 0.01 and 2000"));
+                }
+                let min = step
+                    .get("min")
+                    .and_then(|value| value.as_integer())
+                    .unwrap_or(0);
+                if !(0..=level).contains(&min) {
+                    return Err(context("min must be between 0 and level"));
+                }
+                command = command
+                    .field("min", min)
+                    .field("freq_mhz", (frequency_hz * 1_000.0).round() as i64);
+                summary = format!(
+                    "{} {min}..{level} @ {frequency_hz} Hz for {duration_s} s",
+                    mode.name()
+                );
+            } else {
+                summary = format!("CONST level={level} for {duration_s} s");
+            }
+            (command, summary)
+        };
+        steps.push(ProtocolStep {
+            duration: Duration::from_secs_f64(duration_s),
+            command,
+            summary,
+        });
+    }
+    Ok((steps, loops))
+}
+
+/// Walks the steps on an absolute schedule (no drift accumulation); the last
+/// commanded step holds after completion — set-and-hold, like the firmware.
+fn run_protocol(
+    steps: Vec<ProtocolStep>,
+    loops: usize,
+    shared: Arc<SharedLink>,
+    stop: Arc<AtomicBool>,
+    progress: Arc<Mutex<ProtocolProgress>>,
+) {
+    let mut next_deadline = Instant::now();
+    'run: for loop_index in 1..=loops {
+        for (step_index, step) in steps.iter().enumerate() {
+            if stop.load(Ordering::Relaxed) {
+                break 'run;
+            }
+            if let Ok(mut progress) = progress.lock() {
+                progress.loop_index = loop_index;
+                progress.step_index = step_index + 1;
+                progress.summary = step.summary.clone();
+            }
+            *shared.pending.lock().expect("pending lock") = Some(step.command.clone());
+            shared.bump();
+            next_deadline += step.duration;
+            while Instant::now() < next_deadline {
+                if stop.load(Ordering::Relaxed) {
+                    break 'run;
+                }
+                let remaining = next_deadline.saturating_duration_since(Instant::now());
+                std::thread::sleep(remaining.min(Duration::from_millis(10)));
+            }
+        }
+    }
+    if let Ok(mut progress) = progress.lock() {
+        progress.finished = true;
+        progress.stopped = stop.load(Ordering::Relaxed);
+    }
+    shared.bump();
+}
+
 pub struct StageAModulationPlugin {
     enabled: bool,
     link: Option<DeviceLink>,
     shared: Arc<SharedLink>,
+    protocol: Option<ProtocolRun>,
     // -- settings (every accepted change is sent immediately) --
     connect_requested: bool,
     port_hint: String,
@@ -254,6 +441,7 @@ pub struct StageAModulationPlugin {
     min_level: i64,
     mode: Mode,
     frequency_hz: f64,
+    protocol_path: String,
     last_error: Option<String>,
 }
 
@@ -263,6 +451,7 @@ impl Default for StageAModulationPlugin {
             enabled: false,
             link: None,
             shared: Arc::new(SharedLink::new()),
+            protocol: None,
             connect_requested: false,
             port_hint: "auto".into(),
             max_level: MAX_DAC_CODE,
@@ -270,6 +459,7 @@ impl Default for StageAModulationPlugin {
             min_level: 0,
             mode: Mode::Const,
             frequency_hz: 10.0,
+            protocol_path: String::new(),
             last_error: None,
         }
     }
@@ -328,7 +518,56 @@ impl StageAModulationPlugin {
     }
 
     fn disconnect(&mut self) {
+        // A protocol without a device to drain its commands is meaningless.
+        self.protocol = None;
         self.link = None; // Drop stops and joins the device thread.
+        self.shared.bump();
+    }
+
+    fn protocol_active(&self) -> bool {
+        self.protocol
+            .as_ref()
+            .is_some_and(|run| !run.progress.lock().map(|p| p.finished).unwrap_or(true))
+    }
+
+    fn start_protocol(&mut self) -> Result<(), String> {
+        if self.protocol_active() {
+            return Ok(());
+        }
+        if self.link.is_none() {
+            return Err("connect to the controller before running a protocol".into());
+        }
+        if self.protocol_path.trim().is_empty() {
+            return Err("choose a protocol file first".into());
+        }
+        let text = std::fs::read_to_string(self.protocol_path.trim())
+            .map_err(|err| format!("reading {} failed: {err}", self.protocol_path.trim()))?;
+        let (steps, loops) = parse_protocol(&text)?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let progress = Arc::new(Mutex::new(ProtocolProgress {
+            loops,
+            total_steps: steps.len(),
+            ..ProtocolProgress::default()
+        }));
+        let join = std::thread::Builder::new()
+            .name("stage-a-modulation-protocol".into())
+            .spawn({
+                let shared = Arc::clone(&self.shared);
+                let stop = Arc::clone(&stop);
+                let progress = Arc::clone(&progress);
+                move || run_protocol(steps, loops, shared, stop, progress)
+            })
+            .expect("spawning the protocol thread must succeed");
+        self.protocol = Some(ProtocolRun {
+            stop,
+            join: Some(join),
+            progress,
+        });
+        Ok(())
+    }
+
+    fn stop_protocol(&mut self) {
+        self.protocol = None; // Drop stops and joins; last command holds.
         self.shared.bump();
     }
 
@@ -571,109 +810,147 @@ impl Plugin for StageAModulationPlugin {
             .position(|m| *m == self.mode)
             .unwrap_or(0);
         SettingsSchema {
-            sections: vec![SettingsSection {
-                label: "Laser modulation".into(),
-                description: Some(
-                    "Tick Connect, then every change is sent to the Teensy immediately — no \
+            sections: vec![
+                SettingsSection {
+                    label: "Laser modulation".into(),
+                    description: Some(
+                        "Tick Connect, then every change is sent to the Teensy immediately — no \
                      camera required. The output never exceeds the power slider, the slider \
                      never exceeds the max limit. The firmware holds the output when \
                      disconnected; drag the slider to 0 to drive 0 V."
-                        .into(),
-                ),
-                default_open: true,
-                items: vec![
-                    SettingItem {
-                        key: "port".into(),
-                        label: "Port".into(),
-                        tooltip: Some(
-                            "auto (recommended) probes the attached usbmodem ports and picks \
+                            .into(),
+                    ),
+                    default_open: true,
+                    items: vec![
+                        SettingItem {
+                            key: "port".into(),
+                            label: "Port".into(),
+                            tooltip: Some(
+                                "auto (recommended) probes the attached usbmodem ports and picks \
                              the one that answers HELLO — the Teensy command port; \
                              mock = in-process simulated controller"
-                                .into(),
-                        ),
-                        kind: SettingKind::Enum {
-                            variants: port_variants,
-                            default: port_default,
+                                    .into(),
+                            ),
+                            kind: SettingKind::Enum {
+                                variants: port_variants,
+                                default: port_default,
+                            },
                         },
-                    },
-                    SettingItem {
-                        key: "connect".into(),
-                        label: "Connect".into(),
-                        tooltip: Some(
-                            "Opens/closes the command port. Connecting never changes the \
+                        SettingItem {
+                            key: "connect".into(),
+                            label: "Connect".into(),
+                            tooltip: Some(
+                                "Opens/closes the command port. Connecting never changes the \
                              output; disconnecting leaves it held (set-and-hold firmware)."
-                                .into(),
-                        ),
-                        kind: SettingKind::Bool {
-                            default: self.connect_requested,
+                                    .into(),
+                            ),
+                            kind: SettingKind::Bool {
+                                default: self.connect_requested,
+                            },
                         },
-                    },
-                    SettingItem {
-                        key: "level".into(),
-                        label: "Power (DAC code)".into(),
-                        tooltip: Some(
-                            "Output level in DAC codes; peak value for sine/square. \
+                        SettingItem {
+                            key: "level".into(),
+                            label: "Power (DAC code)".into(),
+                            tooltip: Some(
+                                "Output level in DAC codes; peak value for sine/square. \
                              Capped by the max limit below. 0 = output off."
-                                .into(),
-                        ),
-                        kind: SettingKind::I64Slider {
-                            min: 0,
-                            max: self.max_level,
-                            default: self.level,
-                            suffix: None,
+                                    .into(),
+                            ),
+                            kind: SettingKind::I64Slider {
+                                min: 0,
+                                max: self.max_level,
+                                default: self.level,
+                                suffix: None,
+                            },
                         },
-                    },
-                    SettingItem {
-                        key: "max_level".into(),
-                        label: "Max limit (DAC code)".into(),
-                        tooltip: Some(
-                            "Safety cap: the slider cannot go above this. Set it to the \
+                        SettingItem {
+                            key: "max_level".into(),
+                            label: "Max limit (DAC code)".into(),
+                            tooltip: Some(
+                                "Safety cap: the slider cannot go above this. Set it to the \
                              highest code the connected device tolerates at J23."
-                                .into(),
-                        ),
-                        kind: SettingKind::I64Drag {
-                            min: 0,
-                            max: MAX_DAC_CODE,
-                            default: self.max_level,
+                                    .into(),
+                            ),
+                            kind: SettingKind::I64Drag {
+                                min: 0,
+                                max: MAX_DAC_CODE,
+                                default: self.max_level,
+                            },
                         },
-                    },
-                    SettingItem {
-                        key: "mode".into(),
-                        label: "Mode".into(),
-                        tooltip: Some("CONST holds the level; SINE/SQUARE modulate".into()),
-                        kind: SettingKind::Enum {
-                            variants: mode_variants,
-                            default: mode_default,
+                        SettingItem {
+                            key: "mode".into(),
+                            label: "Mode".into(),
+                            tooltip: Some("CONST holds the level; SINE/SQUARE modulate".into()),
+                            kind: SettingKind::Enum {
+                                variants: mode_variants,
+                                default: mode_default,
+                            },
                         },
-                    },
-                    SettingItem {
-                        key: "frequency_hz".into(),
-                        label: "Frequency".into(),
-                        tooltip: Some("Sine/square frequency, 0.01–2000 Hz".into()),
-                        kind: SettingKind::F64Drag {
-                            min: 0.01,
-                            max: 2_000.0,
-                            speed: 1.0,
-                            default: self.frequency_hz,
+                        SettingItem {
+                            key: "frequency_hz".into(),
+                            label: "Frequency".into(),
+                            tooltip: Some("Sine/square frequency, 0.01–2000 Hz".into()),
+                            kind: SettingKind::F64Drag {
+                                min: 0.01,
+                                max: 2_000.0,
+                                speed: 1.0,
+                                default: self.frequency_hz,
+                            },
                         },
-                    },
-                    SettingItem {
-                        key: "min_level".into(),
-                        label: "Min threshold (DAC code)".into(),
-                        tooltip: Some(
-                            "Lower bound for sine/square: the waveform swings between this \
+                        SettingItem {
+                            key: "min_level".into(),
+                            label: "Min threshold (DAC code)".into(),
+                            tooltip: Some(
+                                "Lower bound for sine/square: the waveform swings between this \
                              and the power slider. Ignored in CONST mode."
-                                .into(),
-                        ),
-                        kind: SettingKind::I64Slider {
-                            min: 0,
-                            max: self.max_level,
-                            default: self.min_level,
-                            suffix: None,
+                                    .into(),
+                            ),
+                            kind: SettingKind::I64Slider {
+                                min: 0,
+                                max: self.max_level,
+                                default: self.min_level,
+                                suffix: None,
+                            },
                         },
-                    },
-                ],
-            }],
+                    ],
+                },
+                SettingsSection {
+                    label: "Protocol".into(),
+                    description: Some(
+                        "Timed sequence of MOD steps from a TOML file: `loops = N` plus \
+                     [[steps]] with duration_s, wave (OFF/CONST/SINE/SQUARE), level, \
+                     min, frequency_hz. Steps run on an absolute schedule; the last \
+                     step holds after completion (set-and-hold). Stopping never \
+                     switches the output off by itself."
+                            .into(),
+                    ),
+                    default_open: false,
+                    items: vec![
+                        SettingItem {
+                            key: "protocol_path".into(),
+                            label: "Protocol file".into(),
+                            tooltip: Some("TOML protocol file (validated on start).".into()),
+                            kind: SettingKind::Path {
+                                dialog: PathDialogKind::OpenFile,
+                                default: self.protocol_path.clone(),
+                            },
+                        },
+                        SettingItem {
+                            key: "protocol_run".into(),
+                            label: "Run protocol".into(),
+                            tooltip: Some(
+                                "Start/stop the loaded protocol. Requires an open connection; \
+                             manual drive controls stay live and override the current step \
+                             until the next one begins."
+                                    .into(),
+                            ),
+                            kind: SettingKind::Bool {
+                                default: self.protocol_active(),
+                            },
+                        },
+                    ],
+                },
+            ],
         }
     }
 
@@ -700,6 +977,8 @@ impl Plugin for StageAModulationPlugin {
             }
             "frequency_hz" => Some(json!(self.frequency_hz)),
             "min_level" => Some(json!(self.min_level)),
+            "protocol_path" => Some(json!(self.protocol_path)),
+            "protocol_run" => Some(json!(self.protocol_active())),
             _ => None,
         }
     }
@@ -773,6 +1052,27 @@ impl Plugin for StageAModulationPlugin {
                 }
                 Ok(())
             }
+            "protocol_path" => {
+                self.protocol_path = value
+                    .as_str()
+                    .ok_or("protocol_path must be a string")?
+                    .to_owned();
+                Ok(())
+            }
+            "protocol_run" => {
+                let requested = value.as_bool().ok_or("protocol_run must be a boolean")?;
+                // Failures surface through status entries (like `connect`).
+                if requested {
+                    match self.start_protocol() {
+                        Ok(()) => self.last_error = None,
+                        Err(err) => self.last_error = Some(err),
+                    }
+                } else {
+                    self.stop_protocol();
+                }
+                self.shared.bump();
+                Ok(())
+            }
             _ => Err(format!("unknown setting: {key}")),
         }
     }
@@ -792,6 +1092,26 @@ impl Plugin for StageAModulationPlugin {
                 "Board: code={code} ({})",
                 state.board_mod
             )));
+        }
+        if let Some(run) = &self.protocol {
+            if let Ok(progress) = run.progress.lock() {
+                entries.push(StatusEntry::Text(if progress.finished {
+                    if progress.stopped {
+                        "Protocol: stopped (last step holds)".into()
+                    } else {
+                        "Protocol: finished (last step holds)".into()
+                    }
+                } else {
+                    format!(
+                        "Protocol: loop {}/{} step {}/{} — {}",
+                        progress.loop_index,
+                        progress.loops,
+                        progress.step_index,
+                        progress.total_steps,
+                        progress.summary
+                    )
+                }));
+            }
         }
         if let Some(error) = state.last_error.clone().or_else(|| self.last_error.clone()) {
             entries.push(StatusEntry::Text(format!("Error: {error}")));
@@ -942,6 +1262,123 @@ mod tests {
             board_code(p) == Some(0)
         });
         plugin.set_setting("connect", json!(false)).unwrap();
+    }
+
+    const TEST_PROTOCOL: &str = r#"
+loops = 2
+
+[[steps]]
+duration_s = 0.03
+wave = "SINE"
+level = 2000
+min = 100
+frequency_hz = 100.0
+
+[[steps]]
+duration_s = 0.03
+wave = "CONST"
+level = 750
+"#;
+
+    #[test]
+    fn protocol_parsing_validates_steps() {
+        let (steps, loops) = parse_protocol(TEST_PROTOCOL).expect("valid protocol");
+        assert_eq!(loops, 2);
+        assert_eq!(steps.len(), 2);
+        let encoded = |command: &Command, seq: u32| {
+            String::from_utf8(command.encode(seq).expect("encodes")).expect("utf8")
+        };
+        assert_eq!(
+            encoded(&steps[0].command, 1),
+            "@1 MOD wave=SINE level=2000 min=100 freq_mhz=100000\n"
+        );
+        assert_eq!(
+            encoded(&steps[1].command, 2),
+            "@2 MOD wave=CONST level=750\n"
+        );
+        assert!((steps[0].duration.as_secs_f64() - 0.03).abs() < 1e-9);
+
+        assert!(parse_protocol("loops = 1").is_err(), "steps required");
+        assert!(
+            parse_protocol("[[steps]]\nduration_s = 1.0\nwave = \"SINE\"\nlevel = 100").is_err(),
+            "periodic steps need a frequency"
+        );
+        assert!(
+            parse_protocol("[[steps]]\nduration_s = 1.0\nwave = \"CONST\"\nlevel = 9999").is_err(),
+            "level range enforced"
+        );
+        assert!(
+            parse_protocol(
+                "[[steps]]\nduration_s = 1.0\nwave = \"SINE\"\nlevel = 100\nmin = 200\nfrequency_hz = 10.0"
+            )
+            .is_err(),
+            "min above level rejected"
+        );
+        let (off, _) = parse_protocol("[[steps]]\nduration_s = 0.5\nwave = \"OFF\"")
+            .expect("OFF needs no level");
+        assert_eq!(encoded(&off[0].command, 1), "@1 MOD wave=OFF\n");
+    }
+
+    /// A protocol against the mock walks every step, holds the last one, and
+    /// reports finished.
+    #[test]
+    fn protocol_runs_to_completion_on_the_mock() {
+        let dir = std::env::temp_dir().join(format!(
+            "stage-a-modulation-protocol-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("protocol.toml");
+        std::fs::write(&path, TEST_PROTOCOL).unwrap();
+
+        let mut plugin = StageAModulationPlugin::default();
+        plugin.set_setting("port", json!("mock")).unwrap();
+        plugin.set_setting("connect", json!(true)).unwrap();
+        wait_until(&plugin, Duration::from_secs(2), |p| p.device_connected());
+
+        plugin
+            .set_setting("protocol_path", json!(path.display().to_string()))
+            .unwrap();
+        plugin.set_setting("protocol_run", json!(true)).unwrap();
+        assert!(plugin.last_error.is_none(), "{:?}", plugin.last_error);
+        assert_eq!(plugin.get_setting("protocol_run"), Some(json!(true)));
+
+        // 2 loops × 2 steps × 30 ms ≈ 120 ms; wait for the final CONST 750.
+        wait_until(&plugin, Duration::from_secs(3), |p| {
+            !p.protocol_active() && board_code(p) == Some(750)
+        });
+        assert!(!plugin.protocol_active());
+        assert_eq!(board_code(&plugin), Some(750), "last step holds");
+        let progress = plugin
+            .protocol
+            .as_ref()
+            .unwrap()
+            .progress
+            .lock()
+            .unwrap()
+            .clone();
+        assert!(progress.finished && !progress.stopped);
+        assert_eq!((progress.loop_index, progress.step_index), (2, 2));
+
+        plugin.set_setting("connect", json!(false)).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn protocol_requires_a_connection() {
+        let mut plugin = StageAModulationPlugin::default();
+        plugin
+            .set_setting("protocol_path", json!("/tmp/x.toml"))
+            .unwrap();
+        plugin.set_setting("protocol_run", json!(true)).unwrap();
+        assert!(plugin
+            .last_error
+            .as_deref()
+            .is_some_and(|err| err.contains("connect")));
+        assert_eq!(plugin.get_setting("protocol_run"), Some(json!(false)));
     }
 
     /// The host settings UI exchanges enum values as indices into the

@@ -13,3 +13,4 @@ crate-type = ["cdylib", "rlib"]
 augur-plugin-api.workspace = true
 serde_json.workspace = true
 stage-a-io = { path = "../../stage-a-io" }
+toml = "0.8"
