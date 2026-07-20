@@ -1201,10 +1201,25 @@ fn resolve_auto_port() -> Result<String, String> {
     if candidates.is_empty() {
         return Err("no USB serial device found (looked for usbmodem/ttyACM)".to_owned());
     }
+    let mut saw_legacy_ascii = false;
     for path in &candidates {
-        if probe_pd_stream(path) {
-            return Ok(path.clone());
+        match probe_pd_stream(path) {
+            ProbeResult::Pda1SampleFrames => return Ok(path.clone()),
+            ProbeResult::LegacyAsciiStream => saw_legacy_ascii = true,
+            ProbeResult::Nothing => {}
         }
+    }
+    if saw_legacy_ascii {
+        // The pre-0.4.0 firmware emits `PD code=… n=… t_ms=…` ASCII lines
+        // instead of PDA1 binary frames. This plugin dropped the ASCII path
+        // (three-repo lockstep), so the fix is a firmware flash, not a plugin
+        // setting — say so instead of a generic "no frames".
+        return Err(format!(
+            "found the legacy ASCII photodiode stream (pre-0.4.0 firmware) — flash \
+             stage-a-controller 0.4.0+ so the stream port emits PDA1 binary frames \
+             (tried {})",
+            candidates.join(", ")
+        ));
     }
     Err(format!(
         "no port streamed PDA1 sample frames within 500 ms (tried {})",
@@ -1212,18 +1227,29 @@ fn resolve_auto_port() -> Result<String, String> {
     ))
 }
 
-/// True when `path` produces a CRC-clean `SamplesU16` frame within the probe
-/// window. The command port emits frames too, but only control replies and
-/// acquisition data — unsolicited sample frames identify the stream port.
-fn probe_pd_stream(path: &str) -> bool {
+/// What a brief listen on a candidate port revealed.
+enum ProbeResult {
+    /// CRC-clean PDA1 `SamplesU16` frames — the 0.4.0+ stream port.
+    Pda1SampleFrames,
+    /// `PD code=… n=… t_ms=…` ASCII lines — the pre-0.4.0 stream port.
+    LegacyAsciiStream,
+    /// Nothing parsable (busy/command port, wrong device, or no data).
+    Nothing,
+}
+
+/// Listens on `path` for up to 500 ms and classifies what it emits. The
+/// command port emits frames too, but only control replies and acquisition
+/// data — unsolicited sample frames identify the stream port.
+fn probe_pd_stream(path: &str) -> ProbeResult {
     let Ok(mut port) = serialport::new(path, 115_200)
         .timeout(Duration::from_millis(100))
         .open()
     else {
-        return false;
+        return ProbeResult::Nothing;
     };
     let deadline = Instant::now() + Duration::from_millis(500);
     let mut parser = FrameParser::default();
+    let mut ascii_tail: Vec<u8> = Vec::with_capacity(256);
     let mut buf = [0_u8; 4_096];
     while Instant::now() < deadline {
         match port.read(&mut buf) {
@@ -1232,19 +1258,28 @@ fn probe_pd_stream(path: &str) -> bool {
                 while let Some(event) = parser.next_event() {
                     if let ParseEvent::Frame(frame) = event {
                         if frame.samples().is_some() {
-                            return true;
+                            return ProbeResult::Pda1SampleFrames;
                         }
                     }
+                }
+                // Sniff for the legacy ASCII line format in parallel; a valid
+                // `PD code=` prefix never appears inside PDA1 binary framing.
+                ascii_tail.extend_from_slice(&buf[..read]);
+                if String::from_utf8_lossy(&ascii_tail).contains("PD code=") {
+                    return ProbeResult::LegacyAsciiStream;
+                }
+                if ascii_tail.len() > 512 {
+                    ascii_tail.drain(..ascii_tail.len() - 256);
                 }
             }
             Ok(_) => {}
             Err(err)
                 if err.kind() == std::io::ErrorKind::TimedOut
                     || err.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(_) => return false,
+            Err(_) => return ProbeResult::Nothing,
         }
     }
-    false
+    ProbeResult::Nothing
 }
 
 /// The exact variant list the settings schema shows for the port enum — the
