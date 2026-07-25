@@ -588,6 +588,11 @@ pub struct PhotodiodeSummaryV1 {
     pub requested_revision: Option<SemanticRevision>,
     pub acknowledged_revision: Option<SemanticRevision>,
     pub stream: PhotodiodeStreamV1,
+    /// Directory the owner resolves relative PDQ/sidecar paths against. `None`
+    /// when it is unset, in which case every recording command is rejected —
+    /// automation clients check this before they start a coordinated run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_dir: Option<String>,
     pub active_recording: Option<PdqStartedReceiptV1>,
     pub last_finalized_recording: Option<PdqFinalizedReceiptV1>,
     pub optical_summary: Option<PhotodiodeOpticalSummaryV1>,
