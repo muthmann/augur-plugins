@@ -14,7 +14,12 @@
 //!    settings into the sidecar. The **amplitude sweep** (ADR 010) is the one scoped
 //!    exception: per sweep point it retargets the armed drive's *depth* through the
 //!    leased modulation service (`SetOpticalDepth`), waits for the photodiode-measured
-//!    `a` to settle, and records the point through the same coordinator.
+//!    `a` to settle, and records the point through the same coordinator. The
+//!    **exact-event-count workflow** (ADR 012) reuses that path the other way round:
+//!    the `a₀` **lock** trims the *commanded* depth closed-loop until the photodiode
+//!    *measures* the one frozen depth `a₀`, and an **event-count point** replays that
+//!    trimmed depth under the same lease so one atomic frequency point is recorded at
+//!    exactly `a₀`.
 //!
 //! 2. **Live sanity quicklooks.** Folding the camera event stream on the modulation
 //!    period `T` (defined by the firmware phase-0 `EXT_TRIGGER`), it renders the
@@ -65,6 +70,8 @@ const ROLLING_DATASET_ID: &str = "stage-a-a1.rolling-response";
 const ROLLING_VIEW_ID: &str = "stage-a-a1.rolling-response.view";
 const RESPONSE_CURVE_DATASET_ID: &str = "stage-a-a1.response-curve";
 const RESPONSE_CURVE_VIEW_ID: &str = "stage-a-a1.response-curve.view";
+const A0_LOCK_DATASET_ID: &str = "stage-a-a1.a0-locks";
+const A0_LOCK_VIEW_ID: &str = "stage-a-a1.a0-locks.view";
 
 /// Camera events retained for the live fold. At the bench event rates this is a
 /// few seconds of history and keeps the fold cost bounded.
@@ -84,9 +91,67 @@ const MAX_MARKERS: usize = 65_536;
 /// after this long and record anyway (the sidecar stores the measured value).
 const SWEEP_SETTLE_TIMEOUT_MS: u64 = 30_000;
 
+/// Closed-loop trials the `a₀` lock spends on one frequency before it gives up
+/// and reports the best commanded depth it reached.
+const A0_LOCK_MAX_TRIALS: u32 = 8;
+/// Per-trial cap on the multiplicative correction of the commanded depth, so one
+/// noisy photodiode reading cannot slam the drive across its whole range.
+const A0_LOCK_MAX_STEP_RATIO: f64 = 2.0;
+/// Fresh photodiode optical summaries averaged per trial (fewer only when the
+/// measurement deadline hits first).
+const A0_LOCK_SAMPLES: usize = 3;
+/// Clipping fraction above which a lock's measured `a` is called out as
+/// unreliable in the operator message.
+const A0_LOCK_CLIP_WARNING: f64 = 0.01;
+/// Closed range of commanded optical depths the modulation owner accepts.
+const COMMANDED_A_MIN: f64 = 0.01;
+const COMMANDED_A_MAX: f64 = 6.0;
+/// Relative distance within which two frequencies are the same sweep point.
+const FREQUENCY_MATCH_FRACTION: f64 = 0.01;
+/// Lock table persisted in the output folder, so found depths survive a restart.
+const A0_LOCK_FILE: &str = "a0_locks.json";
+
 /// Absolute/relative tolerance for "the measured `a` reached the sweep target".
 fn sweep_tolerance(target_a: f64) -> f64 {
     (target_a * 0.10).max(0.05)
+}
+
+/// Commanded optical depth clamped to what the modulation owner accepts.
+fn clamp_commanded_a(depth_a: f64) -> f64 {
+    if depth_a.is_finite() {
+        depth_a.clamp(COMMANDED_A_MIN, COMMANDED_A_MAX)
+    } else {
+        COMMANDED_A_MIN
+    }
+}
+
+/// Wire encoding of a commanded optical depth for `SetOpticalDepth`.
+fn depth_a_milli(depth_a: f64) -> u32 {
+    (depth_a * 1_000.0).round().clamp(0.0, u32::MAX as f64) as u32
+}
+
+/// Whether two frequencies name the same sweep point (drive vs trigger readback
+/// never agree to the last digit).
+fn same_frequency(left: f64, right: f64) -> bool {
+    let scale = left.abs().max(right.abs());
+    (left - right).abs() <= (scale * FREQUENCY_MATCH_FRACTION).max(1e-6)
+}
+
+fn frequency_label(hz: f64) -> String {
+    format!("{hz:.3} Hz")
+}
+
+/// Compact file-safe frequency tag for an event-count point's stem:
+/// `50 Hz → f50Hz`, `0.5 Hz → f0p5Hz`.
+fn frequency_tag(hz: f64) -> String {
+    let mut text = format!("{hz:.3}");
+    while text.ends_with('0') {
+        text.pop();
+    }
+    if text.ends_with('.') {
+        text.pop();
+    }
+    format!("f{}Hz", text.replace('.', "p"))
 }
 
 trait RecordingControl {
@@ -176,6 +241,9 @@ enum RecRole {
     Pilot,
     /// Unmodulated (`a≈0`) reference that gives the false-response floor.
     Background,
+    /// One atomic frequency point of the exact-event-count workflow, recorded at
+    /// the one frozen depth `a₀` the lock found for that frequency.
+    EventCount,
 }
 
 impl RecRole {
@@ -185,6 +253,7 @@ impl RecRole {
             RecRole::Normal => "",
             RecRole::Pilot => "_pilot",
             RecRole::Background => "_background",
+            RecRole::EventCount => "_ec",
         }
     }
 
@@ -193,6 +262,7 @@ impl RecRole {
             RecRole::Normal => "point",
             RecRole::Pilot => "pilot",
             RecRole::Background => "background",
+            RecRole::EventCount => "event-count point",
         }
     }
 }
@@ -248,13 +318,47 @@ enum SweepPhase {
     Recording,
 }
 
+/// What a leased sweep is for: the amplitude sweep of one `(I_k, f)` row, or one
+/// atomic frequency point of the exact-event-count workflow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SweepKind {
+    Amplitude,
+    EventCount,
+}
+
+impl SweepKind {
+    fn role(self) -> RecRole {
+        match self {
+            SweepKind::Amplitude => RecRole::Normal,
+            SweepKind::EventCount => RecRole::EventCount,
+        }
+    }
+}
+
+/// One sweep point: what the drive is *commanded* to, and the
+/// photodiode-measured `a` that point is supposed to produce.
+///
+/// The amplitude sweep asks for its own value open-loop, trusting the Pockels
+/// calibration, so both are equal. An event-count point replays a commanded
+/// depth the `a₀` lock already trimmed closed-loop against the *measured* depth,
+/// so there its commanded depth is deliberately **not** the depth it expects to
+/// measure — that difference is the drive roll-off the lock absorbed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SweepPoint {
+    commanded_a: f64,
+    expected_a: f64,
+}
+
 /// One "record every point of the amplitude range" run: per point the sweep
 /// retargets the leased modulation drive, waits for the photodiode-measured
 /// `a` to settle, and hands off to the normal recording coordinator.
 struct Sweep {
     phase: SweepPhase,
-    /// Requested `a` per point, ascending over `[min_a, max_a]`.
-    points: Vec<f64>,
+    kind: SweepKind,
+    /// The points to record, in order.
+    points: Vec<SweepPoint>,
+    /// The `a₀` lock an event-count point replays; `None` for the amplitude sweep.
+    lock: Option<A0LockPoint>,
     index: usize,
     lease_id: LeaseId,
     lease_granted: bool,
@@ -273,13 +377,96 @@ struct Sweep {
 }
 
 impl Sweep {
+    fn point(&self) -> SweepPoint {
+        self.points.get(self.index).copied().unwrap_or(SweepPoint {
+            commanded_a: 0.0,
+            expected_a: 0.0,
+        })
+    }
+
+    /// The photodiode-measured `a` this point must settle at.
     fn target_a(&self) -> f64 {
-        self.points.get(self.index).copied().unwrap_or(0.0)
+        self.point().expected_a
+    }
+
+    /// The depth the drive is commanded to for this point.
+    fn commanded_a(&self) -> f64 {
+        self.point().commanded_a
     }
 
     fn total(&self) -> usize {
         self.points.len()
     }
+}
+
+/// Where the `a₀` lock is within its current closed-loop trial.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum A0LockPhase {
+    /// AcquireLease sent to the modulation owner; waiting for the grant.
+    AcquiringLease,
+    /// SetOpticalDepth for the current trial sent; waiting for Applied.
+    SettingDepth,
+    /// Settling, then averaging fresh photodiode readings for this trial.
+    Measuring,
+}
+
+/// One "find the commanded depth that makes the photodiode measure `a₀` at this
+/// frequency" run. Iterates `commanded ← commanded · a₀/measured` under a
+/// modulation lease and never records anything itself.
+struct A0Lock {
+    phase: A0LockPhase,
+    /// The photodiode-measured log contrast the operator froze for the sweep.
+    target_a: f64,
+    /// Convergence band on `|measured − target|`.
+    tolerance: f64,
+    /// The depth the current trial commands.
+    commanded_a: f64,
+    /// Frequency this lock belongs to, captured when it started.
+    frequency_hz: f64,
+    /// 1-based trial counter, bounded by `A0_LOCK_MAX_TRIALS`.
+    trial: u32,
+    /// Fresh photodiode readings averaged for the current trial.
+    samples: Vec<f64>,
+    /// `service_revision` of the newest photodiode summary already sampled, so a
+    /// slow publisher is not averaged once per control tick.
+    sampled_revision: Option<u64>,
+    /// Instant from which readings count — the drive settle dwell before it.
+    measure_from_ms: u64,
+    /// Give-up deadline for the current trial's measurement.
+    deadline_ms: u64,
+    lease_id: LeaseId,
+    lease_granted: bool,
+    lease_req: u64,
+    depth_req: u64,
+    depth_applied: bool,
+    last_activity_ms: u64,
+    stop_requested: bool,
+}
+
+/// The result of one lock: the commanded depth that produced the frozen `a₀` at
+/// one frequency. Persisted in `a0_locks.json` and replayed by event-count points.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+struct A0LockPoint {
+    frequency_hz: f64,
+    /// The frozen `a₀` the lock aimed at.
+    target_a: f64,
+    /// What the drive must be commanded to in order to *measure* `target_a`.
+    commanded_a: f64,
+    /// The photodiode-measured `a` averaged over the final trial.
+    measured_a: f64,
+    trials: u32,
+    /// False when the lock ran out of trials or hit a drive limit; such a row is
+    /// kept for the record but never arms an event-count recording.
+    converged: bool,
+    locked_at_unix_ms: u64,
+    low_clip_fraction: Option<f64>,
+    high_clip_fraction: Option<f64>,
+}
+
+/// On-disk form of the per-frequency lock table.
+#[derive(Debug, Clone, Default, Serialize, serde::Deserialize)]
+struct A0LockTable {
+    locks: Vec<A0LockPoint>,
 }
 
 pub struct StageAA1Plugin {
@@ -344,6 +531,23 @@ pub struct StageAA1Plugin {
     /// Latched by the Start sweep button, consumed next control tick.
     sweep_pending: bool,
     sweep: Option<Sweep>,
+    // -- exact event-count depth a₀ (ADR 012) --
+    /// The one photodiode-measured log contrast held across the frequency sweep.
+    a0_target: f64,
+    /// Convergence band on `|measured a − a₀|` for the lock and for an
+    /// event-count point's settle check.
+    a0_tolerance: f64,
+    /// Latched by the Find a₀ button, consumed next control tick.
+    a0_lock_pending: bool,
+    /// Latched by the Record a₀ point button, consumed next control tick.
+    a0_point_pending: bool,
+    a0_lock: Option<A0Lock>,
+    /// One converged (or attempted) lock per frequency, newest per frequency
+    /// wins; mirrored to `a0_locks.json` in the output folder.
+    a0_locks: Vec<A0LockPoint>,
+    /// Output folder the lock table was last read for, so it is re-read only
+    /// when the experiment folder changes.
+    loaded_locks_folder: Option<String>,
     // -- momentary-button press forwarding (see PressLatch) --
     press_start: PressLatch,
     press_pilot: PressLatch,
@@ -353,6 +557,9 @@ pub struct StageAA1Plugin {
     press_clear: PressLatch,
     press_record_point: PressLatch,
     press_clear_curve: PressLatch,
+    press_find_a0: PressLatch,
+    press_record_a0: PressLatch,
+    press_clear_a0: PressLatch,
 }
 
 impl Default for StageAA1Plugin {
@@ -393,6 +600,15 @@ impl Default for StageAA1Plugin {
             settle_s: 2.0,
             sweep_pending: false,
             sweep: None,
+            // No numerical a₀ is frozen in the repository: this default is a
+            // placeholder the operator replaces with the scout result.
+            a0_target: 0.5,
+            a0_tolerance: 0.02,
+            a0_lock_pending: false,
+            a0_point_pending: false,
+            a0_lock: None,
+            a0_locks: Vec::new(),
+            loaded_locks_folder: None,
             press_start: PressLatch::default(),
             press_pilot: PressLatch::default(),
             press_background: PressLatch::default(),
@@ -401,6 +617,9 @@ impl Default for StageAA1Plugin {
             press_clear: PressLatch::default(),
             press_record_point: PressLatch::default(),
             press_clear_curve: PressLatch::default(),
+            press_find_a0: PressLatch::default(),
+            press_record_a0: PressLatch::default(),
+            press_clear_a0: PressLatch::default(),
         }
     }
 }
@@ -486,6 +705,11 @@ impl StageAA1Plugin {
         }
         let hz = self.acknowledged_frequency_hz()?;
         (hz > 0.0).then(|| 1_000_000.0 / hz)
+    }
+
+    /// Modulation frequency implied by [`Self::period_us`].
+    fn frequency_hz(&self) -> Option<f64> {
+        self.period_us().map(|period| 1_000_000.0 / period)
     }
 
     /// Modulation period measured from the phase-0 markers (mean spacing).
@@ -901,8 +1125,24 @@ impl StageAA1Plugin {
                 "sweep_requested_a".into(),
                 format!("{:.6}", sweep.target_a()),
             );
+            meta.insert(
+                "sweep_commanded_a".into(),
+                format!("{:.6}", sweep.commanded_a()),
+            );
             meta.insert("sweep_point_index".into(), (sweep.index + 1).to_string());
             meta.insert("sweep_point_total".into(), sweep.total().to_string());
+        }
+        if let Some(lock) = self.sweep.as_ref().and_then(|sweep| sweep.lock.as_ref()) {
+            meta.insert("a0_target".into(), format!("{:.6}", lock.target_a));
+            meta.insert("a0_commanded_a".into(), format!("{:.6}", lock.commanded_a));
+            meta.insert(
+                "a0_lock_measured_a".into(),
+                format!("{:.6}", lock.measured_a),
+            );
+            meta.insert(
+                "a0_lock_frequency_hz".into(),
+                format!("{:.6}", lock.frequency_hz),
+            );
         }
         if let Some(a) = self.measured_a() {
             meta.insert("measured_a".into(), format!("{a:.6}"));
@@ -942,12 +1182,26 @@ impl StageAA1Plugin {
         let now_ms = now_unix_ms();
         let id = sanitize_stem(self.measurement_id.trim());
         // Sweep points get a stable per-point tag so the row's files sort by
-        // sweep order as well as by timestamp.
+        // sweep order as well as by timestamp. Event-count points instead carry
+        // their frequency, because one measurement id spans the whole frequency
+        // sweep at the single frozen depth a₀.
+        let live_hz = self.frequency_hz();
         let sweep_tag = self
             .sweep
             .as_ref()
             .filter(|sweep| sweep.phase == SweepPhase::Recording)
-            .map(|sweep| format!("_p{:02}", sweep.index + 1))
+            .map(|sweep| match sweep.kind {
+                SweepKind::Amplitude => format!("_p{:02}", sweep.index + 1),
+                SweepKind::EventCount => {
+                    let hz = sweep
+                        .lock
+                        .as_ref()
+                        .map(|lock| lock.frequency_hz)
+                        .or(live_hz)
+                        .unwrap_or_default();
+                    format!("_{}", frequency_tag(hz))
+                }
+            })
             .unwrap_or_default();
         let stem = format!(
             "{id}_{}{}{sweep_tag}",
@@ -974,7 +1228,8 @@ impl StageAA1Plugin {
         match role {
             RecRole::Pilot => self.freeze_pilot_windows(),
             RecRole::Background => self.capture_background_floor(),
-            RecRole::Normal => {}
+            // Both keep the row's pilot-frozen windows and background floor.
+            RecRole::Normal | RecRole::EventCount => {}
         }
 
         self.start_camera(context);
@@ -1188,11 +1443,19 @@ impl StageAA1Plugin {
     }
 
     /// The requested `a` per sweep point, ascending and inclusive of both ends.
-    fn sweep_points(&self) -> Vec<f64> {
+    /// The amplitude sweep trusts the calibration, so each point commands the
+    /// very depth it expects to measure.
+    fn sweep_points(&self) -> Vec<SweepPoint> {
         let count = self.sweep_count.clamp(2, 64) as usize;
         let span = self.max_a - self.min_a;
         (0..count)
-            .map(|index| self.min_a + span * index as f64 / (count - 1) as f64)
+            .map(|index| {
+                let depth_a = self.min_a + span * index as f64 / (count - 1) as f64;
+                SweepPoint {
+                    commanded_a: depth_a,
+                    expected_a: depth_a,
+                }
+            })
             .collect()
     }
 
@@ -1208,23 +1471,7 @@ impl StageAA1Plugin {
     }
 
     /// Kick off the amplitude sweep: validate, then lease the modulation owner.
-    fn begin_sweep(&mut self, context: &mut PluginControlContext<'_>) {
-        if self.recording.is_active() || self.sweep.is_some() {
-            self.message = "A recording or sweep is already running".into();
-            return;
-        }
-        if self.output_folder.trim().is_empty() {
-            self.message = "Set an output folder before sweeping".into();
-            return;
-        }
-        if self.measurement_id.trim().is_empty() {
-            self.message = "Set a measurement id before sweeping".into();
-            return;
-        }
-        if !self.modulation_connected() {
-            self.message = "Modulation owner is not connected — cannot sweep".into();
-            return;
-        }
+    fn begin_sweep(&mut self, context: &mut impl RecordingControl) {
         if self.min_a.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
             self.message =
                 "Set Sweep min a > 0 (a = 0 is the background reference, not a sweep point)".into();
@@ -1235,17 +1482,56 @@ impl StageAA1Plugin {
             return;
         }
         let points = self.sweep_points();
+        let message = format!(
+            "Sweep: acquiring modulation lease for {} points…",
+            points.len()
+        );
+        self.begin_leased_sweep(context, SweepKind::Amplitude, points, None, message);
+    }
+
+    /// Shared entry point for both leased recording runs (amplitude sweep and
+    /// single event-count point): validate the destination and the owner, then
+    /// acquire the modulation lease that holds the drive for the whole run.
+    fn begin_leased_sweep(
+        &mut self,
+        context: &mut impl RecordingControl,
+        kind: SweepKind,
+        points: Vec<SweepPoint>,
+        lock: Option<A0LockPoint>,
+        message: String,
+    ) {
+        if self.recording.is_active() || self.sweep.is_some() || self.a0_lock.is_some() {
+            self.message = "A recording, sweep or a₀ lock is already running".into();
+            return;
+        }
+        if self.output_folder.trim().is_empty() {
+            self.message = "Set an output folder before recording".into();
+            return;
+        }
+        if self.measurement_id.trim().is_empty() {
+            self.message = "Set a measurement id before recording".into();
+            return;
+        }
+        if !self.modulation_connected() {
+            self.message = "Modulation owner is not connected — cannot drive the depth".into();
+            return;
+        }
+        if points.is_empty() {
+            self.message = "Nothing to record: the run has no points".into();
+            return;
+        }
         let now_ms = now_unix_ms();
         let lease_id = LeaseId::new(format!("a1-sweep-{}", format_compact_utc(now_ms / 1_000)));
         let ttl_ms = self.sweep_lease_ttl_ms(points.len());
         let request =
             self.modulation_request(ModulationCommandV1::AcquireLease { ttl_ms }, &lease_id);
         let lease_req = request.request_id;
-        let _ = context.request_service(&request);
-        let total = points.len();
+        context.request_service(&request);
         self.sweep = Some(Sweep {
             phase: SweepPhase::AcquiringLease,
+            kind,
             points,
+            lock,
             index: 0,
             lease_id,
             lease_granted: false,
@@ -1258,11 +1544,42 @@ impl StageAA1Plugin {
             last_activity_ms: now_ms,
             stop_requested: false,
         });
-        self.message = format!("Sweep: acquiring modulation lease for {total} points…");
+        self.message = message;
+    }
+
+    /// Record one atomic frequency point of the exact-event-count workflow.
+    ///
+    /// The armed lock's commanded depth is re-applied under a modulation lease —
+    /// which also locks the operator's drive settings out for the whole point, so
+    /// the amplitude provably cannot change during the recorded interval — and the
+    /// point is then recorded through the same coordinator as every other run.
+    fn begin_a0_point(&mut self, context: &mut impl RecordingControl) {
+        let Some(hz) = self.frequency_hz() else {
+            self.message = "No modulation frequency yet — arm the drive first".into();
+            return;
+        };
+        let Some(lock) = self.armed_lock().cloned() else {
+            self.message = format!(
+                "No converged a₀ lock for {} — press Find a₀ at this frequency first",
+                frequency_label(hz)
+            );
+            return;
+        };
+        let points = vec![SweepPoint {
+            commanded_a: lock.commanded_a,
+            expected_a: lock.target_a,
+        }];
+        let message = format!(
+            "Event-count point at {}: leasing the drive at commanded a = {:.3} (a₀ = {:.3})…",
+            frequency_label(lock.frequency_hz),
+            lock.commanded_a,
+            lock.target_a
+        );
+        self.begin_leased_sweep(context, SweepKind::EventCount, points, Some(lock), message);
     }
 
     /// Release the modulation lease (if held) and clear the sweep.
-    fn finish_sweep(&mut self, context: &mut PluginControlContext<'_>, message: String) {
+    fn finish_sweep(&mut self, context: &mut impl RecordingControl, message: String) {
         if let Some(sweep) = self.sweep.take() {
             if sweep.lease_granted {
                 let request = self.modulation_request(
@@ -1272,35 +1589,36 @@ impl StageAA1Plugin {
                     },
                     &sweep.lease_id,
                 );
-                let _ = context.request_service(&request);
+                context.request_service(&request);
             }
         }
         self.message = message;
     }
 
     /// Renew the modulation lease and retarget the drive at the current point.
-    fn send_sweep_depth(&mut self, context: &mut PluginControlContext<'_>) {
+    fn send_sweep_depth(&mut self, context: &mut impl RecordingControl) {
         let Some(sweep) = self.sweep.as_ref() else {
             return;
         };
         let lease_id = sweep.lease_id.clone();
         let remaining = sweep.total().saturating_sub(sweep.index);
+        let commanded_a = sweep.commanded_a();
         let target_a = sweep.target_a();
         let index = sweep.index;
         let total = sweep.total();
 
         let ttl_ms = self.sweep_lease_ttl_ms(remaining);
         let renew = self.modulation_request(ModulationCommandV1::RenewLease { ttl_ms }, &lease_id);
-        let _ = context.request_service(&renew);
+        context.request_service(&renew);
 
         let depth = self.modulation_request(
             ModulationCommandV1::SetOpticalDepth {
-                depth_a_milli: (target_a * 1_000.0).round().clamp(0.0, u32::MAX as f64) as u32,
+                depth_a_milli: depth_a_milli(commanded_a),
             },
             &lease_id,
         );
         let depth_req = depth.request_id;
-        let _ = context.request_service(&depth);
+        context.request_service(&depth);
 
         let now_ms = now_unix_ms();
         if let Some(sweep) = self.sweep.as_mut() {
@@ -1311,29 +1629,46 @@ impl StageAA1Plugin {
             sweep.point_started = false;
             sweep.last_activity_ms = now_ms;
         }
-        self.message = format!(
-            "Sweep point {}/{}: retargeting drive to a = {:.3}…",
-            index + 1,
-            total,
-            target_a
-        );
+        self.message = if commanded_a == target_a {
+            format!(
+                "Sweep point {}/{total}: retargeting drive to a = {target_a:.3}…",
+                index + 1
+            )
+        } else {
+            format!(
+                "Event-count point: commanding a = {commanded_a:.3} for a measured a₀ = {target_a:.3}…"
+            )
+        };
     }
 
     /// Advance the amplitude sweep one control tick. Runs before
     /// `drive_recording`, so a point's recording starts on the same tick.
-    fn drive_sweep(&mut self, context: &mut PluginControlContext<'_>) {
+    fn drive_sweep(&mut self, context: &mut impl RecordingControl) {
         if self.sweep.is_none() {
             if std::mem::take(&mut self.sweep_pending) {
                 self.begin_sweep(context);
+            } else if std::mem::take(&mut self.a0_point_pending) {
+                self.begin_a0_point(context);
             }
             return;
         }
         self.sweep_pending = false;
+        self.a0_point_pending = false;
         let now_ms = now_unix_ms();
-        let (phase, stop_requested, lease_granted, depth_applied, last_activity_ms, index, total) = {
+        let (
+            phase,
+            kind,
+            stop_requested,
+            lease_granted,
+            depth_applied,
+            last_activity_ms,
+            index,
+            total,
+        ) = {
             let sweep = self.sweep.as_ref().expect("sweep checked above");
             (
                 sweep.phase,
+                sweep.kind,
                 sweep.stop_requested,
                 sweep.lease_granted,
                 sweep.depth_applied,
@@ -1388,9 +1723,16 @@ impl StageAA1Plugin {
             }
             SweepPhase::Settling => {
                 let target = self.sweep.as_ref().map(Sweep::target_a).unwrap_or_default();
+                // The amplitude sweep drives open-loop and accepts the coarse
+                // calibration band; an event-count point replays a depth that was
+                // already trimmed against `a₀`, so it holds the lock's band.
+                let tolerance = match kind {
+                    SweepKind::Amplitude => sweep_tolerance(target),
+                    SweepKind::EventCount => self.a0_tolerance.max(1e-3),
+                };
                 let settled = self
                     .measured_a()
-                    .is_some_and(|measured| (measured - target).abs() <= sweep_tolerance(target));
+                    .is_some_and(|measured| (measured - target).abs() <= tolerance);
                 let dwell_ms = (self.settle_s.max(0.0) * 1_000.0) as u64;
                 let mut start_recording = false;
                 let mut settle_timed_out = false;
@@ -1414,10 +1756,14 @@ impl StageAA1Plugin {
                     }
                 }
                 if start_recording {
-                    self.pending_role = Some(RecRole::Normal);
+                    self.pending_role = Some(kind.role());
                     if settle_timed_out {
+                        let measured = self
+                            .measured_a()
+                            .map_or_else(|| "—".into(), |value| format!("{value:.3}"));
                         self.message = format!(
-                            "Sweep point {}/{}: a did not settle at {target:.3} — recording anyway",
+                            "Sweep point {}/{}: a did not settle at {target:.3} (measured {measured}) \
+                             — recording anyway",
                             index + 1,
                             total,
                         );
@@ -1446,7 +1792,11 @@ impl StageAA1Plugin {
                     let message = format!("Sweep aborted: {}", self.message);
                     self.finish_sweep(context, message);
                 } else if index + 1 >= total {
-                    self.finish_sweep(context, format!("Sweep complete: {total} points recorded"));
+                    let message = match kind {
+                        SweepKind::Amplitude => format!("Sweep complete: {total} points recorded"),
+                        SweepKind::EventCount => self.message.clone(),
+                    };
+                    self.finish_sweep(context, message);
                 } else {
                     if let Some(sweep) = self.sweep.as_mut() {
                         sweep.index += 1;
@@ -1510,6 +1860,514 @@ impl StageAA1Plugin {
         }
     }
 
+    // ---- exact event-count depth a₀ (ADR 012) ------------------------------
+
+    /// The lock stored for `hz`, whether or not it converged.
+    fn lock_for_frequency(&self, hz: f64) -> Option<&A0LockPoint> {
+        self.a0_locks
+            .iter()
+            .find(|lock| same_frequency(lock.frequency_hz, hz))
+    }
+
+    /// The lock that applies to the drive right now: same frequency, converged,
+    /// and aimed at the `a₀` currently entered.
+    fn armed_lock(&self) -> Option<&A0LockPoint> {
+        let hz = self.frequency_hz()?;
+        self.lock_for_frequency(hz)
+            .filter(|lock| lock.converged && (lock.target_a - self.a0_target).abs() <= 1e-6)
+    }
+
+    fn a0_locks_path(&self) -> Option<PathBuf> {
+        let folder = self.output_folder.trim();
+        (!folder.is_empty()).then(|| Path::new(folder).join(A0_LOCK_FILE))
+    }
+
+    /// Store a finished lock, replacing any earlier one at the same frequency,
+    /// and mirror the table to disk.
+    fn store_lock(&mut self, lock: A0LockPoint) {
+        self.a0_locks
+            .retain(|existing| !same_frequency(existing.frequency_hz, lock.frequency_hz));
+        self.a0_locks.push(lock);
+        self.a0_locks
+            .sort_by(|left, right| left.frequency_hz.total_cmp(&right.frequency_hz));
+        self.save_a0_locks();
+    }
+
+    /// Persist the lock table next to the recordings, so the found depths survive
+    /// a restart and can be cited offline.
+    fn save_a0_locks(&mut self) {
+        let Some(path) = self.a0_locks_path() else {
+            return;
+        };
+        let table = A0LockTable {
+            locks: self.a0_locks.clone(),
+        };
+        let written = serde_json::to_string_pretty(&table)
+            .map_err(|error| error.to_string())
+            .and_then(|text| {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+                }
+                std::fs::write(&path, text).map_err(|error| error.to_string())
+            });
+        if let Err(error) = written {
+            self.message = format!("a₀ lock table save failed: {error}");
+        }
+    }
+
+    /// Re-read the lock table when the experiment folder changes.
+    fn load_a0_locks(&mut self) {
+        let folder = self.output_folder.trim().to_string();
+        if self.loaded_locks_folder.as_deref() == Some(folder.as_str()) {
+            return;
+        }
+        self.loaded_locks_folder = Some(folder);
+        self.a0_locks.clear();
+        let Some(path) = self.a0_locks_path() else {
+            return;
+        };
+        if let Some(table) = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<A0LockTable>(&text).ok())
+        {
+            self.a0_locks = table.locks;
+        }
+    }
+
+    /// Worst-case lock duration, used as the modulation lease TTL.
+    fn a0_lock_lease_ttl_ms(&self) -> u64 {
+        let per_trial_ms = (self.settle_s.max(0.0) * 1_000.0) as u64 + SWEEP_SETTLE_TIMEOUT_MS;
+        u64::from(A0_LOCK_MAX_TRIALS)
+            .saturating_mul(per_trial_ms)
+            .saturating_add(60_000)
+    }
+
+    /// Kick off the closed-loop `a₀` lock at the current frequency.
+    fn begin_a0_lock(&mut self, context: &mut impl RecordingControl) {
+        if self.recording.is_active() || self.sweep.is_some() || self.a0_lock.is_some() {
+            self.message = "A recording, sweep or a₀ lock is already running".into();
+            return;
+        }
+        if !self.modulation_connected() {
+            self.message = "Modulation owner is not connected — cannot find a₀".into();
+            return;
+        }
+        // The lock table belongs to the experiment folder, and it is re-read
+        // whenever that folder changes: without one, a lock found now would be
+        // dropped the moment the operator picks the destination.
+        if self.output_folder.trim().is_empty() {
+            self.message = "Set an output folder before finding a₀".into();
+            return;
+        }
+        let Some(hz) = self.frequency_hz() else {
+            self.message = "No modulation frequency yet — arm the drive before finding a₀".into();
+            return;
+        };
+        if self.measured_a().is_none() {
+            self.message =
+                "No photodiode-measured a — connect the photodiode and anchor I_tot first".into();
+            return;
+        }
+        let target = self.a0_target;
+        if !(COMMANDED_A_MIN..=COMMANDED_A_MAX).contains(&target) {
+            self.message = format!(
+                "a₀ = {target:.3} is outside the drivable {COMMANDED_A_MIN}..={COMMANDED_A_MAX}"
+            );
+            return;
+        }
+        // Warm start from an earlier lock at this frequency; otherwise trust the
+        // Pockels calibration for the first guess (command exactly `a₀`).
+        let start = self
+            .lock_for_frequency(hz)
+            .map(|lock| lock.commanded_a)
+            .unwrap_or(target);
+        let now_ms = now_unix_ms();
+        let lease_id = LeaseId::new(format!("a1-a0-{}", format_compact_utc(now_ms / 1_000)));
+        let ttl_ms = self.a0_lock_lease_ttl_ms();
+        let request =
+            self.modulation_request(ModulationCommandV1::AcquireLease { ttl_ms }, &lease_id);
+        let lease_req = request.request_id;
+        context.request_service(&request);
+        self.a0_lock = Some(A0Lock {
+            phase: A0LockPhase::AcquiringLease,
+            target_a: target,
+            tolerance: self.a0_tolerance.max(1e-3),
+            commanded_a: clamp_commanded_a(start),
+            frequency_hz: hz,
+            trial: 1,
+            samples: Vec::new(),
+            sampled_revision: None,
+            measure_from_ms: 0,
+            deadline_ms: 0,
+            lease_id,
+            lease_granted: false,
+            lease_req,
+            depth_req: 0,
+            depth_applied: false,
+            last_activity_ms: now_ms,
+            stop_requested: false,
+        });
+        self.message = format!(
+            "a₀ lock at {}: acquiring the modulation lease…",
+            frequency_label(hz)
+        );
+    }
+
+    /// Renew the lease and command the current trial's depth.
+    fn send_a0_depth(&mut self, context: &mut impl RecordingControl) {
+        let Some(lock) = self.a0_lock.as_ref() else {
+            return;
+        };
+        let lease_id = lock.lease_id.clone();
+        let commanded = lock.commanded_a;
+        let trial = lock.trial;
+        let target = lock.target_a;
+
+        let ttl_ms = self.a0_lock_lease_ttl_ms();
+        let renew = self.modulation_request(ModulationCommandV1::RenewLease { ttl_ms }, &lease_id);
+        context.request_service(&renew);
+        let depth = self.modulation_request(
+            ModulationCommandV1::SetOpticalDepth {
+                depth_a_milli: depth_a_milli(commanded),
+            },
+            &lease_id,
+        );
+        let depth_req = depth.request_id;
+        context.request_service(&depth);
+
+        let now_ms = now_unix_ms();
+        if let Some(lock) = self.a0_lock.as_mut() {
+            lock.phase = A0LockPhase::SettingDepth;
+            lock.depth_req = depth_req;
+            lock.depth_applied = false;
+            lock.samples.clear();
+            lock.sampled_revision = None;
+            lock.last_activity_ms = now_ms;
+        }
+        self.message = format!(
+            "a₀ lock trial {trial}/{A0_LOCK_MAX_TRIALS}: commanding a = {commanded:.3} for a \
+             measured a₀ = {target:.3}…"
+        );
+    }
+
+    /// Release the modulation lease and clear the lock.
+    ///
+    /// Never `safe_off`: the drive must stay exactly where the lock left it, so
+    /// the event-count point that follows records at `a₀`.
+    fn finish_a0_lock(&mut self, context: &mut impl RecordingControl, message: String) {
+        if let Some(lock) = self.a0_lock.take() {
+            if lock.lease_granted {
+                let request = self.modulation_request(
+                    ModulationCommandV1::ReleaseLease {
+                        safe_off: false,
+                        reason: "a1 a0 lock finished".into(),
+                    },
+                    &lock.lease_id,
+                );
+                context.request_service(&request);
+            }
+        }
+        self.message = message;
+    }
+
+    /// Take one reading per *fresh* photodiode summary, so the trial average is
+    /// not weighted by the control-tick rate.
+    fn sample_a0_measurement(&mut self, now_ms: u64) {
+        let Some((revision, measured)) = self.photodiode.as_ref().and_then(|summary| {
+            summary
+                .optical_summary
+                .as_ref()
+                .map(|optical| (summary.service_revision, optical.measured_log_contrast))
+        }) else {
+            return;
+        };
+        let Some(lock) = self.a0_lock.as_mut() else {
+            return;
+        };
+        if now_ms < lock.measure_from_ms || lock.sampled_revision == Some(revision) {
+            return;
+        }
+        lock.sampled_revision = Some(revision);
+        lock.samples.push(measured);
+    }
+
+    /// Photodiode clipping note for a lock message, empty when the windows are clean.
+    fn clip_warning(&self) -> String {
+        let Some(optical) = self
+            .photodiode
+            .as_ref()
+            .and_then(|summary| summary.optical_summary.as_ref())
+        else {
+            return String::new();
+        };
+        if optical.low_clip_fraction.max(optical.high_clip_fraction) <= A0_LOCK_CLIP_WARNING {
+            return String::new();
+        }
+        format!(
+            " — warning: photodiode clipping (low {:.1} %, high {:.1} %), the measured a is a \
+             truncated estimate",
+            optical.low_clip_fraction * 100.0,
+            optical.high_clip_fraction * 100.0
+        )
+    }
+
+    /// Close out one trial: converged, out of trials, at a drive limit, or one
+    /// more multiplicative correction.
+    fn evaluate_a0_trial(&mut self, context: &mut impl RecordingControl) {
+        let Some(lock) = self.a0_lock.as_ref() else {
+            return;
+        };
+        let (target, tolerance, commanded, trial, hz) = (
+            lock.target_a,
+            lock.tolerance,
+            lock.commanded_a,
+            lock.trial,
+            lock.frequency_hz,
+        );
+        let samples = lock.samples.len();
+        if samples == 0 {
+            self.finish_a0_lock(
+                context,
+                "a₀ lock aborted: the photodiode published no optical summary while measuring"
+                    .into(),
+            );
+            return;
+        }
+        let measured = lock.samples.iter().sum::<f64>() / samples as f64;
+        if measured <= 0.0 {
+            self.finish_a0_lock(
+                context,
+                format!(
+                    "a₀ lock aborted: the photodiode measured a = {measured:.3} — check the I_tot \
+                     anchor and that the drive is modulating"
+                ),
+            );
+            return;
+        }
+
+        let converged = (measured - target).abs() <= tolerance;
+        // The delivered optical depth is proportional to the commanded one to
+        // first order, so one gain correction per trial converges in a couple of
+        // steps even where the drive rolls off at high frequency.
+        let ratio = (target / measured).clamp(1.0 / A0_LOCK_MAX_STEP_RATIO, A0_LOCK_MAX_STEP_RATIO);
+        let next = clamp_commanded_a(commanded * ratio);
+        let railed = !converged && (next - commanded).abs() < 1e-9;
+        let exhausted = trial >= A0_LOCK_MAX_TRIALS;
+
+        if !converged && !railed && !exhausted {
+            if let Some(lock) = self.a0_lock.as_mut() {
+                lock.commanded_a = next;
+                lock.trial += 1;
+            }
+            self.message = format!(
+                "a₀ lock trial {trial}: measured a = {measured:.3} vs a₀ = {target:.3} — \
+                 correcting the commanded depth to {next:.3}"
+            );
+            self.send_a0_depth(context);
+            return;
+        }
+
+        let optical = self
+            .photodiode
+            .as_ref()
+            .and_then(|summary| summary.optical_summary.as_ref());
+        self.store_lock(A0LockPoint {
+            frequency_hz: hz,
+            target_a: target,
+            commanded_a: commanded,
+            measured_a: measured,
+            trials: trial,
+            converged,
+            locked_at_unix_ms: now_unix_ms(),
+            low_clip_fraction: optical.map(|optical| optical.low_clip_fraction),
+            high_clip_fraction: optical.map(|optical| optical.high_clip_fraction),
+        });
+        let label = frequency_label(hz);
+        let message = if converged {
+            format!(
+                "a₀ locked at {label}: commanded a = {commanded:.3} measures a = {measured:.3} \
+                 (a₀ = {target:.3}, {trial} trial(s)){}",
+                self.clip_warning()
+            )
+        } else if railed {
+            format!(
+                "a₀ lock stopped at {label}: commanded a = {commanded:.3} is at the drivable limit \
+                 and only measures a = {measured:.3} — lower a₀ or the operating point I_k"
+            )
+        } else {
+            format!(
+                "a₀ lock did not converge at {label}: best commanded a = {commanded:.3} measures \
+                 a = {measured:.3} after {trial} trials — widen the tolerance or check the drive"
+            )
+        };
+        self.finish_a0_lock(context, message);
+    }
+
+    /// Advance the `a₀` lock one control tick.
+    fn drive_a0_lock(&mut self, context: &mut impl RecordingControl) {
+        if self.a0_lock.is_none() {
+            if std::mem::take(&mut self.a0_lock_pending) {
+                self.begin_a0_lock(context);
+            }
+            return;
+        }
+        self.a0_lock_pending = false;
+        let now_ms = now_unix_ms();
+        let (phase, stop_requested, lease_granted, depth_applied, last_activity_ms) = {
+            let lock = self.a0_lock.as_ref().expect("lock checked above");
+            (
+                lock.phase,
+                lock.stop_requested,
+                lock.lease_granted,
+                lock.depth_applied,
+                lock.last_activity_ms,
+            )
+        };
+        if stop_requested {
+            let message = if self.message.is_empty() {
+                "a₀ lock stopped".into()
+            } else {
+                self.message.clone()
+            };
+            self.finish_a0_lock(context, message);
+            return;
+        }
+        match phase {
+            A0LockPhase::AcquiringLease => {
+                if lease_granted {
+                    self.send_a0_depth(context);
+                } else if now_ms.saturating_sub(last_activity_ms) > REPLY_TIMEOUT_MS {
+                    self.finish_a0_lock(
+                        context,
+                        "a₀ lock aborted: timed out acquiring the modulation lease".into(),
+                    );
+                }
+            }
+            A0LockPhase::SettingDepth => {
+                if depth_applied {
+                    let dwell_ms = (self.settle_s.max(0.0) * 1_000.0) as u64;
+                    // Only summaries published *after* this depth was commanded
+                    // count, so the trial never averages the previous depth.
+                    let published = self
+                        .photodiode
+                        .as_ref()
+                        .map(|summary| summary.service_revision);
+                    if let Some(lock) = self.a0_lock.as_mut() {
+                        lock.phase = A0LockPhase::Measuring;
+                        // Readings also only count after the drive has settled and
+                        // the photodiode's averaging window has flushed.
+                        lock.measure_from_ms = now_ms.saturating_add(dwell_ms);
+                        lock.deadline_ms = lock.measure_from_ms + SWEEP_SETTLE_TIMEOUT_MS;
+                        lock.samples.clear();
+                        lock.sampled_revision = published;
+                    }
+                } else if now_ms.saturating_sub(last_activity_ms) > REPLY_TIMEOUT_MS {
+                    self.finish_a0_lock(
+                        context,
+                        "a₀ lock aborted: timed out retargeting the modulation drive".into(),
+                    );
+                }
+            }
+            A0LockPhase::Measuring => {
+                self.sample_a0_measurement(now_ms);
+                let ready = self.a0_lock.as_ref().is_some_and(|lock| {
+                    lock.samples.len() >= A0_LOCK_SAMPLES || now_ms >= lock.deadline_ms
+                });
+                if ready {
+                    self.evaluate_a0_trial(context);
+                }
+            }
+        }
+    }
+
+    /// Routes modulation-service replies belonging to the `a₀` lock. Returns true
+    /// when the reply was consumed.
+    fn on_a0_lock_reply(&mut self, reply: &PluginServiceReply) -> bool {
+        let Some((lease_req, depth_req)) = self
+            .a0_lock
+            .as_ref()
+            .map(|lock| (lock.lease_req, lock.depth_req))
+        else {
+            return false;
+        };
+        let abort = |this: &mut Self, message: String| {
+            this.message = message;
+            if let Some(lock) = this.a0_lock.as_mut() {
+                lock.stop_requested = true;
+            }
+        };
+        if reply.request_id == lease_req {
+            match &reply.outcome {
+                PluginServiceOutcome::Accepted { .. } => {
+                    if let Some(lock) = self.a0_lock.as_mut() {
+                        lock.lease_granted = true;
+                        lock.last_activity_ms = now_unix_ms();
+                    }
+                }
+                PluginServiceOutcome::Rejected { message, .. } => abort(
+                    self,
+                    format!("a₀ lock aborted: modulation lease rejected: {message}"),
+                ),
+            }
+            true
+        } else if reply.request_id == depth_req {
+            match &reply.outcome {
+                PluginServiceOutcome::Accepted { .. } => {
+                    if let Some(lock) = self.a0_lock.as_mut() {
+                        lock.depth_applied = true;
+                        lock.last_activity_ms = now_unix_ms();
+                    }
+                }
+                // The owner refuses a depth its calibrated drive cannot express
+                // (lobe ceiling, DAC limit) — that *is* the "a₀ unreachable at
+                // this operating point" answer, so surface its wording verbatim.
+                PluginServiceOutcome::Rejected { message, .. } => abort(
+                    self,
+                    format!("a₀ lock aborted: the drive rejected the commanded depth: {message}"),
+                ),
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    fn a0_locks_dataset(&self) -> TableDatasetV1 {
+        let column = |id: &str, values: Vec<String>| TableColumnData {
+            column_id: id.into(),
+            values: TableColumnValues::String(values),
+        };
+        let map = |select: fn(&A0LockPoint) -> String| {
+            self.a0_locks.iter().map(select).collect::<Vec<_>>()
+        };
+        TableDatasetV1 {
+            columns: vec![
+                column("frequency", map(|lock| frequency_label(lock.frequency_hz))),
+                column("target_a", map(|lock| format!("{:.3}", lock.target_a))),
+                column(
+                    "commanded_a",
+                    map(|lock| format!("{:.3}", lock.commanded_a)),
+                ),
+                column("measured_a", map(|lock| format!("{:.3}", lock.measured_a))),
+                column("trials", map(|lock| lock.trials.to_string())),
+                column(
+                    "state",
+                    map(|lock| {
+                        if lock.converged {
+                            "locked".into()
+                        } else {
+                            "not converged".into()
+                        }
+                    }),
+                ),
+                column(
+                    "locked_at",
+                    map(|lock| format_iso_utc(lock.locked_at_unix_ms / 1_000)),
+                ),
+            ],
+        }
+    }
+
     fn on_host_reply(&mut self, reply: &HostCommandReply) {
         if reply.request_id == self.recording.cam_start_req {
             match &reply.outcome {
@@ -1554,7 +2412,7 @@ impl StageAA1Plugin {
     }
 
     fn on_service_reply(&mut self, reply: &PluginServiceReply) {
-        if self.on_sweep_reply(reply) {
+        if self.on_sweep_reply(reply) || self.on_a0_lock_reply(reply) {
             return;
         }
         let response = match &reply.outcome {
@@ -1758,10 +2616,24 @@ impl StageAA1Plugin {
                     min_a: self.min_a,
                     max_a: self.max_a,
                     requested_a: point.map(Sweep::target_a),
+                    commanded_a: point.map(Sweep::commanded_a),
                     point_index: point.map(|sweep| sweep.index + 1),
                     point_total: point.map(Sweep::total),
                 }
             },
+            a0_lock: self
+                .sweep
+                .as_ref()
+                .and_then(|sweep| sweep.lock.as_ref())
+                .map(|lock| A0LockSidecar {
+                    target_a: lock.target_a,
+                    commanded_a: lock.commanded_a,
+                    measured_a_at_lock: lock.measured_a,
+                    frequency_hz_at_lock: lock.frequency_hz,
+                    trials: lock.trials,
+                    converged: lock.converged,
+                    locked_at_utc: format_iso_utc(lock.locked_at_unix_ms / 1_000),
+                }),
             pilot: (self.recording.role == RecRole::Pilot)
                 .then_some(self.pilot_windows)
                 .flatten()
@@ -1831,6 +2703,9 @@ struct SidecarDoc {
     finalized_at_utc: String,
     duration_s: u64,
     sweep: SweepSidecar,
+    /// Present on **event-count** points: the `a₀` lock this point replayed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    a0_lock: Option<A0LockSidecar>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pilot: Option<PilotSidecar>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1850,11 +2725,29 @@ struct SweepSidecar {
     /// `[optical]`); absent on manual recordings.
     #[serde(skip_serializing_if = "Option::is_none")]
     requested_a: Option<f64>,
+    /// The depth the drive was *commanded* to for this point. Equal to
+    /// `requested_a` on the amplitude sweep; on an event-count point it is the
+    /// `a₀`-locked depth, which differs by the drive roll-off at that frequency.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    commanded_a: Option<f64>,
     /// 1-based point position within the sweep; absent on manual recordings.
     #[serde(skip_serializing_if = "Option::is_none")]
     point_index: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     point_total: Option<usize>,
+}
+
+/// The `a₀` lock an **event-count** point replayed: the closed-loop trim that
+/// made the photodiode measure the frozen `a₀` at this frequency.
+#[derive(Serialize)]
+struct A0LockSidecar {
+    target_a: f64,
+    commanded_a: f64,
+    measured_a_at_lock: f64,
+    frequency_hz_at_lock: f64,
+    trials: u32,
+    converged: bool,
+    locked_at_utc: String,
 }
 
 /// Frozen ON/OFF windows written into a **pilot** recording's sidecar and read
@@ -2238,8 +3131,11 @@ impl Plugin for StageAA1Plugin {
         // the folder or id changes, look them up in the folder.
         if !self.recording.is_active() {
             self.scan_measurement_folder();
+            self.load_a0_locks();
         }
-        // The sweep runs first so a point's recording starts on the same tick.
+        // The lock and the sweep run first so a point's recording starts on the
+        // same tick. They are mutually exclusive, guarded when they begin.
+        self.drive_a0_lock(context);
         self.drive_sweep(context);
         self.drive_recording(context);
         // The fold reflects live snapshots (T, a) even between frames.
@@ -2446,6 +3342,104 @@ impl Plugin for StageAA1Plugin {
                     ],
                 },
                 SettingsSection {
+                    label: "Exact event-count depth a₀".into(),
+                    description: Some(
+                        "Second Stage-A workflow, on top of the minimum-depth sweep above: hold \
+                         ONE photodiode-measured depth a₀ = ln(I_exc,max / I_exc,min) constant \
+                         across the frequency sweep. Freeze the flux point, camera configuration \
+                         and references first (pilot and background are recorded above), then per \
+                         frequency: set f in the modulation plugin, press Find a₀ — A1 leases the \
+                         drive and trims the *commanded* depth until the photodiode *measures* a₀ \
+                         — and then press Record a₀ point, which re-applies that depth under the \
+                         same lease (so the amplitude cannot change during the recorded interval) \
+                         and records one atomic RAW + PDQ + sidecar point named …_ec_f<f>Hz. The \
+                         found depths are kept per frequency, listed in the a₀ lock table view and \
+                         mirrored to a0_locks.json in the output folder. Randomising the frequency \
+                         order, interleaving the low-frequency reference and repeating blocks stay \
+                         yours — every point is one button press."
+                            .into(),
+                    ),
+                    default_open: false,
+                    items: vec![
+                        SettingItem {
+                            key: "a0_target".into(),
+                            label: "a₀ (measured log contrast)".into(),
+                            tooltip: Some(
+                                "The one photodiode-measured depth held across the whole frequency \
+                                 sweep — never a DAC excursion. Pick it from the low-frequency \
+                                 scout: high enough for several events per pixel per half-cycle, \
+                                 still proportional (not saturated), and refractory-safe at the \
+                                 highest frequency."
+                                    .into(),
+                            ),
+                            kind: SettingKind::F64Drag {
+                                min: COMMANDED_A_MIN,
+                                max: COMMANDED_A_MAX,
+                                speed: 0.01,
+                                default: self.a0_target,
+                            },
+                        },
+                        SettingItem {
+                            key: "a0_tolerance".into(),
+                            label: "a₀ tolerance (absolute)".into(),
+                            tooltip: Some(
+                                "Convergence band on |measured a − a₀| for the lock, and the \
+                                 settle band an event-count point must hold before it records."
+                                    .into(),
+                            ),
+                            kind: SettingKind::F64Drag {
+                                min: 0.002,
+                                max: 0.5,
+                                speed: 0.002,
+                                default: self.a0_tolerance,
+                            },
+                        },
+                        SettingItem {
+                            key: "find_a0".into(),
+                            label: "Find a₀ (lock the drive depth)".into(),
+                            tooltip: Some(
+                                "Leases the modulation owner and iterates commanded a ← commanded \
+                                 a · a₀/measured a until the photodiode-measured depth is a₀ at the \
+                                 current frequency (up to 8 trials, waiting Sweep settle (s) per \
+                                 trial). Records nothing, leaves the drive at the depth it found, \
+                                 and stores it for this frequency. Requires a calibrated \
+                                 periodic/optical drive armed in the modulation plugin and a \
+                                 photodiode-measured a. Disabled until an output folder is selected."
+                                    .into(),
+                            ),
+                            kind: SettingKind::Button {
+                                enabled: can_record,
+                            },
+                        },
+                        SettingItem {
+                            key: "record_a0_point".into(),
+                            label: "Record a₀ point (event-count)".into(),
+                            tooltip: Some(
+                                "Records one atomic frequency point at the locked depth: re-applies \
+                                 the found commanded a under a modulation lease, waits for the \
+                                 measured a to hold a₀, then records camera RAW + photodiode PDQ + \
+                                 sidecar under one run id (…_ec_f<f>Hz). Needs a converged lock for \
+                                 the current frequency and an output folder."
+                                    .into(),
+                            ),
+                            kind: SettingKind::Button {
+                                enabled: can_record,
+                            },
+                        },
+                        SettingItem {
+                            key: "clear_a0_locks".into(),
+                            label: "Clear a₀ lock table".into(),
+                            tooltip: Some(
+                                "Drops every stored per-frequency lock and rewrites \
+                                 a0_locks.json. Use it after changing the flux point, the \
+                                 calibration or a₀ itself."
+                                    .into(),
+                            ),
+                            kind: SettingKind::Button { enabled: true },
+                        },
+                    ],
+                },
+                SettingsSection {
                     label: "Live analysis".into(),
                     description: Some(
                         "Live sanity quicklook. Folds the camera event stream on the modulation \
@@ -2572,6 +3566,11 @@ impl Plugin for StageAA1Plugin {
             "clear" => Some(self.press_clear.value()),
             "record_point" => Some(self.press_record_point.value()),
             "clear_curve" => Some(self.press_clear_curve.value()),
+            "a0_target" => Some(json!(self.a0_target)),
+            "a0_tolerance" => Some(json!(self.a0_tolerance)),
+            "find_a0" => Some(self.press_find_a0.value()),
+            "record_a0_point" => Some(self.press_record_a0.value()),
+            "clear_a0_locks" => Some(self.press_clear_a0.value()),
             // New id regenerates the measurement id locally; the id itself is
             // what synchronizes, so the press must not be forwarded (both
             // instances would generate different ids).
@@ -2656,7 +3655,13 @@ impl Plugin for StageAA1Plugin {
                         sweep.stop_requested = true;
                         self.message = "Sweep stop requested".into();
                     }
+                    if let Some(lock) = self.a0_lock.as_mut() {
+                        lock.stop_requested = true;
+                        self.message = "a₀ lock stop requested".into();
+                    }
                     self.sweep_pending = false;
+                    self.a0_lock_pending = false;
+                    self.a0_point_pending = false;
                 }
             }
             "live" => {
@@ -2697,6 +3702,34 @@ impl Plugin for StageAA1Plugin {
                     self.response_points.clear();
                 }
             }
+            "a0_target" => {
+                self.a0_target = value
+                    .as_f64()
+                    .ok_or("a0_target must be a number")?
+                    .clamp(COMMANDED_A_MIN, COMMANDED_A_MAX);
+            }
+            "a0_tolerance" => {
+                self.a0_tolerance = value
+                    .as_f64()
+                    .ok_or("a0_tolerance must be a number")?
+                    .clamp(0.002, 0.5);
+            }
+            "find_a0" => {
+                if self.press_find_a0.accept(&value) {
+                    self.a0_lock_pending = true;
+                }
+            }
+            "record_a0_point" => {
+                if self.press_record_a0.accept(&value) {
+                    self.a0_point_pending = true;
+                }
+            }
+            "clear_a0_locks" => {
+                if self.press_clear_a0.accept(&value) {
+                    self.a0_locks.clear();
+                    self.save_a0_locks();
+                }
+            }
             "new_id" => return Ok(()),
             _ => return Err(format!("unknown setting '{key}'")),
         }
@@ -2725,11 +3758,32 @@ impl Plugin for StageAA1Plugin {
                 SweepPhase::Settling => "settling",
                 SweepPhase::Recording => "recording",
             };
+            let label = match sweep.kind {
+                SweepKind::Amplitude => "Sweep",
+                SweepKind::EventCount => "Event-count point",
+            };
             entries.push(StatusEntry::Text(format!(
-                "Sweep: point {}/{} at a → {:.3} ({phase})",
+                "{label}: point {}/{} commanding a = {:.3} for a measured {:.3} ({phase})",
                 sweep.index + 1,
                 sweep.total(),
+                sweep.commanded_a(),
                 sweep.target_a()
+            )));
+        }
+        if let Some(lock) = &self.a0_lock {
+            let phase = match lock.phase {
+                A0LockPhase::AcquiringLease => "leasing modulation",
+                A0LockPhase::SettingDepth => "commanding depth",
+                A0LockPhase::Measuring => "measuring",
+            };
+            entries.push(StatusEntry::Text(format!(
+                "a₀ lock at {}: trial {}/{A0_LOCK_MAX_TRIALS} commanding a = {:.3} for a₀ = {:.3} \
+                 ({phase}, {} sample(s))",
+                frequency_label(lock.frequency_hz),
+                lock.trial,
+                lock.commanded_a,
+                lock.target_a,
+                lock.samples.len()
             )));
         }
         if !self.message.is_empty() {
@@ -2803,6 +3857,21 @@ impl Plugin for StageAA1Plugin {
                 "Background floor: q0_on = {q0_on:.3}, q0_off = {q0_off:.3}"
             )));
         }
+        entries.push(StatusEntry::Text(match self.armed_lock() {
+            Some(lock) => format!(
+                "a₀ = {:.3} armed at {}: commanded a = {:.3} (measured {:.3}); {} lock(s) stored",
+                lock.target_a,
+                frequency_label(lock.frequency_hz),
+                lock.commanded_a,
+                lock.measured_a,
+                self.a0_locks.len()
+            ),
+            None => format!(
+                "a₀ = {:.3}: no lock for this frequency — press Find a₀; {} lock(s) stored",
+                self.a0_target,
+                self.a0_locks.len()
+            ),
+        }));
         entries
     }
 
@@ -2853,6 +3922,25 @@ impl Plugin for StageAA1Plugin {
                     display: None,
                     relations: Vec::new(),
                 },
+                HostDatasetDescriptor {
+                    id: A0_LOCK_DATASET_ID.into(),
+                    title: "A1 a₀ locks — commanded depth per frequency".into(),
+                    kind: HostDatasetKind::TableV1(TableSchema {
+                        columns: vec![
+                            column("frequency", "Frequency"),
+                            column("target_a", "a₀ (target)"),
+                            column("commanded_a", "Commanded a"),
+                            column("measured_a", "Measured a"),
+                            column("trials", "Trials"),
+                            column("state", "State"),
+                            column("locked_at", "Locked at (UTC)"),
+                        ],
+                        ..TableSchema::default()
+                    }),
+                    empty_message: "No a₀ lock yet — set a₀ and press Find a₀ per frequency".into(),
+                    display: None,
+                    relations: Vec::new(),
+                },
             ],
             views: vec![
                 HostViewDescriptor {
@@ -2876,6 +3964,13 @@ impl Plugin for StageAA1Plugin {
                     placement: HostViewPlacement::Window,
                     kind: HostViewKind::LineSeriesWindow,
                 },
+                HostViewDescriptor {
+                    id: A0_LOCK_VIEW_ID.into(),
+                    title: "A1 a₀ locks (commanded depth per frequency)".into(),
+                    dataset_id: A0_LOCK_DATASET_ID.into(),
+                    placement: HostViewPlacement::Window,
+                    kind: HostViewKind::TableWindow,
+                },
             ],
             actions: Vec::new(),
         }
@@ -2886,6 +3981,7 @@ impl Plugin for StageAA1Plugin {
             STATUS_DATASET_ID => serde_json::to_vec(&self.status_dataset()).ok(),
             ROLLING_DATASET_ID => serde_json::to_vec(&self.rolling_dataset()).ok(),
             RESPONSE_CURVE_DATASET_ID => serde_json::to_vec(&self.response_curve_dataset()).ok(),
+            A0_LOCK_DATASET_ID => serde_json::to_vec(&self.a0_locks_dataset()).ok(),
             _ => None,
         }
     }
@@ -2893,7 +3989,7 @@ impl Plugin for StageAA1Plugin {
     fn host_view_dataset_generation(&self, dataset_id: &str) -> u64 {
         matches!(
             dataset_id,
-            STATUS_DATASET_ID | ROLLING_DATASET_ID | RESPONSE_CURVE_DATASET_ID
+            STATUS_DATASET_ID | ROLLING_DATASET_ID | RESPONSE_CURVE_DATASET_ID | A0_LOCK_DATASET_ID
         )
         .then_some(self.dataset_generation)
         .unwrap_or(0)
@@ -2936,6 +4032,7 @@ mod tests {
         }
     }
 
+    /// Mirrors the ordering of [`StageAA1Plugin::process_control`].
     fn control_tick(
         plugin: &mut StageAA1Plugin,
         inbox: PluginControlInbox,
@@ -2947,7 +4044,200 @@ mod tests {
         for reply in &inbox.service_replies {
             plugin.on_service_reply(reply);
         }
+        plugin.drive_a0_lock(sink);
+        plugin.drive_sweep(sink);
         plugin.drive_recording(sink);
+    }
+
+    /// Bare `Accepted` reply, as the modulation owner answers a lease or depth
+    /// command (only the outcome variant is routed).
+    fn accepted(request_id: u64) -> PluginServiceReply {
+        PluginServiceReply {
+            request_id,
+            source_plugin_id: A1_PLUGIN_ID.into(),
+            target_plugin_id: MODULATION_PLUGIN_ID.into(),
+            service: SERVICE_STAGE_A_MODULATION_CONTROL_V1.into(),
+            outcome: PluginServiceOutcome::Accepted {
+                payload: Value::Null,
+            },
+        }
+    }
+
+    fn rejected(request_id: u64, message: &str) -> PluginServiceReply {
+        PluginServiceReply {
+            request_id,
+            source_plugin_id: A1_PLUGIN_ID.into(),
+            target_plugin_id: MODULATION_PLUGIN_ID.into(),
+            service: SERVICE_STAGE_A_MODULATION_CONTROL_V1.into(),
+            outcome: PluginServiceOutcome::Rejected {
+                code: "invalid_command".into(),
+                message: message.into(),
+            },
+        }
+    }
+
+    fn connected_modulation() -> ModulationStateV1 {
+        ModulationStateV1 {
+            contract_version: stage_a_plugin_contract::CONTRACT_VERSION_V1,
+            owner_instance: OwnerInstanceId::new("mod-test"),
+            service_revision: 1,
+            connection: ConnectionStateV1::Connected {
+                port_label: "mock".into(),
+                firmware_version: Some("0.4.0".into()),
+            },
+            capabilities: Vec::new(),
+            lease: None,
+            controller_state: stage_a_plugin_contract::ControllerStateV1::Configured,
+            active_run_id: None,
+            requested: None,
+            acknowledged: None,
+            synchronization: stage_a_plugin_contract::SynchronizationV1::Unsynced {
+                reason: stage_a_plugin_contract::UnsyncedReasonV1::NoLease,
+                detail: None,
+            },
+            last_response: None,
+            freshness: stage_a_plugin_contract::FreshnessV1 {
+                observed_at_unix_ms: now_unix_ms(),
+                valid_for_ms: 5_000,
+            },
+            calibration_id: Some("pockels-test".into()),
+        }
+    }
+
+    /// A photodiode snapshot reporting `measured_a`, published at `revision`.
+    fn photodiode_measuring(revision: u64, measured_a: f64) -> PhotodiodeSummaryV1 {
+        PhotodiodeSummaryV1 {
+            contract_version: stage_a_plugin_contract::CONTRACT_VERSION_V1,
+            owner_instance: OwnerInstanceId::new("pd-test"),
+            service_revision: revision,
+            connection: ConnectionStateV1::Connected {
+                port_label: "mock".into(),
+                firmware_version: None,
+            },
+            lease: None,
+            active_run_id: None,
+            requested_revision: None,
+            acknowledged_revision: None,
+            stream: stage_a_plugin_contract::PhotodiodeStreamV1 {
+                stream_epoch: 1,
+                sample_range: None,
+                sample_rate_hz: Some(20_000),
+                latest_adc_code: None,
+                integrity: StreamIntegrityV1::default(),
+                level: None,
+            },
+            active_recording: None,
+            last_finalized_recording: None,
+            optical_summary: Some(stage_a_plugin_contract::PhotodiodeOpticalSummaryV1 {
+                run_id: RunId::new("pd-run"),
+                calibration: stage_a_plugin_contract::PhotodiodeCalibrationV1 {
+                    adc_calibration_id: "adc".into(),
+                    dark_id: "dark".into(),
+                    anchor_id: "anchor".into(),
+                    dark_volts: 0.0,
+                    total_power_volts: 1.0,
+                },
+                measured_log_contrast: measured_a,
+                log_contrast_stddev: None,
+                excitation_min_volts: 0.1,
+                excitation_max_volts: 0.9,
+                excitation_headroom_volts: 0.1,
+                low_clip_fraction: 0.0,
+                high_clip_fraction: 0.0,
+                measured_frequency_hz: None,
+                fundamental_phase_rad: None,
+                total_harmonic_distortion: None,
+            }),
+            synchronization: stage_a_plugin_contract::SynchronizationV1::Unsynced {
+                reason: stage_a_plugin_contract::UnsyncedReasonV1::NoLease,
+                detail: None,
+            },
+            last_response: None,
+            freshness: stage_a_plugin_contract::FreshnessV1 {
+                observed_at_unix_ms: now_unix_ms(),
+                valid_for_ms: 5_000,
+            },
+        }
+    }
+
+    /// The depth carried by the newest `SetOpticalDepth` the plugin emitted.
+    fn last_commanded_depth(sink: &ControlSink) -> Option<f64> {
+        sink.services.iter().rev().find_map(|request| {
+            let envelope: ModulationRequestV1 =
+                serde_json::from_value(request.payload.clone()).ok()?;
+            match envelope.command {
+                ModulationCommandV1::SetOpticalDepth { depth_a_milli } => {
+                    Some(f64::from(depth_a_milli) / 1_000.0)
+                }
+                _ => None,
+            }
+        })
+    }
+
+    /// A unique scratch directory for a test's lock table and sidecars.
+    fn temp_folder(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("a1-{tag}-{}", now_unix_ms()))
+    }
+
+    /// A plugin wired to a connected drive at 1 kHz (marker-anchored) whose
+    /// photodiode reports a bench that delivers `gain ×` the commanded depth.
+    fn plugin_locking(gain: f64, folder: &Path) -> StageAA1Plugin {
+        let mut plugin = plugin_with_markers();
+        plugin.modulation = Some(connected_modulation());
+        plugin.photodiode = Some(photodiode_measuring(1, gain));
+        plugin.output_folder = folder.display().to_string();
+        plugin.measurement_id = "A1-ec".into();
+        plugin.settle_s = 0.0;
+        plugin.a0_tolerance = 0.02;
+        plugin
+    }
+
+    /// Answers the lock's outstanding lease/depth request and publishes the
+    /// photodiode readings the commanded depth produces, until the lock ends.
+    fn run_lock_to_completion(
+        plugin: &mut StageAA1Plugin,
+        sink: &mut ControlSink,
+        gain: f64,
+        max_ticks: usize,
+    ) -> usize {
+        let mut revision = 1;
+        // The first tick consumes the latched press and starts the lock.
+        control_tick(plugin, PluginControlInbox::default(), sink);
+        for tick in 0..max_ticks {
+            if plugin.a0_lock.is_none() {
+                return tick + 1;
+            }
+            let (lease_req, depth_req, granted, applied) = {
+                let lock = plugin.a0_lock.as_ref().expect("lock");
+                (
+                    lock.lease_req,
+                    lock.depth_req,
+                    lock.lease_granted,
+                    lock.depth_applied,
+                )
+            };
+            let mut replies = Vec::new();
+            if !granted {
+                replies.push(accepted(lease_req));
+            } else if !applied && depth_req != 0 {
+                replies.push(accepted(depth_req));
+            } else {
+                // Measuring: publish what the bench delivers for the commanded
+                // depth as a fresh summary.
+                let commanded = plugin.a0_lock.as_ref().expect("lock").commanded_a;
+                revision += 1;
+                plugin.photodiode = Some(photodiode_measuring(revision, commanded * gain));
+            }
+            control_tick(
+                plugin,
+                PluginControlInbox {
+                    service_replies: replies,
+                    ..PluginControlInbox::default()
+                },
+                sink,
+            );
+        }
+        max_ticks
     }
 
     fn pd_reply(request_id: u64, receipt: Option<PdqReceiptV1>) -> PluginServiceReply {
@@ -3322,9 +4612,13 @@ mod tests {
         };
         let points = plugin.sweep_points();
         assert_eq!(points.len(), 5);
-        assert!((points[0] - 0.5).abs() < 1e-12);
-        assert!((points[4] - 2.5).abs() < 1e-12);
-        assert!((points[2] - 1.5).abs() < 1e-12);
+        assert!((points[0].expected_a - 0.5).abs() < 1e-12);
+        assert!((points[4].expected_a - 2.5).abs() < 1e-12);
+        assert!((points[2].expected_a - 1.5).abs() < 1e-12);
+        // The amplitude sweep trusts the calibration: it commands what it expects.
+        assert!(points
+            .iter()
+            .all(|point| point.commanded_a == point.expected_a));
     }
 
     #[test]
@@ -3332,9 +4626,12 @@ mod tests {
         let mut plugin = plugin_with_markers();
         plugin.min_a = 0.5;
         plugin.max_a = 1.5;
+        plugin.sweep_count = 3;
         plugin.sweep = Some(Sweep {
             phase: SweepPhase::Recording,
-            points: vec![0.5, 1.0, 1.5],
+            kind: SweepKind::Amplitude,
+            points: plugin.sweep_points(),
+            lock: None,
             index: 1,
             lease_id: LeaseId::new("a1-sweep-test"),
             lease_granted: true,
@@ -3358,6 +4655,272 @@ mod tests {
         assert!(text.contains("point_index = 2"));
         assert!(text.contains("point_total = 3"));
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a0_lock_trims_the_commanded_depth_until_the_photodiode_measures_a0() {
+        // A bench that delivers 60 % of the commanded depth (drive roll-off):
+        // commanding a₀ directly would record a = 0.30 instead of 0.50.
+        let folder = temp_folder("lock");
+        let mut plugin = plugin_locking(0.6, &folder);
+        plugin.a0_target = 0.5;
+        plugin.a0_lock_pending = true;
+        let mut sink = ControlSink::default();
+
+        let ticks = run_lock_to_completion(&mut plugin, &mut sink, 0.6, 64);
+        assert!(ticks < 64, "lock never finished");
+
+        let lock = plugin
+            .a0_locks
+            .first()
+            .expect("the converged lock is stored");
+        assert!(lock.converged, "message: {}", plugin.message);
+        assert!(
+            (lock.measured_a - 0.5).abs() <= plugin.a0_tolerance,
+            "measured {}",
+            lock.measured_a
+        );
+        assert!(
+            (lock.commanded_a - 0.5 / 0.6).abs() < 0.01,
+            "commanded {}",
+            lock.commanded_a
+        );
+        assert!(lock.trials >= 2, "trials {}", lock.trials);
+        assert!((lock.frequency_hz - 1_000.0).abs() < 1.0);
+        // The drive is left at the depth the lock found, and the lease is
+        // released without a safe-off so it stays there for the recording.
+        assert!((last_commanded_depth(&sink).expect("depth") - lock.commanded_a).abs() < 0.002);
+        let release: ModulationRequestV1 =
+            serde_json::from_value(sink.services.last().expect("release").payload.clone())
+                .expect("envelope");
+        assert!(matches!(
+            release.command,
+            ModulationCommandV1::ReleaseLease {
+                safe_off: false,
+                ..
+            }
+        ));
+        // The lock arms the event-count recording for this frequency.
+        assert!(plugin.armed_lock().is_some());
+        // …and the table is on disk next to the recordings.
+        assert!(folder.join(A0_LOCK_FILE).exists());
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn a0_lock_reports_an_unreachable_depth_instead_of_arming_a_recording() {
+        // The bench delivers 5 % of the commanded depth: a₀ = 0.5 would need a
+        // commanded depth far beyond what the owner accepts.
+        let folder = temp_folder("unreachable");
+        let mut plugin = plugin_locking(0.05, &folder);
+        plugin.a0_target = 0.5;
+        plugin.a0_lock_pending = true;
+        let mut sink = ControlSink::default();
+
+        assert!(run_lock_to_completion(&mut plugin, &mut sink, 0.05, 256) < 256);
+        let lock = plugin.a0_locks.first().expect("the attempt is recorded");
+        assert!(!lock.converged);
+        assert!((lock.commanded_a - COMMANDED_A_MAX).abs() < 1e-9);
+        assert!(
+            plugin.message.contains("drivable limit")
+                || plugin.message.contains("did not converge"),
+            "message: {}",
+            plugin.message
+        );
+        // A non-converged lock must never arm an event-count recording.
+        assert!(plugin.armed_lock().is_none());
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn a0_lock_surfaces_a_drive_rejection_verbatim() {
+        let folder = temp_folder("reject");
+        let mut plugin = plugin_locking(1.0, &folder);
+        plugin.a0_lock_pending = true;
+        let mut sink = ControlSink::default();
+        // Tick 1: begin and lease.
+        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+        let lease_req = plugin.a0_lock.as_ref().expect("lock").lease_req;
+        control_tick(
+            &mut plugin,
+            PluginControlInbox {
+                service_replies: vec![accepted(lease_req)],
+                ..PluginControlInbox::default()
+            },
+            &mut sink,
+        );
+        let depth_req = plugin.a0_lock.as_ref().expect("lock").depth_req;
+        control_tick(
+            &mut plugin,
+            PluginControlInbox {
+                service_replies: vec![rejected(
+                    depth_req,
+                    "calibrated optical peak u = 1.2 exceeds the lobe ceiling",
+                )],
+                ..PluginControlInbox::default()
+            },
+            &mut sink,
+        );
+        assert!(plugin.a0_lock.is_none(), "the lock must not keep trying");
+        assert!(
+            plugin.message.contains("lobe ceiling"),
+            "message: {}",
+            plugin.message
+        );
+        assert!(plugin.a0_locks.is_empty(), "a rejected lock stores nothing");
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn event_count_point_commands_the_locked_depth_not_a0() {
+        let folder = temp_folder("ecpoint");
+        let mut plugin = plugin_locking(0.6, &folder);
+        plugin.a0_target = 0.5;
+        plugin.a0_locks.push(A0LockPoint {
+            frequency_hz: 1_000.0,
+            target_a: 0.5,
+            commanded_a: 0.8333,
+            measured_a: 0.5,
+            trials: 2,
+            converged: true,
+            locked_at_unix_ms: now_unix_ms(),
+            low_clip_fraction: Some(0.0),
+            high_clip_fraction: Some(0.0),
+        });
+        let mut sink = ControlSink::default();
+
+        plugin
+            .set_setting("record_a0_point", json!(true))
+            .expect("press");
+        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+        let sweep = plugin.sweep.as_ref().expect("event-count sweep");
+        assert_eq!(sweep.kind, SweepKind::EventCount);
+        assert_eq!(sweep.total(), 1);
+        let lease_req = sweep.lease_req;
+
+        control_tick(
+            &mut plugin,
+            PluginControlInbox {
+                service_replies: vec![accepted(lease_req)],
+                ..PluginControlInbox::default()
+            },
+            &mut sink,
+        );
+        // The drive is commanded to the locked depth, *not* to a₀ itself.
+        let commanded = last_commanded_depth(&sink).expect("commanded depth");
+        assert!((commanded - 0.833).abs() < 0.002, "commanded {commanded}");
+        assert!((plugin.sweep.as_ref().expect("sweep").target_a() - 0.5).abs() < 1e-9);
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn event_count_stems_and_sidecars_carry_the_frequency_and_the_lock() {
+        let folder = temp_folder("ecstem");
+        let mut plugin = plugin_locking(0.6, &folder);
+        plugin.measurement_id = "A1-ecrow".into();
+        plugin.frame_width = 4;
+        plugin.frame_height = 1;
+        let lock = A0LockPoint {
+            frequency_hz: 1_000.0,
+            target_a: 0.5,
+            commanded_a: 0.8333,
+            measured_a: 0.5,
+            trials: 2,
+            converged: true,
+            locked_at_unix_ms: 1_784_764_800_000,
+            low_clip_fraction: Some(0.0),
+            high_clip_fraction: Some(0.0),
+        };
+        plugin.sweep = Some(Sweep {
+            phase: SweepPhase::Recording,
+            kind: SweepKind::EventCount,
+            points: vec![SweepPoint {
+                commanded_a: 0.8333,
+                expected_a: 0.5,
+            }],
+            lock: Some(lock),
+            index: 0,
+            lease_id: LeaseId::new("a1-sweep-test"),
+            lease_granted: true,
+            lease_req: 0,
+            depth_req: 0,
+            depth_applied: true,
+            settled_since_ms: None,
+            settle_deadline_ms: 0,
+            point_started: true,
+            last_activity_ms: 0,
+            stop_requested: false,
+        });
+
+        // The stem carries the frequency instead of a sweep-point index.
+        let mut sink = ControlSink::default();
+        plugin.begin_recording(&mut sink, RecRole::EventCount);
+        let stem = plugin.recording.stem.clone();
+        assert!(stem.ends_with("_ec_f1000Hz"), "stem: {stem}");
+
+        plugin.recording.duration_s = 5;
+        plugin.recording.start_unix_ms = 1_784_764_800_000;
+        let path = plugin.write_sidecar().expect("sidecar path");
+        let text = std::fs::read_to_string(&path).expect("read sidecar");
+        assert!(text.contains("role = \"event-count point\""), "{text}");
+        assert!(text.contains("[a0_lock]"), "{text}");
+        assert!(text.contains("target_a = 0.5"), "{text}");
+        assert!(text.contains("commanded_a = 0.8333"), "{text}");
+        assert!(text.contains("converged = true"), "{text}");
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn frequency_tags_are_file_safe() {
+        assert_eq!(frequency_tag(50.0), "f50Hz");
+        assert_eq!(frequency_tag(0.5), "f0p5Hz");
+        assert_eq!(frequency_tag(1_200.0), "f1200Hz");
+        assert_eq!(frequency_tag(12.345), "f12p345Hz");
+        assert_eq!(sanitize_stem(&frequency_tag(0.5)), frequency_tag(0.5));
+    }
+
+    #[test]
+    fn locks_are_one_per_frequency_and_round_trip_through_the_folder() {
+        let dir = std::env::temp_dir().join(format!("a1-a0-{}", now_unix_ms()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let folder = dir.display().to_string();
+
+        let mut plugin = StageAA1Plugin {
+            output_folder: folder.clone(),
+            ..StageAA1Plugin::default()
+        };
+        let point = |hz: f64, commanded_a: f64| A0LockPoint {
+            frequency_hz: hz,
+            target_a: 0.5,
+            commanded_a,
+            measured_a: 0.5,
+            trials: 2,
+            converged: true,
+            locked_at_unix_ms: now_unix_ms(),
+            low_clip_fraction: None,
+            high_clip_fraction: None,
+        };
+        plugin.store_lock(point(1_000.0, 0.83));
+        plugin.store_lock(point(50.0, 0.52));
+        // Re-locking the same frequency replaces the row rather than appending.
+        plugin.store_lock(point(1_000.5, 0.86));
+        assert_eq!(plugin.a0_locks.len(), 2);
+        assert!(
+            (plugin.a0_locks[0].frequency_hz - 50.0).abs() < 1e-9,
+            "sorted by frequency"
+        );
+
+        let mut other = StageAA1Plugin {
+            output_folder: folder.clone(),
+            ..StageAA1Plugin::default()
+        };
+        other.load_a0_locks();
+        assert_eq!(other.a0_locks.len(), 2);
+        let reloaded = other.lock_for_frequency(1_000.0).expect("reloaded lock");
+        assert!((reloaded.commanded_a - 0.86).abs() < 1e-9);
+        assert_eq!(other.a0_locks_dataset().columns.len(), 7);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
