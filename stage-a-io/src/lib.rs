@@ -12,7 +12,8 @@
 //!   ADC overruns — any of which invalidates a measurement point),
 //! - a bounded background I/O worker so plugin `process_frame()` never
 //!   blocks on serial,
-//! - the `.pdq` raw-frame writer and the JSON run sidecar,
+//! - streaming `.pdq` write/replay with CRC32, SHA-256, byte/frame counts,
+//!   contiguous sample-range receipts, plus the JSON run sidecar,
 //! - the calibrated optical log-contrast estimator (`a` is measured light,
 //!   never the commanded DAC excursion),
 //! - a mock controller for tests and hardware-free development.
@@ -26,20 +27,29 @@ pub mod estimator;
 pub mod mock;
 pub mod pdq;
 pub mod protocol;
+mod sha256;
 pub mod sidecar;
 pub mod transport;
 pub mod wire;
 
 pub use client::{ClientError, DeviceEvent, StageAClient, StreamIntegrity};
-pub use estimator::{estimate_contrast, AdcCalibration, ContrastEstimate, EstimateError};
+pub use estimator::{
+    estimate_contrast, AdcCalibration, ContrastEstimate, ContrastGeometry, EstimateError,
+};
 pub use mock::{MockController, MockState, MockWave};
-pub use pdq::{PdqSummary, PdqWriter};
+pub use pdq::{
+    inspect_pdq, PdqReadEvent, PdqReadSummary, PdqReader, PdqSampleRange, PdqSummary, PdqWriter,
+};
 pub use protocol::{Command, ControlMessage, ProtocolError};
+pub use sha256::Sha256Digest;
 pub use sidecar::{DetectorLoad, IntegrityRecord, RunSidecar, TriggerSource};
 #[cfg(feature = "hardware")]
 pub use transport::SerialTransport;
 pub use transport::{MockLink, MockTransport, Transport};
-pub use wire::{Frame, FrameHeader, FrameParser, FrameType, ParseEvent, SummaryPayload};
+pub use wire::{
+    Frame, FrameHeader, FrameParser, FrameType, MarkerPayload, ParseEvent, SummaryPayload,
+    MARKER_SOURCE_PHASE0,
+};
 pub use worker::{IoWorker, WorkerOutput, WorkerRequest};
 
 pub mod worker;

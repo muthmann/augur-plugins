@@ -14,7 +14,19 @@ plus the newest value. During a command-port acquisition the firmware mirrors th
 blocks here — every rate change or sample-index jump restarts the ring as a new segment, so the
 `index / rate` time base is always consistent.
 
-Two modes:
+## Phase-0 trigger overlay
+
+The firmware stamps a device-clock **`Marker` frame** (wire type 4) on the stream at every
+modulation phase-0, in step with the J24 camera trigger. Because the chart is on the device
+(Teensy) sample clock — not the camera clock — this stream marker is the correctly-aligned phase-0
+source (the camera `EXT_TRIGGER` belongs to A1's camera-clock analysis, not here).
+
+- **Show phase-0 trigger markers** (opt-in) overlays them as one toggleable vertical curve
+  ("phase-0 trigger") on the chart.
+- The **modulation frequency is derived from the marker spacing** (`f = rate / mean marker gap`) and
+  shown in the status; the mock emits synthetic markers so the overlay works without hardware.
+
+## Modes
 
 - **RAW** — ADC code and volts (`V = code · 3.3 / 4095`).
 - **EXCITATION** — the diode sits behind the PBS in the excitation path and measures the light
@@ -31,6 +43,21 @@ Two modes:
   tool for modulated signals — **one full period of a user-given frequency**
   (`avg_sync_freq_hz`, e.g. the MOD drive frequency): window = `rate / f` samples, which makes
   the mean independent of the modulation phase instead of riding the waveform.
+
+## Data (cache snapshot + disk recording)
+
+- The monitor cache always holds the last *N* seconds (`cache_s`). **Save cache
+  snapshot** writes it **once** as `pd_cache_<timestamp>.csv` + JSON sidecar.
+- **Start recording** / **Stop recording** buttons tee every incoming sample
+  frame to `pd_rec_<timestamp>.pdq`; stopping writes the JSON sidecar. Both
+  buttons (and the snapshot) are disabled until a data directory is selected.
+- All three are momentary buttons whose presses are forwarded from the UI
+  mirror to the live worker as monotonic press counters (`PressLatch`, ADR 010)
+  and act only on a press **edge**. The previous unguarded `save_snapshot`
+  handler fired on every host settings sync — one unwanted CSV per settings
+  change of *any* plugin — and the old `record` checkbox synced the mirror's
+  always-false state to the worker, so it could never stay recording. The
+  `record` boolean setting remains as a non-schema compatibility alias.
 
 ## Contract
 
@@ -51,4 +78,5 @@ Two modes:
 jumps and rate changes, duration-bounded ring with aligned indexes, moving-average window
 derivation from the sync frequency, newest-window average, envelope decimation bounds and
 min ≤ mean ≤ max, raw rendering for short windows, excitation inversion, mock reader, settings
-round-trips.
+round-trips, the forwarded snapshot counter saving exactly once, and the record start/stop
+buttons.

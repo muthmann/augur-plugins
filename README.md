@@ -58,6 +58,9 @@ The plugin crates under `plugins/` are under active development and not yet read
 | `evesmlm-candidates` | `RawEvents` | Event-domain candidate clustering plus accepted/rejected raw-event investigation layers |
 | `evesmlm-fitting` | `DerivedData` | Candidate fitting plus shared current-localization datasets, stable ids, and linked 3D inspection |
 | `evesmlm-postproc` | `DerivedData` | Filtering, drift correction, evaluation, and the later shared EVE current-localization provider |
+| `stage-a-modulation` | control service | Sole owner of the Stage-A Teensy command port and ACKed modulation state |
+| `stage-a-photodiode` | control service | Sole owner of the Stage-A stream port, PDA1 ingestion, and PDQ persistence |
+| `stage-a-a1` | `RawEvents` + orchestration | A1 protocol/schedule validation, raw phase quicklooks, analysis core, and a safety-gated commissioning run through the two owner services |
 
 `plugin-template/` is the starting point for new plugin crates.
 

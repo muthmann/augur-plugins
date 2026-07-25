@@ -70,6 +70,17 @@ impl MockWave {
     }
 }
 
+/// Optical warp parameters accepted on `MOD wave=WARP` (firmware rebuilds the
+/// DAC table from these; the mock only validates them).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct WarpParams {
+    target: Option<String>,
+    a_milli: u32,
+    u_k_milli: u32,
+    v_null: u32,
+    v_pi: u32,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct MockConfig {
     mode: String,
@@ -435,6 +446,7 @@ impl<T: Transport> MockController<T> {
         let mut min_level = 0_u32;
         let mut freq_mhz = 0_u32;
         let mut saw_freq = false;
+        let mut warp: WarpParams = WarpParams::default();
         for (key, value) in fields {
             match key.as_str() {
                 "wave" => {
@@ -443,6 +455,7 @@ impl<T: Transport> MockController<T> {
                         "CONST" => "CONST",
                         "SINE" => "SINE",
                         "SQUARE" => "SQUARE",
+                        "WARP" => "WARP",
                         _ => return err("RANGE", "invalid_wave"),
                     });
                 }
@@ -464,12 +477,64 @@ impl<T: Transport> MockController<T> {
                     }
                     _ => return err("RANGE", "invalid_freq_mhz"),
                 },
+                // Optical warp parameters (wave=WARP): the firmware rebuilds the
+                // 256-entry DAC table from these; the mock only validates them.
+                "target" => match value.as_str() {
+                    "LOG_SINE" | "LINEAR_SINE" => warp.target = Some(value.clone()),
+                    _ => return err("RANGE", "invalid_target"),
+                },
+                "a_milli" => match value.parse::<u32>() {
+                    Ok(parsed) if parsed > 0 => warp.a_milli = parsed,
+                    _ => return err("RANGE", "invalid_a"),
+                },
+                "u_k_milli" => match value.parse::<u32>() {
+                    Ok(parsed) if (1..=1_000).contains(&parsed) => warp.u_k_milli = parsed,
+                    _ => return err("RANGE", "invalid_u_k"),
+                },
+                "v_null" => match value.parse::<u32>() {
+                    Ok(parsed) if parsed <= 4_095 => warp.v_null = parsed,
+                    _ => return err("RANGE", "invalid_v_null"),
+                },
+                "v_pi" => match value.parse::<u32>() {
+                    Ok(parsed) if (1..=4_095).contains(&parsed) => warp.v_pi = parsed,
+                    _ => return err("RANGE", "invalid_v_pi"),
+                },
                 _ => return err("SYNTAX", "unknown_mod_field"),
             }
         }
         let Some(wave) = wave else {
             return err("SYNTAX", "wave_required");
         };
+        if wave == "WARP" {
+            if !saw_freq {
+                return err("SYNTAX", "freq_mhz_required");
+            }
+            if warp.target.is_none() {
+                return err("SYNTAX", "target_required");
+            }
+            if warp.u_k_milli == 0 {
+                return err("SYNTAX", "u_k_required");
+            }
+            if warp.v_null + warp.v_pi > 4_095 {
+                return err("RANGE", "warp_exceeds_range");
+            }
+            if !(MOCK_MOD_MIN_FREQ_MHZ..=MOCK_MOD_MAX_FREQ_MHZ).contains(&freq_mhz) {
+                return err("RANGE", "mod_rejected");
+            }
+            self.mod_wave = "WARP";
+            self.mod_min = warp.v_null;
+            self.mod_level = warp.v_null + warp.v_pi;
+            self.mod_code = warp.v_null;
+            self.mod_freq_mhz = freq_mhz;
+            return format!(
+                "+{sequence} OK mod_wave=WARP mod_level={} mod_min={} mod_freq_mhz={} code={} target={}",
+                self.mod_level,
+                self.mod_min,
+                self.mod_freq_mhz,
+                self.mod_code,
+                warp.target.unwrap_or_default()
+            );
+        }
         let periodic = wave == "SINE" || wave == "SQUARE";
         if wave != "OFF" && !saw_level {
             return err("SYNTAX", "level_required");
@@ -778,6 +843,41 @@ mod tests {
     }
 
     #[test]
+    fn mod_warp_validates_optical_parameters_and_reports_the_lobe_range() {
+        let link = MockLink::new();
+        let mut host = link.host_end();
+        let mut controller = MockController::new(link.device_end());
+
+        request(&mut controller, "@1 MOD wave=WARP freq_mhz=10000");
+        assert!(last_control_text(&mut host).contains("code=SYNTAX detail=target_required"));
+
+        // Operating point is required.
+        request(
+            &mut controller,
+            "@2 MOD wave=WARP freq_mhz=10000 target=LOG_SINE a_milli=800 v_null=200 v_pi=1600",
+        );
+        assert!(last_control_text(&mut host).contains("code=SYNTAX detail=u_k_required"));
+
+        // V_null + Vπ overruns the DAC top rail.
+        request(
+            &mut controller,
+            "@3 MOD wave=WARP freq_mhz=10000 target=LOG_SINE a_milli=800 u_k_milli=500 v_null=200 v_pi=4000",
+        );
+        assert!(last_control_text(&mut host).contains("code=RANGE detail=warp_exceeds_range"));
+
+        // A valid log-sine warp holds and reports the reachable code range.
+        request(
+            &mut controller,
+            "@4 MOD wave=WARP freq_mhz=10000 target=LOG_SINE a_milli=800 u_k_milli=500 v_null=200 v_pi=1600",
+        );
+        let ok = last_control_text(&mut host);
+        assert!(
+            ok.contains("mod_wave=WARP mod_level=1800 mod_min=200 mod_freq_mhz=10000 code=200 target=LOG_SINE"),
+            "{ok}"
+        );
+    }
+
+    #[test]
     fn waveform_extension_validates_drive_bounds() {
         let link = MockLink::new();
         let mut host = link.host_end();
@@ -846,6 +946,7 @@ mod tests {
                     dark_volts: 40.0 * 3.3 / 4_095.0,
                     ..Default::default()
                 },
+                crate::estimator::ContrastGeometry::Direct,
             )
             .expect("clean synthetic window");
             estimate.a

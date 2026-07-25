@@ -191,8 +191,18 @@ mod tests {
         let pdq = PdqSummary {
             path: PathBuf::from("/data/A1-20260713-01.pdq"),
             frames_written: 128,
+            sample_frames_written: 128,
+            samples_written: 32_768,
             bytes_written: 65_536,
             file_crc32: 0xDEAD_BEEF,
+            file_sha256: crate::Sha256Digest::from_bytes([0xAB; 32]),
+            sample_range: Some(crate::PdqSampleRange {
+                first_sample_index: 0,
+                end_sample_index_exclusive: 32_768,
+                sample_count: 32_768,
+            }),
+            sample_rate_hz: Some(20_000),
+            sample_segments: 1,
             integrity: StreamIntegrity::default(),
             valid: true,
         };
