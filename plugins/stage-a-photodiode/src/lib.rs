@@ -1766,6 +1766,10 @@ impl StageAPhotodiodePlugin {
             requested_revision: self.requested_revision,
             acknowledged_revision: self.acknowledged_revision,
             stream,
+            // Automation clients need this to refuse a coordinated run before
+            // it starts the camera, instead of failing at BeginRecording.
+            data_dir: Some(self.data_dir.trim().to_owned())
+                .filter(|folder| !folder.is_empty()),
             active_recording,
             last_finalized_recording: self.last_finalized_recording.clone(),
             optical_summary,

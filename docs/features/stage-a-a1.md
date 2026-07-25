@@ -76,16 +76,21 @@ the drive to still be where a previous action left it (ADR 013).
 **Naming.** Files share an `<id>_<timestamp>[_role]` stem under an `<id>/` subfolder
 (`_pilot` / `_background` tag the reference runs, `_ec_f<f>Hz` an event-count point):
 
-- `<id>/<id>_<ts>.raw` — camera RAW, under the **host output root**, with the host's
-  own `<stem>.toml` sidecar (camera biases, ROI) written next to it.
-- `<id>/<id>_<ts>_pd.pdq` + `_pd.json` — photodiode PDQ + sidecar, under the
-  **photodiode data root**.
-- `<id>/<id>_<ts>_config.toml` — the A1 sidecar, under the chosen output folder.
+- `<id>/<id>_<ts>.raw` — camera RAW, with the host's own `<stem>.toml` sidecar
+  (camera biases, ROI) next to it.
+- `<id>/<id>_<ts>_pd.pdq` + `_pd.json` — photodiode PDQ + sidecar.
+- `<id>/<id>_<ts>_config.toml` — the A1 sidecar.
 
-Each recorder confines its writes to its own root, so A1 cannot force one absolute
-directory (see ADR 009). Point the host output root and the photodiode data root
-at the same experiment directory to co-locate everything; the A1 sidecar records
-the *resolved* paths so the set stays linked either way.
+**Everything lands under `<A1 output folder>/<id>/`.** The two recorders each
+write below their own root while recording — the host resolves plugin recording
+paths below *its* output directory and rejects absolute ones, the photodiode
+resolves PDQ paths below *its* data directory — so once both files are finalized
+(closed and hashed) A1 moves them into the measurement folder and records the
+final paths in the sidecar (ADR 015). The A1 output folder is therefore the only
+setting that decides where a measurement ends up; the host and photodiode roots
+no longer have to be kept aligned by hand. A move is a rename on one volume and a
+size-verified copy across volumes; a file that cannot be moved stays where it is
+and the sidecar points at it there.
 
 **A1 config sidecar** captures: `measurement_id`, file stem, role, start/finalize
 timestamps, duration; the sweep `[min_a, max_a]`; modulation settings from the
@@ -111,15 +116,32 @@ one concise result or error message; it does not render an internal event log.
 A1 declares `host_commands = ["start_recording", "stop_recording"]` in its
 manifest. Every role uses this same lifecycle.
 
+**When something is wrong** (ADR 015):
+
+- **Before the camera starts**, A1 refuses the recording — writing nothing — if
+  the photodiode is not reporting status, not connected, has no data directory,
+  or is leased by someone else. The same hint fills the status `message` cell
+  while idle, so it is visible before the button is pressed.
+- **If the photodiode fails once the camera is running**, the camera keeps
+  recording for the full requested duration and closes normally. The run is
+  marked camera-only: `recording_completed_ok` stays false (so a sweep stops),
+  but the RAW is complete rather than a truncated stub.
+- **The first, most specific failure is what you see.** The closing message is
+  `Recording <id> incomplete: <cause> — metadata saved to <path>`; later fallout
+  cannot overwrite the original cause.
+- **Starting and stopping the host recorder restarts the capture pipeline**, which
+  the host reports as a `SourceChanged` discontinuity — twice per recording. While
+  a recording or sweep is in flight that boundary resets only the event fold, not
+  the row's pilot windows, background floor, or collected response points.
+
 **Host-side note.** The camera RAW leg restarts the host pipeline into
 Recording mode and stops it again at finalize. After the file is finalized, the
 host restores Preview before returning the receipt, so a sweep or another button
 press can start the next recording automatically.
 
-**File locations** (three roots, point them at the same experiment directory):
-`<host output root>/<id>/<stem>.raw` (+ host `<stem>.toml`),
-`<photodiode data dir>/<id>/<stem>_pd.pdq` + `<stem>_pd.json`, and
-`<A1 output folder>/<id>/<stem>_config.toml`.
+**File locations.** One place: `<A1 output folder>/<id>/` holds `<stem>.raw`
+(+ the host's `<stem>.toml`), `<stem>_pd.pdq` + `<stem>_pd.json`, and
+`<stem>_config.toml`.
 
 ## The two live plots
 
@@ -193,8 +215,9 @@ used to do nothing — the presses died on the mirror.
 
 Related: A1 overrides `on_discontinuity` to ignore `SettingsChanged` (raised on
 *every* settings sync of any plugin), so the response curve, pilot windows and
-background floor survive ordinary UI interaction; source changes and seeks
-still reset everything.
+background floor survive ordinary UI interaction. Source changes and seeks reset
+everything **unless** a recording or sweep is in flight, in which case the
+boundary is A1's own pipeline restart and only the event fold resets (ADR 015).
 
 ## Where the inputs come from
 
@@ -215,5 +238,12 @@ the pilot-window round-trip through the measurement folder, press-latch edge/bas
 semantics, the jittery-marker free-running fallback, sweep-point spacing, the
 sweep-point sidecar fields, the ordered camera → PDQ → PDQ finalize → camera
 finalize lifecycle (including envelope identity/revision and save location), the
-selective discontinuity reset, and the `a₀`-lock set listed in the
-[exact-event-count brief](./stage-a-a1-event-count.md).
+selective discontinuity reset, and the `a₀`-lock and frequency-ladder sets listed
+in the [exact-event-count brief](./stage-a-a1-event-count.md).
+
+Three of them guard the recording defects fixed in ADR 015: a photodiode leg that
+cannot start is refused before any host command is sent; a photodiode failure
+mid-run keeps the camera recording for the full duration, names the cause in the
+closing message, and still gathers the RAW and its bias sidecar into the
+measurement folder; and a self-inflicted `SourceChanged` during a recording keeps
+the row's response points and pilot windows while still resetting the event fold.

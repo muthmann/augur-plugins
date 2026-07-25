@@ -1,6 +1,8 @@
 # ADR 009 — Stage-A A1 as a focused recording coordinator
 
-- **Status:** Accepted
+- **Status:** Accepted — decision 3 revised by
+  [ADR 015](015-stage-a-a1-recording-robustness.md), which makes A1's output
+  folder authoritative and gathers the RAW/PDQ into it after finalization
 - **Date:** 2026-07-23
 - **Relates to:** ADR 005 (device ownership), ADR 006 (two-plugin split),
   ADR 007 (owner orchestration — the earlier, broader orchestrator),
@@ -100,8 +102,10 @@ phase-anchoring knobs (event latency, self-align) that the now-reliable
   not a rolling internal log.
 - The host returns to Preview before delivering its final receipt, which keeps
   repeated recordings and automated sweeps live without an extra operator step.
-- True single-directory co-location is a **configuration** convention (align the
+- ~~True single-directory co-location is a **configuration** convention (align the
   recorder roots), not something A1 enforces. Enforcing it would require host and
-  photodiode path changes and is out of scope.
+  photodiode path changes and is out of scope.~~ **Revised by ADR 015:** A1 moves
+  the finalized files into its own measurement folder, which needs no host or
+  photodiode path changes because both files are already closed and hashed.
 - The contract and ABI are unchanged: every message used already exists
   (`HostCommand`, `PhotodiodeCommandV1` lease/begin/finalize).

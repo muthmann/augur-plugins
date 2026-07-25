@@ -332,6 +332,9 @@ struct Recording {
     /// The photodiode rejected BeginRecording — skip the finalize and don't
     /// wait for its receipt.
     pd_rejected: bool,
+    /// First thing that went wrong, kept verbatim so the closing message names
+    /// the cause instead of only reporting that the run was incomplete.
+    failure: Option<String>,
 }
 
 /// Where the amplitude sweep is within its per-point cycle.
@@ -835,6 +838,15 @@ impl Recording {
             pd_finalized: false,
             pd_valid: false,
             pd_rejected: false,
+            failure: None,
+        }
+    }
+
+    /// Records the first failure only: later fallout (a stop that finds nothing
+    /// to finalize) must not mask the reason the run went wrong.
+    fn fail(&mut self, reason: impl Into<String>) {
+        if self.failure.is_none() {
+            self.failure = Some(reason.into());
         }
     }
 
@@ -891,6 +903,18 @@ impl StageAA1Plugin {
     fn note(&mut self, message: impl Into<String>) {
         self.message = message.into();
         self.bump();
+    }
+
+    /// Reports a failure and remembers it as the run's cause, so the closing
+    /// message can name it after the coordinator has unwound. The first cause
+    /// wins: it is the specific one, and later arms only see the fallout.
+    fn note_failure(&mut self, message: impl Into<String>) {
+        if self.recording.failure.is_some() {
+            return;
+        }
+        let message = message.into();
+        self.recording.fail(message.clone());
+        self.note(message);
     }
 
     /// The modulation period `T` in microseconds: measured from the phase-0
@@ -1296,10 +1320,13 @@ impl StageAA1Plugin {
                 cell("events", self.camera_events.len().to_string()),
                 cell(
                     "message",
-                    if self.message.is_empty() {
-                        "—".into()
-                    } else {
-                        self.message.clone()
+                    // While idle, anything that would refuse the next recording
+                    // is worth more than the previous run's result: the operator
+                    // sees it before pressing Record, not after.
+                    match (self.recording.is_active(), self.photodiode_blocker()) {
+                        (false, Some(blocker)) => blocker,
+                        _ if self.message.is_empty() => "—".into(),
+                        _ => self.message.clone(),
                     },
                 ),
             ],
@@ -1439,6 +1466,42 @@ impl StageAA1Plugin {
         meta
     }
 
+    /// Why the photodiode cannot record right now, phrased as the operator
+    /// action that fixes it. `None` means the PDQ leg is expected to succeed.
+    fn photodiode_blocker(&self) -> Option<String> {
+        let Some(photodiode) = self.photodiode.as_ref() else {
+            return Some(
+                "The photodiode plugin is not reporting status — enable it before recording".into(),
+            );
+        };
+        if !matches!(photodiode.connection, ConnectionStateV1::Connected { .. }) {
+            return Some(format!(
+                "The photodiode is {} — connect it before recording",
+                connection_label(&photodiode.connection)
+            ));
+        }
+        if photodiode
+            .data_dir
+            .as_ref()
+            .is_none_or(|folder| folder.trim().is_empty())
+        {
+            return Some(
+                "Set the photodiode Data directory before recording — the PDQ has nowhere to go"
+                    .into(),
+            );
+        }
+        // A lease held by anyone else means the PDQ is already committed.
+        if let Some(lease) = photodiode.lease.as_ref() {
+            if lease.holder.as_str() != A1_PLUGIN_ID {
+                return Some(format!(
+                    "The photodiode is leased by {} — release it before recording",
+                    lease.holder.as_str()
+                ));
+            }
+        }
+        None
+    }
+
     /// Kick off a coordinated recording by starting the camera first. Called
     /// on the control tick after a record button is pressed.
     fn begin_recording(&mut self, context: &mut impl RecordingControl, role: RecRole) {
@@ -1451,6 +1514,13 @@ impl StageAA1Plugin {
         }
         if self.measurement_id.trim().is_empty() {
             self.note("Set a measurement id before recording");
+            return;
+        }
+        // Checked before the camera starts: every one of these used to surface
+        // as a PDQ rejection *after* the host was already recording, which left
+        // a stub RAW behind and no photodiode data.
+        if let Some(blocker) = self.photodiode_blocker() {
+            self.note(blocker);
             return;
         }
         let now_ms = now_unix_ms();
@@ -1630,6 +1700,31 @@ impl StageAA1Plugin {
         ));
     }
 
+    /// The photodiode leg failed while the camera was already recording. The
+    /// camera RAW is the primary measurement, so it keeps running for its full
+    /// duration instead of being cut short — a truncated file that reports
+    /// itself as finalized is worse than a complete camera-only one. Any lease
+    /// still held is released by the normal stop path at the end.
+    fn continue_without_photodiode(&mut self, context: &mut impl RecordingControl) {
+        let camera_running = self.recording.cam_raw_path.is_some() && !self.recording.cam_rejected;
+        if !camera_running || self.recording.stop_requested {
+            self.stop_camera(context);
+            return;
+        }
+        self.recording.phase = RecPhase::Running;
+        self.recording.start_unix_ms = now_unix_ms();
+        self.recording.last_activity_ms = self.recording.start_unix_ms;
+        let reason = self
+            .recording
+            .failure
+            .clone()
+            .unwrap_or_else(|| "the photodiode did not start".into());
+        self.note(format!(
+            "{reason} — recording camera only for {} s",
+            self.recording.duration_s
+        ));
+    }
+
     /// Stop the host recorder after the PDQ has been safely finalized.
     fn stop_camera(&mut self, context: &mut impl RecordingControl) {
         if self.recording.cam_raw_path.is_some() && !self.recording.cam_rejected {
@@ -1656,11 +1751,19 @@ impl StageAA1Plugin {
             && self.recording.pd_valid
             && self.recording.pd_pdq_path.is_some()
             && self.recording.pd_sidecar_path.is_some();
+        // Gather the RAW/PDQ next to the sidecar before writing it, so the
+        // recorded paths are the final ones.
+        self.gather_into_measurement_folder();
         let sidecar = self.write_sidecar();
+        let reason = self
+            .recording
+            .failure
+            .clone()
+            .unwrap_or_else(|| "not every file was finalized".into());
         let message = match (sidecar, clean) {
             (Ok(path), true) => format!("Saved recording {} → {path}", self.recording.id),
             (Ok(path), false) => format!(
-                "Recording {} was incomplete — metadata saved to {path}",
+                "Recording {} incomplete: {reason} — metadata saved to {path}",
                 self.recording.id
             ),
             (Err(err), _) => format!(
@@ -1670,6 +1773,67 @@ impl StageAA1Plugin {
         };
         self.recording_completed_ok = clean;
         self.release_and_idle(context, message);
+    }
+
+    /// Collects the finalized artifacts into `<output folder>/<measurement id>/`.
+    ///
+    /// The camera RAW and the PDQ are written by two other owners against their
+    /// own roots — the host resolves plugin recording paths below *its* output
+    /// directory and rejects absolute ones, and the photodiode resolves PDQ
+    /// paths below *its* data directory. Left alone, one measurement scatters
+    /// across up to three unrelated folders. Both files are closed and hashed
+    /// by the time their receipts arrive, so moving them here is safe and makes
+    /// this plugin's output folder authoritative for the whole measurement.
+    fn gather_into_measurement_folder(&mut self) {
+        let dir = PathBuf::from(&self.recording.folder).join(&self.recording.id);
+        if std::fs::create_dir_all(&dir).is_err() {
+            return;
+        }
+        let raw = self
+            .recording
+            .cam_finalized_path
+            .clone()
+            .or_else(|| self.recording.cam_raw_path.clone());
+        // The host writes the bias/config sidecar as a sibling of the RAW; it
+        // travels with it so the recording stays self-describing.
+        if let Some(raw) = raw {
+            if let Some(moved) = move_into(&dir, &raw) {
+                if self.recording.cam_finalized_path.is_some() {
+                    self.recording.cam_finalized_path = Some(moved.clone());
+                }
+                self.recording.cam_raw_path = Some(moved);
+            }
+            if let Some(bias) = sibling_toml(&raw) {
+                move_into(&dir, &bias);
+            }
+        }
+        // PDQ receipts report the *label* A1 asked for, which is relative to the
+        // photodiode's data directory — resolve it before touching the file, and
+        // record the absolute path either way.
+        if let Some(pdq) = self.resolved_photodiode_path(self.recording.pd_pdq_path.as_deref()) {
+            self.recording.pd_pdq_path = Some(move_into(&dir, &pdq).unwrap_or(pdq));
+        }
+        if let Some(sidecar) =
+            self.resolved_photodiode_path(self.recording.pd_sidecar_path.as_deref())
+        {
+            self.recording.pd_sidecar_path = Some(move_into(&dir, &sidecar).unwrap_or(sidecar));
+        }
+    }
+
+    /// Absolute location of a photodiode-reported recording path. The owner
+    /// reports paths relative to its own data directory, which it publishes in
+    /// its summary; an already-absolute path is taken as given.
+    fn resolved_photodiode_path(&self, reported: Option<&str>) -> Option<String> {
+        let reported = reported?;
+        let path = Path::new(reported);
+        if path.is_absolute() {
+            return Some(reported.to_owned());
+        }
+        let root = self
+            .photodiode
+            .as_ref()
+            .and_then(|photodiode| photodiode.data_dir.as_deref())?;
+        Some(Path::new(root).join(path).display().to_string())
     }
 
     /// Release the photodiode lease (only if we actually hold it) and return to idle.
@@ -3385,7 +3549,7 @@ impl StageAA1Plugin {
                 HostCommandOutcome::Rejected { code, message } => {
                     // Stop the rest of the recording; drive_recording resolves the
                     // abort from the current phase on the next tick.
-                    self.note(format!("Camera recording rejected ({code}): {message}"));
+                    self.note_failure(format!("Camera recording rejected ({code}): {message}"));
                     self.recording.cam_rejected = true;
                     self.recording.stop_requested = true;
                 }
@@ -3407,7 +3571,7 @@ impl StageAA1Plugin {
                     self.recording.last_activity_ms = now_unix_ms();
                 }
                 HostCommandOutcome::Rejected { code, message } => {
-                    self.message = format!("Camera stop failed ({code}): {message}");
+                    self.note_failure(format!("Camera stop failed ({code}): {message}"));
                     self.recording.cam_rejected = true;
                     self.recording.last_activity_ms = now_unix_ms();
                 }
@@ -3432,11 +3596,13 @@ impl StageAA1Plugin {
                     || reply.request_id == self.recording.lease_req
                     || reply.request_id == self.recording.pd_begin_req
                 {
-                    self.note(format!("Photodiode start failed ({code}): {message}"));
+                    // Not `stop_requested`: that flag means the operator asked
+                    // to stop. A photodiode fault leaves the camera running to
+                    // its full duration (see `continue_without_photodiode`).
+                    self.note_failure(format!("Photodiode start failed ({code}): {message}"));
                     self.recording.pd_rejected = true;
-                    self.recording.stop_requested = true;
                 } else if reply.request_id == self.recording.pd_finalize_req {
-                    self.note(format!("Photodiode save failed ({code}): {message}"));
+                    self.note_failure(format!("Photodiode save failed ({code}): {message}"));
                     self.recording.pd_rejected = true;
                     self.recording.lease_granted = false;
                     self.recording.last_activity_ms = now_unix_ms();
@@ -3493,11 +3659,15 @@ impl StageAA1Plugin {
                 } else if now_ms.saturating_sub(self.recording.last_activity_ms) > REPLY_TIMEOUT_MS
                 {
                     self.recording.cam_rejected = true;
-                    self.release_and_idle(context, "Timed out starting camera recording".into());
+                    self.note_failure("Timed out starting camera recording");
+                    let message = self.message.clone();
+                    self.release_and_idle(context, message);
                 }
             }
             RecPhase::ConnectingPhotodiode => {
-                if self.recording.stop_requested && !self.recording.connect_accepted {
+                if self.recording.pd_rejected {
+                    self.continue_without_photodiode(context);
+                } else if self.recording.stop_requested && !self.recording.connect_accepted {
                     self.stop_camera(context);
                 } else if self.recording.connect_accepted {
                     if self.recording.stop_requested {
@@ -3508,13 +3678,13 @@ impl StageAA1Plugin {
                 } else if now_ms.saturating_sub(self.recording.last_activity_ms) > REPLY_TIMEOUT_MS
                 {
                     self.recording.pd_rejected = true;
-                    self.note("Timed out connecting the photodiode");
-                    self.stop_camera(context);
+                    self.note_failure("Timed out connecting the photodiode");
+                    self.continue_without_photodiode(context);
                 }
             }
             RecPhase::AcquiringLease => {
                 if self.recording.pd_rejected {
-                    self.stop_camera(context);
+                    self.continue_without_photodiode(context);
                 } else if self.recording.lease_granted {
                     if self.recording.stop_requested {
                         self.stop_photodiode(context);
@@ -3524,8 +3694,8 @@ impl StageAA1Plugin {
                 } else if now_ms.saturating_sub(self.recording.last_activity_ms) > REPLY_TIMEOUT_MS
                 {
                     self.recording.pd_rejected = true;
-                    self.note("Timed out preparing the photodiode");
-                    self.stop_camera(context);
+                    self.note_failure("Timed out preparing the photodiode");
+                    self.continue_without_photodiode(context);
                 }
             }
             RecPhase::StartingPhotodiode => {
@@ -3545,7 +3715,8 @@ impl StageAA1Plugin {
                     || now_ms.saturating_sub(self.recording.last_activity_ms) > REPLY_TIMEOUT_MS
                 {
                     self.recording.pd_rejected = true;
-                    self.stop_photodiode(context);
+                    self.note_failure("The photodiode did not open its PDQ file");
+                    self.continue_without_photodiode(context);
                 }
             }
             RecPhase::Running => {
@@ -3562,7 +3733,7 @@ impl StageAA1Plugin {
                 {
                     self.recording.pd_rejected = true;
                     self.recording.lease_granted = false;
-                    self.note("Timed out saving photodiode data");
+                    self.note_failure("Timed out saving photodiode data");
                     self.stop_camera(context);
                 }
             }
@@ -3573,7 +3744,7 @@ impl StageAA1Plugin {
                 {
                     if self.recording.cam_finalized_path.is_none() && !self.recording.cam_rejected {
                         self.recording.cam_rejected = true;
-                        self.note("Timed out saving camera data");
+                        self.note_failure("Timed out saving camera data");
                     }
                     self.finish_recording(context);
                 }
@@ -3921,6 +4092,39 @@ fn waveform_label(waveform: &WaveformV1) -> String {
     }
 }
 
+/// Moves `source` into `dir`, returning the new path when it now lives there.
+///
+/// A rename covers the common case (one volume) at zero cost; a cross-volume
+/// move falls back to copy-then-delete, and the copy is size-checked before the
+/// original goes away so a failed move never loses measurement data. `None`
+/// means the file stayed where it was — callers keep the original path.
+fn move_into(dir: &Path, source: &str) -> Option<String> {
+    let source = Path::new(source);
+    let name = source.file_name()?;
+    if source.parent() == Some(dir) {
+        return None;
+    }
+    if !source.is_file() {
+        return None;
+    }
+    let destination = dir.join(name);
+    if destination.exists() {
+        return None;
+    }
+    if std::fs::rename(source, &destination).is_ok() {
+        return Some(destination.display().to_string());
+    }
+    let copied = std::fs::copy(source, &destination).ok()?;
+    let expected = source.metadata().ok()?.len();
+    if copied != expected {
+        let _ = std::fs::remove_file(&destination);
+        return None;
+    }
+    // Keeping the original after a verified copy is harmless; losing it is not.
+    let _ = std::fs::remove_file(source);
+    Some(destination.display().to_string())
+}
+
 fn sibling_toml(raw_path: &str) -> Option<String> {
     let path = Path::new(raw_path);
     let stem = path.file_stem()?.to_string_lossy();
@@ -4080,7 +4284,22 @@ impl Plugin for StageAA1Plugin {
             PluginDiscontinuity::SettingsChanged => {}
             PluginDiscontinuity::Seek
             | PluginDiscontinuity::SourceChanged
-            | PluginDiscontinuity::HistoryEvicted => self.reset(),
+            | PluginDiscontinuity::HistoryEvicted => {
+                // Starting and stopping the host recorder restarts the capture
+                // pipeline, and the host reports that as SourceChanged. Those
+                // boundaries are self-inflicted — twice per recording — so they
+                // must not wipe the row's pilot windows, background floor, or
+                // the response points collected across a sweep. The event fold
+                // still resets: that timeline really did restart.
+                if self.recording.is_active() || self.sweep.is_some() {
+                    self.camera_events.clear();
+                    self.event_scratch.clear();
+                    self.camera_markers_us.clear();
+                    self.bump();
+                } else {
+                    self.reset();
+                }
+            }
         }
     }
 
@@ -4220,11 +4439,12 @@ impl Plugin for StageAA1Plugin {
                     description: Some(
                         "Records the camera RAW stream and the photodiode PDQ stream together for \
                          a fixed duration and writes an A1 config sidecar (.toml) linking them. \
-                         Files are grouped under the measurement id and share an <id>_<timestamp> \
-                         stem. Arm the optical drive in the modulation plugin first; A1 only reads \
-                         its settings — it never drives the Teensy. For everything to land in one \
-                         place, point the host output folder and the photodiode data folder at the \
-                         same experiment directory as this folder."
+                         Everything lands under <output folder>/<measurement id>/ and shares an \
+                         <id>_<timestamp> stem: the RAW and PDQ are gathered here once both are \
+                         finalized, wherever their own recorders wrote them. Arm the optical \
+                         drive in the modulation plugin first; A1 only reads its settings — it \
+                         never drives the Teensy. The photodiode must be connected and have a \
+                         data directory set, otherwise the recording is refused before it starts."
                             .into(),
                     ),
                     default_open: true,
@@ -4233,8 +4453,9 @@ impl Plugin for StageAA1Plugin {
                             key: "output_folder".into(),
                             label: "Output folder".into(),
                             tooltip: Some(
-                                "Directory where the A1 config sidecar is written. Also the \
-                                 recommended shared experiment root for the RAW/PDQ files."
+                                "Experiment directory for this measurement. The config sidecar is \
+                                 written here, and the camera RAW and photodiode PDQ are moved \
+                                 here once finalized, so one measurement is one folder."
                                     .into(),
                             ),
                             kind: SettingKind::Path {
@@ -5266,8 +5487,9 @@ export_plugin!(StageAA1Plugin);
 #[cfg(test)]
 mod tests {
     use stage_a_plugin_contract::{
-        OwnerInstanceId, PdqFinalizedReceiptV1, PdqStartedReceiptV1, RequestOutcomeV1,
-        ResponseCommonV1, Sha256V1, StreamIntegrityV1, CONTRACT_VERSION_V1,
+        FreshnessV1, OwnerInstanceId, PdqFinalizedReceiptV1, PdqStartedReceiptV1,
+        PhotodiodeStreamV1, RequestOutcomeV1, ResponseCommonV1, Sha256V1, StreamIntegrityV1,
+        SynchronizationV1, CONTRACT_VERSION_V1,
     };
 
     use super::*;
@@ -5387,6 +5609,7 @@ mod tests {
             },
             active_recording: None,
             last_finalized_recording: None,
+            data_dir: Some(std::env::temp_dir().display().to_string()),
             optical_summary: Some(stage_a_plugin_contract::PhotodiodeOpticalSummaryV1 {
                 run_id: RunId::new("pd-run"),
                 calibration: stage_a_plugin_contract::PhotodiodeCalibrationV1 {
@@ -5529,6 +5752,45 @@ mod tests {
             service: SERVICE_STAGE_A_PHOTODIODE_CONTROL_V1.into(),
             outcome: PluginServiceOutcome::Accepted {
                 payload: serde_json::to_value(response).expect("response"),
+            },
+        }
+    }
+
+    /// A photodiode summary that passes the pre-flight: connected, unleased,
+    /// and with somewhere to put the PDQ.
+    fn ready_photodiode() -> PhotodiodeSummaryV1 {
+        PhotodiodeSummaryV1 {
+            contract_version: CONTRACT_VERSION_V1,
+            owner_instance: OwnerInstanceId::new("pd-test"),
+            service_revision: 1,
+            connection: ConnectionStateV1::Connected {
+                port_label: "mock".into(),
+                firmware_version: None,
+            },
+            lease: None,
+            active_run_id: None,
+            requested_revision: None,
+            acknowledged_revision: None,
+            stream: PhotodiodeStreamV1 {
+                stream_epoch: 1,
+                sample_range: None,
+                sample_rate_hz: Some(20_000),
+                latest_adc_code: Some(1_000),
+                integrity: StreamIntegrityV1::default(),
+                level: None,
+            },
+            data_dir: Some("/pd".into()),
+            active_recording: None,
+            last_finalized_recording: None,
+            optical_summary: None,
+            synchronization: SynchronizationV1::Unsynced {
+                reason: stage_a_plugin_contract::UnsyncedReasonV1::NoLease,
+                detail: None,
+            },
+            last_response: None,
+            freshness: FreshnessV1 {
+                observed_at_unix_ms: now_unix_ms(),
+                valid_for_ms: 60_000,
             },
         }
     }
@@ -5790,6 +6052,7 @@ mod tests {
             measurement_id: "A1-row".into(),
             duration_s: 1,
             pending_role: Some(RecRole::Normal),
+            photodiode: Some(ready_photodiode()),
             ..StageAA1Plugin::default()
         };
         let mut sink = ControlSink::default();
@@ -6918,5 +7181,249 @@ mod tests {
         assert!(other.windows_are_frozen());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn pd_rejection(request_id: u64, code: &str, message: &str) -> PluginServiceReply {
+        PluginServiceReply {
+            request_id,
+            source_plugin_id: A1_PLUGIN_ID.into(),
+            target_plugin_id: PHOTODIODE_PLUGIN_ID.into(),
+            service: SERVICE_STAGE_A_PHOTODIODE_CONTROL_V1.into(),
+            outcome: PluginServiceOutcome::Rejected {
+                code: code.into(),
+                message: message.into(),
+            },
+        }
+    }
+
+    /// A photodiode that cannot record is caught before the host is recording,
+    /// so a misconfigured bench no longer leaves a stub RAW behind.
+    #[test]
+    fn a_photodiode_without_a_data_directory_is_refused_before_the_camera_starts() {
+        let mut photodiode = ready_photodiode();
+        photodiode.data_dir = None;
+        let mut plugin = StageAA1Plugin {
+            output_folder: "/tmp/a1-preflight".into(),
+            measurement_id: "A1-row".into(),
+            duration_s: 10,
+            pending_role: Some(RecRole::Normal),
+            photodiode: Some(photodiode),
+            ..StageAA1Plugin::default()
+        };
+        let mut sink = ControlSink::default();
+
+        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+
+        assert_eq!(plugin.recording.phase, RecPhase::Idle);
+        assert!(
+            sink.hosts.is_empty(),
+            "the camera must not start when the PDQ has nowhere to go"
+        );
+        assert!(
+            plugin.message.contains("Data directory"),
+            "message={}",
+            plugin.message
+        );
+    }
+
+    /// The regression this whole coordinator exists for: a photodiode failure
+    /// used to stop the host recorder immediately, leaving a RAW that was a
+    /// fraction of the requested duration but reported itself as finalized.
+    #[test]
+    fn a_photodiode_failure_keeps_the_camera_recording_for_the_full_duration() {
+        let folder = std::env::temp_dir().join(format!("a1-camera-only-{}", now_unix_ms()));
+        let host_dir = folder.join("host-output");
+        std::fs::create_dir_all(&host_dir).expect("host dir");
+        let mut plugin = StageAA1Plugin {
+            output_folder: folder.display().to_string(),
+            measurement_id: "A1-row".into(),
+            duration_s: 10,
+            pending_role: Some(RecRole::Normal),
+            photodiode: Some(ready_photodiode()),
+            ..StageAA1Plugin::default()
+        };
+        let mut sink = ControlSink::default();
+
+        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+        let cam_start_req = sink.hosts[0].request_id;
+        let raw_path = host_dir.join(format!("{}.raw", plugin.recording.stem));
+        std::fs::write(&raw_path, b"raw-events").expect("raw file");
+        std::fs::write(raw_path.with_extension("toml"), b"biases = true").expect("bias sidecar");
+
+        control_tick(
+            &mut plugin,
+            PluginControlInbox {
+                host_replies: vec![HostCommandReply {
+                    request_id: cam_start_req,
+                    outcome: HostCommandOutcome::RecordingStarted {
+                        actual_raw_path: raw_path.display().to_string(),
+                        started_at: "2026-07-25T00:00:00Z".into(),
+                    },
+                }],
+                ..PluginControlInbox::default()
+            },
+            &mut sink,
+        );
+        let connect = sink.services.last().expect("connect request").clone();
+
+        // The photodiode refuses to open the stream.
+        control_tick(
+            &mut plugin,
+            PluginControlInbox {
+                service_replies: vec![pd_rejection(
+                    connect.request_id,
+                    "transport",
+                    "photodiode connection failed",
+                )],
+                ..PluginControlInbox::default()
+            },
+            &mut sink,
+        );
+
+        assert_eq!(
+            plugin.recording.phase,
+            RecPhase::Running,
+            "the camera must keep recording without the photodiode"
+        );
+        assert_eq!(
+            sink.hosts.len(),
+            1,
+            "no StopRecording may be sent before the duration elapses"
+        );
+
+        // Nothing happens until the fixed duration is actually over.
+        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+        assert_eq!(sink.hosts.len(), 1, "the run is still inside its window");
+
+        plugin.recording.start_unix_ms = now_unix_ms().saturating_sub(10_000);
+        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+        assert_eq!(plugin.recording.phase, RecPhase::StoppingCamera);
+        let cam_stop_req = sink.hosts[1].request_id;
+
+        control_tick(
+            &mut plugin,
+            PluginControlInbox {
+                host_replies: vec![HostCommandReply {
+                    request_id: cam_stop_req,
+                    outcome: HostCommandOutcome::RecordingFinalized {
+                        actual_raw_path: raw_path.display().to_string(),
+                        size: 10,
+                        sha256: "cd".repeat(32),
+                        duration_us: 10_000_000,
+                    },
+                }],
+                ..PluginControlInbox::default()
+            },
+            &mut sink,
+        );
+
+        assert_eq!(plugin.recording.phase, RecPhase::Idle);
+        assert!(!plugin.recording_completed_ok, "the PDQ is missing");
+        // The closing message names the cause instead of only "incomplete".
+        assert!(
+            plugin.message.contains("photodiode connection failed"),
+            "message={}",
+            plugin.message
+        );
+        // Camera RAW, its bias sidecar, and the config all land together.
+        let measurement_dir = folder.join("A1-row");
+        let mut names: Vec<String> = std::fs::read_dir(&measurement_dir)
+            .expect("measurement folder")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names.len(), 3, "names={names:?}");
+        assert!(names.iter().any(|name| name.ends_with(".raw")));
+        assert!(names.iter().any(|name| name.ends_with("_config.toml")));
+        assert!(
+            !raw_path.exists(),
+            "the RAW must be moved out of the host output folder"
+        );
+
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// PDQ receipts name the path *relative to the photodiode's data directory*,
+    /// so gathering has to resolve it against the owner's published root before
+    /// the file can be found and moved.
+    #[test]
+    fn a_relative_pdq_label_is_resolved_against_the_photodiode_data_directory() {
+        let root = std::env::temp_dir().join(format!("a1-gather-{}", now_unix_ms()));
+        let pd_root = root.join("pd-data");
+        std::fs::create_dir_all(pd_root.join("A1-row")).expect("pd dirs");
+        std::fs::write(pd_root.join("A1-row/run_pd.pdq"), b"pdq").expect("pdq");
+        std::fs::write(pd_root.join("A1-row/run_pd.json"), b"{}").expect("pd sidecar");
+
+        let mut photodiode = ready_photodiode();
+        photodiode.data_dir = Some(pd_root.display().to_string());
+        let mut plugin = StageAA1Plugin {
+            output_folder: root.display().to_string(),
+            photodiode: Some(photodiode),
+            ..StageAA1Plugin::default()
+        };
+        plugin.recording.id = "A1-row".into();
+        plugin.recording.stem = "run".into();
+        plugin.recording.folder = root.display().to_string();
+        // Exactly what the owner reports: a label, not a path.
+        plugin.recording.pd_pdq_path = Some("A1-row/run_pd.pdq".into());
+        plugin.recording.pd_sidecar_path = Some("A1-row/run_pd.json".into());
+
+        plugin.gather_into_measurement_folder();
+
+        let measurement_dir = root.join("A1-row");
+        assert!(measurement_dir.join("run_pd.pdq").is_file());
+        assert!(measurement_dir.join("run_pd.json").is_file());
+        assert!(!pd_root.join("A1-row/run_pd.pdq").exists());
+        // The sidecar records where the file actually ended up.
+        assert_eq!(
+            plugin.recording.pd_pdq_path.as_deref(),
+            Some(measurement_dir.join("run_pd.pdq").display().to_string()).as_deref()
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The host restarts the pipeline when A1 starts its own recording and
+    /// reports it as SourceChanged. That must not wipe the row's science state.
+    #[test]
+    fn a_self_inflicted_source_change_keeps_the_rows_science_state() {
+        let mut plugin = StageAA1Plugin {
+            response_points: vec![ResponsePoint {
+                measured_a: 1.0,
+                q_on: 0.5,
+                q_off: 0.4,
+                cycles: 20,
+                valid_pixels: 10,
+            }],
+            pilot_windows: Some((
+                PhaseWindow {
+                    start: 0.1,
+                    end: 0.4,
+                },
+                PhaseWindow {
+                    start: 0.6,
+                    end: 0.9,
+                },
+            )),
+            camera_markers_us: vec![0, 1_000],
+            ..StageAA1Plugin::default()
+        };
+        plugin.recording.phase = RecPhase::Running;
+
+        plugin.on_discontinuity(PluginDiscontinuity::SourceChanged);
+
+        assert_eq!(plugin.response_points.len(), 1, "sweep points were wiped");
+        assert!(plugin.pilot_windows.is_some(), "pilot windows were wiped");
+        assert!(
+            plugin.camera_markers_us.is_empty(),
+            "the event timeline really did restart and must reset"
+        );
+
+        // Outside a recording the boundary still resets everything.
+        plugin.recording = Recording::idle();
+        plugin.on_discontinuity(PluginDiscontinuity::SourceChanged);
+        assert!(plugin.response_points.is_empty());
+        assert!(plugin.pilot_windows.is_none());
     }
 }
