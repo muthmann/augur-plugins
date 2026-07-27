@@ -5,6 +5,7 @@
 - **Design:** [ADR 009](../adr/009-stage-a-a1-recording-coordinator.md),
   [ADR 010](../adr/010-stage-a-a1-amplitude-sweep.md) (sweep + button
   press forwarding),
+  [ADR 014](../adr/014-stage-a-a1-frequency-ladder.md) (the unattended ladder),
   [ADR 013](../adr/013-stage-a-a1-event-count-depth-lock.md) (exact-event-count
   `a₀` lock)
 - **Automation roadmap:** [Stage-A A1 Automation](./stage-a-a1-automation.md)
@@ -47,7 +48,7 @@ folder. A1 makes each recording one button press:
 | Record pilot | records a bright reference (`…_pilot`) **and** freezes the ON/OFF windows for the row from the live signal |
 | Record background | records an unmodulated reference (`…_background`) **and** captures the false-response floor `q0` |
 | Stop (abort recording / sweep) | finalize the current recording early; during a sweep also aborts the remaining points |
-| a₀ / Find a₀ / Record a₀ point | the **exact-event-count** workflow: hold one *measured* depth `a₀` across the frequency sweep — see [its brief](./stage-a-a1-event-count.md) |
+| a₀ / Find a₀ / Record a₀ point / Start frequency sweep | the **exact-event-count** workflow: hold one *measured* depth `a₀` across the frequency sweep, by hand or as an unattended ladder — see [its brief](./stage-a-a1-event-count.md) |
 
 The record and sweep buttons stay **disabled until an output folder is
 selected**.

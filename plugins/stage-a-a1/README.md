@@ -72,6 +72,8 @@ pixels come from the augur-rs camera config.
 See [docs/features/stage-a-a1.md](../../docs/features/stage-a-a1.md) for the full brief,
 [ADR 009](../../docs/adr/009-stage-a-a1-recording-coordinator.md) for the coordinator design,
 [docs/features/stage-a-a1-event-count.md](../../docs/features/stage-a-a1-event-count.md) plus
-[ADR 013](../../docs/adr/013-stage-a-a1-event-count-depth-lock.md) for the `a₀` lock, and
+[ADR 013](../../docs/adr/013-stage-a-a1-event-count-depth-lock.md) for the `a₀` lock,
+[ADR 014](../../docs/adr/014-stage-a-a1-frequency-ladder.md) for the unattended
+frequency ladder, and
 [docs/features/stage-a-a1-automation.md](../../docs/features/stage-a-a1-automation.md) for the
 planned amplitude-sweep automation on top of this.

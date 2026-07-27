@@ -293,6 +293,19 @@ pub enum ModulationCommandV1 {
     SetOpticalDepth {
         depth_a_milli: u32,
     },
+    /// Retarget the armed drive's *frequency*, leaving everything else — the
+    /// waveform shape, the depth, the operating point and the calibration — as
+    /// the operator armed it. The frequency counterpart of
+    /// [`ModulationCommandV1::SetOpticalDepth`], and the same scoping rules
+    /// apply: leased only, rejected when the link is closed or the armed drive
+    /// has no frequency to retarget (manual DAC method, constant mode).
+    ///
+    /// A1's frequency sweep drives this. The owner parks the operator's armed
+    /// frequency on the first one and restores it when the lease ends, so a
+    /// finished sweep does not leave the bench on its last point.
+    SetDriveFrequency {
+        frequency_millihz: u64,
+    },
     PrepareA1 {
         configuration: A1AcquisitionConfigV1,
     },

@@ -1,11 +1,15 @@
 # Stage-A A1 Exact Event Count — the `a₀` depth lock
 
 - **Crate:** `plugins/stage-a-a1` (`augur-plugin-stage-a-a1`)
-- **Status:** Built — per-frequency `a₀` lock + one-button event-count point
-- **Design:** [ADR 013](../adr/013-stage-a-a1-event-count-depth-lock.md); builds
-  on [ADR 010](../adr/010-stage-a-a1-amplitude-sweep.md) (leased
-  `SetOpticalDepth`) and [ADR 009](../adr/009-stage-a-a1-recording-coordinator.md)
-  (the RAW + PDQ + sidecar coordinator)
+- **Status:** Built — per-frequency `a₀` lock, one-button event-count point, and
+  an unattended frequency ladder that does both at every planned `f`
+- **Design:** [ADR 013](../adr/013-stage-a-a1-event-count-depth-lock.md) (the
+  lock) and [ADR 014](../adr/014-stage-a-a1-frequency-ladder.md) (the ladder);
+  builds on [ADR 010](../adr/010-stage-a-a1-amplitude-sweep.md) (leased
+  `SetOpticalDepth`), [ADR 009](../adr/009-stage-a-a1-recording-coordinator.md)
+  (the RAW + PDQ + sidecar coordinator) and
+  [ADR 012](../adr/012-stage-a-contrast-geometry-is-bench-not-display.md) (the
+  geometry the measured `a` is defined in)
 - **Relates to:** [Stage-A A1 Analysis](./stage-a-a1.md),
   [Stage-A Pockels Transfer Calibration](./stage-a-pockels-calibration.md),
   [Stage-A Photodiode](./stage-a-photodiode.md)
@@ -22,7 +26,8 @@ a_0=\ln\!\left(\frac{I_{\mathrm{exc,max}}}{I_{\mathrm{exc,min}}}\right),
 
 and hold that **photodiode-measured** value constant while the frequency varies,
 so event counts per half-cycle are comparable across `f` at equal optical
-contrast. `a₀` is a measured log contrast — **never** a DAC-code excursion.
+contrast. `a₀` is a measured log contrast — **never** a DAC-code excursion, and
+never the reject-port detector's own contrast (ADR 012).
 
 ## Why a lock is needed at all
 
@@ -36,6 +41,31 @@ record at the wrong depth.
 
 The lock closes that loop: it commands, measures, and corrects until the
 photodiode reports `a₀`.
+
+## What the measured `a` needs to be worth dividing by
+
+The lock divides by the measured `a`, so a *biased* measurement is not noise —
+it is a systematic push on the drive. Two properties of the photodiode estimate
+therefore matter more here than anywhere else, and both are enforced:
+
+- **Whole cycles.** `a` is peak-to-peak, so its window has to span at least one
+  full modulation cycle. The photodiode sizes its contrast window from the
+  phase-0 markers to cover several cycles, and **withholds `a` entirely** below
+  one. A fixed 0.82 s window — what it used before — is under one cycle for
+  every `f < 1.2 Hz`, exactly where the A1 plateau reference lives, and would
+  have under-reported `a` and driven the depth up until it railed. Its length
+  and cycle count are published as `window_seconds` / `covered_cycles`.
+- **A window that has turned over.** A reading taken sooner than one window
+  after a depth change still contains the old depth. The lock's per-trial dwell
+  is therefore at least one window (never less than **Sweep settle (s)**), and
+  its three readings are spaced by half a window so they are not three views of
+  the same samples. The trial value is their **median**; if they spread by more
+  than twice the tolerance the operating point is called unsettled and the lock
+  aborts rather than latching onto a drifting drive.
+
+If the ladder's lowest frequency needs a longer window than the photodiode's
+ring holds, raise its **Cache length**; the refusal says so and names the
+seconds needed.
 
 ## The workflow, one frequency at a time
 
@@ -56,9 +86,67 @@ across frequencies is not automated, i.e. off by default). Then:
 3. Press **Record a₀ point (event-count)**. A1 re-applies the found depth under a
    modulation lease, waits for the measured `a` to hold `a₀`, and records one
    atomic camera RAW + photodiode PDQ + sidecar under one run id.
-4. Repeat for the next frequency. Randomising the frequency order, interleaving
-   the low-frequency reference and repeating independent blocks (three where
-   practical) are yours — every point is one button press.
+4. Repeat for the next frequency. Repeating independent blocks (three where
+   practical) is yours — every point is one button press.
+
+Steps 1–4 are what **Start frequency sweep** automates; see below.
+
+## The frequency ladder (unattended)
+
+**Start frequency sweep (find a₀ + record per f)** runs the whole ladder on
+**one** modulation lease. Per point it retargets the drive's frequency
+(`ModulationCommandV1::SetDriveFrequency`), waits for the phase-0 trigger to
+actually report the new period, runs the `a₀` lock, and records one atomic
+event-count point — then moves on.
+
+| Control | Meaning |
+|---|---|
+| Sweep min f / max f (Hz) | ends of the ladder, both included |
+| Frequency points | how many, **log-spaced** — `\|H(f)\|` is read per decade |
+| Frequency order | ascending / descending / alternating / random (seeded) |
+| Random order seed | makes the random schedule reproducible; recorded per point |
+| Low-f reference every N points | re-visit the lowest frequency every N points |
+| Start frequency sweep | run the ladder |
+| Stop | aborts the ladder and whichever child is mid-flight |
+
+What it guarantees:
+
+- **One lease for the whole ladder.** The lock and the recording run on the
+  ladder's lease instead of taking their own, so the operator's drive settings
+  are locked out from the first frequency to the last — the amplitude provably
+  cannot move between a lock and the point that replays it. The owner parks the
+  operator's frequency *and* depth on the first retarget and hands both back
+  when the lease is released.
+- **The trigger confirms the frequency, not the firmware.** An ACK says a table
+  was accepted; the phase-0 markers say the light is modulating at that rate.
+  A point only starts once enough markers at the *new* period agree with the
+  commanded frequency.
+- **Nothing from the previous frequency survives.** Retained markers and events
+  are dropped on every frequency change — the measured period is their mean
+  spacing, so keeping them would confirm the new frequency against a mixture.
+  **Pilot windows are dropped too**: windows frozen at one period do not
+  transfer to another, and scoring a point in the wrong window is a silent
+  error. Re-freeze a pilot per frequency if you need pilot-frozen windows.
+- **A bad point is skipped, not fatal.** A frequency whose `a₀` is unreachable,
+  whose trigger never confirms, or whose recording fails is skipped and named in
+  the final summary; the remaining decades are still recorded. The lock table
+  keeps the failed attempt.
+- **The plan is checked before the drive moves.** The lowest planned frequency
+  decides whether the photodiode can measure `a` at all, so it is checked up
+  front — not at the ninth point, two hours in.
+
+Every point's sidecar gains a `[frequency_sweep]` section: `min_f`, `max_f`,
+`planned_points`, the position in the **executed** order, the order name, the
+seed, whether the point is an interleaved reference, and the requested
+frequency (`[trigger]` carries what the markers measured).
+
+### What the ladder still does not do
+
+The flux point `I_k`, the camera configuration, ROI/mask, pedestal, bias set,
+gates, the `I_tot` anchor, the zero-depth background, the pilot, and repeating
+independent blocks stay the operator's. `a₀` itself is an operator input, and
+the refractory condition `2·f·a₀/C ≪ 1/τ_refr` is **not** checked — verify it at
+your highest planned frequency when you pick `a₀`.
 
 ## Controls
 
