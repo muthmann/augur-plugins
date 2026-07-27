@@ -24,6 +24,7 @@
 //!    `q_p(a, f)` fit is computed offline from the recordings; the live plot is a
 //!    quicklook.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -299,9 +300,10 @@ pub struct StageAA1Plugin {
     /// anchor the fold to the drive on the camera clock; empty falls back to the
     /// free-running fold on `T`.
     camera_markers_us: Vec<u64>,
-    valid_pixels: usize,
     frame_width: u16,
     frame_height: u16,
+    /// Memoised [`StageAA1Plugin::current_fold`], keyed on its inputs.
+    fold_cache: RefCell<Option<(FoldKey, Option<PhaseFold>)>>,
     // -- host camera ROI/mask, mirrored from CTX_GLOBAL_SETTINGS --
     host_roi: Option<RoiV1>,
     masked_pixels: HashSet<(u16, u16)>,
@@ -367,7 +369,7 @@ impl Default for StageAA1Plugin {
             event_scratch: Vec::new(),
             analysis_window_ms: DEFAULT_ANALYSIS_WINDOW_MS,
             camera_markers_us: Vec::new(),
-            valid_pixels: 0,
+            fold_cache: RefCell::new(None),
             frame_width: 0,
             frame_height: 0,
             host_roi: None,
@@ -466,6 +468,22 @@ impl Recording {
     }
 }
 
+/// Fingerprint of everything the phase fold is computed from. Cheap to build
+/// (no scan of the event buffer) and exact enough that a stale fold cannot
+/// survive a change to any input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FoldKey {
+    period_us_bits: u64,
+    event_count: usize,
+    first_event_us: Option<u64>,
+    last_event_us: Option<u64>,
+    marker_count: usize,
+    first_marker_us: Option<u64>,
+    last_marker_us: Option<u64>,
+    roi: Option<Roi>,
+    masked_count: usize,
+}
+
 impl StageAA1Plugin {
     fn bump(&mut self) {
         self.dataset_generation = self.dataset_generation.wrapping_add(1);
@@ -523,12 +541,59 @@ impl StageAA1Plugin {
         }
     }
 
+    /// The current phase fold, memoised.
+    ///
+    /// Called several times per repaint (`rolling_dataset`, `latest_rolling`
+    /// from both `status_dataset` and `status_entries`, `current_windows`,
+    /// `current_response`). Each fold allocates a `Vec<FoldedEvent>` over up to
+    /// `MAX_EVENTS` events, so refolding per call threw away hundreds of
+    /// megabytes per repaint at bench event rates. The cache is keyed on a
+    /// cheap fingerprint of everything the fold reads, so it invalidates
+    /// exactly when the inputs move rather than on every `bump()`.
     fn current_fold(&self) -> Option<PhaseFold> {
+        let key = self.fold_key()?;
+        if let Ok(cache) = self.fold_cache.try_borrow() {
+            if let Some((cached_key, fold)) = cache.as_ref() {
+                if *cached_key == key {
+                    return fold.clone();
+                }
+            }
+        }
+        let fold = self.compute_fold();
+        if let Ok(mut cache) = self.fold_cache.try_borrow_mut() {
+            *cache = Some((key, fold.clone()));
+        }
+        fold
+    }
+
+    /// Fingerprint of every input [`Self::compute_fold`] reads. `None` when
+    /// there is no period, i.e. no fold to compute.
+    fn fold_key(&self) -> Option<FoldKey> {
         let period_us = self.period_us()?;
+        Some(FoldKey {
+            period_us_bits: period_us.to_bits(),
+            event_count: self.camera_events.len(),
+            first_event_us: self.camera_events.first().map(|event| event.timestamp_us),
+            last_event_us: self.camera_events.last().map(|event| event.timestamp_us),
+            marker_count: self.camera_markers_us.len(),
+            first_marker_us: self.camera_markers_us.first().copied(),
+            last_marker_us: self.camera_markers_us.last().copied(),
+            roi: self.roi(),
+            masked_count: self.masked_pixels.len(),
+        })
+    }
+
+    fn compute_fold(&self) -> Option<PhaseFold> {
+        let period_us = self.period_us()?;
+        // Fold only the events the analysis is normalised over. `q_p` already
+        // restricts to ROI minus masked pixels; the rolling response divides by
+        // the same count, so its numerator has to be restricted too or it
+        // counts events from outside the ROI against an ROI-sized denominator.
+        let events = self.roi_filtered_events();
         let marker_fold = self.is_marker_anchored().then(|| {
             let expected_hz = 1_000_000.0 / period_us;
             fold_events(
-                &self.camera_events,
+                &events,
                 &self.camera_markers_us,
                 MarkerValidationConfig {
                     expected_frequency_hz: expected_hz,
@@ -545,7 +610,27 @@ impl StageAA1Plugin {
         // blank the live plots — fall back to the free-running fold on T.
         marker_fold
             .flatten()
-            .or_else(|| fold_events_free_running(&self.camera_events, period_us))
+            .or_else(|| fold_events_free_running(&events, period_us))
+    }
+
+    /// The analysis-window events restricted to the ROI, masked pixels removed.
+    /// Without an ROI the whole frame is the ROI, so this is a clone.
+    fn roi_filtered_events(&self) -> Vec<CameraEvent> {
+        let Some(roi) = self.roi() else {
+            return self.camera_events.clone();
+        };
+        if roi.area() == usize::from(self.frame_width) * usize::from(self.frame_height)
+            && self.masked_pixels.is_empty()
+        {
+            return self.camera_events.clone();
+        }
+        self.camera_events
+            .iter()
+            .filter(|event| {
+                roi.contains(event.x, event.y) && !self.masked_pixels.contains(&(event.x, event.y))
+            })
+            .copied()
+            .collect()
     }
 
     /// Optical modulation depth `a` published by the photodiode plugin.
@@ -622,6 +707,10 @@ impl StageAA1Plugin {
                 self.note("Pilot windows frozen from the live signal");
             }
             None => {
+                // Drop whatever was loaded for this measurement: leaving it in
+                // place let `write_sidecar` record windows from an *earlier*
+                // pilot as if they had just been frozen from this run.
+                self.pilot_windows = None;
                 self.note("No live signal to freeze windows — enable Live analysis first");
             }
         }
@@ -716,8 +805,13 @@ impl StageAA1Plugin {
         let sample_times: Vec<u64> = (0..samples)
             .map(|index| first + (last - first) * index / (samples - 1))
             .collect();
+        // Same denominator as `q_p` (ROI minus masked), against the ROI-filtered
+        // fold — the two are shown side by side and must mean the same thing.
+        let Some(valid_pixels) = self.valid_pixel_count() else {
+            return empty();
+        };
         let line = |polarity: Polarity| {
-            rolling_half_period_response(&fold, polarity, self.valid_pixels, &sample_times, None)
+            rolling_half_period_response(&fold, polarity, valid_pixels, &sample_times, None)
                 .map(|points| points_for(&points, first))
                 .unwrap_or_default()
         };
@@ -741,8 +835,9 @@ impl StageAA1Plugin {
     fn latest_rolling(&self) -> Option<(f64, f64)> {
         let fold = self.current_fold()?;
         let at = [fold.validation.last_marker_us];
+        let valid_pixels = self.valid_pixel_count()?;
         let value = |polarity| {
-            rolling_half_period_response(&fold, polarity, self.valid_pixels, &at, None)
+            rolling_half_period_response(&fold, polarity, valid_pixels, &at, None)
                 .ok()
                 .and_then(|points| points.first().map(|point| point.run_per_pixel))
         };
@@ -2123,7 +2218,6 @@ impl Plugin for StageAA1Plugin {
         self.camera_events.clear();
         self.event_scratch.clear();
         self.camera_markers_us.clear();
-        self.valid_pixels = 0;
         self.response_points.clear();
         self.pilot_windows = None;
         self.background_floor = None;
@@ -2179,7 +2273,6 @@ impl Plugin for StageAA1Plugin {
         if !self.live {
             return;
         }
-        self.valid_pixels = usize::from(frame.width()) * usize::from(frame.height());
 
         // Markers (phase-0 sync) only exist on the preview frame, so accumulate
         // the rising EXT_TRIGGER edges here regardless of the event source.
@@ -2216,11 +2309,30 @@ impl Plugin for StageAA1Plugin {
             // Keep the marker set on the same window as the events.
             self.camera_markers_us
                 .retain(|&marker| marker >= window_start);
-        } else if self.camera_events.len() < MAX_EVENTS {
+        } else {
             // Fallback (no retained history available): accumulate the
-            // best-effort preview-frame events.
+            // best-effort preview-frame events, then trim to the same analysis
+            // window the exact path uses. Without the trim the buffer grew to
+            // MAX_EVENTS and then stopped accepting anything at all, so the
+            // fold silently spanned an ever-widening window and finally froze
+            // on a stale 4M-event buffer while the plots still looked live.
             self.camera_events
                 .extend(frame.events().iter().map(ffi_to_camera_event));
+            let window_start = window_end.saturating_sub(window_us);
+            let keep_from = self
+                .camera_events
+                .partition_point(|event| event.timestamp_us < window_start);
+            if keep_from > 0 {
+                self.camera_events.drain(..keep_from);
+            }
+            // Hard ceiling as well: a window longer than the event buffer can
+            // hold must drop the oldest events, not stop taking new ones.
+            if self.camera_events.len() > MAX_EVENTS {
+                let excess = self.camera_events.len() - MAX_EVENTS;
+                self.camera_events.drain(..excess);
+            }
+            self.camera_markers_us
+                .retain(|&marker| marker >= window_start);
         }
         self.bump();
     }
@@ -2673,7 +2785,6 @@ impl Plugin for StageAA1Plugin {
                     self.camera_events.clear();
                     self.event_scratch.clear();
                     self.camera_markers_us.clear();
-                    self.valid_pixels = 0;
                 }
             }
             "window_floor" => {
@@ -2759,7 +2870,7 @@ impl Plugin for StageAA1Plugin {
         entries.push(StatusEntry::Text(format!(
             "{} events, {} valid pixels; {anchor}",
             self.camera_events.len(),
-            self.valid_pixels
+            self.valid_pixel_count().unwrap_or(0)
         )));
         entries.push(StatusEntry::Text(match self.measured_a() {
             Some(a) => format!("a = {a:.3} (photodiode)"),
@@ -2988,7 +3099,9 @@ mod tests {
     /// A plugin whose period comes from marker spacing (no fallback frequency).
     fn plugin_with_markers() -> StageAA1Plugin {
         StageAA1Plugin {
-            valid_pixels: 10,
+            // 10 x 1 sensor, no host ROI => valid_pixel_count() == 10.
+            frame_width: 10,
+            frame_height: 1,
             camera_markers_us: vec![0, 1_000, 2_000, 3_000],
             ..StageAA1Plugin::default()
         }
@@ -3075,6 +3188,106 @@ mod tests {
         // Recording a point is still refused without a photodiode-measured a.
         assert!(plugin.measured_a().is_none());
         assert!(plugin.record_response_point().is_err());
+    }
+
+    #[test]
+    fn the_rolling_response_is_normalised_over_the_roi_not_the_sensor() {
+        // `q_p` counts ROI-minus-masked pixels; the rolling half-period rate is
+        // plotted next to it and must agree. Normalising by the whole sensor
+        // under-reported S_p by the ROI/frame ratio *and* counted events from
+        // outside the ROI.
+        let mut plugin = StageAA1Plugin {
+            frame_width: 10,
+            frame_height: 10,
+            camera_markers_us: vec![0, 1_000, 2_000, 3_000],
+            ..StageAA1Plugin::default()
+        };
+        plugin.host_roi = Some(RoiV1 {
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 2,
+        });
+        let event = |x: u16, y: u16, timestamp_us: u64| CameraEvent {
+            timestamp_us,
+            x,
+            y,
+            polarity: Polarity::On,
+        };
+        // Two ON events inside the 2x2 ROI, five well outside it, all inside
+        // the trailing half period the status readout samples.
+        plugin.camera_events.push(event(0, 0, 2_800));
+        plugin.camera_events.push(event(1, 1, 2_850));
+        for x in 5..10_u16 {
+            plugin.camera_events.push(event(x, 9, 2_900));
+        }
+
+        let (on_rate, _) = plugin.latest_rolling().expect("rolling value");
+        assert!(
+            (on_rate - 0.5).abs() < 1e-9,
+            "expected 2 ROI events over 4 valid pixels, got {on_rate}"
+        );
+    }
+
+    #[test]
+    fn the_fold_cache_tracks_its_inputs() {
+        let mut plugin = plugin_with_markers();
+        for cycle in 0..8 {
+            plugin.camera_events.push(on(cycle * 1_000 + 200));
+        }
+        let first = plugin.current_fold().expect("fold");
+        // Repeated calls within a repaint must be identical, not merely equal
+        // to a fresh recomputation.
+        assert_eq!(plugin.current_fold().as_ref(), Some(&first));
+        assert_eq!(plugin.compute_fold().as_ref(), Some(&first));
+
+        // ...and adding an event inside the marker span must invalidate it.
+        plugin.camera_events.push(on(2_500));
+        plugin.camera_events.sort_by_key(|event| event.timestamp_us);
+        let second = plugin.current_fold().expect("fold");
+        assert_eq!(second.events.len(), first.events.len() + 1);
+
+        // A changed ROI also invalidates, even at identical event counts.
+        plugin.host_roi = Some(RoiV1 {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+        });
+        let third = plugin.current_fold().expect("fold");
+        assert_eq!(third.events.len(), second.events.len());
+        plugin.host_roi = Some(RoiV1 {
+            x: 5,
+            y: 0,
+            width: 1,
+            height: 1,
+        });
+        let fourth = plugin.current_fold().expect("fold");
+        assert!(
+            fourth.events.is_empty(),
+            "ROI moved off the events but the cache served a stale fold"
+        );
+    }
+
+    #[test]
+    fn a_failed_pilot_freeze_clears_stale_windows() {
+        // `scan_measurement_folder` may have loaded windows from an earlier
+        // pilot for this measurement. If the freeze then fails, the sidecar
+        // must not record those as if they had come from this run.
+        let mut plugin = plugin_with_markers();
+        plugin.pilot_windows = Some((
+            PhaseWindow { start: 0.0, end: 0.2 },
+            PhaseWindow { start: 0.5, end: 0.7 },
+        ));
+        // No events => the fold carries no signal => the freeze cannot pick
+        // windows and must not leave the loaded ones in place.
+        assert!(plugin.camera_events.is_empty());
+        plugin.freeze_pilot_windows();
+        assert!(
+            plugin.pilot_windows.is_none(),
+            "stale pilot windows survived a failed freeze"
+        );
+        assert!(!plugin.windows_are_frozen());
     }
 
     #[test]
@@ -3300,7 +3513,8 @@ mod tests {
         // marker validation rejects the fold, but the quicklook must fall back
         // to the free-running fold instead of blanking.
         let mut plugin = StageAA1Plugin {
-            valid_pixels: 10,
+            frame_width: 10,
+            frame_height: 1,
             camera_markers_us: vec![0, 1_000, 2_000, 10_000],
             ..StageAA1Plugin::default()
         };
