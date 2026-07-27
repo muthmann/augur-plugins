@@ -541,6 +541,18 @@ pub struct PhotodiodeOpticalSummaryV1 {
     pub measured_frequency_hz: Option<f64>,
     pub fundamental_phase_rad: Option<f64>,
     pub total_harmonic_distortion: Option<f64>,
+    /// Duration of the trailing window `measured_log_contrast` was estimated
+    /// over. A consumer that *commands* a depth and then reads this value back
+    /// has to wait at least this long, or it averages the previous depth in.
+    /// Additive in V1: absent from older owners, ignored by older consumers.
+    #[serde(default)]
+    pub window_seconds: Option<f64>,
+    /// Whole modulation cycles that window covered, from the phase-0 markers.
+    /// `a` is peak-to-peak, so below one cycle the owner withholds it entirely
+    /// rather than publish a phase-dependent under-estimate. `None` when there
+    /// is no marker period to measure against.
+    #[serde(default)]
+    pub covered_cycles: Option<f64>,
 }
 
 /// Settled detector level over the newest averaging window, in **raw detector

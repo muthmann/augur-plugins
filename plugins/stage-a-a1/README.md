@@ -24,6 +24,28 @@ optical drive in the modulation plugin; A1 only reads its published settings.
   one normal recording. Sidecars carry `sweep.requested_a` / `point_index` / `point_total`.
 - The record/sweep buttons are disabled until an output folder is selected.
 
+## Exact event count (`a₀` lock)
+
+The second Stage-A workflow holds **one** photodiode-measured depth
+`a₀ = ln(I_exc,max / I_exc,min)` constant while the frequency varies. Because the measured Pockels
+inversion is static, the delivered depth rolls off with frequency — so the depth must be found by
+measurement, not calculated.
+
+- **a₀** / **a₀ tolerance** — the frozen measured depth and its convergence band (default ±0.02).
+- **Find a₀** — per frequency: leases the modulation owner and iterates
+  `commanded a ← commanded a · a₀/measured a` (≤ 8 trials, averaging three fresh photodiode summaries
+  per trial after **Sweep settle (s)**) until the photodiode measures `a₀`. Records nothing, leaves the
+  drive at the depth it found, and stores one row per frequency — shown in the **A1 a₀ locks** view and
+  mirrored to `a0_locks.json`. An unreachable `a₀` is reported (drive limit or the owner's own
+  rejection) before any data is recorded.
+- **Record a₀ point (event-count)** — re-applies the locked depth under the lease (so the amplitude
+  cannot change during the recorded interval), waits for the measured `a` to hold `a₀`, and records
+  one atomic frequency point named `…_ec_f<f>Hz` with an `[a0_lock]` sidecar section.
+- **Clear a₀ lock table** — after changing the flux point, the calibration or `a₀` itself.
+
+Frequency order, the interleaved low-frequency reference and the repeated blocks stay yours — every
+point is one button press.
+
 Files share an `<id>_<timestamp>` stem: `<id>/<id>_<ts>.raw` (camera, under the host output root),
 `<id>/<id>_<ts>_pd.pdq` + `.json` (photodiode, under its data root), and
 `<id>/<id>_<ts>_config.toml` (A1, under the chosen folder). Point all three roots at the same
@@ -48,6 +70,8 @@ the frequency), falling back to the modulation plugin's acknowledged waveform. T
 pixels come from the augur-rs camera config.
 
 See [docs/features/stage-a-a1.md](../../docs/features/stage-a-a1.md) for the full brief,
-[ADR 009](../../docs/adr/009-stage-a-a1-recording-coordinator.md) for the coordinator design, and
+[ADR 009](../../docs/adr/009-stage-a-a1-recording-coordinator.md) for the coordinator design,
+[docs/features/stage-a-a1-event-count.md](../../docs/features/stage-a-a1-event-count.md) plus
+[ADR 013](../../docs/adr/013-stage-a-a1-event-count-depth-lock.md) for the `a₀` lock, and
 [docs/features/stage-a-a1-automation.md](../../docs/features/stage-a-a1-automation.md) for the
 planned amplitude-sweep automation on top of this.

@@ -4802,7 +4802,10 @@ level = 750
                 reply.outcome
             );
         }
-        assert!((plugin.depth_a - 1.25).abs() < 1e-9, "sweep drives the depth");
+        assert!(
+            (plugin.depth_a - 1.25).abs() < 1e-9,
+            "sweep drives the depth"
+        );
 
         plugin.end_lease();
         assert!(

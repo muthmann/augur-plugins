@@ -1,11 +1,15 @@
 # Stage-A A1 Analysis
 
 - **Crate:** `plugins/stage-a-a1` (`augur-plugin-stage-a-a1`)
-- **Status:** Recording coordinator + live quicklooks + amplitude sweep
+- **Status:** Recording coordinator + live quicklooks + amplitude sweep + `a₀` lock
 - **Design:** [ADR 009](../adr/009-stage-a-a1-recording-coordinator.md),
   [ADR 010](../adr/010-stage-a-a1-amplitude-sweep.md) (sweep + button
-  press forwarding)
+  press forwarding),
+  [ADR 013](../adr/013-stage-a-a1-event-count-depth-lock.md) (exact-event-count
+  `a₀` lock)
 - **Automation roadmap:** [Stage-A A1 Automation](./stage-a-a1-automation.md)
+- **Second workflow:** [Stage-A A1 Exact Event Count](./stage-a-a1-event-count.md)
+  — hold one *measured* depth `a₀` across the frequency sweep
 
 ## Purpose
 
@@ -43,6 +47,7 @@ folder. A1 makes each recording one button press:
 | Record pilot | records a bright reference (`…_pilot`) **and** freezes the ON/OFF windows for the row from the live signal |
 | Record background | records an unmodulated reference (`…_background`) **and** captures the false-response floor `q0` |
 | Stop (abort recording / sweep) | finalize the current recording early; during a sweep also aborts the remaining points |
+| a₀ / Find a₀ / Record a₀ point | the **exact-event-count** workflow: hold one *measured* depth `a₀` across the frequency sweep — see [its brief](./stage-a-a1-event-count.md) |
 
 The record and sweep buttons stay **disabled until an output folder is
 selected**.
@@ -63,10 +68,12 @@ require `min a > 0` — record `a≈0` with the background button instead. Sidec
 of sweep recordings additionally carry `sweep.requested_a`, `sweep.point_index`
 and `sweep.point_total`. After the sweep releases the lease, the drive holds the
 last sweep amplitude until the operator's own `depth a` setting is re-applied
-(any modulation settings change re-sends it).
+(any modulation settings change re-sends it) — which is exactly why an
+event-count point re-applies its locked depth under the lease instead of trusting
+the drive to still be where a previous action left it (ADR 013).
 
 **Naming.** Files share an `<id>_<timestamp>[_role]` stem under an `<id>/` subfolder
-(`_pilot` / `_background` tag the reference runs):
+(`_pilot` / `_background` tag the reference runs, `_ec_f<f>Hz` an event-count point):
 
 - `<id>/<id>_<ts>.raw` — camera RAW, under the **host output root**, with the host's
   own `<stem>.toml` sidecar (camera biases, ROI) written next to it.
@@ -206,5 +213,6 @@ path, file-safe id generation, UTC timestamp formatting, the config-sidecar buil
 the pilot-window round-trip through the measurement folder, press-latch edge/baseline
 semantics, the jittery-marker free-running fallback, sweep-point spacing, the
 sweep-point sidecar fields, the ordered camera → PDQ → PDQ finalize → camera
-finalize lifecycle (including envelope identity/revision and save location), and
-the selective discontinuity reset.
+finalize lifecycle (including envelope identity/revision and save location), the
+selective discontinuity reset, and the `a₀`-lock set listed in the
+[exact-event-count brief](./stage-a-a1-event-count.md).

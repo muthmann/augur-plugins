@@ -105,6 +105,18 @@ pub enum EstimateError {
         total_power_volts: f64,
         detector_max_volts: f64,
     },
+    /// The window is shorter than one full modulation cycle, so the robust
+    /// extrema only see an arc of the waveform and `a` would be a
+    /// phase-dependent *under*-estimate.
+    ///
+    /// Constructed by the caller — [`estimate_contrast`] is given codes, not a
+    /// period, and sizing the window against the drive is the caller's job.
+    /// It is in this enum because it belongs with the other fail-closed
+    /// reasons a consumer has to render.
+    WindowShorterThanCycle {
+        covered_cycles: f64,
+        window_seconds: f64,
+    },
 }
 
 impl std::fmt::Display for EstimateError {
@@ -130,6 +142,14 @@ impl std::fmt::Display for EstimateError {
                 f,
                 "total-power anchor {total_power_volts:.4} V is not above the detector \
                  maximum {detector_max_volts:.4} V; a is undefined"
+            ),
+            Self::WindowShorterThanCycle {
+                covered_cycles,
+                window_seconds,
+            } => write!(
+                f,
+                "the {window_seconds:.2} s window covers only {covered_cycles:.2} modulation \
+                 cycles; a needs at least one full cycle — raise the cache length"
             ),
         }
     }

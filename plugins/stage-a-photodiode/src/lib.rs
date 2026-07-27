@@ -83,9 +83,20 @@ const SPECTRUM_MIN_SAMPLES: usize = 256;
 const SPECTRUM_MAX_SAMPLES: usize = 16_384;
 /// The firmware's default stream rate; the mock mirrors it.
 const MOCK_RATE_HZ: u32 = 20_000;
-/// Trailing samples used for the live optical log-contrast `a`. Sized like the
-/// spectrum window so a handful of modulation cycles are always covered.
+/// Floor on the trailing samples used for the live optical log-contrast `a`,
+/// and the fallback window when no phase-0 markers give a period. Sized like
+/// the spectrum window: 16 384 samples ≈ 0.82 s at 20 kSa/s.
 const CONTRAST_WINDOW_SAMPLES: usize = 16_384;
+/// Whole modulation cycles the contrast window is sized to cover.
+///
+/// `a` is a *peak-to-peak* quantity, so a window shorter than one cycle sees
+/// only an arc of the waveform and under-reports it — and a consumer that
+/// divides by the measured `a` (A1's `a₀` lock) then inflates its drive against
+/// that bias. A fixed 0.82 s window is below one cycle for every `f < 1.2 Hz`,
+/// i.e. exactly the sub-hertz plateau reference the A1 protocol needs. The
+/// markers give the period on the same sample clock, so size the window from
+/// them instead.
+const CONTRAST_WINDOW_CYCLES: f64 = 8.0;
 const MOCK_BLOCK_SAMPLES: usize = 256;
 /// Cap on retained phase-0 markers (bounds the overlay + frequency window).
 const MAX_MARKERS: usize = 4_096;
@@ -171,6 +182,16 @@ struct SharedState {
     /// `Marker` stream frames. Used for the opt-in trigger overlay and to derive
     /// the modulation frequency.
     markers: VecDeque<u64>,
+    /// Newest phase-0 marker index seen, retained or already evicted, and the
+    /// spacing to the one before it.
+    ///
+    /// The retained markers alone cannot measure a period longer than the ring:
+    /// once the ring holds less than one cycle it holds at most one marker, so
+    /// the mean spacing is undefined exactly where knowing the period matters
+    /// most. Markers arrive one at a time, so remember the interval as it goes
+    /// past instead of trying to recover it from what survived eviction.
+    last_marker_index: Option<u64>,
+    marker_period_estimate: Option<f64>,
     latest: Option<u16>,
     /// Cumulative firmware-side drop counter (latest header value).
     device_dropped: u32,
@@ -218,6 +239,8 @@ impl Default for SharedState {
             samples: VecDeque::new(),
             cells: VecDeque::new(),
             markers: VecDeque::new(),
+            last_marker_index: None,
+            marker_period_estimate: None,
             latest: None,
             device_dropped: 0,
             crc_failures: 0,
@@ -252,6 +275,10 @@ impl SharedState {
             self.samples.clear();
             self.cells.clear();
             self.markers.clear();
+            // The sample clock restarts with the segment, so a spacing
+            // measured across the discontinuity is meaningless.
+            self.last_marker_index = None;
+            self.marker_period_estimate = None;
             self.ring_first_index = first_index;
             self.rate_hz = rate_hz;
         }
@@ -312,6 +339,12 @@ impl SharedState {
         {
             return; // ignore duplicate stamps
         }
+        if let Some(previous) = self.last_marker_index {
+            if sample_index > previous {
+                self.marker_period_estimate = Some((sample_index - previous) as f64);
+            }
+        }
+        self.last_marker_index = Some(sample_index);
         self.markers.push_back(sample_index);
         while self.markers.len() > MAX_MARKERS {
             self.markers.pop_front();
@@ -319,11 +352,31 @@ impl SharedState {
         self.last_update_unix_ms = now_unix_ms();
     }
 
+    /// How many trailing samples the optical log-contrast is estimated over,
+    /// with the whole modulation cycles that window covers.
+    ///
+    /// `a` is peak-to-peak, so the window has to span whole cycles: sized to
+    /// [`CONTRAST_WINDOW_CYCLES`] of the marker-measured period, floored at
+    /// [`CONTRAST_WINDOW_SAMPLES`] so nothing gets shorter than today at high
+    /// `f`, and capped by what the ring actually retains. `covered_cycles` is
+    /// `None` when there is no period to measure against — then the caller can
+    /// only fall back to the fixed window and say so.
+    fn contrast_window(&self) -> (usize, Option<f64>) {
+        let available = self.samples.len();
+        let Some(period) = self.marker_period_samples() else {
+            return (available.min(CONTRAST_WINDOW_SAMPLES), None);
+        };
+        let wanted = (period * CONTRAST_WINDOW_CYCLES).ceil() as usize;
+        let window = wanted.max(CONTRAST_WINDOW_SAMPLES).min(available);
+        (window, Some(window as f64 / period))
+    }
+
     /// Mean marker spacing in samples, i.e. the modulation period on the device
     /// clock — the trigger *defining* the frequency. `None` with < 2 markers.
     fn marker_period_samples(&self) -> Option<f64> {
         if self.markers.len() < 2 {
-            return None;
+            // Below one retained cycle only the remembered interval is left.
+            return self.marker_period_estimate;
         }
         let first = *self.markers.front()?;
         let last = *self.markers.back()?;
@@ -1529,8 +1582,8 @@ impl StageAPhotodiodePlugin {
     /// retarget the sweep and write a wrong `measured_a` into every sidecar.
     ///
     /// `None` when there is no valid window or no valid total-power anchor.
-    fn optical_summary(&self, samples: &VecDeque<u16>) -> Option<PhotodiodeOpticalSummaryV1> {
-        self.optical_summary_result(samples).ok()
+    fn optical_summary(&self, state: &SharedState) -> Option<PhotodiodeOpticalSummaryV1> {
+        self.optical_summary_result(state).ok()
     }
 
     /// [`Self::optical_summary`], keeping the rejection reason so the status
@@ -1538,9 +1591,23 @@ impl StageAPhotodiodePlugin {
     /// showing nothing.
     fn optical_summary_result(
         &self,
-        samples: &VecDeque<u16>,
+        state: &SharedState,
     ) -> Result<PhotodiodeOpticalSummaryV1, EstimateError> {
-        let start = samples.len().saturating_sub(CONTRAST_WINDOW_SAMPLES);
+        let samples = &state.samples;
+        let (window_samples, covered_cycles) = state.contrast_window();
+        let rate_hz = f64::from(state.rate_hz.max(1));
+        let window_seconds = window_samples as f64 / rate_hz;
+        // Fail closed below one full cycle: the robust extrema would see an arc
+        // of the waveform, and `a` would be a phase-dependent under-estimate. A
+        // consumer that divides by the measured `a` — A1's `a₀` lock — would
+        // then drive itself up against a bias it cannot see.
+        if let Some(cycles) = covered_cycles.filter(|cycles| *cycles < 1.0) {
+            return Err(EstimateError::WindowShorterThanCycle {
+                covered_cycles: cycles,
+                window_seconds,
+            });
+        }
+        let start = samples.len().saturating_sub(window_samples);
         let window: Vec<u16> = samples.iter().skip(start).copied().collect();
         let calibration = self.adc_calibration();
         // `ContrastGeometry::RejectedComplement` wants the *dark-corrected*
@@ -1585,9 +1652,13 @@ impl StageAPhotodiodePlugin {
             excitation_headroom_volts: estimate.v_min_volts,
             low_clip_fraction: estimate.low_clip_fraction,
             high_clip_fraction: estimate.high_clip_fraction,
-            measured_frequency_hz: None,
+            // The phase-0 markers are the trigger that *defines* the frequency,
+            // on the same sample clock as the codes above.
+            measured_frequency_hz: state.marker_period_samples().map(|period| rate_hz / period),
             fundamental_phase_rad: None,
             total_harmonic_distortion: None,
+            window_seconds: Some(window_seconds),
+            covered_cycles,
         })
     }
 
@@ -1595,7 +1666,7 @@ impl StageAPhotodiodePlugin {
     /// keeping the rejection reason so the caller can explain a withheld `a`.
     fn latest_optical_result(&self) -> Option<Result<PhotodiodeOpticalSummaryV1, EstimateError>> {
         let state = self.shared.lock().ok()?;
-        (!state.samples.is_empty()).then(|| self.optical_summary_result(&state.samples))
+        (!state.samples.is_empty()).then(|| self.optical_summary_result(&state))
     }
 
     fn control_summary(&self) -> PhotodiodeSummaryV1 {
@@ -1606,7 +1677,7 @@ impl StageAPhotodiodePlugin {
                     end_sample_index_exclusive: state.ring_first_index + state.samples.len() as u64,
                     sample_count: state.samples.len() as u64,
                 });
-                let optical_summary = self.optical_summary(&state.samples);
+                let optical_summary = self.optical_summary(&state);
                 let level = self.current_level(&state);
                 let connection = if self.connected() {
                     ConnectionStateV1::Connected {
@@ -3347,13 +3418,137 @@ mod tests {
 
     /// A clean rejected-port sine: the detector swings around `center` while
     /// the excitation is its complement against `I_tot`.
-    fn rejected_port_samples(center: f64, amplitude: f64, count: usize) -> VecDeque<u16> {
+    fn rejected_port_samples(center: f64, amplitude: f64, count: usize) -> Vec<u16> {
         (0..count)
             .map(|i| {
                 let phase = 2.0 * std::f64::consts::PI * (i as f64) * 8.0 / count as f64;
-                (center + amplitude * phase.sin()).round().clamp(0.0, 4_095.0) as u16
+                (center + amplitude * phase.sin())
+                    .round()
+                    .clamp(0.0, 4_095.0) as u16
             })
             .collect()
+    }
+
+    /// [`rejected_port_samples`] ingested into a ring, with one phase-0 marker
+    /// per cycle when `mark_cycles` — the estimator sizes its window from them.
+    fn rejected_port_state(
+        center: f64,
+        amplitude: f64,
+        count: usize,
+        mark_cycles: bool,
+    ) -> SharedState {
+        let mut state = SharedState::default();
+        state.ingest(
+            0,
+            20_000,
+            0,
+            &rejected_port_samples(center, amplitude, count),
+        );
+        if mark_cycles {
+            // `rejected_port_samples` puts 8 whole cycles in `count` samples.
+            let period = (count / 8) as u64;
+            for cycle in 0..8 {
+                state.push_marker(cycle * period);
+            }
+        }
+        state
+    }
+
+    /// A slow sine streamed for `total` samples into a ring that only retains
+    /// `retained` of them, with one phase-0 marker per cycle delivered as the
+    /// stream goes past — so markers are evicted exactly as they are on the
+    /// bench when the period outgrows the monitor cache.
+    fn slow_sine_state(period_samples: u64, retained: usize, total: usize) -> SharedState {
+        let mut state = SharedState {
+            cache_seconds: retained as f64 / 20_000.0,
+            ..Default::default()
+        };
+        let block = 4_000;
+        let mut index = 0usize;
+        while index < total {
+            let end = (index + block).min(total);
+            let codes: Vec<u16> = (index..end)
+                .map(|i| {
+                    let phase = 2.0 * std::f64::consts::PI * (i as f64) / period_samples as f64;
+                    (1_600.0 + 700.0 * phase.sin()).round() as u16
+                })
+                .collect();
+            state.ingest(index as u64, 20_000, 0, &codes);
+            let mut marker = index.next_multiple_of(period_samples as usize) as u64;
+            while (marker as usize) < end {
+                state.push_marker(marker);
+                marker += period_samples;
+            }
+            index = end;
+        }
+        state
+    }
+
+    #[test]
+    fn a_window_shorter_than_one_cycle_withholds_a_instead_of_under_reporting_it() {
+        // `a` is peak-to-peak. Below one full cycle the robust extrema see an
+        // arc of the sine, so `a` comes out low — and A1's a₀ lock divides by
+        // it, inflating its drive against a bias it cannot see. Fail closed.
+        let mut plugin = live_plugin();
+        plugin.reference_volts = 3.0;
+
+        // 0.5 Hz at 20 kSa/s = 40 000 samples per cycle; retain 0.6 of one.
+        let partial = slow_sine_state(40_000, 24_000, 200_000);
+        let error = plugin
+            .optical_summary_result(&partial)
+            .expect_err("a partial cycle must not publish an a");
+        assert!(
+            matches!(
+                error,
+                EstimateError::WindowShorterThanCycle { covered_cycles, .. }
+                    if (covered_cycles - 0.6).abs() < 0.05
+            ),
+            "unexpected rejection: {error:?}"
+        );
+
+        // Two whole cycles of the same drive: published, and the window is
+        // reported so a consumer can wait it out before trusting a re-read.
+        let whole = slow_sine_state(40_000, 80_000, 200_000);
+        let summary = plugin
+            .optical_summary(&whole)
+            .expect("two whole cycles estimate");
+        let expected = ((3.0_f64 - (1_600.0 - 700.0) * (3.3 / 4_095.0))
+            / (3.0 - (1_600.0 + 700.0) * (3.3 / 4_095.0)))
+            .ln();
+        assert!(
+            (summary.measured_log_contrast - expected).abs() < 0.02,
+            "a={} expected~{expected}",
+            summary.measured_log_contrast
+        );
+        assert!((summary.measured_frequency_hz.expect("markers") - 0.5).abs() < 0.01);
+        assert!((summary.window_seconds.expect("window") - 4.0).abs() < 0.01);
+        assert!(summary.covered_cycles.expect("cycles") >= 1.0);
+    }
+
+    #[test]
+    fn the_contrast_window_grows_to_cover_whole_cycles_at_low_frequency() {
+        // A fixed 16 384-sample window is 0.82 s: below one cycle for every
+        // f < 1.2 Hz, which is where the A1 plateau reference lives.
+        let fast = rejected_port_state(1_600.0, 700.0, 4_096, true);
+        let (window, cycles) = fast.contrast_window();
+        assert_eq!(window, 4_096, "high f keeps the whole retained ring");
+        assert!(cycles.expect("markers") >= 8.0);
+
+        let slow = slow_sine_state(40_000, 400_000, 400_000);
+        let (window, cycles) = slow.contrast_window();
+        assert_eq!(
+            window,
+            (CONTRAST_WINDOW_CYCLES as usize) * 40_000,
+            "the window is sized from the marker period, not fixed"
+        );
+        assert!((cycles.expect("markers") - CONTRAST_WINDOW_CYCLES).abs() < 0.01);
+
+        // Without markers there is no period to size against: fall back to the
+        // fixed window and report no cycle count rather than guess one.
+        let mut unmarked = slow_sine_state(40_000, 400_000, 400_000);
+        unmarked.markers.clear();
+        unmarked.marker_period_estimate = None;
+        assert_eq!(unmarked.contrast_window(), (CONTRAST_WINDOW_SAMPLES, None));
     }
 
     #[test]
@@ -3363,14 +3558,12 @@ mod tests {
         // scientific quantity. A1's amplitude sweep settles on this value.
         let mut plugin = live_plugin();
         plugin.reference_volts = 3.0;
-        let samples = rejected_port_samples(1_600.0, 700.0, 4_096);
+        let state = rejected_port_state(1_600.0, 700.0, 4_096, true);
 
         plugin.mode = Mode::Raw;
-        let raw = plugin.optical_summary(&samples).expect("raw display");
+        let raw = plugin.optical_summary(&state).expect("raw display");
         plugin.mode = Mode::Excitation;
-        let excitation = plugin
-            .optical_summary(&samples)
-            .expect("excitation display");
+        let excitation = plugin.optical_summary(&state).expect("excitation display");
 
         assert_eq!(raw.measured_log_contrast, excitation.measured_log_contrast);
         assert_eq!(raw.calibration.anchor_id, "reference-volts");
@@ -3390,14 +3583,14 @@ mod tests {
     fn captured_dark_level_reaches_the_estimator_and_is_named() {
         let mut plugin = live_plugin();
         plugin.reference_volts = 3.0;
-        let samples = rejected_port_samples(1_600.0, 700.0, 4_096);
+        let state = rejected_port_state(1_600.0, 700.0, 4_096, true);
 
-        let undarkened = plugin.optical_summary(&samples).expect("no dark yet");
+        let undarkened = plugin.optical_summary(&state).expect("no dark yet");
         assert_eq!(undarkened.calibration.dark_id, "dark-none");
         assert_eq!(undarkened.calibration.dark_volts, 0.0);
 
         plugin.dark_volts = 0.05;
-        let darkened = plugin.optical_summary(&samples).expect("with dark");
+        let darkened = plugin.optical_summary(&state).expect("with dark");
         assert_eq!(darkened.calibration.dark_id, "dark-measured");
         assert_eq!(darkened.calibration.dark_volts, 0.05);
         // A DC dark offset is common to the detector samples and to the
@@ -3679,7 +3872,7 @@ mod tests {
         railed.ingest(0, 20_000, 0, &[4_095; 8]);
         let clipped = plugin.current_level(&railed).expect("still reports");
         assert!(clipped.clipped);
-        assert!(plugin.optical_summary(&railed.samples).is_none());
+        assert!(plugin.optical_summary(&railed).is_none());
     }
 
     #[test]
