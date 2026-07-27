@@ -93,6 +93,13 @@ calibration reads photodiode levels this way while driving only its own DAC:
 [`docs/adr/011-stage-a-pockels-transfer-calibration.md`](./adr/011-stage-a-pockels-transfer-calibration.md).
 Reserve the leased service path for *commanding* hardware someone else owns.
 
+A published field is part of that contract, so its **meaning must not depend on
+the publisher's UI state**. The photodiode plugin's display toggle used to
+select the optical geometry the published log-contrast was computed in, which
+silently retargeted A1's amplitude sweep whenever the chart was left on its
+default. Geometry follows the bench, not the display:
+[`docs/adr/012-stage-a-contrast-geometry-is-bench-not-display.md`](./adr/012-stage-a-contrast-geometry-is-bench-not-display.md).
+
 ## Host Views
 
 Plugins declare host-rendered datasets and views through:

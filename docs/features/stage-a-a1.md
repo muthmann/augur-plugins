@@ -133,8 +133,14 @@ quicklook falls back to the free-running fold on `T` instead of going empty.
 
    events per valid pixel in the trailing half-cycle, ON and OFF. A live indicator:
    are events appearing, does the ON/OFF timing look sane, is the response
-   saturating? It counts *every* event, so a noisy pixel weighs heavily — it is a
-   quicklook, not the response metric.
+   saturating? It counts *every* event in the ROI, so a noisy pixel weighs heavily
+   — it is a quicklook, not the response metric.
+
+   `N_valid` is **ROI area minus masked pixels**, the same denominator `q_p` uses,
+   and the numerator counts only events inside that same region. The two are shown
+   side by side and have to mean the same thing; normalising `S_p` over the whole
+   sensor under-reported it by the ROI/frame ratio while counting events from
+   outside the ROI.
 
 2. **Response probability** `q_p`
 
@@ -186,10 +192,10 @@ still reset everything.
 
 | Input | Source |
 |---|---|
-| camera events, valid pixels | retained **EventStore** over a trailing analysis window; falls back to `frame.events()` |
+| camera events, valid pixels | retained **EventStore** over a trailing analysis window; falls back to `frame.events()`, trimmed to the same window |
 | phase-0 markers | rising `frame.external_triggers()` — the host **banks trigger edges from dropped preview frames** into the next processed frame (drain-to-newest and the preview throttle drop whole frames; at low modulation frequencies the survivors alone rarely held 2 markers inside the analysis window) |
 | modulation period `T` | measured from the `EXT_TRIGGER` marker spacing; else the modulation plugin's acknowledged waveform — which, since the board-echo fallback, includes the **operator-armed UI drive**, not only service-path (leased) targets |
-| optical modulation depth `a` | photodiode plugin's optical summary (`measured_log_contrast`) |
+| optical modulation depth `a` | photodiode plugin's optical summary (`measured_log_contrast`) — always the *excitation* contrast, independent of that plugin's display mode (ADR 012) |
 | ROI, masked pixels | augur-rs camera config (`CTX_GLOBAL_SETTINGS`) |
 
 ## Tests
