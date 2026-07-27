@@ -561,10 +561,16 @@ fn apply_reply_fields(state: &mut DeviceState, fields: &BTreeMap<String, String>
     if let Some(wave) = fields.get("mod_wave") {
         let level = fields.get("mod_level").map(String::as_str).unwrap_or("?");
         let min = fields.get("mod_min").map(String::as_str).unwrap_or("?");
-        let freq_mhz = fields
+        // Parse the echoed frequency exactly once, as f64. Parsing it a second
+        // time as u64 silently yielded None the moment the firmware echoed a
+        // decimal ("10000.0"): `board_echo_target` then published
+        // frequency_millihz: 0, A1 rejected it, and A1 lost its only fallback
+        // modulation period whenever the EXT_TRIGGER markers were absent.
+        let freq_millihz = fields
             .get("mod_freq_mhz")
             .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(0.0);
+            .filter(|hz| hz.is_finite() && *hz >= 0.0);
+        let freq_mhz = freq_millihz.unwrap_or(0.0);
         state.board_mod = if wave == "SINE" || wave == "SQUARE" {
             format!("{wave} {min}..{level} @ {:.3} Hz", freq_mhz / 1_000.0)
         } else {
@@ -573,7 +579,7 @@ fn apply_reply_fields(state: &mut DeviceState, fields: &BTreeMap<String, String>
         state.board_wave = Some(wave.clone());
         state.board_level = fields.get("mod_level").and_then(|v| v.parse().ok());
         state.board_min = fields.get("mod_min").and_then(|v| v.parse().ok());
-        state.board_freq_millihz = fields.get("mod_freq_mhz").and_then(|v| v.parse().ok());
+        state.board_freq_millihz = freq_millihz.map(|hz| hz.round() as u64);
     }
 }
 
@@ -900,6 +906,9 @@ pub struct StageAModulationPlugin {
     // -- optical drive inversion (OPTICAL_* modes) --
     /// Requested optical log-modulation depth `a = ln(I_max / I_min)`.
     depth_a: f64,
+    /// The operator's armed `depth_a`, parked while a lease drives the optical
+    /// depth (A1's amplitude sweep) and restored by [`Self::end_lease`].
+    armed_depth_a: Option<f64>,
     /// Operating illumination `I_k` as a normalised lobe intensity `u_k ∈ (0,1]`.
     /// Held fixed while `a` is swept, so one response curve keeps `I_k` constant.
     operating_point: f64,
@@ -973,6 +982,7 @@ impl Default for StageAModulationPlugin {
             mode: Mode::Const,
             frequency_hz: 10.0,
             depth_a: 0.5,
+            armed_depth_a: None,
             operating_point: 0.5,
             v_null_dac: 0,
             v_pi_dac: 2_048,
@@ -1240,14 +1250,20 @@ impl StageAModulationPlugin {
     /// Queues one MOD command carrying the complete current drive settings;
     /// newer changes overwrite queued ones (drag coalescing).
     ///
-    /// Silent while another owner holds the DAC. Besides an automation lease
-    /// that now includes a calibration sweep: the host re-applies the *whole*
-    /// settings snapshot on every sync, and most handlers here call this
-    /// unconditionally, so without the guard every sync would re-arm the
-    /// operator's drive on top of the code the sweep just commanded — the
-    /// sweep would measure the armed waveform instead of its own staircase.
+    /// Silent while another owner holds the DAC: an automation lease, a
+    /// calibration sweep, or a running protocol. The host re-applies the
+    /// *whole* settings snapshot on every sync, and most handlers here call
+    /// this unconditionally, so without the guard every sync would re-arm the
+    /// operator's drive on top of the code the current owner just commanded —
+    /// the sweep would measure the armed waveform instead of its own
+    /// staircase, and a protocol step would be overwritten mid-step and held
+    /// until the next step boundary.
     fn send_modulation(&mut self) {
-        if self.link.is_none() || self.lease.is_some() || self.sweep.is_some() {
+        if self.link.is_none()
+            || self.lease.is_some()
+            || self.sweep.is_some()
+            || self.protocol_active()
+        {
             return;
         }
         let command = match self.drive_command() {
@@ -1887,7 +1903,7 @@ impl StageAModulationPlugin {
                     self.deferred_release_ack_published = false;
                     return Ok(response);
                 }
-                self.lease = None;
+                self.end_lease();
                 self.deferred_release_request = None;
                 self.shared
                     .fail_closed_on_stop
@@ -1976,6 +1992,10 @@ impl StageAModulationPlugin {
                         ));
                     }
                 };
+                // Remember what the operator had armed before the first
+                // sweep point, so `end_lease` can hand it back. Only the
+                // first one: later points must not overwrite the original.
+                self.armed_depth_a.get_or_insert(previous);
                 *self.shared.pending.lock().expect("pending lock") = Some(PendingOperation {
                     commands: vec![command],
                     purpose: "MOD",
@@ -2131,6 +2151,23 @@ impl StageAModulationPlugin {
         }
     }
 
+    /// Ends the current lease and gives the operator their armed drive back.
+    ///
+    /// A leased `SetOpticalDepth` (A1's amplitude sweep) writes straight into
+    /// `depth_a`. Without this the modulation UI kept showing — and the board
+    /// kept holding — the last sweep point's depth after the sweep finished,
+    /// rather than what the operator had armed. The calibration sweep already
+    /// restores through `Sweep::restore`; this is the leased equivalent.
+    fn end_lease(&mut self) {
+        self.lease = None;
+        if let Some(depth) = self.armed_depth_a.take() {
+            self.depth_a = depth;
+            // Re-arm the board only if nobody else now owns the DAC;
+            // `send_modulation` is itself guarded.
+            self.send_modulation();
+        }
+    }
+
     fn expire_lease_if_needed(&mut self) {
         let expired = self
             .lease
@@ -2152,7 +2189,7 @@ impl StageAModulationPlugin {
             purpose: "LEASE_EXPIRED_SAFE_OFF",
             meta: None,
         });
-        self.lease = None;
+        self.end_lease();
         self.last_error = Some("automation lease expired; queued STOP + output off".into());
         self.shared.bump();
     }
@@ -2175,7 +2212,7 @@ impl StageAModulationPlugin {
             return;
         }
         if self.deferred_release_ack_published {
-            self.lease = None;
+            self.end_lease();
             self.deferred_release_request = None;
             self.deferred_release_ack_published = false;
             self.shared
@@ -2201,7 +2238,7 @@ impl StageAModulationPlugin {
                     .store(self.lease.is_some(), Ordering::Relaxed);
                 self.disconnect();
             }
-            self.lease = None;
+            self.end_lease();
             self.deferred_release_request = None;
             self.deferred_release_ack_published = false;
             return;
@@ -2647,7 +2684,7 @@ impl Plugin for StageAModulationPlugin {
                 .fail_closed_on_stop
                 .store(self.lease.is_some(), Ordering::Relaxed);
             self.disconnect();
-            self.lease = None;
+            self.end_lease();
             self.deferred_release_request = None;
         }
     }
@@ -2662,7 +2699,7 @@ impl Plugin for StageAModulationPlugin {
                     .store(self.lease.is_some(), Ordering::Relaxed);
                 self.disconnect();
             }
-            self.lease = None;
+            self.end_lease();
             self.deferred_release_request = None;
             self.deferred_release_ack_published = false;
         }
@@ -2686,7 +2723,7 @@ impl Plugin for StageAModulationPlugin {
                 .fail_closed_on_stop
                 .store(self.lease.is_some(), Ordering::Relaxed);
             self.disconnect();
-            self.lease = None;
+            self.end_lease();
             self.last_error = Some("disconnected: replay mode".into());
         }
     }
@@ -3336,6 +3373,13 @@ impl Plugin for StageAModulationPlugin {
                         return Err(error);
                     }
                     self.send_modulation();
+                }
+                // An edit made while a lease drives the depth is withheld from
+                // the board (`send_modulation` is guarded), so it has to land
+                // in the parked value or it would be lost when the lease ends
+                // — same rule the calibration sweep follows.
+                if self.armed_depth_a.is_some() {
+                    self.armed_depth_a = Some(self.depth_a);
                 }
                 Ok(())
             }
@@ -4716,6 +4760,114 @@ level = 750
             other => panic!("expected periodic waveform, got {other:?}"),
         }
         plugin.disconnect();
+    }
+
+    #[test]
+    fn ending_a_lease_restores_the_operators_armed_optical_depth() {
+        let mut plugin = live_plugin();
+        plugin.port_hint = "mock".into();
+        plugin.connect_requested = true;
+        plugin.connect();
+        wait_until(&plugin, Duration::from_secs(2), |owner| {
+            owner.device_connected()
+        });
+        plugin.method = DriveMethod::Calibrated;
+        plugin.mode = Mode::Sine;
+        plugin.depth_a = 0.4; // what the operator armed
+
+        let acquire = service_request(
+            &plugin,
+            60,
+            "stage-a-a1",
+            ModulationCommandV1::AcquireLease { ttl_ms: 10_000 },
+            None,
+        );
+        plugin.handle_service_request(&acquire, &live_execution());
+
+        // Two sweep points: only the first must be remembered as "armed".
+        for (id, milli) in [(61_u64, 900_u32), (62, 1_250)] {
+            let point = service_request(
+                &plugin,
+                id,
+                "stage-a-a1",
+                ModulationCommandV1::SetOpticalDepth {
+                    depth_a_milli: milli,
+                },
+                None,
+            );
+            let reply = plugin.handle_service_request(&point, &live_execution());
+            assert!(
+                matches!(reply.outcome, PluginServiceOutcome::Accepted { .. }),
+                "sweep point {milli} rejected: {:?}",
+                reply.outcome
+            );
+        }
+        assert!((plugin.depth_a - 1.25).abs() < 1e-9, "sweep drives the depth");
+
+        plugin.end_lease();
+        assert!(
+            (plugin.depth_a - 0.4).abs() < 1e-9,
+            "armed depth not restored: {}",
+            plugin.depth_a
+        );
+        assert!(plugin.armed_depth_a.is_none());
+        plugin.disconnect();
+    }
+
+    #[test]
+    fn a_running_protocol_owns_the_pending_slot() {
+        // The host re-applies the whole settings snapshot on every sync. An
+        // unguarded `send_modulation` would drop the operator's armed drive
+        // into the slot the protocol step is queued in, and the board would
+        // hold it until the next step boundary.
+        let mut plugin = live_plugin();
+        plugin.port_hint = "mock".into();
+        plugin.connect_requested = true;
+        plugin.connect();
+        wait_until(&plugin, Duration::from_secs(2), |owner| {
+            owner.device_connected()
+        });
+
+        let progress = Arc::new(Mutex::new(ProtocolProgress::default()));
+        plugin.protocol = Some(ProtocolRun {
+            progress: Arc::clone(&progress),
+            stop: Arc::new(AtomicBool::new(false)),
+            join: None,
+        });
+        assert!(plugin.protocol_active());
+
+        *plugin.shared.pending.lock().unwrap() = None;
+        plugin.set_setting("max_level", json!(3_000)).expect("set");
+        assert!(
+            plugin.shared.pending.lock().unwrap().is_none(),
+            "a settings sync overwrote the protocol's pending slot"
+        );
+
+        // Once the protocol finishes, the operator's drive gets through again.
+        progress.lock().unwrap().finished = true;
+        assert!(!plugin.protocol_active());
+        plugin.set_setting("max_level", json!(3_100)).expect("set");
+        assert!(plugin.shared.pending.lock().unwrap().is_some());
+        plugin.disconnect();
+    }
+
+    #[test]
+    fn a_decimal_frequency_echo_still_yields_millihertz() {
+        // Firmware echoing "10000.0" used to parse as u64 -> None, which
+        // published frequency_millihz: 0 and cost A1 its fallback period.
+        let mut state = DeviceState::default();
+        let mut fields = BTreeMap::new();
+        fields.insert("mod_wave".to_owned(), "SINE".to_owned());
+        fields.insert("mod_level".to_owned(), "2000".to_owned());
+        fields.insert("mod_min".to_owned(), "100".to_owned());
+        fields.insert("mod_freq_mhz".to_owned(), "10000.0".to_owned());
+        apply_reply_fields(&mut state, &fields);
+        assert_eq!(state.board_freq_millihz, Some(10_000));
+
+        // The integer form keeps working.
+        fields.insert("mod_freq_mhz".to_owned(), "7500".to_owned());
+        apply_reply_fields(&mut state, &fields);
+        assert_eq!(state.board_freq_millihz, Some(7_500));
     }
 
     #[test]
