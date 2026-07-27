@@ -21,10 +21,10 @@
 //! or — for modulated signals — one full period of a user-given frequency,
 //! which makes the mean independent of the modulation phase.
 
-use std::collections::VecDeque;
-use std::fs::File;
+use std::collections::{BTreeMap, VecDeque};
+use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -34,12 +34,26 @@ use augur_plugin_api::PathDialogKind;
 use augur_plugin_api::{
     export_plugin, EventStoreHandle, HostContext, HostDatasetDescriptor, HostDatasetKind,
     HostOutput, HostViewDescriptor, HostViewKind, HostViewPlacement, HostViewRegistry, Plugin,
-    PluginFrame, Series1dLine, Series1dPoint, Series1dV1, SettingItem, SettingKind, SettingsSchema,
-    SettingsSection, StatusEntry, TableColumn, TableColumnData, TableColumnValues, TableDatasetV1,
-    TableSchema, TableValueType,
+    PluginControlContext, PluginControlSnapshot, PluginFrame, PluginRuntimeRole,
+    PluginServiceOutcome, PluginServiceReply, PluginServiceRequest, Series1dLine, Series1dPoint,
+    Series1dV1, SettingItem, SettingKind, SettingsSchema, SettingsSection, StatusEntry,
+    TableColumn, TableColumnData, TableColumnValues, TableDatasetV1, TableSchema, TableValueType,
 };
 use serde_json::{json, Value};
-use stage_a_io::{FrameParser, ParseEvent, PdqWriter, StreamIntegrity};
+use stage_a_io::{
+    estimate_contrast, AdcCalibration, ContrastGeometry, FrameParser, ParseEvent, PdqWriter,
+    StreamIntegrity,
+};
+use stage_a_plugin_contract::{
+    ClientId, ConnectionStateV1, FreshnessV1, LeaseId, LeaseSnapshotV1, OwnerInstanceId,
+    PdqFinalizedReceiptV1, PdqReceiptV1, PdqStartSpecV1, PdqStartedReceiptV1, PdqTerminationV1,
+    PhotodiodeCalibrationV1, PhotodiodeCommandV1, PhotodiodeLevelV1, PhotodiodeOpticalSummaryV1,
+    PhotodiodeRequestV1, PhotodiodeResponseV1, PhotodiodeStreamV1, PhotodiodeSummaryV1,
+    RequestOutcomeV1, ResponseCommonV1, RunId, SampleRangeV1, SemanticRevision, ServiceErrorCodeV1,
+    ServiceErrorV1, Sha256V1, StreamIntegrityV1, SynchronizationV1, UnsyncedReasonV1,
+    CONTRACT_VERSION_V1, CTX_STAGE_A_PHOTODIODE_SUMMARY_V1, PLUGIN_ID_STAGE_A_PHOTODIODE,
+    SERVICE_STAGE_A_PHOTODIODE_CONTROL_V1,
+};
 
 const SERIES_DATASET_ID: &str = "stage-a-photodiode.series";
 const SPECTRUM_DATASET_ID: &str = "stage-a-photodiode.spectrum";
@@ -69,7 +83,22 @@ const SPECTRUM_MIN_SAMPLES: usize = 256;
 const SPECTRUM_MAX_SAMPLES: usize = 16_384;
 /// The firmware's default stream rate; the mock mirrors it.
 const MOCK_RATE_HZ: u32 = 20_000;
+/// Trailing samples used for the live optical log-contrast `a`. Sized like the
+/// spectrum window so a handful of modulation cycles are always covered.
+const CONTRAST_WINDOW_SAMPLES: usize = 16_384;
 const MOCK_BLOCK_SAMPLES: usize = 256;
+/// Cap on retained phase-0 markers (bounds the overlay + frequency window).
+const MAX_MARKERS: usize = 4_096;
+/// Mock phase-0 marker period in samples (20 kSa/s / 40 = 500 Hz modulation).
+const MOCK_MARKER_PERIOD_SAMPLES: u64 = 40;
+/// Codes within this margin of an ADC rail mark a level window as clipped;
+/// mirrors the estimator's own clip margin.
+const CLIP_MARGIN_CODES: u16 = 4;
+const REQUEST_CACHE_LIMIT: usize = 256;
+const MIN_LEASE_TTL_MS: u64 = 1_000;
+const MAX_LEASE_TTL_MS: u64 = 60_000;
+const SNAPSHOT_VALID_FOR_MS: u64 = 2_000;
+static OWNER_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 fn code_to_volts(code: f64) -> f64 {
     code * ADC_FULL_SCALE_VOLTS / ADC_MAX_CODE
@@ -138,6 +167,10 @@ struct SharedState {
     /// chart and moving average never rescan the raw window — at 500 kSa/s a
     /// full-window rescan per repaint would not be viable.
     cells: VecDeque<SummaryCell>,
+    /// Phase-0 marker sample indices (device clock) still inside the ring, from
+    /// `Marker` stream frames. Used for the opt-in trigger overlay and to derive
+    /// the modulation frequency.
+    markers: VecDeque<u64>,
     latest: Option<u16>,
     /// Cumulative firmware-side drop counter (latest header value).
     device_dropped: u32,
@@ -148,6 +181,7 @@ struct SharedState {
     /// Monitor-cache length driving ring eviction (user setting).
     cache_seconds: f64,
     error: Option<String>,
+    last_update_unix_ms: u64,
 }
 
 /// min/max/sum over exactly [`SUMMARY_CELL`] consecutive raw samples.
@@ -183,6 +217,7 @@ impl Default for SharedState {
             ring_first_index: 0,
             samples: VecDeque::new(),
             cells: VecDeque::new(),
+            markers: VecDeque::new(),
             latest: None,
             device_dropped: 0,
             crc_failures: 0,
@@ -190,6 +225,7 @@ impl Default for SharedState {
             segments: 0,
             cache_seconds: DEFAULT_CACHE_SECONDS,
             error: None,
+            last_update_unix_ms: 0,
         }
     }
 }
@@ -215,12 +251,14 @@ impl SharedState {
             }
             self.samples.clear();
             self.cells.clear();
+            self.markers.clear();
             self.ring_first_index = first_index;
             self.rate_hz = rate_hz;
         }
         self.samples.extend(codes.iter().copied());
         self.latest = codes.last().copied();
         self.device_dropped = device_dropped;
+        self.last_update_unix_ms = now_unix_ms();
 
         // Summarize every newly completed cell.
         while (self.cells.len() + 1) * SUMMARY_CELL <= self.samples.len() {
@@ -251,6 +289,47 @@ impl SharedState {
             self.cells.drain(..evict_cells);
             self.ring_first_index += evict as u64;
         }
+        // Drop markers that fell out of the retained ring window.
+        while self
+            .markers
+            .front()
+            .is_some_and(|&index| index < self.ring_first_index)
+        {
+            self.markers.pop_front();
+        }
+    }
+
+    /// Records a phase-0 marker (device sample index) if it sits inside the
+    /// current ring window. Bounded so a marker storm cannot grow unbounded.
+    fn push_marker(&mut self, sample_index: u64) {
+        if sample_index < self.ring_first_index {
+            return;
+        }
+        if self
+            .markers
+            .back()
+            .is_some_and(|&last| last == sample_index)
+        {
+            return; // ignore duplicate stamps
+        }
+        self.markers.push_back(sample_index);
+        while self.markers.len() > MAX_MARKERS {
+            self.markers.pop_front();
+        }
+        self.last_update_unix_ms = now_unix_ms();
+    }
+
+    /// Mean marker spacing in samples, i.e. the modulation period on the device
+    /// clock — the trigger *defining* the frequency. `None` with < 2 markers.
+    fn marker_period_samples(&self) -> Option<f64> {
+        if self.markers.len() < 2 {
+            return None;
+        }
+        let first = *self.markers.front()?;
+        let last = *self.markers.back()?;
+        let spans = (self.markers.len() - 1) as f64;
+        let period = last.saturating_sub(first) as f64 / spans;
+        (period > 0.0).then_some(period)
     }
 
     /// min/max/sum over deque offsets `[start, end)`, combining whole
@@ -306,6 +385,14 @@ impl SharedState {
 struct RecordingSink {
     writer: PdqWriter,
     pdq_path: PathBuf,
+    sidecar_path: PathBuf,
+    pdq_path_label: String,
+    sidecar_path_label: String,
+    run_id: RunId,
+    opened_at_unix_ms: u64,
+    stream_epoch: u64,
+    first_sample_index: Option<u64>,
+    metadata: BTreeMap<String, String>,
     started_slug: String,
     samples_written: u64,
     write_error: Option<String>,
@@ -315,6 +402,19 @@ struct RecordingSink {
     start_resync_bytes: u64,
     start_device_dropped: u32,
     start_segments: u64,
+}
+
+impl RecordingSink {
+    fn started_receipt(&self) -> PdqStartedReceiptV1 {
+        PdqStartedReceiptV1 {
+            run_id: self.run_id.clone(),
+            pdq_path: self.pdq_path_label.clone(),
+            sidecar_path: self.sidecar_path_label.clone(),
+            opened_at_unix_ms: self.opened_at_unix_ms,
+            stream_epoch: self.stream_epoch,
+            first_sample_index: self.first_sample_index,
+        }
+    }
 }
 
 type SharedRecording = Arc<Mutex<Option<RecordingSink>>>;
@@ -422,6 +522,15 @@ impl Reader {
                         sequence = sequence.wrapping_add(1);
                         if let Ok(mut state) = shared.lock() {
                             state.ingest(next_index, MOCK_RATE_HZ, 0, &codes);
+                            // Synthesize phase-0 markers on the device clock so the
+                            // trigger overlay and frequency work without hardware.
+                            let block_end = next_index + MOCK_BLOCK_SAMPLES as u64;
+                            let mut marker =
+                                next_index.next_multiple_of(MOCK_MARKER_PERIOD_SAMPLES);
+                            while marker < block_end {
+                                state.push_marker(marker);
+                                marker += MOCK_MARKER_PERIOD_SAMPLES;
+                            }
                         }
                         next_index += MOCK_BLOCK_SAMPLES as u64;
                         produced = true;
@@ -506,6 +615,13 @@ fn read_frames(
         while let Some(event) = parser.next_event() {
             match event {
                 ParseEvent::Frame(frame) => {
+                    if let Some(marker) = frame.marker() {
+                        if let Ok(mut state) = shared.lock() {
+                            state.push_marker(marker.sample_index);
+                        }
+                        changed = true;
+                        continue;
+                    }
                     let Some(codes) = frame.samples() else {
                         continue; // Control/summary frames are not expected here.
                     };
@@ -540,6 +656,15 @@ fn read_frames(
 
 pub struct StageAPhotodiodePlugin {
     enabled: bool,
+    runtime_role: PluginRuntimeRole,
+    effects_allowed: bool,
+    owner_instance: OwnerInstanceId,
+    lease: Option<ControlLease>,
+    request_cache: VecDeque<(PluginServiceRequest, PluginServiceReply)>,
+    requested_revision: Option<SemanticRevision>,
+    acknowledged_revision: Option<SemanticRevision>,
+    last_response: Option<PhotodiodeResponseV1>,
+    last_finalized_recording: Option<PdqFinalizedReceiptV1>,
     reader: Option<Reader>,
     shared: Arc<Mutex<SharedState>>,
     generation: Arc<AtomicU64>,
@@ -556,13 +681,86 @@ pub struct StageAPhotodiodePlugin {
     avg_samples: usize,
     avg_sync_freq_hz: f64,
     time_axis: TimeAxis,
+    /// Overlay the phase-0 trigger markers on the chart (opt-in).
+    show_markers: bool,
     data_dir: String,
+    // -- momentary-button press forwarding (see PressLatch) --
+    press_save_snapshot: PressLatch,
+    press_record_start: PressLatch,
+    press_record_stop: PressLatch,
+}
+
+/// Forwards momentary button presses across the host's UI-mirror → live-worker
+/// settings snapshot. A click arrives as `true` on the clicked instance; the
+/// other instance only ever sees the snapshot value from `get_setting`, so the
+/// press is transported as a monotonic counter and a counter advance counts as
+/// one press edge. The first counter a fresh instance sees is adopted silently
+/// so a reloaded worker does not replay old presses. Without this, an
+/// unguarded button `set_setting` fires on every settings sync — the
+/// "snapshot files kept appearing" bug.
+#[derive(Debug, Default, Clone, Copy)]
+struct PressLatch {
+    counter: u64,
+    seen: Option<u64>,
+}
+
+impl PressLatch {
+    /// Interprets a settings write to this button; returns true on a press edge.
+    fn accept(&mut self, value: &Value) -> bool {
+        if value.as_bool() == Some(true) {
+            self.counter += 1;
+            self.seen = Some(self.counter);
+            return true;
+        }
+        let Some(incoming) = value.as_u64() else {
+            return false;
+        };
+        match self.seen {
+            None => {
+                self.seen = Some(incoming);
+                self.counter = self.counter.max(incoming);
+                false
+            }
+            Some(seen) if incoming > seen => {
+                self.seen = Some(incoming);
+                self.counter = self.counter.max(incoming);
+                true
+            }
+            Some(_) => false,
+        }
+    }
+
+    fn value(&self) -> Value {
+        json!(self.counter)
+    }
+}
+
+#[derive(Clone)]
+struct ControlLease {
+    lease_id: LeaseId,
+    holder: ClientId,
+    run_id: Option<RunId>,
+    expires_at_unix_ms: u64,
 }
 
 impl Default for StageAPhotodiodePlugin {
     fn default() -> Self {
         Self {
             enabled: false,
+            runtime_role: PluginRuntimeRole::UiMirror,
+            effects_allowed: false,
+            owner_instance: OwnerInstanceId::new(format!(
+                "photodiode-{}-{}-{}",
+                std::process::id(),
+                now_unix_ms(),
+                OWNER_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            )),
+            lease: None,
+            request_cache: VecDeque::new(),
+            requested_revision: None,
+            acknowledged_revision: None,
+            last_response: None,
+            last_finalized_recording: None,
             reader: None,
             shared: Arc::new(Mutex::new(SharedState::default())),
             generation: Arc::new(AtomicU64::new(1)),
@@ -577,7 +775,11 @@ impl Default for StageAPhotodiodePlugin {
             avg_samples: 4,
             avg_sync_freq_hz: 0.0,
             time_axis: TimeAxis::BeforeNow,
+            show_markers: false,
             data_dir: String::new(),
+            press_save_snapshot: PressLatch::default(),
+            press_record_start: PressLatch::default(),
+            press_record_stop: PressLatch::default(),
         }
     }
 }
@@ -589,6 +791,10 @@ impl StageAPhotodiodePlugin {
 
     fn connect(&mut self) {
         if self.reader.is_some() {
+            return;
+        }
+        if self.runtime_role != PluginRuntimeRole::LiveWorker || !self.effects_allowed {
+            self.last_error = Some("connection deferred: hardware effects are not allowed".into());
             return;
         }
         if let Ok(mut state) = self.shared.lock() {
@@ -648,15 +854,189 @@ impl StageAPhotodiodePlugin {
         Ok(PathBuf::from(self.data_dir.trim()))
     }
 
+    /// Resolves a workflow-owned relative evidence path beneath the configured
+    /// data directory. Existing or newly created parent components must be
+    /// real directories, never symlinks.
+    fn resolve_control_path(&self, label: &str, extension: &str) -> Result<PathBuf, String> {
+        let relative = Path::new(label);
+        if relative.as_os_str().is_empty()
+            || relative.is_absolute()
+            || relative
+                .components()
+                .any(|part| !matches!(part, Component::Normal(_)))
+        {
+            return Err(
+                "workflow recording paths must be non-empty relative paths without '..'".into(),
+            );
+        }
+        if relative.extension().and_then(|value| value.to_str()) != Some(extension) {
+            return Err(format!("workflow path must use the .{extension} extension"));
+        }
+
+        let root = self.resolved_data_dir()?;
+        std::fs::create_dir_all(&root)
+            .map_err(|err| format!("creating {} failed: {err}", root.display()))?;
+        let root = root
+            .canonicalize()
+            .map_err(|err| format!("resolving data directory failed: {err}"))?;
+        let mut parent = root.clone();
+        if let Some(relative_parent) = relative.parent() {
+            for component in relative_parent.components() {
+                let Component::Normal(name) = component else {
+                    return Err("invalid workflow recording path".into());
+                };
+                parent.push(name);
+                match std::fs::symlink_metadata(&parent) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        return Err(format!(
+                            "workflow path crosses symlink {}",
+                            parent.display()
+                        ));
+                    }
+                    Ok(metadata) if !metadata.is_dir() => {
+                        return Err(format!("{} is not a directory", parent.display()));
+                    }
+                    Ok(_) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        std::fs::create_dir(&parent).map_err(|err| {
+                            format!("creating {} failed: {err}", parent.display())
+                        })?;
+                    }
+                    Err(err) => {
+                        return Err(format!("checking {} failed: {err}", parent.display()));
+                    }
+                }
+                let canonical = parent
+                    .canonicalize()
+                    .map_err(|err| format!("resolving {} failed: {err}", parent.display()))?;
+                if !canonical.starts_with(&root) {
+                    return Err("workflow path escapes the configured data directory".into());
+                }
+            }
+        }
+        let candidate = root.join(relative);
+        if let Ok(metadata) = std::fs::symlink_metadata(&candidate) {
+            if metadata.file_type().is_symlink() {
+                return Err(format!(
+                    "workflow target is a symlink: {}",
+                    candidate.display()
+                ));
+            }
+        }
+        Ok(candidate)
+    }
+
+    fn begin_named_recording(
+        &mut self,
+        run_id: RunId,
+        specification: &PdqStartSpecV1,
+    ) -> Result<PdqStartedReceiptV1, ServiceErrorV1> {
+        if !self.connected() {
+            return Err(service_error(
+                ServiceErrorCodeV1::NotConnected,
+                "photodiode stream is not connected",
+                true,
+            ));
+        }
+        if specification.metadata.len() > 64
+            || specification
+                .metadata
+                .iter()
+                .any(|(key, value)| key.len() > 128 || value.len() > 1_024)
+        {
+            return Err(service_error(
+                ServiceErrorCodeV1::InvalidCommand,
+                "recording metadata exceeds owner bounds",
+                false,
+            ));
+        }
+        let (rate_hz, stream_epoch) = self
+            .shared
+            .lock()
+            .map(|state| (state.rate_hz, state.segments))
+            .unwrap_or((0, 0));
+        if specification
+            .expected_sample_rate_hz
+            .is_some_and(|expected| rate_hz != 0 && expected != rate_hz)
+            || specification
+                .expected_stream_epoch
+                .is_some_and(|expected| expected != stream_epoch)
+        {
+            return Err(service_error(
+                ServiceErrorCodeV1::Integrity,
+                "live photodiode stream does not match the requested epoch or sample rate",
+                true,
+            ));
+        }
+        let pdq_path = self
+            .resolve_control_path(&specification.pdq_path, "pdq")
+            .map_err(|message| service_error(ServiceErrorCodeV1::InvalidPath, message, false))?;
+        let sidecar_path = self
+            .resolve_control_path(&specification.sidecar_path, "json")
+            .map_err(|message| service_error(ServiceErrorCodeV1::InvalidPath, message, false))?;
+        if pdq_path == sidecar_path {
+            return Err(service_error(
+                ServiceErrorCodeV1::InvalidPath,
+                "PDQ and sidecar paths must differ",
+                false,
+            ));
+        }
+        self.open_recording(
+            run_id,
+            pdq_path,
+            sidecar_path,
+            specification.pdq_path.clone(),
+            specification.sidecar_path.clone(),
+            specification.metadata.clone(),
+            true,
+        )
+        .map_err(|message| service_error(ServiceErrorCodeV1::Io, message, false))
+    }
+
     fn start_recording(&mut self) -> Result<(), String> {
-        if self.recording_active() {
-            return Ok(());
+        if self.runtime_role != PluginRuntimeRole::LiveWorker || !self.effects_allowed {
+            return Err("recording is allowed only on the active live worker".into());
+        }
+        if self.lease.is_some() {
+            return Err("manual recording is locked while a workflow lease is active".into());
         }
         let dir = self.resolved_data_dir()?;
         let slug = timestamp_slug();
         let pdq_path = dir.join(format!("pd_rec_{slug}.pdq"));
-        let writer = PdqWriter::create(&pdq_path)
-            .map_err(|err| format!("creating {} failed: {err}", pdq_path.display()))?;
+        let sidecar_path = pdq_path.with_extension("json");
+        self.open_recording(
+            RunId::new(format!("manual-{slug}")),
+            pdq_path.clone(),
+            sidecar_path.clone(),
+            pdq_path.to_string_lossy().into_owned(),
+            sidecar_path.to_string_lossy().into_owned(),
+            BTreeMap::new(),
+            false,
+        )?;
+        self.last_save_note = Some(format!("recording → {}", pdq_path.display()));
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn open_recording(
+        &mut self,
+        run_id: RunId,
+        pdq_path: PathBuf,
+        sidecar_path: PathBuf,
+        pdq_path_label: String,
+        sidecar_path_label: String,
+        metadata: BTreeMap<String, String>,
+        exclusive: bool,
+    ) -> Result<PdqStartedReceiptV1, String> {
+        if self.recording_active() {
+            return Err("a photodiode recording is already active".into());
+        }
+        let writer = if exclusive {
+            PdqWriter::create_new(&pdq_path)
+        } else {
+            PdqWriter::create(&pdq_path)
+        }
+        .map_err(|err| format!("creating {} failed: {err}", pdq_path.display()))?;
         let (crc, resync, dropped, segments) = match self.shared.lock() {
             Ok(state) => (
                 state.crc_failures,
@@ -666,10 +1046,45 @@ impl StageAPhotodiodePlugin {
             ),
             Err(_) => (0, 0, 0, 0),
         };
+        let (stream_epoch, first_sample_index) = self
+            .shared
+            .lock()
+            .map(|state| {
+                (
+                    state.segments,
+                    (!state.samples.is_empty())
+                        .then_some(state.ring_first_index + state.samples.len() as u64),
+                )
+            })
+            .unwrap_or((0, None));
+        let opened_at_unix_ms = now_unix_ms();
+        let started_slug = timestamp_slug();
+        if exclusive {
+            let started = json!({
+                "kind": "recording_in_progress",
+                "run_id": run_id.as_str(),
+                "opened_at_unix_ms": opened_at_unix_ms,
+                "pdq_path": pdq_path_label,
+                "metadata": metadata,
+            });
+            if let Err(err) = write_json_new(&sidecar_path, &started) {
+                drop(writer);
+                let _ = std::fs::remove_file(&pdq_path);
+                return Err(err);
+            }
+        }
         let sink = RecordingSink {
             writer,
             pdq_path: pdq_path.clone(),
-            started_slug: slug,
+            sidecar_path,
+            pdq_path_label,
+            sidecar_path_label,
+            run_id,
+            opened_at_unix_ms,
+            stream_epoch,
+            first_sample_index,
+            metadata,
+            started_slug,
             samples_written: 0,
             write_error: None,
             start_crc_failures: crc,
@@ -677,16 +1092,25 @@ impl StageAPhotodiodePlugin {
             start_device_dropped: dropped,
             start_segments: segments,
         };
+        let receipt = sink.started_receipt();
         if let Ok(mut slot) = self.recording.lock() {
             *slot = Some(sink);
         }
-        self.last_save_note = Some(format!("recording → {}", pdq_path.display()));
-        Ok(())
+        self.generation.fetch_add(1, Ordering::Relaxed);
+        Ok(receipt)
     }
 
     fn stop_recording(&mut self) -> Result<(), String> {
+        self.finalize_recording(PdqTerminationV1::OperatorStopped)
+            .map(|_| ())
+    }
+
+    fn finalize_recording(
+        &mut self,
+        termination: PdqTerminationV1,
+    ) -> Result<Option<PdqFinalizedReceiptV1>, String> {
         let Some(sink) = self.recording.lock().ok().and_then(|mut slot| slot.take()) else {
-            return Ok(());
+            return Ok(None);
         };
         let (rate_hz, crc, resync, dropped, segments) = match self.shared.lock() {
             Ok(state) => (
@@ -707,12 +1131,43 @@ impl StageAPhotodiodePlugin {
         let write_error = sink.write_error.clone();
         let started = sink.started_slug.clone();
         let samples = sink.samples_written;
+        let pdq_path = sink.pdq_path.clone();
+        let sidecar_path = sink.sidecar_path.clone();
+        let run_id = sink.run_id.clone();
+        let opened_at_unix_ms = sink.opened_at_unix_ms;
+        let pdq_path_label = sink.pdq_path_label.clone();
+        let sidecar_path_label = sink.sidecar_path_label.clone();
+        let metadata = sink.metadata.clone();
         let summary = sink
             .writer
             .finish(integrity)
             .map_err(|err| format!("finishing recording failed: {err}"))?;
+        let contract_integrity = contract_integrity(summary.integrity, summary.sample_segments);
+        let receipt = PdqFinalizedReceiptV1 {
+            run_id: run_id.clone(),
+            pdq_path: pdq_path_label,
+            sidecar_path: sidecar_path_label,
+            opened_at_unix_ms,
+            finalized_at_unix_ms: now_unix_ms(),
+            file_size_bytes: summary.bytes_written,
+            sha256: Sha256V1::parse(summary.file_sha256_hex())
+                .map_err(|err| format!("invalid recording digest: {err}"))?,
+            frames_written: summary.frames_written,
+            sample_frames_written: summary.sample_frames_written,
+            sample_range: summary.sample_range.map(|range| SampleRangeV1 {
+                first_sample_index: range.first_sample_index,
+                end_sample_index_exclusive: range.end_sample_index_exclusive,
+                sample_count: range.sample_count,
+            }),
+            sample_rate_hz: summary.sample_rate_hz,
+            segment_count: summary.sample_segments,
+            integrity: contract_integrity,
+            termination,
+            valid: summary.valid && write_error.is_none(),
+        };
         let sidecar = json!({
             "kind": "recording",
+            "run_id": run_id,
             "started_utc": started,
             "stopped_utc": timestamp_slug(),
             "port": self.port_hint,
@@ -722,6 +1177,9 @@ impl StageAPhotodiodePlugin {
             "pdq_frames": summary.frames_written,
             "pdq_bytes": summary.bytes_written,
             "pdq_crc32": summary.file_crc32,
+            "pdq_sha256": receipt.sha256.as_str(),
+            "metadata": metadata,
+            "termination": receipt.termination,
             "adc": { "bits": 12, "full_scale_volts": ADC_FULL_SCALE_VOLTS },
             "display_mode": self.mode.name(),
             "reference_volts": self.reference_volts,
@@ -734,14 +1192,463 @@ impl StageAPhotodiodePlugin {
             "valid": summary.valid && write_error.is_none(),
             "write_error": write_error,
         });
-        let sidecar_path = sink.pdq_path.with_extension("json");
         write_json(&sidecar_path, &sidecar)?;
         self.last_save_note = Some(format!(
             "saved recording {} ({} samples)",
-            sink.pdq_path.display(),
+            pdq_path.display(),
             samples
         ));
+        self.last_finalized_recording = Some(receipt.clone());
+        self.generation.fetch_add(1, Ordering::Relaxed);
+        Ok(Some(receipt))
+    }
+
+    fn lease_snapshot(&self) -> Option<LeaseSnapshotV1> {
+        self.lease.as_ref().map(|lease| LeaseSnapshotV1 {
+            lease_id: lease.lease_id.clone(),
+            holder: lease.holder.clone(),
+            expires_at_unix_ms: lease.expires_at_unix_ms,
+            run_id: lease.run_id.clone(),
+        })
+    }
+
+    fn require_lease(&self, request: &PhotodiodeRequestV1) -> Result<(), ServiceErrorV1> {
+        let lease = self.lease.as_ref().ok_or_else(|| {
+            service_error(
+                ServiceErrorCodeV1::LeaseRequired,
+                "the photodiode owner requires an active automation lease",
+                false,
+            )
+        })?;
+        if now_unix_ms() > lease.expires_at_unix_ms {
+            return Err(service_error(
+                ServiceErrorCodeV1::LeaseExpired,
+                "the photodiode automation lease expired",
+                false,
+            ));
+        }
+        if request.lease_id.as_ref() != Some(&lease.lease_id)
+            || request.requester != lease.holder
+            || request.run_id != lease.run_id
+        {
+            return Err(service_error(
+                ServiceErrorCodeV1::LeaseMismatch,
+                "request lease, holder, or run does not match the active lease",
+                false,
+            ));
+        }
         Ok(())
+    }
+
+    fn require_new_revision(
+        &self,
+        request: &PhotodiodeRequestV1,
+    ) -> Result<SemanticRevision, ServiceErrorV1> {
+        let revision = request.requested_revision.ok_or_else(|| {
+            service_error(
+                ServiceErrorCodeV1::InvalidCommand,
+                "recording transitions require requested_revision",
+                false,
+            )
+        })?;
+        if self
+            .requested_revision
+            .is_some_and(|current| revision <= current)
+        {
+            return Err(service_error(
+                ServiceErrorCodeV1::StaleRequest,
+                "requested_revision must be newer than the current photodiode state",
+                false,
+            ));
+        }
+        Ok(revision)
+    }
+
+    fn immediate_response(
+        &mut self,
+        request: &PhotodiodeRequestV1,
+        receipt: Option<PdqReceiptV1>,
+    ) -> PhotodiodeResponseV1 {
+        let response = PhotodiodeResponseV1 {
+            common: ResponseCommonV1 {
+                contract_version: CONTRACT_VERSION_V1,
+                request_id: request.request_id,
+                owner_instance: self.owner_instance.clone(),
+                run_id: request.run_id.clone(),
+                requested_revision: request.requested_revision,
+                acknowledged_revision: self.acknowledged_revision,
+                outcome: RequestOutcomeV1::Applied,
+                completed_at_unix_ms: Some(now_unix_ms()),
+                error: None,
+            },
+            receipt,
+        };
+        self.last_response = Some(response.clone());
+        self.generation.fetch_add(1, Ordering::Relaxed);
+        response
+    }
+
+    fn handle_photodiode_command(
+        &mut self,
+        request: &PhotodiodeRequestV1,
+    ) -> Result<PhotodiodeResponseV1, ServiceErrorV1> {
+        match &request.command {
+            PhotodiodeCommandV1::Connect => {
+                if self.lease.is_some() {
+                    return Err(service_error(
+                        ServiceErrorCodeV1::LeaseBusy,
+                        "connection cannot be changed while leased",
+                        false,
+                    ));
+                }
+                self.connect_requested = true;
+                self.connect();
+                if !self.connected() {
+                    return Err(service_error(
+                        ServiceErrorCodeV1::Transport,
+                        self.last_error
+                            .clone()
+                            .unwrap_or_else(|| "photodiode connection failed".into()),
+                        true,
+                    ));
+                }
+                Ok(self.immediate_response(request, None))
+            }
+            PhotodiodeCommandV1::Disconnect {
+                finalize_recording,
+                reason,
+            } => {
+                if self.lease.is_some() {
+                    return Err(service_error(
+                        ServiceErrorCodeV1::LeaseBusy,
+                        "use ReleaseLease while the owner is leased",
+                        false,
+                    ));
+                }
+                let receipt = if *finalize_recording {
+                    self.finalize_recording(PdqTerminationV1::OperatorStopped)
+                        .map_err(|message| service_error(ServiceErrorCodeV1::Io, message, false))?
+                        .map(PdqReceiptV1::Finalized)
+                } else {
+                    None
+                };
+                self.connect_requested = false;
+                self.disconnect();
+                self.last_error = Some(format!("disconnected by service: {reason}"));
+                Ok(self.immediate_response(request, receipt))
+            }
+            PhotodiodeCommandV1::AcquireLease { ttl_ms } => {
+                let lease_id = request.lease_id.clone().ok_or_else(|| {
+                    service_error(
+                        ServiceErrorCodeV1::InvalidCommand,
+                        "AcquireLease requires lease_id",
+                        false,
+                    )
+                })?;
+                if let Some(active) = &self.lease {
+                    if active.lease_id != lease_id || active.holder != request.requester {
+                        return Err(service_error(
+                            ServiceErrorCodeV1::LeaseBusy,
+                            "the photodiode owner is already leased",
+                            true,
+                        ));
+                    }
+                }
+                self.lease = Some(ControlLease {
+                    lease_id,
+                    holder: request.requester.clone(),
+                    run_id: request.run_id.clone(),
+                    expires_at_unix_ms: lease_deadline(*ttl_ms),
+                });
+                Ok(self.immediate_response(request, None))
+            }
+            PhotodiodeCommandV1::RenewLease { ttl_ms } => {
+                self.require_lease(request)?;
+                if let Some(lease) = &mut self.lease {
+                    lease.expires_at_unix_ms = lease_deadline(*ttl_ms);
+                }
+                Ok(self.immediate_response(request, None))
+            }
+            PhotodiodeCommandV1::ReleaseLease {
+                finalize_recording,
+                reason,
+            } => {
+                self.require_lease(request)?;
+                let receipt = if *finalize_recording {
+                    self.finalize_recording(PdqTerminationV1::OperatorStopped)
+                        .map_err(|message| service_error(ServiceErrorCodeV1::Io, message, false))?
+                        .map(PdqReceiptV1::Finalized)
+                } else if self.recording_active() {
+                    return Err(service_error(
+                        ServiceErrorCodeV1::InvalidCommand,
+                        "cannot release a lease with an active recording unless it is finalized",
+                        false,
+                    ));
+                } else {
+                    None
+                };
+                self.lease = None;
+                self.last_error = Some(format!("automation lease released: {reason}"));
+                Ok(self.immediate_response(request, receipt))
+            }
+            PhotodiodeCommandV1::BeginRecording { specification } => {
+                self.require_lease(request)?;
+                let revision = self.require_new_revision(request)?;
+                let run_id = request.run_id.clone().ok_or_else(|| {
+                    service_error(
+                        ServiceErrorCodeV1::InvalidCommand,
+                        "BeginRecording requires run_id",
+                        false,
+                    )
+                })?;
+                let started = self.begin_named_recording(run_id, specification)?;
+                self.requested_revision = Some(revision);
+                self.acknowledged_revision = Some(revision);
+                Ok(self.immediate_response(request, Some(PdqReceiptV1::Started(started))))
+            }
+            PhotodiodeCommandV1::FinalizeRecording { termination } => {
+                self.require_lease(request)?;
+                let revision = self.require_new_revision(request)?;
+                let finalized = self
+                    .finalize_recording(*termination)
+                    .map_err(|message| service_error(ServiceErrorCodeV1::Io, message, false))?
+                    .ok_or_else(|| {
+                        service_error(
+                            ServiceErrorCodeV1::InvalidCommand,
+                            "no photodiode recording is active",
+                            false,
+                        )
+                    })?;
+                self.requested_revision = Some(revision);
+                self.acknowledged_revision = Some(revision);
+                Ok(self.immediate_response(request, Some(PdqReceiptV1::Finalized(finalized))))
+            }
+            PhotodiodeCommandV1::AbortRecording { reason } => {
+                self.require_lease(request)?;
+                let revision = self.require_new_revision(request)?;
+                let finalized = self
+                    .finalize_recording(PdqTerminationV1::Aborted)
+                    .map_err(|message| service_error(ServiceErrorCodeV1::Io, message, false))?
+                    .ok_or_else(|| {
+                        service_error(
+                            ServiceErrorCodeV1::InvalidCommand,
+                            "no photodiode recording is active",
+                            false,
+                        )
+                    })?;
+                self.requested_revision = Some(revision);
+                self.acknowledged_revision = Some(revision);
+                self.last_error = Some(format!("recording aborted: {reason}"));
+                Ok(self.immediate_response(request, Some(PdqReceiptV1::Finalized(finalized))))
+            }
+        }
+    }
+
+    /// Live optical log-contrast `a` from the trailing ring window. The ADC
+    /// always measures the rejected diode `I_pd`, so the display mode selects
+    /// the geometry: RAW reports the raw detector contrast (`Direct`),
+    /// EXCITATION reports the excitation contrast (`RejectedComplement`) using
+    /// `reference_volts` as the total-power anchor `I_tot`. `None` when there is
+    /// no valid window or, in EXCITATION mode, no valid anchor.
+    fn optical_summary(&self, samples: &VecDeque<u16>) -> Option<PhotodiodeOpticalSummaryV1> {
+        let start = samples.len().saturating_sub(CONTRAST_WINDOW_SAMPLES);
+        let window: Vec<u16> = samples.iter().skip(start).copied().collect();
+        let calibration = AdcCalibration {
+            volts_per_code: ADC_FULL_SCALE_VOLTS / ADC_MAX_CODE,
+            offset_volts: 0.0,
+            dark_volts: 0.0,
+            full_scale_code: ADC_MAX_CODE as u16,
+        };
+        let geometry = match self.mode {
+            Mode::Raw => ContrastGeometry::Direct,
+            Mode::Excitation => ContrastGeometry::RejectedComplement {
+                total_power_volts: self.reference_volts,
+            },
+        };
+        let estimate = estimate_contrast(&window, &calibration, geometry).ok()?;
+        let run_id = self
+            .lease
+            .as_ref()
+            .and_then(|lease| lease.run_id.clone())
+            .unwrap_or_else(|| RunId::from("live"));
+        Some(PhotodiodeOpticalSummaryV1 {
+            run_id,
+            calibration: PhotodiodeCalibrationV1 {
+                adc_calibration_id: "adc-default".into(),
+                dark_id: "dark-0".into(),
+                anchor_id: match self.mode {
+                    Mode::Raw => "detector-direct".into(),
+                    Mode::Excitation => "reference-volts".into(),
+                },
+                dark_volts: calibration.dark_volts,
+                total_power_volts: self.reference_volts,
+            },
+            measured_log_contrast: estimate.a,
+            log_contrast_stddev: None,
+            excitation_min_volts: estimate.v_min_volts,
+            excitation_max_volts: estimate.v_max_volts,
+            excitation_headroom_volts: estimate.v_min_volts,
+            low_clip_fraction: estimate.low_clip_fraction,
+            high_clip_fraction: estimate.high_clip_fraction,
+            measured_frequency_hz: None,
+            fundamental_phase_rad: None,
+            total_harmonic_distortion: None,
+        })
+    }
+
+    /// Locks the ring and returns the current optical log-contrast summary.
+    fn latest_optical(&self) -> Option<PhotodiodeOpticalSummaryV1> {
+        let state = self.shared.lock().ok()?;
+        self.optical_summary(&state.samples)
+    }
+
+    fn control_summary(&self) -> PhotodiodeSummaryV1 {
+        let (stream, connection, observed_at, optical_summary) = match self.shared.lock() {
+            Ok(state) => {
+                let sample_range = (!state.samples.is_empty()).then_some(SampleRangeV1 {
+                    first_sample_index: state.ring_first_index,
+                    end_sample_index_exclusive: state.ring_first_index + state.samples.len() as u64,
+                    sample_count: state.samples.len() as u64,
+                });
+                let optical_summary = self.optical_summary(&state.samples);
+                let level = self.current_level(&state);
+                let connection = if self.connected() {
+                    ConnectionStateV1::Connected {
+                        port_label: self.port_hint.clone(),
+                        firmware_version: None,
+                    }
+                } else if let Some(message) =
+                    state.error.clone().or_else(|| self.last_error.clone())
+                {
+                    ConnectionStateV1::Faulted { message }
+                } else if self.connect_requested {
+                    ConnectionStateV1::Connecting
+                } else {
+                    ConnectionStateV1::Disconnected
+                };
+                (
+                    PhotodiodeStreamV1 {
+                        stream_epoch: state.segments,
+                        sample_range,
+                        sample_rate_hz: (state.rate_hz != 0).then_some(state.rate_hz),
+                        latest_adc_code: state.latest,
+                        integrity: StreamIntegrityV1 {
+                            skipped_bytes: state.resync_bytes,
+                            crc_failures: state.crc_failures,
+                            sequence_gaps: state.segments,
+                            dropped_samples: u64::from(state.device_dropped),
+                            segment_restarts: state.segments,
+                            truncated_bytes: 0,
+                        },
+                        level,
+                    },
+                    connection,
+                    state.last_update_unix_ms,
+                    optical_summary,
+                )
+            }
+            Err(_) => (
+                PhotodiodeStreamV1 {
+                    stream_epoch: 0,
+                    sample_range: None,
+                    sample_rate_hz: None,
+                    latest_adc_code: None,
+                    integrity: StreamIntegrityV1::default(),
+                    level: None,
+                },
+                ConnectionStateV1::Faulted {
+                    message: "photodiode state lock poisoned".into(),
+                },
+                0,
+                None,
+            ),
+        };
+        let active_recording = self
+            .recording
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(RecordingSink::started_receipt));
+        let synchronization = match (
+            self.lease.as_ref().and_then(|lease| lease.run_id.clone()),
+            self.requested_revision,
+            self.acknowledged_revision,
+        ) {
+            (Some(run_id), Some(requested), Some(acknowledged)) if requested == acknowledged => {
+                SynchronizationV1::Synced {
+                    run_id,
+                    acknowledged_revision: acknowledged,
+                    stream_epoch: Some(stream.stream_epoch),
+                }
+            }
+            (None, _, _) => SynchronizationV1::Unsynced {
+                reason: UnsyncedReasonV1::NoLease,
+                detail: None,
+            },
+            _ => SynchronizationV1::Unsynced {
+                reason: UnsyncedReasonV1::RequestedRevisionNotAcknowledged,
+                detail: None,
+            },
+        };
+        PhotodiodeSummaryV1 {
+            contract_version: CONTRACT_VERSION_V1,
+            owner_instance: self.owner_instance.clone(),
+            service_revision: self.generation.load(Ordering::Relaxed),
+            connection,
+            lease: self.lease_snapshot(),
+            active_run_id: self.lease.as_ref().and_then(|lease| lease.run_id.clone()),
+            requested_revision: self.requested_revision,
+            acknowledged_revision: self.acknowledged_revision,
+            stream,
+            active_recording,
+            last_finalized_recording: self.last_finalized_recording.clone(),
+            optical_summary,
+            synchronization,
+            last_response: self.last_response.clone(),
+            freshness: FreshnessV1 {
+                observed_at_unix_ms: if observed_at == 0 {
+                    now_unix_ms()
+                } else {
+                    observed_at
+                },
+                valid_for_ms: SNAPSHOT_VALID_FOR_MS,
+            },
+        }
+    }
+
+    fn expire_lease_if_needed(&mut self) {
+        if self
+            .lease
+            .as_ref()
+            .is_none_or(|lease| now_unix_ms() <= lease.expires_at_unix_ms)
+        {
+            return;
+        }
+        if let Err(error) = self.finalize_recording(PdqTerminationV1::LeaseExpired) {
+            self.last_error = Some(error);
+        } else {
+            self.last_error = Some("automation lease expired; recording finalized".into());
+        }
+        self.lease = None;
+        self.generation.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn apply_execution_context(&mut self, execution: &augur_plugin_api::ExecutionContext) {
+        let allowed = self.runtime_role == PluginRuntimeRole::LiveWorker
+            && execution.hardware_effects_allowed();
+        self.effects_allowed = allowed;
+        if !allowed {
+            if let Err(error) = self.finalize_recording(PdqTerminationV1::Aborted) {
+                self.last_error = Some(error);
+            }
+            self.connect_requested = false;
+            self.disconnect();
+            self.lease = None;
+            return;
+        }
+        self.expire_lease_if_needed();
+        if self.connect_requested && self.reader.is_none() {
+            self.connect();
+        }
     }
 
     /// Dumps the current monitor cache (ring) as CSV + JSON sidecar. Raw
@@ -749,6 +1656,9 @@ impl StageAPhotodiodePlugin {
     /// EXCITATION values stay derivable without baking display state into
     /// the data.
     fn save_cache_snapshot(&mut self) -> Result<(), String> {
+        if self.runtime_role != PluginRuntimeRole::LiveWorker || !self.effects_allowed {
+            return Err("saving is allowed only on the active live worker".into());
+        }
         let dir = self.resolved_data_dir()?;
         let slug = timestamp_slug();
         let csv_path = dir.join(format!("pd_cache_{slug}.csv"));
@@ -842,6 +1752,40 @@ impl StageAPhotodiodePlugin {
             .min(state.samples.len());
         let start = state.samples.len() - window;
         Some(state.range_summary(start, state.samples.len()).mean())
+    }
+
+    /// Settled detector level over the same window, published on the contract
+    /// in **raw** detector volts — never `display_volts`, so a consumer does
+    /// not have to know the display mode, and never the optical geometry
+    /// transform, which needs an anchor this reading must not depend on.
+    ///
+    /// Deliberately fail-open where [`Self::optical_summary`] is fail-closed:
+    /// a transfer-curve sweep needs a level exactly at the excitation null,
+    /// where the reject-port detector is brightest and may rail. Clipping is
+    /// reported rather than refused.
+    fn current_level(&self, state: &SharedState) -> Option<PhotodiodeLevelV1> {
+        if state.samples.is_empty() {
+            return None;
+        }
+        let window = self
+            .avg_window_samples(state.rate_hz)
+            .min(state.samples.len());
+        let start = state.samples.len() - window;
+        let summary = state.range_summary(start, state.samples.len());
+        if summary.count == 0 {
+            return None;
+        }
+        let full_scale = ADC_MAX_CODE as u16;
+        Some(PhotodiodeLevelV1 {
+            mean_volts: code_to_volts(summary.mean()),
+            // `code_to_volts` is a pure scale, so it maps a code difference to
+            // a voltage difference directly.
+            peak_to_peak_volts: code_to_volts(f64::from(summary.max - summary.min)),
+            sample_count: summary.count as u64,
+            end_sample_index: state.ring_first_index + state.samples.len() as u64,
+            clipped: summary.min <= CLIP_MARGIN_CODES
+                || summary.max >= full_scale.saturating_sub(CLIP_MARGIN_CODES),
+        })
     }
 
     fn series_dataset(&self) -> Series1dV1 {
@@ -951,6 +1895,43 @@ impl StageAPhotodiodePlugin {
                 name: format!("avg ({avg_window} spl)"),
                 points: avg_points,
             });
+        }
+        // Opt-in phase-0 trigger overlay: one toggleable line drawing a vertical
+        // spike at each marker (up then back to a flat baseline between markers).
+        if self.show_markers && !state.markers.is_empty() {
+            let first_visible = state.ring_first_index + start as u64;
+            let y_range = lines
+                .iter()
+                .flat_map(|line| line.points.iter())
+                .map(|point| point.y)
+                .fold(None::<(f64, f64)>, |acc, y| {
+                    Some(acc.map_or((y, y), |(lo, hi)| (lo.min(y), hi.max(y))))
+                });
+            if let Some((y_lo, y_hi)) = y_range {
+                let x_for = |index: u64| -> f64 {
+                    let device_t = index as f64 / rate;
+                    match self.time_axis {
+                        TimeAxis::BeforeNow => device_t - latest_x_index as f64 / rate,
+                        TimeAxis::Segment => device_t,
+                    }
+                };
+                let mut points = Vec::with_capacity(state.markers.len() * 3);
+                for &index in &state.markers {
+                    if index < first_visible || index > latest_x_index {
+                        continue;
+                    }
+                    let x = x_for(index);
+                    points.push(Series1dPoint { x, y: y_lo });
+                    points.push(Series1dPoint { x, y: y_hi });
+                    points.push(Series1dPoint { x, y: y_lo });
+                }
+                if !points.is_empty() {
+                    lines.push(Series1dLine {
+                        name: "phase-0 trigger".into(),
+                        points,
+                    });
+                }
+            }
         }
         Series1dV1 {
             x_label: x_label.into(),
@@ -1180,6 +2161,85 @@ fn write_json(path: &Path, value: &Value) -> Result<(), String> {
     std::fs::write(path, bytes).map_err(|err| format!("writing {} failed: {err}", path.display()))
 }
 
+fn write_json_new(path: &Path, value: &Value) -> Result<(), String> {
+    let bytes = serde_json::to_vec_pretty(value)
+        .map_err(|err| format!("serializing sidecar failed: {err}"))?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|err| format!("creating {} failed: {err}", path.display()))?;
+    file.write_all(&bytes)
+        .and_then(|()| file.flush())
+        .map_err(|err| format!("writing {} failed: {err}", path.display()))
+}
+
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn lease_deadline(ttl_ms: u64) -> u64 {
+    now_unix_ms().saturating_add(ttl_ms.clamp(MIN_LEASE_TTL_MS, MAX_LEASE_TTL_MS))
+}
+
+fn service_error(
+    code: ServiceErrorCodeV1,
+    message: impl Into<String>,
+    retryable: bool,
+) -> ServiceErrorV1 {
+    ServiceErrorV1 {
+        code,
+        message: message.into(),
+        retryable,
+    }
+}
+
+fn contract_integrity(integrity: StreamIntegrity, segments: u64) -> StreamIntegrityV1 {
+    StreamIntegrityV1 {
+        skipped_bytes: integrity.skipped_bytes,
+        crc_failures: integrity.crc_failures,
+        sequence_gaps: integrity.sequence_gaps,
+        dropped_samples: integrity.dropped_samples,
+        segment_restarts: segments.saturating_sub(1),
+        truncated_bytes: 0,
+    }
+}
+
+fn accepted_service_reply(
+    request: &PluginServiceRequest,
+    response: &PhotodiodeResponseV1,
+) -> PluginServiceReply {
+    PluginServiceReply {
+        request_id: request.request_id,
+        source_plugin_id: request.source_plugin_id.clone(),
+        target_plugin_id: request.target_plugin_id.clone(),
+        service: request.service.clone(),
+        outcome: PluginServiceOutcome::Accepted {
+            payload: serde_json::to_value(response).unwrap_or(Value::Null),
+        },
+    }
+}
+
+fn rejected_service_reply(
+    request: &PluginServiceRequest,
+    code: impl Into<String>,
+    message: impl Into<String>,
+) -> PluginServiceReply {
+    PluginServiceReply {
+        request_id: request.request_id,
+        source_plugin_id: request.source_plugin_id.clone(),
+        target_plugin_id: request.target_plugin_id.clone(),
+        service: request.service.clone(),
+        outcome: PluginServiceOutcome::Rejected {
+            code: code.into(),
+            message: message.into(),
+        },
+    }
+}
+
 fn serial_ports() -> Vec<String> {
     serialport::available_ports()
         .map(|ports| {
@@ -1348,10 +2408,29 @@ impl Plugin for StageAPhotodiodePlugin {
             self.connect_requested = false;
             // Finalize an active recording so the .pdq/.json pair is complete
             // even when the plugin is disabled mid-run.
-            if let Err(err) = self.stop_recording() {
+            let termination = if self.lease.is_some() {
+                PdqTerminationV1::Aborted
+            } else {
+                PdqTerminationV1::OperatorStopped
+            };
+            if let Err(err) = self.finalize_recording(termination) {
                 self.last_error = Some(err);
             }
             self.disconnect();
+            self.lease = None;
+        }
+    }
+
+    fn set_runtime_role(&mut self, role: PluginRuntimeRole) {
+        self.runtime_role = role;
+        if role != PluginRuntimeRole::LiveWorker {
+            if let Err(error) = self.finalize_recording(PdqTerminationV1::Aborted) {
+                self.last_error = Some(error);
+            }
+            self.connect_requested = false;
+            self.disconnect();
+            self.lease = None;
+            self.effects_allowed = false;
         }
     }
 
@@ -1366,12 +2445,116 @@ impl Plugin for StageAPhotodiodePlugin {
         &mut self,
         _frame: &PluginFrame<'_>,
         _output: &mut HostOutput<'_>,
-        _context: &mut HostContext<'_>,
+        context: &mut HostContext<'_>,
         _event_store: &EventStoreHandle<'_>,
     ) {
-        // Reading is settings-driven (connect checkbox) and works without
-        // camera frames; the stream port carries no commands, so no replay
-        // teardown is needed either.
+        if context.execution().mode == augur_plugin_api::ExecutionMode::Replay {
+            if let Err(error) = self.finalize_recording(PdqTerminationV1::Aborted) {
+                self.last_error = Some(error);
+            }
+            self.connect_requested = false;
+            self.disconnect();
+            self.lease = None;
+        }
+    }
+
+    fn process_control(&mut self, context: &mut PluginControlContext<'_>) {
+        let execution = context.execution();
+        self.apply_execution_context(&execution);
+    }
+
+    fn handle_service_request(
+        &mut self,
+        request: &PluginServiceRequest,
+        execution: &augur_plugin_api::ExecutionContext,
+    ) -> PluginServiceReply {
+        if let Some((previous, reply)) = self.request_cache.iter().find(|(previous, _)| {
+            previous.source_plugin_id == request.source_plugin_id
+                && previous.request_id == request.request_id
+        }) {
+            return if previous == request {
+                reply.clone()
+            } else {
+                rejected_service_reply(
+                    request,
+                    "request_id_conflict",
+                    "request ID was reused for a different photodiode payload",
+                )
+            };
+        }
+
+        let reply = if request.target_plugin_id != PLUGIN_ID_STAGE_A_PHOTODIODE {
+            rejected_service_reply(request, "wrong_target", "wrong photodiode owner target")
+        } else if request.service != SERVICE_STAGE_A_PHOTODIODE_CONTROL_V1 {
+            rejected_service_reply(
+                request,
+                "unsupported_service",
+                format!("unsupported photodiode service '{}'", request.service),
+            )
+        } else if self.runtime_role != PluginRuntimeRole::LiveWorker
+            || !execution.hardware_effects_allowed()
+        {
+            rejected_service_reply(
+                request,
+                "effects_not_allowed",
+                "photodiode effects are allowed only on the active live worker",
+            )
+        } else {
+            self.effects_allowed = true;
+            match serde_json::from_value::<PhotodiodeRequestV1>(request.payload.clone()) {
+                Err(error) => rejected_service_reply(
+                    request,
+                    "invalid_payload",
+                    format!("invalid photodiode request: {error}"),
+                ),
+                Ok(payload)
+                    if payload.contract_version != CONTRACT_VERSION_V1
+                        || payload.request_id.0 != request.request_id
+                        || payload.requester.as_str() != request.source_plugin_id
+                        || payload
+                            .target_owner_instance
+                            .as_ref()
+                            .is_some_and(|owner| owner != &self.owner_instance) =>
+                {
+                    rejected_service_reply(
+                        request,
+                        "identity_mismatch",
+                        "contract version, request, requester, or owner instance mismatch",
+                    )
+                }
+                Ok(payload)
+                    if payload.issued_at_unix_ms != 0
+                        && (now_unix_ms().saturating_sub(payload.issued_at_unix_ms) > 120_000
+                            || payload.issued_at_unix_ms.saturating_sub(now_unix_ms())
+                                > 30_000) =>
+                {
+                    rejected_service_reply(request, "stale_request", "request timestamp is stale")
+                }
+                Ok(payload) => match self.handle_photodiode_command(&payload) {
+                    Ok(response) => accepted_service_reply(request, &response),
+                    Err(error) => rejected_service_reply(
+                        request,
+                        format!("{:?}", error.code).to_ascii_lowercase(),
+                        error.message,
+                    ),
+                },
+            }
+        };
+        self.request_cache
+            .push_back((request.clone(), reply.clone()));
+        while self.request_cache.len() > REQUEST_CACHE_LIMIT {
+            self.request_cache.pop_front();
+        }
+        reply
+    }
+
+    fn control_snapshots(&self) -> Vec<PluginControlSnapshot> {
+        vec![PluginControlSnapshot {
+            plugin_id: PLUGIN_ID_STAGE_A_PHOTODIODE.into(),
+            topic: CTX_STAGE_A_PHOTODIODE_SUMMARY_V1.into(),
+            revision: self.generation.load(Ordering::Relaxed).max(1),
+            payload: serde_json::to_value(self.control_summary()).unwrap_or(Value::Null),
+        }]
     }
 
     fn settings_schema(&self) -> SettingsSchema {
@@ -1516,6 +2699,19 @@ impl Plugin for StageAPhotodiodePlugin {
                                     .unwrap_or(0),
                             },
                         },
+                        SettingItem {
+                            key: "show_markers".into(),
+                            label: "Show phase-0 trigger markers".into(),
+                            tooltip: Some(
+                                "Overlay the firmware phase-0 markers (device-clock MARKER frames) \
+                                 as a toggleable vertical curve. Also defines the modulation \
+                                 frequency from the marker spacing."
+                                    .into(),
+                            ),
+                            kind: SettingKind::Bool {
+                                default: self.show_markers,
+                            },
+                        },
                     ],
                 },
                 SettingsSection {
@@ -1561,26 +2757,37 @@ impl Plugin for StageAPhotodiodePlugin {
                             },
                         },
                         SettingItem {
-                            key: "record".into(),
-                            label: "Record to disk".into(),
+                            key: "record_start".into(),
+                            label: "Start recording".into(),
                             tooltip: Some(
-                                "Start/stop appending every incoming sample frame to \
-                             pd_rec_<timestamp>.pdq; stopping writes the JSON sidecar."
+                                "Start appending every incoming sample frame to \
+                             pd_rec_<timestamp>.pdq. Disabled until a data directory \
+                             is selected."
                                     .into(),
                             ),
-                            kind: SettingKind::Bool {
-                                default: self.recording_active(),
+                            kind: SettingKind::Button {
+                                enabled: !self.data_dir.trim().is_empty(),
                             },
+                        },
+                        SettingItem {
+                            key: "record_stop".into(),
+                            label: "Stop recording".into(),
+                            tooltip: Some(
+                                "Stop the disk recording and write the JSON sidecar.".into(),
+                            ),
+                            kind: SettingKind::Button { enabled: true },
                         },
                         SettingItem {
                             key: "save_snapshot".into(),
                             label: "Save cache snapshot".into(),
                             tooltip: Some(
-                                "Write the current cache as pd_cache_<timestamp>.csv \
-                             (+ JSON sidecar)."
+                                "Write the current cache once as pd_cache_<timestamp>.csv \
+                             (+ JSON sidecar). Disabled until a data directory is selected."
                                     .into(),
                             ),
-                            kind: SettingKind::Button,
+                            kind: SettingKind::Button {
+                                enabled: !self.data_dir.trim().is_empty(),
+                            },
                         },
                     ],
                 },
@@ -1610,6 +2817,7 @@ impl Plugin for StageAPhotodiodePlugin {
             "reference_volts" => Some(json!(self.reference_volts)),
             "window_s" => Some(json!(self.window_s)),
             "avg_samples" => Some(json!(self.avg_samples)),
+            "show_markers" => Some(json!(self.show_markers)),
             "avg_sync_freq_hz" => Some(json!(self.avg_sync_freq_hz)),
             "time_axis" => {
                 let index = TimeAxis::VARIANTS
@@ -1624,14 +2832,25 @@ impl Plugin for StageAPhotodiodePlugin {
                 .lock()
                 .map(|state| state.cache_seconds)
                 .unwrap_or(DEFAULT_CACHE_SECONDS))),
+            // Kept for compatibility (tests, external tooling); not in the
+            // schema anymore, so it is never synced across instances.
             "record" => Some(json!(self.recording_active())),
-            // Momentary trigger: never reports as pressed.
-            "save_snapshot" => Some(json!(false)),
+            // Button presses are exported as monotonic counters so the host's
+            // settings snapshot transports them from the UI mirror to the
+            // live worker (see PressLatch).
+            "record_start" => Some(self.press_record_start.value()),
+            "record_stop" => Some(self.press_record_stop.value()),
+            "save_snapshot" => Some(self.press_save_snapshot.value()),
             _ => None,
         }
     }
 
     fn set_setting(&mut self, key: &str, value: Value) -> Result<(), String> {
+        if self.lease.is_some() {
+            return Err(format!(
+                "manual setting '{key}' is locked while the photodiode owner is leased"
+            ));
+        }
         match key {
             "port" => {
                 self.port_hint = variant_path(&enum_choice(&value, &port_variants())?).to_owned();
@@ -1658,6 +2877,10 @@ impl Plugin for StageAPhotodiodePlugin {
             "reference_volts" => {
                 let volts = value.as_f64().ok_or("reference_volts must be a number")?;
                 self.reference_volts = volts.clamp(0.0, ADC_FULL_SCALE_VOLTS);
+                Ok(())
+            }
+            "show_markers" => {
+                self.show_markers = value.as_bool().ok_or("show_markers must be a boolean")?;
                 Ok(())
             }
             "window_s" => {
@@ -1700,9 +2923,9 @@ impl Plugin for StageAPhotodiodePlugin {
                 Ok(())
             }
             "record" => {
+                // Compatibility alias (not in the schema): direct boolean
+                // start/stop with the same edge-free semantics as before.
                 let requested = value.as_bool().ok_or("record must be a boolean")?;
-                // Failures surface through status entries (like `connect`),
-                // so a missing data directory doesn't read as a broken UI.
                 let result = if requested {
                     self.start_recording()
                 } else {
@@ -1716,12 +2939,39 @@ impl Plugin for StageAPhotodiodePlugin {
                 self.generation.fetch_add(1, Ordering::Relaxed);
                 Ok(())
             }
-            "save_snapshot" => {
-                match self.save_cache_snapshot() {
-                    Ok(()) => self.last_error = None,
-                    Err(err) => self.last_error = Some(err),
+            "record_start" => {
+                // Failures surface through status entries (like `connect`),
+                // so a missing data directory doesn't read as a broken UI.
+                if self.press_record_start.accept(&value) {
+                    match self.start_recording() {
+                        Ok(()) => self.last_error = None,
+                        Err(err) => self.last_error = Some(err),
+                    }
+                    self.generation.fetch_add(1, Ordering::Relaxed);
                 }
-                self.generation.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            "record_stop" => {
+                if self.press_record_stop.accept(&value) {
+                    match self.stop_recording() {
+                        Ok(()) => self.last_error = None,
+                        Err(err) => self.last_error = Some(err),
+                    }
+                    self.generation.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(())
+            }
+            "save_snapshot" => {
+                // Edge-guarded: the host re-applies the full settings snapshot
+                // on every sync, and an unguarded arm wrote one cache file per
+                // sync of *any* plugin's settings.
+                if self.press_save_snapshot.accept(&value) {
+                    match self.save_cache_snapshot() {
+                        Ok(()) => self.last_error = None,
+                        Err(err) => self.last_error = Some(err),
+                    }
+                    self.generation.fetch_add(1, Ordering::Relaxed);
+                }
                 Ok(())
             }
             _ => Err(format!("unknown setting: {key}")),
@@ -1768,6 +3018,27 @@ impl Plugin for StageAPhotodiodePlugin {
                 entries.push(StatusEntry::Text(format!(
                     "Avg ({window} spl): {:.4} V",
                     self.display_volts(average)
+                )));
+            }
+        }
+        if let Some(optical) = self.latest_optical() {
+            let label = match self.mode {
+                Mode::Raw => "a_raw (detector)",
+                Mode::Excitation => "a (excitation)",
+            };
+            entries.push(StatusEntry::Text(format!(
+                "{label} = {:.3}  (I {:.4}..{:.4} V)",
+                optical.measured_log_contrast,
+                optical.excitation_min_volts,
+                optical.excitation_max_volts
+            )));
+        }
+        if let Ok(state) = self.shared.lock() {
+            if let Some(period_samples) = state.marker_period_samples() {
+                let hz = f64::from(state.rate_hz.max(1)) / period_samples;
+                entries.push(StatusEntry::Text(format!(
+                    "Trigger: {} markers, f = {hz:.3} Hz",
+                    state.markers.len()
                 )));
             }
         }
@@ -1877,7 +3148,49 @@ export_plugin!(StageAPhotodiodePlugin);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use augur_plugin_api::{ExecutionContext, ExecutionMode};
     use stage_a_io::{Frame, FrameHeader, FrameType};
+
+    fn live_execution() -> ExecutionContext {
+        ExecutionContext {
+            mode: ExecutionMode::LiveCapture,
+            effects_allowed: true,
+            session_id: Some("test".into()),
+        }
+    }
+
+    fn live_plugin() -> StageAPhotodiodePlugin {
+        let mut plugin = StageAPhotodiodePlugin::default();
+        plugin.set_runtime_role(PluginRuntimeRole::LiveWorker);
+        plugin.effects_allowed = true;
+        plugin
+    }
+
+    fn service_request(
+        plugin: &StageAPhotodiodePlugin,
+        id: u64,
+        requester: &str,
+        command: PhotodiodeCommandV1,
+        revision: Option<u64>,
+    ) -> PluginServiceRequest {
+        let mut payload = PhotodiodeRequestV1::new(
+            stage_a_plugin_contract::RequestId(id),
+            ClientId::from(requester),
+            command,
+        );
+        payload.target_owner_instance = Some(plugin.owner_instance.clone());
+        payload.run_id = Some(RunId::from("run-a"));
+        payload.lease_id = Some(LeaseId::from("lease-a"));
+        payload.requested_revision = revision.map(SemanticRevision);
+        payload.issued_at_unix_ms = now_unix_ms();
+        PluginServiceRequest {
+            request_id: id,
+            source_plugin_id: requester.into(),
+            target_plugin_id: PLUGIN_ID_STAGE_A_PHOTODIODE.into(),
+            service: SERVICE_STAGE_A_PHOTODIODE_CONTROL_V1.into(),
+            payload: serde_json::to_value(payload).unwrap(),
+        }
+    }
 
     fn sample_frame(sequence: u32, first_index: u64, rate_hz: u32, codes: &[u16]) -> Vec<u8> {
         let payload: Vec<u8> = codes.iter().flat_map(|c| c.to_le_bytes()).collect();
@@ -1942,6 +3255,31 @@ mod tests {
     }
 
     #[test]
+    fn phase0_markers_define_frequency_and_evict_with_the_ring() {
+        // Ring holds 1 s = 20_000 samples at 20 kSa/s.
+        let mut state = SharedState {
+            cache_seconds: 1.0,
+            ..SharedState::default()
+        };
+        // 500 Hz modulation: markers every 40 samples.
+        ingest_bytes(&mut state, &sample_frame(0, 0, 20_000, &[100; 40]));
+        state.push_marker(0);
+        state.push_marker(40);
+        state.push_marker(80);
+        assert_eq!(state.markers.len(), 3);
+        let period = state.marker_period_samples().expect("period");
+        assert!((period - 40.0).abs() < 1e-9);
+        let hz = f64::from(state.rate_hz) / period;
+        assert!((hz - 500.0).abs() < 1e-6, "hz={hz}");
+
+        // Duplicate stamps are ignored, and markers before the ring start too.
+        state.push_marker(80);
+        state.ring_first_index = 60;
+        state.push_marker(40); // now below the ring start
+        assert_eq!(state.markers.len(), 3);
+    }
+
+    #[test]
     fn ring_is_bounded_by_duration() {
         let mut state = SharedState::default();
         let rate = 1_000; // capacity = cache_seconds (20 s default) × rate
@@ -1999,6 +3337,35 @@ mod tests {
         state.ingest(0, 20_000, 0, &[0, 0, 0, 0, 100, 200, 300, 400]);
         let average = plugin.current_average_code(&state).expect("has samples");
         assert!((average - 250.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn published_level_is_raw_volts_and_survives_clipping() {
+        let mut plugin = StageAPhotodiodePlugin::default(); // window = 4 samples
+        let mut state = SharedState::default();
+        state.ingest(0, 20_000, 0, &[0, 0, 0, 0, 100, 200, 300, 400]);
+
+        let level = plugin.current_level(&state).expect("has samples");
+        assert!((level.mean_volts - code_to_volts(250.0)).abs() < 1e-9);
+        assert!((level.peak_to_peak_volts - code_to_volts(300.0)).abs() < 1e-9);
+        assert_eq!(level.sample_count, 4);
+        // The window is the newest 4 of 8 ingested samples.
+        assert_eq!(level.end_sample_index, 8);
+        assert!(!level.clipped);
+
+        // EXCITATION display must not leak into the published level: it stays
+        // the raw detector reading whatever the operator is looking at.
+        plugin.set_setting("mode", json!(1)).expect("excitation");
+        let raw_again = plugin.current_level(&state).expect("has samples");
+        assert_eq!(raw_again.mean_volts, level.mean_volts);
+
+        // At the rail the optical summary refuses; the level must not, because
+        // that is exactly where a transfer sweep needs a reading.
+        let mut railed = SharedState::default();
+        railed.ingest(0, 20_000, 0, &[4_095; 8]);
+        let clipped = plugin.current_level(&railed).expect("still reports");
+        assert!(clipped.clipped);
+        assert!(plugin.optical_summary(&railed.samples).is_none());
     }
 
     #[test]
@@ -2065,7 +3432,7 @@ mod tests {
     fn mock_reader_fills_the_ring_and_series() {
         let mut plugin = StageAPhotodiodePlugin {
             port_hint: "mock".into(),
-            ..Default::default()
+            ..live_plugin()
         };
         plugin.connect();
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -2212,7 +3579,7 @@ mod tests {
     #[test]
     fn cache_snapshot_writes_csv_and_sidecar() {
         let dir = temp_dir("snapshot");
-        let mut plugin = StageAPhotodiodePlugin::default();
+        let mut plugin = live_plugin();
         plugin
             .set_setting("data_dir", json!(dir.display().to_string()))
             .unwrap();
@@ -2248,8 +3615,58 @@ mod tests {
     }
 
     #[test]
+    fn forwarded_snapshot_counter_saves_exactly_once() {
+        let dir = temp_dir("snapshot-forwarded");
+        let mut plugin = live_plugin();
+        plugin
+            .set_setting("data_dir", json!(dir.display().to_string()))
+            .unwrap();
+        {
+            let mut state = plugin.shared.lock().unwrap();
+            state.ingest(10, 20_000, 0, &[100, 200, 300]);
+        }
+        let csv_count = |dir: &std::path::Path| {
+            std::fs::read_dir(dir)
+                .unwrap()
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.extension().is_some_and(|ext| ext == "csv"))
+                .count()
+        };
+        // First forwarded counter is the baseline a fresh worker adopts.
+        plugin.set_setting("save_snapshot", json!(2)).unwrap();
+        assert_eq!(csv_count(&dir), 0, "baseline must not save");
+        // One press on the mirror advances the counter by one → one file.
+        plugin.set_setting("save_snapshot", json!(3)).unwrap();
+        assert_eq!(csv_count(&dir), 1);
+        // The host re-applies the same snapshot on every settings sync of any
+        // plugin — this used to write one file per sync.
+        plugin.set_setting("save_snapshot", json!(3)).unwrap();
+        plugin.set_setting("save_snapshot", json!(3)).unwrap();
+        assert_eq!(csv_count(&dir), 1, "re-applied snapshots must not save");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn record_buttons_start_and_stop_the_disk_recording() {
+        let dir = temp_dir("record-buttons");
+        let mut plugin = live_plugin();
+        plugin
+            .set_setting("data_dir", json!(dir.display().to_string()))
+            .unwrap();
+        plugin.set_setting("record_start", json!(true)).unwrap();
+        assert!(plugin.recording_active());
+        // Idle stop is a no-op, an active stop finalizes.
+        plugin.set_setting("record_stop", json!(true)).unwrap();
+        assert!(!plugin.recording_active());
+        assert!(plugin.last_error.is_none(), "{:?}", plugin.last_error);
+        plugin.set_setting("record_stop", json!(true)).unwrap();
+        assert!(plugin.last_error.is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn snapshot_without_data_dir_reports_an_error() {
-        let mut plugin = StageAPhotodiodePlugin::default();
+        let mut plugin = live_plugin();
         plugin.set_setting("save_snapshot", json!(true)).unwrap();
         assert!(plugin
             .last_error
@@ -2260,7 +3677,7 @@ mod tests {
     #[test]
     fn recording_tees_frames_to_pdq_and_writes_a_sidecar() {
         let dir = temp_dir("recording");
-        let mut plugin = StageAPhotodiodePlugin::default();
+        let mut plugin = live_plugin();
         plugin
             .set_setting("data_dir", json!(dir.display().to_string()))
             .unwrap();
@@ -2341,5 +3758,218 @@ mod tests {
             .set_setting("mode", json!("RAW"))
             .expect("name accepted");
         assert_eq!(plugin.mode, Mode::Raw);
+    }
+
+    #[test]
+    fn ui_mirror_never_opens_the_stream_or_writes_recordings() {
+        let dir = temp_dir("ui-mirror");
+        let mut plugin = StageAPhotodiodePlugin {
+            port_hint: "mock".into(),
+            data_dir: dir.display().to_string(),
+            ..Default::default()
+        };
+        plugin.set_setting("connect", json!(true)).unwrap();
+        plugin.set_setting("record", json!(true)).unwrap();
+        assert!(!plugin.connected());
+        assert!(!plugin.recording_active());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn service_is_idempotent_and_enforces_exclusive_leases_without_frames() {
+        let mut plugin = live_plugin();
+        let acquire = service_request(
+            &plugin,
+            1,
+            "workflow-a",
+            PhotodiodeCommandV1::AcquireLease { ttl_ms: 10_000 },
+            None,
+        );
+        let first = plugin.handle_service_request(&acquire, &live_execution());
+        let expiry = plugin.lease.as_ref().unwrap().expires_at_unix_ms;
+        let duplicate = plugin.handle_service_request(&acquire, &live_execution());
+        assert_eq!(first, duplicate);
+        assert_eq!(plugin.lease.as_ref().unwrap().expires_at_unix_ms, expiry);
+
+        let conflict = service_request(
+            &plugin,
+            2,
+            "workflow-b",
+            PhotodiodeCommandV1::AcquireLease { ttl_ms: 10_000 },
+            None,
+        );
+        assert!(matches!(
+            plugin
+                .handle_service_request(&conflict, &live_execution())
+                .outcome,
+            PluginServiceOutcome::Rejected { .. }
+        ));
+        assert!(plugin.set_setting("mode", json!("RAW")).is_err());
+    }
+
+    #[test]
+    fn named_recording_rejects_unsafe_paths_and_returns_final_receipt() {
+        let dir = temp_dir("named");
+        let mut plugin = live_plugin();
+        plugin.port_hint = "mock".into();
+        plugin.data_dir = dir.display().to_string();
+        plugin.connect();
+        let acquire = service_request(
+            &plugin,
+            10,
+            "workflow-a",
+            PhotodiodeCommandV1::AcquireLease { ttl_ms: 10_000 },
+            None,
+        );
+        assert!(matches!(
+            plugin
+                .handle_service_request(&acquire, &live_execution())
+                .outcome,
+            PluginServiceOutcome::Accepted { .. }
+        ));
+
+        let unsafe_begin = service_request(
+            &plugin,
+            11,
+            "workflow-a",
+            PhotodiodeCommandV1::BeginRecording {
+                specification: PdqStartSpecV1 {
+                    pdq_path: "../escape.pdq".into(),
+                    sidecar_path: "run/escape.json".into(),
+                    expected_sample_rate_hz: None,
+                    expected_stream_epoch: None,
+                    metadata: BTreeMap::new(),
+                },
+            },
+            Some(1),
+        );
+        assert!(matches!(
+            plugin
+                .handle_service_request(&unsafe_begin, &live_execution())
+                .outcome,
+            PluginServiceOutcome::Rejected { .. }
+        ));
+
+        let begin = service_request(
+            &plugin,
+            12,
+            "workflow-a",
+            PhotodiodeCommandV1::BeginRecording {
+                specification: PdqStartSpecV1 {
+                    pdq_path: "A1/run-a_pd.pdq".into(),
+                    sidecar_path: "A1/run-a_pd.json".into(),
+                    expected_sample_rate_hz: None,
+                    expected_stream_epoch: None,
+                    metadata: BTreeMap::from([("workflow".into(), "A1".into())]),
+                },
+            },
+            Some(1),
+        );
+        let begin_reply = plugin.handle_service_request(&begin, &live_execution());
+        assert!(matches!(
+            begin_reply.outcome,
+            PluginServiceOutcome::Accepted { .. }
+        ));
+        assert_eq!(
+            plugin.handle_service_request(&begin, &live_execution()),
+            begin_reply,
+            "duplicate begin must not open a second file"
+        );
+        record_frame(&plugin.recording, &mock_sample_frame(9, 0, &[1, 2, 3]), 3);
+
+        let finalize = service_request(
+            &plugin,
+            13,
+            "workflow-a",
+            PhotodiodeCommandV1::FinalizeRecording {
+                termination: PdqTerminationV1::Completed,
+            },
+            Some(2),
+        );
+        let reply = plugin.handle_service_request(&finalize, &live_execution());
+        let PluginServiceOutcome::Accepted { payload } = reply.outcome else {
+            panic!("finalize rejected");
+        };
+        let response: PhotodiodeResponseV1 = serde_json::from_value(payload).unwrap();
+        let Some(PdqReceiptV1::Finalized(receipt)) = response.receipt else {
+            panic!("missing finalized receipt");
+        };
+        assert_eq!(receipt.sha256.as_str().len(), 64);
+        assert!(receipt.file_size_bytes > 0);
+        assert!(dir.join(&receipt.pdq_path).is_file());
+        assert!(dir.join(&receipt.sidecar_path).is_file());
+
+        let collision = service_request(
+            &plugin,
+            14,
+            "workflow-a",
+            PhotodiodeCommandV1::BeginRecording {
+                specification: PdqStartSpecV1 {
+                    pdq_path: receipt.pdq_path.clone(),
+                    sidecar_path: receipt.sidecar_path.clone(),
+                    expected_sample_rate_hz: None,
+                    expected_stream_epoch: None,
+                    metadata: BTreeMap::new(),
+                },
+            },
+            Some(3),
+        );
+        assert!(matches!(
+            plugin
+                .handle_service_request(&collision, &live_execution())
+                .outcome,
+            PluginServiceOutcome::Rejected { .. }
+        ));
+        plugin.disconnect();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn effects_revocation_finalizes_and_disconnects_without_a_frame() {
+        let dir = temp_dir("revoked");
+        let mut plugin = live_plugin();
+        plugin.port_hint = "mock".into();
+        plugin.data_dir = dir.display().to_string();
+        plugin.connect();
+        let acquire = service_request(
+            &plugin,
+            20,
+            "workflow-a",
+            PhotodiodeCommandV1::AcquireLease { ttl_ms: 10_000 },
+            None,
+        );
+        plugin.handle_service_request(&acquire, &live_execution());
+        let begin = service_request(
+            &plugin,
+            21,
+            "workflow-a",
+            PhotodiodeCommandV1::BeginRecording {
+                specification: PdqStartSpecV1 {
+                    pdq_path: "revoked/run.pdq".into(),
+                    sidecar_path: "revoked/run.json".into(),
+                    expected_sample_rate_hz: None,
+                    expected_stream_epoch: None,
+                    metadata: BTreeMap::new(),
+                },
+            },
+            Some(1),
+        );
+        plugin.handle_service_request(&begin, &live_execution());
+        assert!(plugin.recording_active());
+
+        plugin.apply_execution_context(&ExecutionContext::fail_closed());
+        assert!(!plugin.connected());
+        assert!(!plugin.recording_active());
+        assert!(plugin.lease.is_none());
+        assert_eq!(
+            plugin
+                .last_finalized_recording
+                .as_ref()
+                .unwrap()
+                .termination,
+            PdqTerminationV1::Aborted
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

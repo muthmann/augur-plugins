@@ -2,6 +2,7 @@
 
 - **Status:** Accepted
 - **Date:** 2026-07-13
+- **Amended by:** ADR 006 and ADR 007
 
 ## Context
 
@@ -14,10 +15,11 @@ laboratory-instrument abstractions.
 
 ## Decision
 
-1. **Device control lives in removable protocol plugins** (`stage-a-monitor`,
-   `stage-a-a1`, later `-a2`/`-a3`), one experiment concern per plugin.
-   Exactly one enabled, armed plugin owns the serial port; opening a busy
-   device is a visible error.
+1. **Device control lives in removable protocol plugins.** The permanent
+   command-port and stream-port owners are now `stage-a-modulation` and
+   `stage-a-photodiode` (ADR 006/007). Experiment workflows such as A1/A2/A3
+   orchestrate those owners through the host service plane and do not open the
+   ports themselves.
 2. **A shared plain-Rust library `stage-a-io`** (this repo, not a plugin)
    owns everything protocol-shaped: PDA1 framing + CRC resync, the ASCII
    command grammar with idempotent sequence retries, the bounded I/O
@@ -35,8 +37,8 @@ laboratory-instrument abstractions.
 
 ## Consequences
 
-- A2/A3 plugins reuse `stage-a-io` unchanged; only their state machines
-  and views are new code.
+- A1/A2/A3 reuse the owner services and serde-only contracts; they may reuse
+  hardware-free `stage-a-io` parsing/analysis but not its serial transports.
 - The GUI knows nothing about Teensys; removing the three plugins removes
   every trace of lab hardware from the product.
 - Protocol changes must land in the firmware header first, then in

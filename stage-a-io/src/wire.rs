@@ -139,7 +139,8 @@ impl Frame {
 
     /// Decodes the payload of a `SamplesU16` frame into ADC codes.
     pub fn samples(&self) -> Option<Vec<u16>> {
-        if self.header.frame_type != FrameType::SamplesU16 || self.payload.len() % 2 != 0 {
+        if self.header.frame_type != FrameType::SamplesU16 || !self.payload.len().is_multiple_of(2)
+        {
             return None;
         }
         Some(
@@ -156,6 +157,21 @@ impl Frame {
             return None;
         }
         std::str::from_utf8(&self.payload).ok()
+    }
+
+    /// Decodes the payload of a `Marker` frame (phase-0 fiducial on the device
+    /// clock).
+    pub fn marker(&self) -> Option<MarkerPayload> {
+        if self.header.frame_type != FrameType::Marker || self.payload.len() != 16 {
+            return None;
+        }
+        let p = &self.payload;
+        Some(MarkerPayload {
+            sample_index: u64::from_le_bytes(p[0..8].try_into().ok()?),
+            tick_us: u32::from_le_bytes(p[8..12].try_into().ok()?),
+            level: p[12],
+            source: p[13],
+        })
     }
 }
 
@@ -186,6 +202,32 @@ impl SummaryPayload {
             return 0.0;
         }
         self.sum_codes as f64 / f64::from(self.sample_count)
+    }
+}
+
+/// A `Marker` frame payload: a phase-0 fiducial stamped on the device clock
+/// (matches the firmware `MarkerPayload`; `source = 1` is a modulation phase-0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MarkerPayload {
+    /// ADC sample index at the fiducial — aligns the marker with the stream.
+    pub sample_index: u64,
+    pub tick_us: u32,
+    pub level: u8,
+    pub source: u8,
+}
+
+/// `source` value the firmware stamps on a modulation phase-0 marker.
+pub const MARKER_SOURCE_PHASE0: u8 = 1;
+
+impl MarkerPayload {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(16);
+        out.extend_from_slice(&self.sample_index.to_le_bytes());
+        out.extend_from_slice(&self.tick_us.to_le_bytes());
+        out.push(self.level);
+        out.push(self.source);
+        out.extend_from_slice(&[0_u8, 0_u8]); // reserved[2]
+        out
     }
 }
 
@@ -268,6 +310,22 @@ pub struct FrameParser {
 impl FrameParser {
     pub fn extend(&mut self, bytes: &[u8]) {
         self.buffer.extend_from_slice(bytes);
+    }
+
+    /// Bytes retained while waiting for a complete header or payload.
+    /// Primarily useful at a finite-file EOF, where a nonzero value means
+    /// the PDQ ends with a truncated frame or garbage tail.
+    pub fn buffered_len(&self) -> usize {
+        self.buffer.len()
+    }
+
+    /// Discards and returns the number of bytes still buffered. Live serial
+    /// readers normally never need this; finite-file readers use it once at
+    /// EOF to report a truncated tail without exposing parser internals.
+    pub fn discard_buffered(&mut self) -> usize {
+        let len = self.buffer.len();
+        self.buffer.clear();
+        len
     }
 
     pub fn next_event(&mut self) -> Option<ParseEvent> {
@@ -441,6 +499,33 @@ mod tests {
         );
         assert_eq!(frame.summary(), Some(summary));
         assert!((summary.mean_code() - 1953.125).abs() < 1e-9);
+    }
+
+    #[test]
+    fn marker_payload_round_trips() {
+        let marker = MarkerPayload {
+            sample_index: 1_234_567,
+            tick_us: 987_654,
+            level: 1,
+            source: MARKER_SOURCE_PHASE0,
+        };
+        let frame = Frame::build(
+            FrameHeader {
+                version: PROTOCOL_VERSION,
+                frame_type: FrameType::Marker,
+                flags: 0,
+                sequence: 9,
+                payload_bytes: 0,
+                first_sample_index: 0,
+                sample_rate_hz: 20_000,
+                dropped_samples: 0,
+                crc32: 0,
+            },
+            marker.encode(),
+        );
+        assert_eq!(frame.marker(), Some(marker));
+        // A samples decode must not accept a marker frame.
+        assert_eq!(frame.samples(), None);
     }
 
     #[test]

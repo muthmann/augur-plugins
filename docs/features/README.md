@@ -5,8 +5,12 @@ Repository-level feature notes for larger plugin suites, interface migrations, a
 ## Available Briefs
 
 - [Stage-A Bench Stack](./stage-a.md) — Teensy-driven Stage-A bench: two serial ports, two minimal plugins, and the shared `stage-a-io` library.
-- [Stage-A Modulation](./stage-a-modulation.md) — capped power slider + constant/sine/square laser-modulation drive on the command port, applied immediately.
-- [Stage-A Photodiode](./stage-a-photodiode.md) — live SMA5/A4 photodiode readout from the PDA1 stream port at 20 kSa/s with envelope decimation and a period-synced moving average: raw values or excitation power `I_exc = I_tot − I_pd`.
+- [Stage-A Modulation](./stage-a-modulation.md) — orthogonal Manual/Calibrated drive methods and five waveform modes under one hard DAC ceiling, applied immediately on the command port.
+- [Stage-A Optical Waveform Drive](./stage-a-optical-waveform.md) — pre-warps the DAC so the *optical* output is a log- or linear-intensity sine, inverting the Pockels `sin²` transfer from settable `V_null`/`Vπ`.
+- [Stage-A Pockels Transfer Calibration](./stage-a-pockels-calibration.md) — one-button sweep of settled `CONST` DAC codes against the photodiode level, fitting `V_null`/`Vπ` from the light instead of a nominal datasheet, with a transfer-curve view that makes the two parameters legible before anything is measured.
+- [Stage-A Photodiode](./stage-a-photodiode.md) — live SMA5/A4 photodiode readout from the PDA1 stream port at 20 kSa/s with envelope decimation and a period-synced moving average: raw values or excitation power `I_exc = I_tot − I_pd`, plus the geometry-corrected optical depth `a`.
+- [Stage-A A1 Analysis](./stage-a-a1.md) — Stage-A recording coordinator: one-button synchronized camera RAW + photodiode PDQ recording with a config sidecar per `(I_k, f)` measurement, a one-button amplitude sweep (leased `SetOpticalDepth` + settle + per-point recording), plus live rolling-response and response-probability quicklooks.
+- [Stage-A A1 Automation](./stage-a-a1-automation.md) — roadmap to semi-automate the amplitude sweep; the single-row sweep core is **built** (ADR 010), scout/multi-row/`a50` fit remain planned.
 - [EVE Temporal Diagnostics](./evesmlm-temporal-diagnostics.md) — temporal candidate tracking, boundary overlays, and rejected-fit datasets for the eveSMLM pipeline.
 - [Plugin Authoring Docs Refresh](./plugin-authoring-doc-refresh.md) — repo docs synced to the current runtime-only interface, host views, and `GlobalSettings`.
 - [Plugin Install And Reload](./plugin-install-reload.md) — macOS dylib identity fix so installed plugins do not keep pointing back at Cargo's build tree during reloads.
