@@ -2,9 +2,12 @@
 
 - **Crate:** `plugins/stage-a-a1` (`augur-plugin-stage-a-a1`)
 - **Status:** Recording coordinator + live quicklooks + amplitude sweep + `a₀` lock
+  + unattended frequency ladder
 - **Design:** [ADR 009](../adr/009-stage-a-a1-recording-coordinator.md),
   [ADR 010](../adr/010-stage-a-a1-amplitude-sweep.md) (sweep + button
   press forwarding),
+  [ADR 015](../adr/015-stage-a-a1-recording-robustness.md) (one folder, full
+  duration, named failures),
   [ADR 014](../adr/014-stage-a-a1-frequency-ladder.md) (the unattended ladder),
   [ADR 013](../adr/013-stage-a-a1-event-count-depth-lock.md) (exact-event-count
   `a₀` lock)

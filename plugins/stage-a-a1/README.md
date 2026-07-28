@@ -74,6 +74,8 @@ See [docs/features/stage-a-a1.md](../../docs/features/stage-a-a1.md) for the ful
 [docs/features/stage-a-a1-event-count.md](../../docs/features/stage-a-a1-event-count.md) plus
 [ADR 013](../../docs/adr/013-stage-a-a1-event-count-depth-lock.md) for the `a₀` lock,
 [ADR 014](../../docs/adr/014-stage-a-a1-frequency-ladder.md) for the unattended
-frequency ladder, and
+frequency ladder,
+[ADR 015](../../docs/adr/015-stage-a-a1-recording-robustness.md) for the
+recording coordinator's one-folder/full-duration guarantees, and
 [docs/features/stage-a-a1-automation.md](../../docs/features/stage-a-a1-automation.md) for the
 planned amplitude-sweep automation on top of this.
