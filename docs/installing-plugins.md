@@ -47,6 +47,14 @@ cp target/release/libaugur_plugin_localization.dylib ~/.augur/plugins/localizati
 
 Install each plugin into its own directory under `~/.augur/plugins/<name>/`.
 
+On macOS, a plain `cp` keeps Cargo's build-path dylib identity in the copied file. Rewrite the
+installed copy so reloads do not keep resolving back to the build tree:
+
+```bash
+install_name_tool -id "@loader_path/libaugur_plugin_localization.dylib" \
+  ~/.augur/plugins/localization/libaugur_plugin_localization.dylib
+```
+
 ## Install All Built Plugins
 
 ```bash
@@ -54,6 +62,8 @@ Install each plugin into its own directory under `~/.augur/plugins/<name>/`.
 ```
 
 This copies every plugin that already has a built runtime library in `target/release/`.
+On macOS it also rewrites each installed dylib id to `@loader_path/<basename>` so Plugin Manager
+reloads do not stay pinned to Cargo's original build-path identity.
 
 ## Load Or Reload In The GUI
 
@@ -84,6 +94,16 @@ You copied a source directory instead of the built library. Build the plugin and
 ### “loading symbol augur_plugin_vtable failed”
 
 The library was built against an older plugin interface or does not export the runtime vtable. Port it to `augur-plugin-api::Plugin` and export it with `export_plugin!`.
+
+### “plugin ABI mismatch”
+
+The installed runtime library is stale relative to the host ABI.
+
+1. Rebuild the plugin against the current sibling `augur-rs` checkout.
+2. Replace the installed runtime library in `~/.augur/plugins/<name>/`.
+3. On macOS, prefer `./scripts/install-built-plugins.sh --profile release` or rewrite the copied dylib id with `install_name_tool -id "@loader_path/<basename>" ...`.
+
+If you overwrote a plugin while `augur-gui` was already running, restart the host once after the ABI bump to clear any previously loaded image from the process.
 
 ### The plugin loads but host-owned settings are missing
 

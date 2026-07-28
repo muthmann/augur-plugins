@@ -1,0 +1,9 @@
+id = "stage-a.a1"
+name = "Stage-A A1 Analysis"
+version = "0.3.0"
+description = "Stage-A A1 recording coordinator: one-button synchronized camera .raw + photodiode .pdq recording with a config sidecar, plus live rolling-response and response-probability quicklooks."
+domain = "stage-a"
+library = "augur_plugin_stage_a_a1"
+phase = "raw_events"
+min_augur_version = "1.0.0"
+host_commands = ["start_recording", "stop_recording"]

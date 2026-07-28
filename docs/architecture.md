@@ -71,6 +71,35 @@ Key properties:
 
 New plugins should prefer this shared host contract over duplicating pixel scale or sensor geometry in plugin-local defaults.
 
+## Frame-Independent Plugin Services
+
+Hardware workflows use the host-routed control plane rather than the per-frame
+JSON context. One canonical live-worker instance owns effects; GUI mirrors,
+replay, and offline instances remain fail-closed. Requests target stable manifest
+IDs and carry semantic operation names, request IDs, leases, and explicit
+responses. Device plugins validate and execute their own operations; the host is
+only the router.
+
+Stage-A uses a serde-only companion contract so `stage-a-a1` can orchestrate
+`stage-a-modulation` and `stage-a-photodiode` without linking their implementation
+crates or opening their serial ports. See
+[`docs/adr/007-stage-a-owner-orchestration.md`](./adr/007-stage-a-owner-orchestration.md).
+
+Not every cross-plugin dependency needs that machinery. Because the host
+broadcasts each plugin's `control_snapshots()` to every plugin's inbox, a plugin
+that only needs to *read* another's published state can do so directly — no
+lease, no service request, no router round-trip. The Pockels transfer
+calibration reads photodiode levels this way while driving only its own DAC:
+[`docs/adr/011-stage-a-pockels-transfer-calibration.md`](./adr/011-stage-a-pockels-transfer-calibration.md).
+Reserve the leased service path for *commanding* hardware someone else owns.
+
+A published field is part of that contract, so its **meaning must not depend on
+the publisher's UI state**. The photodiode plugin's display toggle used to
+select the optical geometry the published log-contrast was computed in, which
+silently retargeted A1's amplitude sweep whenever the chart was left on its
+default. Geometry follows the bench, not the display:
+[`docs/adr/012-stage-a-contrast-geometry-is-bench-not-display.md`](./adr/012-stage-a-contrast-geometry-is-bench-not-display.md).
+
 ## Host Views
 
 Plugins declare host-rendered datasets and views through:
@@ -82,6 +111,7 @@ Plugins declare host-rendered datasets and views through:
 The host owns:
 
 - analysis-panel rendering
+- linked 2D/3D investigation state
 - standalone windows
 - dataset caching
 - exports
@@ -89,8 +119,19 @@ The host owns:
 
 This repository currently uses that mechanism for:
 
-- reconstruction table and density windows
-- the shared EVE compact localization panel that can be provided by fitting or post-processing
+- reconstruction table, density, and 3D localization inspection
+- candidate-stage accepted/rejected raw-event layers for live tuning
+- the shared EVE current-localization datasets that can be provided by fitting or post-processing
+
+For investigation-linked table datasets, the important host-consumed metadata is:
+
+- stable row ids via `row_id_column`
+- 2D and 3D coordinates
+- optional time columns
+- layer ids and semantic labels
+- dataset display metadata for title, default visibility, color, marker shape, and size
+
+Overlays remain useful for supplemental 2D annotations, but the host now treats structured datasets as the primary linking surface.
 
 ## Tradeoffs
 

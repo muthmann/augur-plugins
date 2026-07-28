@@ -12,8 +12,10 @@ use std::collections::VecDeque;
 const DEFAULT_NM_PER_PIXEL: f64 = 65.0;
 const DEFAULT_MAX_LOCALIZATIONS: usize = 1_000_000;
 const ACCUMULATED_DATASET_ID: &str = "augur.localization.accumulated";
+const ACCUMULATED_LAYER_ID: &str = "augur.layer.localization.accumulated";
 const LOCALIZATION_TABLE_VIEW_ID: &str = "augur.localization.accumulated.table";
 const RECONSTRUCTION_VIEW_ID: &str = "augur.localization.accumulated.density";
+const RECONSTRUCTION_3D_VIEW_ID: &str = "augur.localization.accumulated.scatter3d";
 
 #[derive(Debug, Clone)]
 struct ReconstructionSettings {
@@ -149,6 +151,27 @@ impl ReconstructionPlugin {
         })
     }
 
+    fn accumulated_coordinate_space_3d(&self) -> Option<augur_plugin_api::TableCoordinateSpace3d> {
+        let (sensor_width, sensor_height) = self.sensor_dims?;
+        let z_min = self.table.front()?.timestamp_us as f64;
+        let z_max = self
+            .table
+            .back()?
+            .timestamp_us
+            .max(self.table.front()?.timestamp_us) as f64;
+        Some(augur_plugin_api::TableCoordinateSpace3d {
+            x_column: "x_nm".into(),
+            y_column: "y_nm".into(),
+            z_column: "timestamp_us".into(),
+            x_min: 0.0,
+            x_max: f64::from(sensor_width) * self.settings.nm_per_pixel,
+            y_min: 0.0,
+            y_max: f64::from(sensor_height) * self.settings.nm_per_pixel,
+            z_min,
+            z_max,
+        })
+    }
+
     fn accumulated_schema(&self) -> augur_plugin_api::TableSchema {
         augur_plugin_api::TableSchema {
             columns: vec![
@@ -199,6 +222,71 @@ impl ReconstructionPlugin {
                 },
             ],
             coordinate_space_2d: self.accumulated_coordinate_space(),
+            coordinate_space_3d: self.accumulated_coordinate_space_3d(),
+            row_id_column: Some("id".into()),
+            time_column: Some("timestamp_us".into()),
+            layer_id: Some(ACCUMULATED_LAYER_ID.into()),
+            semantic_label: Some("localizations".into()),
+            provenance: Some(augur_plugin_api::TableRowProvenance {
+                anchor_time_column: Some("timestamp_us".into()),
+                span_start_column: Some("timestamp_us".into()),
+                span_end_column: Some("timestamp_us".into()),
+                anchor_frame_column: Some("frame".into()),
+            }),
+            column_display: vec![
+                augur_plugin_api::TableColumnDisplayEntry {
+                    column_id: "id".into(),
+                    display: augur_plugin_api::TableColumnDisplayMetadata {
+                        format: Some(augur_plugin_api::TableColumnDisplayFormat::Identifier),
+                        hide_in_compact: true,
+                        ..Default::default()
+                    },
+                },
+                augur_plugin_api::TableColumnDisplayEntry {
+                    column_id: "timestamp_us".into(),
+                    display: augur_plugin_api::TableColumnDisplayMetadata {
+                        format: Some(augur_plugin_api::TableColumnDisplayFormat::TimestampMicros),
+                        label: Some("Time".into()),
+                        ..Default::default()
+                    },
+                },
+                augur_plugin_api::TableColumnDisplayEntry {
+                    column_id: "x_nm".into(),
+                    display: augur_plugin_api::TableColumnDisplayMetadata {
+                        format: Some(augur_plugin_api::TableColumnDisplayFormat::FixedPrecision {
+                            digits: 1,
+                        }),
+                        ..Default::default()
+                    },
+                },
+                augur_plugin_api::TableColumnDisplayEntry {
+                    column_id: "y_nm".into(),
+                    display: augur_plugin_api::TableColumnDisplayMetadata {
+                        format: Some(augur_plugin_api::TableColumnDisplayFormat::FixedPrecision {
+                            digits: 1,
+                        }),
+                        ..Default::default()
+                    },
+                },
+                augur_plugin_api::TableColumnDisplayEntry {
+                    column_id: "sigma_nm".into(),
+                    display: augur_plugin_api::TableColumnDisplayMetadata {
+                        format: Some(augur_plugin_api::TableColumnDisplayFormat::FixedPrecision {
+                            digits: 2,
+                        }),
+                        ..Default::default()
+                    },
+                },
+                augur_plugin_api::TableColumnDisplayEntry {
+                    column_id: "uncertainty_xy_nm".into(),
+                    display: augur_plugin_api::TableColumnDisplayMetadata {
+                        format: Some(augur_plugin_api::TableColumnDisplayFormat::FixedPrecision {
+                            digits: 2,
+                        }),
+                        ..Default::default()
+                    },
+                },
+            ],
         }
     }
 
@@ -269,6 +357,14 @@ impl ReconstructionPlugin {
                 title: "Accumulated localizations".into(),
                 kind: augur_plugin_api::HostDatasetKind::TableV1(self.accumulated_schema()),
                 empty_message: "No accumulated localizations yet.".into(),
+                display: Some(augur_plugin_api::HostDatasetDisplayMetadata {
+                    layer_title: Some("Accumulated localizations".into()),
+                    default_visibility: Some(true),
+                    default_color: Some([255, 180, 80, 255]),
+                    default_marker_shape: Some(augur_plugin_api::HostMarkerShape::Circle),
+                    default_size: Some(3.5),
+                }),
+                relations: Vec::new(),
             }],
             views: vec![
                 augur_plugin_api::HostViewDescriptor {
@@ -288,7 +384,19 @@ impl ReconstructionPlugin {
                         y_column: "y_nm".into(),
                     },
                 },
+                augur_plugin_api::HostViewDescriptor {
+                    id: RECONSTRUCTION_3D_VIEW_ID.into(),
+                    title: "Localization Cloud".into(),
+                    dataset_id: ACCUMULATED_DATASET_ID.into(),
+                    placement: augur_plugin_api::HostViewPlacement::Window,
+                    kind: augur_plugin_api::HostViewKind::Scatter3dFromTable {
+                        x_column: "x_nm".into(),
+                        y_column: "y_nm".into(),
+                        z_column: "timestamp_us".into(),
+                    },
+                },
             ],
+            actions: Vec::new(),
         }
     }
 }
@@ -505,16 +613,23 @@ mod tests {
     }
 
     #[test]
-    fn host_view_registry_exposes_one_dataset_and_two_window_views() {
+    fn host_view_registry_exposes_one_dataset_and_investigation_views() {
         let mut plugin = ReconstructionPlugin::default();
         plugin.sensor_dims = Some((1280, 720));
 
         let registry = plugin.host_view_registry();
 
         assert_eq!(registry.datasets.len(), 1);
-        assert_eq!(registry.views.len(), 2);
+        assert_eq!(registry.views.len(), 3);
         assert_eq!(registry.datasets[0].id, ACCUMULATED_DATASET_ID);
         assert_eq!(registry.views[0].id, LOCALIZATION_TABLE_VIEW_ID);
         assert_eq!(registry.views[1].id, RECONSTRUCTION_VIEW_ID);
+        assert_eq!(registry.views[2].id, RECONSTRUCTION_3D_VIEW_ID);
+        let schema = match &registry.datasets[0].kind {
+            augur_plugin_api::HostDatasetKind::TableV1(schema) => schema,
+            other => panic!("unexpected dataset kind: {other:?}"),
+        };
+        assert_eq!(schema.row_id_column.as_deref(), Some("id"));
+        assert_eq!(schema.time_column.as_deref(), Some("timestamp_us"));
     }
 }
