@@ -976,10 +976,16 @@ impl StageAPhotodiodePlugin {
         Ok(PathBuf::from(self.data_dir.trim()))
     }
 
-    /// Resolves a workflow-owned relative evidence path beneath the configured
-    /// data directory. Existing or newly created parent components must be
-    /// real directories, never symlinks.
-    fn resolve_control_path(&self, label: &str, extension: &str) -> Result<PathBuf, String> {
+    /// Resolves a workflow-owned relative evidence path beneath `root_override`
+    /// when the client named one, else beneath the configured data directory.
+    /// Existing or newly created parent components must be real directories,
+    /// never symlinks — that holds for either root.
+    fn resolve_control_path(
+        &self,
+        label: &str,
+        extension: &str,
+        root_override: Option<&str>,
+    ) -> Result<PathBuf, String> {
         let relative = Path::new(label);
         if relative.as_os_str().is_empty()
             || relative.is_absolute()
@@ -995,12 +1001,24 @@ impl StageAPhotodiodePlugin {
             return Err(format!("workflow path must use the .{extension} extension"));
         }
 
-        let root = self.resolved_data_dir()?;
+        // A client-named root replaces the data directory entirely: a
+        // coordinated run keeps every file of one measurement together, and
+        // the owner's own Data section then has no bearing on it.
+        let root = match root_override.map(str::trim).filter(|root| !root.is_empty()) {
+            Some(root) => {
+                let root = PathBuf::from(root);
+                if !root.is_absolute() {
+                    return Err("workflow recording root must be an absolute path".into());
+                }
+                root
+            }
+            None => self.resolved_data_dir()?,
+        };
         std::fs::create_dir_all(&root)
             .map_err(|err| format!("creating {} failed: {err}", root.display()))?;
         let root = root
             .canonicalize()
-            .map_err(|err| format!("resolving data directory failed: {err}"))?;
+            .map_err(|err| format!("resolving recording directory failed: {err}"))?;
         let mut parent = root.clone();
         if let Some(relative_parent) = relative.parent() {
             for component in relative_parent.components() {
@@ -1032,7 +1050,7 @@ impl StageAPhotodiodePlugin {
                     .canonicalize()
                     .map_err(|err| format!("resolving {} failed: {err}", parent.display()))?;
                 if !canonical.starts_with(&root) {
-                    return Err("workflow path escapes the configured data directory".into());
+                    return Err("workflow path escapes the recording directory".into());
                 }
             }
         }
@@ -1090,11 +1108,12 @@ impl StageAPhotodiodePlugin {
                 true,
             ));
         }
+        let root = specification.root_dir.as_deref();
         let pdq_path = self
-            .resolve_control_path(&specification.pdq_path, "pdq")
+            .resolve_control_path(&specification.pdq_path, "pdq", root)
             .map_err(|message| service_error(ServiceErrorCodeV1::InvalidPath, message, false))?;
         let sidecar_path = self
-            .resolve_control_path(&specification.sidecar_path, "json")
+            .resolve_control_path(&specification.sidecar_path, "json", root)
             .map_err(|message| service_error(ServiceErrorCodeV1::InvalidPath, message, false))?;
         if pdq_path == sidecar_path {
             return Err(service_error(
@@ -1768,8 +1787,7 @@ impl StageAPhotodiodePlugin {
             stream,
             // Automation clients need this to refuse a coordinated run before
             // it starts the camera, instead of failing at BeginRecording.
-            data_dir: Some(self.data_dir.trim().to_owned())
-                .filter(|folder| !folder.is_empty()),
+            data_dir: Some(self.data_dir.trim().to_owned()).filter(|folder| !folder.is_empty()),
             active_recording,
             last_finalized_recording: self.last_finalized_recording.clone(),
             optical_summary,
@@ -4408,6 +4426,109 @@ mod tests {
         assert!(plugin.set_setting("mode", json!("RAW")).is_err());
     }
 
+    /// A workflow client that names its own recording root gets the PDQ written
+    /// there, and the owner's Data directory stops being involved at all — that
+    /// is what lets one coordinated run keep every file in one folder.
+    #[test]
+    fn a_client_named_root_overrides_the_data_directory() {
+        let dir = temp_dir("client-root");
+        let mut plugin = live_plugin();
+        plugin.port_hint = "mock".into();
+        // Deliberately unset: it must not be consulted.
+        plugin.data_dir = String::new();
+        plugin.connect();
+        let acquire = service_request(
+            &plugin,
+            20,
+            "workflow-a",
+            PhotodiodeCommandV1::AcquireLease { ttl_ms: 10_000 },
+            None,
+        );
+        assert!(matches!(
+            plugin
+                .handle_service_request(&acquire, &live_execution())
+                .outcome,
+            PluginServiceOutcome::Accepted { .. }
+        ));
+
+        let begin = service_request(
+            &plugin,
+            21,
+            "workflow-a",
+            PhotodiodeCommandV1::BeginRecording {
+                specification: PdqStartSpecV1 {
+                    pdq_path: "A1-row/run_pd.pdq".into(),
+                    sidecar_path: "A1-row/run_pd.json".into(),
+                    expected_sample_rate_hz: None,
+                    expected_stream_epoch: None,
+                    metadata: BTreeMap::new(),
+                    root_dir: Some(dir.display().to_string()),
+                },
+            },
+            Some(1),
+        );
+        assert!(
+            matches!(
+                plugin
+                    .handle_service_request(&begin, &live_execution())
+                    .outcome,
+                PluginServiceOutcome::Accepted { .. }
+            ),
+            "a client-named root must not need the owner's data directory"
+        );
+        assert!(dir.join("A1-row/run_pd.pdq").is_file());
+
+        // Traversal is still refused below a client-named root.
+        let escape = service_request(
+            &plugin,
+            22,
+            "workflow-a",
+            PhotodiodeCommandV1::BeginRecording {
+                specification: PdqStartSpecV1 {
+                    pdq_path: "../escape.pdq".into(),
+                    sidecar_path: "A1-row/escape.json".into(),
+                    expected_sample_rate_hz: None,
+                    expected_stream_epoch: None,
+                    metadata: BTreeMap::new(),
+                    root_dir: Some(dir.display().to_string()),
+                },
+            },
+            Some(2),
+        );
+        assert!(matches!(
+            plugin
+                .handle_service_request(&escape, &live_execution())
+                .outcome,
+            PluginServiceOutcome::Rejected { .. }
+        ));
+
+        // A relative root is refused outright.
+        let relative_root = service_request(
+            &plugin,
+            23,
+            "workflow-a",
+            PhotodiodeCommandV1::BeginRecording {
+                specification: PdqStartSpecV1 {
+                    pdq_path: "A1-row/other_pd.pdq".into(),
+                    sidecar_path: "A1-row/other_pd.json".into(),
+                    expected_sample_rate_hz: None,
+                    expected_stream_epoch: None,
+                    metadata: BTreeMap::new(),
+                    root_dir: Some("relative/root".into()),
+                },
+            },
+            Some(3),
+        );
+        assert!(matches!(
+            plugin
+                .handle_service_request(&relative_root, &live_execution())
+                .outcome,
+            PluginServiceOutcome::Rejected { .. }
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn named_recording_rejects_unsafe_paths_and_returns_final_receipt() {
         let dir = temp_dir("named");
@@ -4440,6 +4561,7 @@ mod tests {
                     expected_sample_rate_hz: None,
                     expected_stream_epoch: None,
                     metadata: BTreeMap::new(),
+                    root_dir: None,
                 },
             },
             Some(1),
@@ -4462,6 +4584,7 @@ mod tests {
                     expected_sample_rate_hz: None,
                     expected_stream_epoch: None,
                     metadata: BTreeMap::from([("workflow".into(), "A1".into())]),
+                    root_dir: None,
                 },
             },
             Some(1),
@@ -4511,6 +4634,7 @@ mod tests {
                     expected_sample_rate_hz: None,
                     expected_stream_epoch: None,
                     metadata: BTreeMap::new(),
+                    root_dir: None,
                 },
             },
             Some(3),
@@ -4551,6 +4675,7 @@ mod tests {
                     expected_sample_rate_hz: None,
                     expected_stream_epoch: None,
                     metadata: BTreeMap::new(),
+                    root_dir: None,
                 },
             },
             Some(1),

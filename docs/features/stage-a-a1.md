@@ -81,16 +81,20 @@ the drive to still be where a previous action left it (ADR 013).
 - `<id>/<id>_<ts>_pd.pdq` + `_pd.json` — photodiode PDQ + sidecar.
 - `<id>/<id>_<ts>_config.toml` — the A1 sidecar.
 
-**Everything lands under `<A1 output folder>/<id>/`.** The two recorders each
-write below their own root while recording — the host resolves plugin recording
-paths below *its* output directory and rejects absolute ones, the photodiode
-resolves PDQ paths below *its* data directory — so once both files are finalized
-(closed and hashed) A1 moves them into the measurement folder and records the
-final paths in the sidecar (ADR 015). The A1 output folder is therefore the only
-setting that decides where a measurement ends up; the host and photodiode roots
-no longer have to be kept aligned by hand. A move is a rename on one volume and a
-size-verified copy across volumes; a file that cannot be moved stays where it is
-and the sidecar points at it there.
+**Everything lands under `<A1 output folder>/<id>/`** (ADR 015). That folder is
+the only setting deciding where a measurement ends up — the host output root and
+the photodiode Data directory no longer have to be kept aligned by hand:
+
+- **The PDQ and its sidecar are written there directly.** A1 names the
+  destination root in the start spec (`PdqStartSpecV1::root_dir`), which replaces
+  the photodiode's own Data directory for that run. An A1-driven recording
+  therefore does not depend on the photodiode's folder setting at all.
+- **The camera RAW and the host's bias `.toml` are moved there after
+  finalization.** The host resolves plugin recording paths below *its* output
+  directory and rejects absolute ones, so A1 cannot name the destination up
+  front; instead it gathers the file once the host reports it closed and hashed.
+  A rename on one volume, a size-verified copy across volumes. A file that cannot
+  be moved stays where it is and the sidecar points at it there.
 
 **A1 config sidecar** captures: `measurement_id`, file stem, role, start/finalize
 timestamps, duration; the sweep `[min_a, max_a]`; modulation settings from the
@@ -119,9 +123,10 @@ manifest. Every role uses this same lifecycle.
 **When something is wrong** (ADR 015):
 
 - **Before the camera starts**, A1 refuses the recording — writing nothing — if
-  the photodiode is not reporting status, not connected, has no data directory,
-  or is leased by someone else. The same hint fills the status `message` cell
-  while idle, so it is visible before the button is pressed.
+  the photodiode is not reporting status, is not connected, or is leased by
+  someone else. The same hint fills the status `message` cell while idle, so it
+  is visible before the button is pressed. (The photodiode's *Data directory* is
+  deliberately not among these: A1 supplies the destination itself.)
 - **If the photodiode fails once the camera is running**, the camera keeps
   recording for the full requested duration and closes normally. The run is
   marked camera-only: `recording_completed_ok` stays false (so a sweep stops),

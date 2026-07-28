@@ -440,6 +440,14 @@ pub struct PdqStartSpecV1 {
     pub expected_sample_rate_hz: Option<u32>,
     pub expected_stream_epoch: Option<u64>,
     pub metadata: BTreeMap<String, String>,
+    /// Absolute directory the workflow client wants this recording written
+    /// below, so a coordinated run can put every file in one measurement
+    /// folder instead of the owner's own data directory. `None` keeps the
+    /// owner's configured data directory. `pdq_path`/`sidecar_path` stay
+    /// relative to whichever root applies, and the owner still refuses
+    /// traversal and symlinked path components below it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

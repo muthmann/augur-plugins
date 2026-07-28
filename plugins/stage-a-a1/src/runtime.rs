@@ -1480,16 +1480,10 @@ impl StageAA1Plugin {
                 connection_label(&photodiode.connection)
             ));
         }
-        if photodiode
-            .data_dir
-            .as_ref()
-            .is_none_or(|folder| folder.trim().is_empty())
-        {
-            return Some(
-                "Set the photodiode Data directory before recording — the PDQ has nowhere to go"
-                    .into(),
-            );
-        }
+        // The photodiode's own Data directory is deliberately *not* checked: A1
+        // names the destination root in the start spec, so a recording started
+        // here does not depend on the owner's folder setting at all.
+        //
         // A lease held by anyone else means the PDQ is already committed.
         if let Some(lease) = photodiode.lease.as_ref() {
             if lease.holder.as_str() != A1_PLUGIN_ID {
@@ -1664,6 +1658,10 @@ impl StageAA1Plugin {
             expected_sample_rate_hz: None,
             expected_stream_epoch: None,
             metadata: self.recording_metadata(),
+            // Write the PDQ straight into this measurement's folder rather than
+            // the photodiode's own data directory: for a recording started here,
+            // this plugin's output folder is the one that decides where files go.
+            root_dir: Some(self.recording.folder.clone()),
         };
         let pd_request = self.photodiode_request(PhotodiodeCommandV1::BeginRecording {
             specification: spec,
@@ -1820,20 +1818,30 @@ impl StageAA1Plugin {
         }
     }
 
-    /// Absolute location of a photodiode-reported recording path. The owner
-    /// reports paths relative to its own data directory, which it publishes in
-    /// its summary; an already-absolute path is taken as given.
+    /// Absolute location of a photodiode-reported recording path. Receipts name
+    /// the *label* A1 asked for, which is relative to whichever root the owner
+    /// used: the folder A1 named in the start spec, or — for an owner too old to
+    /// honour it — the owner's own data directory. Resolve against both and
+    /// prefer the one that exists.
     fn resolved_photodiode_path(&self, reported: Option<&str>) -> Option<String> {
         let reported = reported?;
         let path = Path::new(reported);
         if path.is_absolute() {
             return Some(reported.to_owned());
         }
-        let root = self
+        let requested = Path::new(&self.recording.folder).join(path);
+        if requested.exists() {
+            return Some(requested.display().to_string());
+        }
+        let owner_root = self
             .photodiode
             .as_ref()
-            .and_then(|photodiode| photodiode.data_dir.as_deref())?;
-        Some(Path::new(root).join(path).display().to_string())
+            .and_then(|photodiode| photodiode.data_dir.as_deref())
+            .map(|root| Path::new(root).join(path));
+        match owner_root {
+            Some(owner_root) if owner_root.exists() => Some(owner_root.display().to_string()),
+            _ => Some(requested.display().to_string()),
+        }
     }
 
     /// Release the photodiode lease (only if we actually hold it) and return to idle.
@@ -7199,9 +7207,9 @@ mod tests {
     /// A photodiode that cannot record is caught before the host is recording,
     /// so a misconfigured bench no longer leaves a stub RAW behind.
     #[test]
-    fn a_photodiode_without_a_data_directory_is_refused_before_the_camera_starts() {
+    fn a_disconnected_photodiode_is_refused_before_the_camera_starts() {
         let mut photodiode = ready_photodiode();
-        photodiode.data_dir = None;
+        photodiode.connection = ConnectionStateV1::Disconnected;
         let mut plugin = StageAA1Plugin {
             output_folder: "/tmp/a1-preflight".into(),
             measurement_id: "A1-row".into(),
@@ -7217,12 +7225,87 @@ mod tests {
         assert_eq!(plugin.recording.phase, RecPhase::Idle);
         assert!(
             sink.hosts.is_empty(),
-            "the camera must not start when the PDQ has nowhere to go"
+            "the camera must not start when the PDQ cannot follow"
         );
         assert!(
-            plugin.message.contains("Data directory"),
+            plugin.message.contains("connect it"),
             "message={}",
             plugin.message
+        );
+    }
+
+    /// The photodiode's own Data directory is irrelevant to a recording started
+    /// from A1: A1 names the destination root, so the run proceeds and the PDQ
+    /// is written into A1's measurement folder.
+    #[test]
+    fn the_pdq_start_spec_points_at_the_a1_output_folder() {
+        let mut photodiode = ready_photodiode();
+        photodiode.data_dir = None;
+        let mut plugin = StageAA1Plugin {
+            output_folder: "/tmp/a1-destination".into(),
+            measurement_id: "A1-row".into(),
+            duration_s: 10,
+            pending_role: Some(RecRole::Normal),
+            photodiode: Some(photodiode),
+            ..StageAA1Plugin::default()
+        };
+        let mut sink = ControlSink::default();
+
+        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+        assert_eq!(
+            plugin.recording.phase,
+            RecPhase::StartingCamera,
+            "an unset owner data directory must not block an A1-driven run"
+        );
+        let cam_start_req = sink.hosts[0].request_id;
+
+        control_tick(
+            &mut plugin,
+            PluginControlInbox {
+                host_replies: vec![HostCommandReply {
+                    request_id: cam_start_req,
+                    outcome: HostCommandOutcome::RecordingStarted {
+                        actual_raw_path: "/camera/A1-row/run.raw".into(),
+                        started_at: "2026-07-25T00:00:00Z".into(),
+                    },
+                }],
+                ..PluginControlInbox::default()
+            },
+            &mut sink,
+        );
+        let connect = sink.services.last().expect("connect").clone();
+        control_tick(
+            &mut plugin,
+            PluginControlInbox {
+                service_replies: vec![pd_reply(connect.request_id, None)],
+                ..PluginControlInbox::default()
+            },
+            &mut sink,
+        );
+        let acquire = sink.services.last().expect("lease").clone();
+        control_tick(
+            &mut plugin,
+            PluginControlInbox {
+                service_replies: vec![pd_reply(acquire.request_id, None)],
+                ..PluginControlInbox::default()
+            },
+            &mut sink,
+        );
+
+        let begin: PhotodiodeRequestV1 =
+            serde_json::from_value(sink.services.last().expect("begin").payload.clone())
+                .expect("begin envelope");
+        let PhotodiodeCommandV1::BeginRecording { specification } = begin.command else {
+            panic!("expected BeginRecording");
+        };
+        assert_eq!(
+            specification.root_dir.as_deref(),
+            Some("/tmp/a1-destination"),
+            "the PDQ must be written below the A1 output folder"
+        );
+        assert_eq!(
+            specification.pdq_path,
+            format!("A1-row/{}_pd.pdq", plugin.recording.stem)
         );
     }
 

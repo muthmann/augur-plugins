@@ -69,24 +69,39 @@ Three separate defects produced that outcome.
    first, most specific cause; later fallout cannot overwrite it. The closing
    message reads `Recording <id> incomplete: <cause> — metadata saved to <path>`.
 
-4. **A1's output folder becomes authoritative for the whole measurement.** After
-   both recorders report finalization, A1 moves the RAW, the host's bias sidecar,
-   and the PDQ and its sidecar into `<output folder>/<id>/`, then writes the
-   config sidecar with the final paths. This reverses ADR 009's "co-location is a
-   configuration convention" without touching the host or photodiode path rules:
-   both files are closed and hashed by the time their receipts arrive, so moving
-   them afterwards is safe and stays inside each owner's contract.
+4. **A1's output folder is the destination for the whole measurement**, reversing
+   ADR 009's "co-location is a configuration convention". A recording started in
+   A1 puts every file under `<output folder>/<id>/`, by two mechanisms — chosen
+   per recorder by how much control that owner grants a client:
 
-   The move is a `rename` on one volume and a size-verified copy-then-delete
-   across volumes. It never overwrites an existing destination and never removes
-   a source it has not verified; if a move fails, the file stays put and the
-   sidecar records where it actually is.
+   **The PDQ is written there directly.** `PdqStartSpecV1` gains an additive
+   `root_dir: Option<String>`: an absolute directory the client wants the
+   recording written below, replacing the owner's configured data directory for
+   that run. The owner keeps every safety rule it already had below the new root
+   — the path stays relative, `..` and non-normal components are refused, parent
+   components must be real directories rather than symlinks, and the resolved
+   target must stay below the root — and additionally requires the root itself to
+   be absolute. Consequently an A1-driven run **does not depend on the
+   photodiode's own Data directory at all**, which is what removed the failure
+   mode in context item 1; the pre-flight in decision 2 no longer checks it.
 
-   PDQ receipts report the path **label** A1 requested — relative to the
-   photodiode's data directory — not an absolute path, so A1 resolves it against
-   the `data_dir` from decision 2 before locating the file. The sidecar records
-   the resolved absolute path either way, which also fixes the previous ambiguity
-   of storing a bare relative label under `[files]`.
+   **The camera RAW is moved there after finalization.** The host resolves plugin
+   recording paths below *its* output directory and rejects absolute paths, and
+   it lives in the other repository, so A1 cannot name the destination up front.
+   Instead, once the host reports finalization — at which point the file is closed
+   and hashed — A1 moves the RAW and the host's bias sidecar into the measurement
+   folder. A `rename` on one volume, a size-verified copy-then-delete across
+   volumes; it never overwrites an existing destination and never removes a source
+   it has not verified. If a move fails the file stays put and the sidecar records
+   where it actually is. The same gather runs over the PDQ, which is normally a
+   no-op because it is already in place.
+
+   PDQ receipts report the path **label** the client requested, not an absolute
+   path, so A1 resolves it against the root it named — falling back to the owner's
+   published `data_dir` (decision 2) and preferring whichever exists, so an owner
+   too old to honour `root_dir` still yields a correct path. The sidecar records
+   the resolved absolute path, which also fixes the previous ambiguity of storing
+   a bare relative label under `[files]`.
 
 5. **Self-inflicted pipeline restarts no longer wipe the row.** Starting and
    stopping the host recorder restarts the capture pipeline, which the host
@@ -107,6 +122,21 @@ Three separate defects produced that outcome.
   the host and photodiode settings happen to point, so operators do not have to
   keep three roots aligned by hand. Aligning them is still harmless — a file
   already in the destination is left alone.
+- The photodiode's Data directory now governs only its *own* manual saves (cache
+  snapshots, operator-started recordings). A workflow-driven run overrides it, so
+  changing it mid-experiment cannot move A1's files out from under a measurement.
+- A crash mid-run leaves the PDQ in the measurement folder, because it was opened
+  there. Only the camera RAW depends on surviving to finalization to be gathered;
+  if a run dies before that, the RAW is left in the host's output directory and
+  the sidecar (if written) names it there.
 - Moving a large RAW across volumes copies it. On one volume (the normal case)
   the move is a metadata operation regardless of file size.
-- The contract addition is additive and backward compatible; no ABI change.
+- Both contract additions (`data_dir`, `root_dir`) are additive `#[serde(default)]`
+  fields, backward compatible in both directions; no ABI change and the contract
+  version stays at 1. Letting a client name an absolute root is a deliberate
+  widening of what a workflow may ask the owner to do — bounded by keeping every
+  traversal and symlink check, and by the owner still refusing anything it cannot
+  resolve below that root.
+- Making the camera RAW land directly in the measurement folder would need the
+  host to accept a plugin-declared recording root. That belongs to `augur-rs` and
+  is deliberately left out of scope here; the gather makes it unnecessary.
