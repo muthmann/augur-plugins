@@ -30,13 +30,45 @@ pub const WARP_TABLE_LEN: usize = 256;
 /// Full-scale DAC code (12-bit).
 pub const DAC_FULL_SCALE: u16 = 4_095;
 
+/// Modified Bessel function `I₀(x)` for the Stage-A depth range (`|x| ≤ 3`).
+///
+/// The positive power series converges rapidly here and avoids adding a
+/// special-functions dependency to the plugin/firmware parameter path.
+fn modified_bessel_i0(x: f64) -> f64 {
+    let y = 0.25 * x * x;
+    let mut sum = 1.0;
+    let mut term = 1.0;
+    for k in 1..=32 {
+        term *= y / (k as f64 * k as f64);
+        sum += term;
+        if term <= f64::EPSILON * sum {
+            break;
+        }
+    }
+    sum
+}
+
+/// Geometric pedestal that makes a log-sine's cycle-mean normalized lobe
+/// coordinate equal `mean_u`:
+///
+/// `u(t) = u_g exp[(a/2) sin(ωt)]`, `u_g = mean_u / I₀(a/2)`.
+pub fn log_sine_geometric_pedestal(mean_u: f64, depth_a: f64) -> f64 {
+    mean_u / modified_bessel_i0(0.5 * depth_a)
+}
+
+pub fn log_sine_cycle_mean(pedestal_u: f64, depth_a: f64) -> f64 {
+    pedestal_u * modified_bessel_i0(0.5 * depth_a)
+}
+
 /// Optical intensity target the drive should reproduce, swung around the
-/// operating point `u_k`.
+/// dimensionless lobe point `u`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpticalTarget {
-    /// Recommended A1 log-intensity sine: `ln I = ln I_k + (a/2) sin ωt`.
+    /// Recommended A1 log-intensity sine in normalized, floor-subtracted lobe
+    /// coordinate: `ln u = ln u_g + (a/2) sin ωt`.
     LogSine,
-    /// Literal linear-intensity sine: `I = I_k (1 + m sin ωt)`, `m = tanh(a/2)`.
+    /// Literal linear-intensity sine: `u = u_c (1 + m sin ωt)`,
+    /// `m = tanh(a/2)`.
     LinearSine,
 }
 
@@ -45,7 +77,7 @@ pub enum OpticalTarget {
 pub struct LobeInversion {
     /// DAC code where the excitation light is at its minimum (`sin² = 0`).
     pub v_null_dac: f64,
-    /// DAC-code distance from `v_null` to the excitation maximum (quarter wave).
+    /// DAC-code half-wave-voltage span from `v_null` to the excitation maximum.
     pub v_pi_dac: f64,
 }
 
@@ -69,9 +101,10 @@ pub struct OpticalDrive {
     pub target: OpticalTarget,
     /// Optical log-modulation depth `a = ln(I_max / I_min)`, must be positive.
     pub depth_a: f64,
-    /// Operating illumination `I_k` as a normalised lobe intensity `u_k ∈ (0, 1]`:
-    /// the geometric-mean point the modulation swings around. Held fixed while
-    /// `a` is swept, so one response curve keeps `I_k` constant.
+    /// Dimensionless, floor-subtracted lobe point in `(0, 1]`. It is the
+    /// geometric pedestal `u_g` for [`OpticalTarget::LogSine`] and the
+    /// arithmetic centre `u_c` for [`OpticalTarget::LinearSine`]. This is not
+    /// the physical A1 flux point `I_k`.
     pub operating_point: f64,
     pub inversion: LobeInversion,
 }
@@ -84,8 +117,8 @@ pub enum WarpError {
     InvalidOperatingPoint,
     /// `Vπ` is not finite or not positive.
     InvalidInversion,
-    /// The peak optical target exceeds the lobe ceiling (`u_k · peak > 1`): the
-    /// operating point is too bright for this depth and would saturate.
+    /// The peak optical target exceeds the lobe ceiling: the internal
+    /// pedestal/centre is too bright for this depth and would saturate.
     Saturates { peak: f64 },
     /// A computed DAC code falls outside `0..=4095`: the inversion parameters do
     /// not fit the requested depth on this lobe. Clamping would silently distort
@@ -141,13 +174,13 @@ impl OpticalDrive {
     }
 
     /// Normalised optical target `u(φ)` for phase fraction `φ ∈ [0, 1)`, swung
-    /// around the operating point `u_k` (not peak-normalised).
+    /// around the internal `u_g`/`u_c` point (not peak-normalised).
     pub fn normalised_intensity(&self, phase: f64) -> f64 {
         let sine = (2.0 * PI * phase).sin();
         match self.target {
-            // ln I = ln I_k + (a/2) sin ωt.
+            // ln u = ln u_g + (a/2) sin ωt.
             OpticalTarget::LogSine => self.operating_point * (0.5 * self.depth_a * sine).exp(),
-            // I = I_k (1 + m sin ωt), m = tanh(a/2).
+            // u = u_c (1 + m sin ωt), m = tanh(a/2).
             OpticalTarget::LinearSine => {
                 let m = (0.5 * self.depth_a).tanh();
                 self.operating_point * (1.0 + m * sine)
@@ -206,7 +239,7 @@ mod tests {
     use super::*;
 
     fn inversion() -> LobeInversion {
-        // Null at code 200, quarter wave 1600 codes later (peak light at 1800).
+        // Null at code 200, one half-wave-voltage span later at peak light.
         LobeInversion {
             v_null_dac: 200.0,
             v_pi_dac: 1_600.0,
@@ -363,19 +396,21 @@ mod tests {
     }
 
     #[test]
-    fn fixed_operating_point_keeps_i_k_while_sweeping_a() {
-        // One response curve: fix u_k, vary a. The geometric-mean intensity at
-        // phase 0 (sin = 0) stays put; only the contrast grows with a.
-        let u_k = 0.3;
+    fn fixed_internal_log_pedestal_stays_at_phase_zero_while_sweeping_a() {
+        // The low-level OpticalDrive takes the geometric pedestal u_g. At
+        // phase 0 (sin = 0), that pedestal stays put while contrast grows.
+        // The plugin wrapper adjusts u_g with I₀(a/2) when its requested
+        // cycle-mean ū is held fixed.
+        let u_g = 0.3;
         let drive = |a: f64| OpticalDrive {
             target: OpticalTarget::LogSine,
             depth_a: a,
-            operating_point: u_k,
+            operating_point: u_g,
             inversion: inversion(),
         };
         for a in [0.2, 0.6, 1.0] {
             // At phase 0 the log-sine sits exactly at the operating point.
-            assert!((drive(a).normalised_intensity(0.0) - u_k).abs() < 1e-12);
+            assert!((drive(a).normalised_intensity(0.0) - u_g).abs() < 1e-12);
             let table = drive(a).warp_table().expect("in range");
             let intensities: Vec<f64> = table
                 .iter()
@@ -384,6 +419,25 @@ mod tests {
             let max = intensities.iter().cloned().fold(f64::MIN, f64::max);
             let min = intensities.iter().cloned().fold(f64::MAX, f64::min);
             assert!(((max / min).ln() - a).abs() < 0.05, "a={a}");
+        }
+    }
+
+    #[test]
+    fn bessel_normalization_keeps_the_log_sine_cycle_mean() {
+        for depth_a in [0.2, 0.4, 1.0, 2.0, 6.0] {
+            let mean_u = 0.2;
+            let pedestal = log_sine_geometric_pedestal(mean_u, depth_a);
+            let sample_mean = (0..65_536)
+                .map(|index| {
+                    let phase = 2.0 * PI * index as f64 / 65_536.0;
+                    pedestal * (0.5 * depth_a * phase.sin()).exp()
+                })
+                .sum::<f64>()
+                / 65_536.0;
+            assert!(
+                (sample_mean - mean_u).abs() < 1e-12,
+                "a={depth_a}: mean={sample_mean}"
+            );
         }
     }
 }

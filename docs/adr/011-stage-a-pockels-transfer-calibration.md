@@ -51,7 +51,7 @@ the port. It cannot. Since `sin²` is symmetric about its peak,
 *identically* — the data cannot say which extremum is zero excitation. This is a
 fact about the optics, so it is asked (`Detector port`, default `REJECT PORT`,
 which `setup/optical-path.md` settles by construction) and the fit selects the
-matching representation. Guessing would place `V_null` a quarter wave off and
+matching representation. Guessing would place `V_null` one half-wave-voltage span off and
 silently run the drive on the inverted branch.
 
 ### 4. One-dimensional harmonic fit, not a nonlinear solve

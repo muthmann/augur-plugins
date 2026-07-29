@@ -285,11 +285,13 @@ pub enum ModulationCommandV1 {
     },
     /// Retarget the owner's *calibrated optical drive* to a new modulation
     /// depth `a` (log contrast, in milli-units) without changing anything else
-    /// about the armed drive: waveform shape, frequency, operating point and
-    /// calibration stay whatever the operator armed in the modulation plugin.
+    /// about the armed drive: waveform shape, frequency, requested normalized
+    /// cycle mean and calibration stay whatever the operator armed in the
+    /// modulation plugin.
     /// This is the scoped amplitude-sweep path (A1 automation): the owner
     /// rejects the command when its current drive cannot express `a`
-    /// (manual DAC method or constant mode) or the device link is closed.
+    /// (anything other than calibrated `OPTICAL_LOG_SINE` with an identified
+    /// transfer calibration) or the device link is closed.
     SetOpticalDepth {
         depth_a_milli: u32,
     },
@@ -337,6 +339,32 @@ pub struct ModulationResponseV1 {
     pub acknowledged_target: Option<ModulationTargetV1>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpticalTargetV1 {
+    LogSine,
+    LinearSine,
+}
+
+/// Exact optical-inversion parameters currently resolved by the modulation
+/// owner. Additive in V1 so A1 sidecars can reproduce the requested drive
+/// without misusing physical flux `I_k` for the normalized lobe coordinate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpticalDriveStateV1 {
+    pub target: OpticalTargetV1,
+    /// Requested normalized cycle-mean lobe coordinate `ū`.
+    pub requested_mean_u_milli: u32,
+    /// Mean reconstructed from the quantized internal wire coordinate.
+    pub resolved_mean_u_milli: u32,
+    /// Internal target pedestal/centre sent in the wire's legacy `u_k_milli`
+    /// field (`u_g` for log-sine, `u_c` for linear-sine).
+    pub internal_u_milli: u32,
+    pub depth_a_milli: u32,
+    pub v_null_dac: u16,
+    /// Null-to-maximum half-wave-voltage span in DAC codes.
+    pub v_pi_dac: u16,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModulationStateV1 {
     pub contract_version: u16,
@@ -358,6 +386,9 @@ pub struct ModulationStateV1 {
     /// entered the lobe parameters by hand. Additive in V1.
     #[serde(default)]
     pub calibration_id: Option<String>,
+    /// Additive V1 optical-drive provenance.
+    #[serde(default)]
+    pub optical_drive: Option<OpticalDriveStateV1>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -744,6 +775,15 @@ mod tests {
                 valid_for_ms: 500,
             },
             calibration_id: Some("pockels-20260724-120000".into()),
+            optical_drive: Some(OpticalDriveStateV1 {
+                target: OpticalTargetV1::LogSine,
+                requested_mean_u_milli: 400,
+                resolved_mean_u_milli: 399,
+                internal_u_milli: 355,
+                depth_a_milli: 1_000,
+                v_null_dac: 1_630,
+                v_pi_dac: 860,
+            }),
         };
         let encoded = serde_json::to_vec(&snapshot).expect("serializes");
         let decoded: ModulationStateV1 = serde_json::from_slice(&encoded).expect("deserializes");
@@ -753,6 +793,24 @@ mod tests {
             decoded.synchronization,
             SynchronizationV1::Unsynced { .. }
         ));
+        assert_eq!(
+            decoded
+                .optical_drive
+                .as_ref()
+                .unwrap()
+                .requested_mean_u_milli,
+            400
+        );
+        assert_eq!(decoded.optical_drive.unwrap().resolved_mean_u_milli, 399);
+
+        let mut legacy = serde_json::to_value(&snapshot).expect("serializes");
+        let object = legacy.as_object_mut().expect("state object");
+        object.remove("calibration_id");
+        object.remove("optical_drive");
+        let decoded_legacy: ModulationStateV1 =
+            serde_json::from_value(legacy).expect("pre-provenance state decodes");
+        assert!(decoded_legacy.calibration_id.is_none());
+        assert!(decoded_legacy.optical_drive.is_none());
     }
 
     #[test]
@@ -820,8 +878,7 @@ mod tests {
 
     #[test]
     fn additive_v1_fields_decode_from_payloads_that_predate_them() {
-        // An older owner's stream block carries no `level`, and an older
-        // modulation state no `calibration_id`. Both must still decode.
+        // An older owner's stream block carries no `level`.
         let stream: PhotodiodeStreamV1 = serde_json::from_value(json!({
             "stream_epoch": 3,
             "sample_range": null,

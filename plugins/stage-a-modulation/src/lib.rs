@@ -43,11 +43,11 @@ use stage_a_io::{Command, DeviceEvent, MockController, StageAClient, Transport};
 use stage_a_plugin_contract::{
     A1AcquisitionConfigV1, ClientId, ConnectionStateV1, ControllerStateV1, FreshnessV1, LeaseId,
     LeaseSnapshotV1, ModulationCommandV1, ModulationRequestV1, ModulationResponseV1,
-    ModulationStateV1, ModulationTargetV1, OwnerInstanceId, PhotodiodeLevelV1, PhotodiodeSummaryV1,
-    RequestOutcomeV1, ResponseCommonV1, RunId, SemanticRevision, ServiceErrorCodeV1,
-    ServiceErrorV1, SynchronizationV1, UnsyncedReasonV1, WaveformV1, CONTRACT_VERSION_V1,
-    CTX_STAGE_A_MODULATION_STATE_V1, CTX_STAGE_A_PHOTODIODE_SUMMARY_V1,
-    PLUGIN_ID_STAGE_A_MODULATION, PLUGIN_ID_STAGE_A_PHOTODIODE,
+    ModulationStateV1, ModulationTargetV1, OpticalDriveStateV1, OpticalTargetV1, OwnerInstanceId,
+    PhotodiodeLevelV1, PhotodiodeSummaryV1, RequestOutcomeV1, ResponseCommonV1, RunId,
+    SemanticRevision, ServiceErrorCodeV1, ServiceErrorV1, SynchronizationV1, UnsyncedReasonV1,
+    WaveformV1, CONTRACT_VERSION_V1, CTX_STAGE_A_MODULATION_STATE_V1,
+    CTX_STAGE_A_PHOTODIODE_SUMMARY_V1, PLUGIN_ID_STAGE_A_MODULATION, PLUGIN_ID_STAGE_A_PHOTODIODE,
     SERVICE_STAGE_A_MODULATION_CONTROL_V1,
 };
 
@@ -909,12 +909,12 @@ pub struct StageAModulationPlugin {
     /// The operator's armed `depth_a`, parked while a lease drives the optical
     /// depth (A1's amplitude sweep) and restored by [`Self::end_lease`].
     armed_depth_a: Option<f64>,
-    /// Operating illumination `I_k` as a normalised lobe intensity `u_k ∈ (0,1]`.
-    /// Held fixed while `a` is swept, so one response curve keeps `I_k` constant.
+    /// Dimensionless, floor-subtracted **cycle-mean** lobe coordinate
+    /// `ū ∈ (0,1]`; not the physical A1 flux point `I_k`.
     operating_point: f64,
     /// DAC code at the excitation minimum of one monotonic Pockels lobe.
     v_null_dac: i64,
-    /// DAC-code quarter-wave distance from `v_null` to the excitation maximum.
+    /// DAC-code half-wave-voltage span from `v_null` to the excitation maximum.
     v_pi_dac: i64,
     // -- measured transfer calibration --
     /// Bench detector geometry. Not inferable from a sweep — see
@@ -1123,6 +1123,24 @@ impl StageAModulationPlugin {
         }
     }
 
+    /// Resolves the calibrated UI setting (cycle-mean normalized lobe
+    /// coordinate) to the target law's internal pedestal/centre.
+    fn periodic_lobe_point(&self) -> f64 {
+        let point = if self.mode == Mode::OpticalLogSine {
+            waveform::log_sine_geometric_pedestal(self.operating_point, self.depth_a)
+        } else {
+            self.operating_point
+        };
+        if matches!(self.mode, Mode::OpticalLogSine | Mode::OpticalLinearSine) {
+            // The firmware contract carries this coordinate in milli-units.
+            // Validate and preview the value the board will actually rebuild,
+            // not a higher-precision local table.
+            (point * 1_000.0).round() / 1_000.0
+        } else {
+            point
+        }
+    }
+
     /// Resolves the selected method into the DAC band used by every waveform.
     /// The third value is the constant-mode operating code.
     fn dac_band(&self) -> Result<(i64, i64, i64), String> {
@@ -1131,9 +1149,9 @@ impl StageAModulationPlugin {
             return Ok((self.min_level.clamp(0, hi), hi, hi));
         }
 
-        let u_k = self.operating_point;
+        let mean_u = self.operating_point;
         let a = self.depth_a;
-        if !u_k.is_finite() || u_k <= 0.0 || u_k > 1.0 {
+        if !mean_u.is_finite() || mean_u <= 0.0 || mean_u > 1.0 {
             return Err("operating point must be in (0, 1]".into());
         }
         let inversion = self.lobe_inversion();
@@ -1141,12 +1159,10 @@ impl StageAModulationPlugin {
             return Err("Vπ must be finite and positive".into());
         }
 
-        // Constant hold at I_k modulates nothing: no ±a/2 headroom applies, so
-        // the full (0, 1] range of u_k is expressible (I_k = 1 holds exactly at
-        // V_null + Vπ). Requiring the modulated band here silently froze the
-        // drive at the last accepted code whenever u_k·e^{a/2} exceeded 1.
+        // A constant hold modulates nothing: no depth headroom applies, so the
+        // full (0, 1] range of normalized lobe coordinate u is expressible.
         if self.mode == Mode::Const {
-            let hold = inversion.dac_for_u(u_k).round() as i64;
+            let hold = inversion.dac_for_u(mean_u).round() as i64;
             if hold < 0 {
                 return Err(format!(
                     "calibrated hold code {hold} is below 0; re-measure V_null/Vπ"
@@ -1154,7 +1170,7 @@ impl StageAModulationPlugin {
             }
             if hold > self.max_level {
                 return Err(format!(
-                    "calibrated hold {hold} exceeds the max limit {}; raise the max limit or lower I_k / Vπ",
+                    "calibrated hold {hold} exceeds the max limit {}; raise the max limit or lower u / Vπ",
                     self.max_level
                 ));
             }
@@ -1164,17 +1180,22 @@ impl StageAModulationPlugin {
         if !a.is_finite() || a <= 0.0 {
             return Err("optical depth a must be finite and positive".into());
         }
-        let u_lo = u_k * (-0.5 * a).exp();
-        let u_hi = u_k * (0.5 * a).exp();
+        let target_u = self.periodic_lobe_point();
+        let (u_lo, u_hi) = if self.mode == Mode::OpticalLinearSine {
+            let m = (0.5 * a).tanh();
+            (target_u * (1.0 - m), target_u * (1.0 + m))
+        } else {
+            (target_u * (-0.5 * a).exp(), target_u * (0.5 * a).exp())
+        };
         if u_hi > 1.0 {
             return Err(format!(
-                "calibrated optical peak u = {u_hi:.3} exceeds the lobe ceiling; lower a or I_k"
+                "calibrated optical peak u = {u_hi:.3} exceeds the lobe ceiling; lower a or u"
             ));
         }
 
         let lo = inversion.dac_for_u(u_lo).round() as i64;
         let hi = inversion.dac_for_u(u_hi).round() as i64;
-        let hold = inversion.dac_for_u(u_k).round() as i64;
+        let hold = inversion.dac_for_u(target_u).round() as i64;
         if lo < 0 {
             return Err(format!(
                 "calibrated lower DAC code {lo} is below 0; re-measure V_null/Vπ"
@@ -1182,7 +1203,7 @@ impl StageAModulationPlugin {
         }
         if hi > self.max_level {
             return Err(format!(
-                "calibrated peak {hi} exceeds the max limit {}; raise the max limit or lower a / I_k / Vπ",
+                "calibrated peak {hi} exceeds the max limit {}; raise the max limit or lower a / u / Vπ",
                 self.max_level
             ));
         }
@@ -1200,10 +1221,41 @@ impl StageAModulationPlugin {
             DriveMethod::Calibrated => waveform::OpticalDrive {
                 target,
                 depth_a: self.depth_a,
-                operating_point: self.operating_point,
+                operating_point: self.periodic_lobe_point(),
                 inversion,
             },
         }
+    }
+
+    fn optical_drive_state(&self) -> Option<OpticalDriveStateV1> {
+        if self.method != DriveMethod::Calibrated {
+            return None;
+        }
+        let (target, contract_target) = match self.mode {
+            Mode::OpticalLogSine => (waveform::OpticalTarget::LogSine, OpticalTargetV1::LogSine),
+            Mode::OpticalLinearSine => (
+                waveform::OpticalTarget::LinearSine,
+                OpticalTargetV1::LinearSine,
+            ),
+            _ => return None,
+        };
+        self.dac_band().ok()?;
+        let drive = self.optical_drive(target);
+        Some(OpticalDriveStateV1 {
+            target: contract_target,
+            requested_mean_u_milli: (self.operating_point * 1_000.0).round() as u32,
+            resolved_mean_u_milli: (match target {
+                waveform::OpticalTarget::LogSine => {
+                    waveform::log_sine_cycle_mean(drive.operating_point, self.depth_a)
+                }
+                waveform::OpticalTarget::LinearSine => drive.operating_point,
+            } * 1_000.0)
+                .round() as u32,
+            internal_u_milli: (drive.operating_point * 1_000.0).round() as u32,
+            depth_a_milli: (self.depth_a * 1_000.0).round() as u32,
+            v_null_dac: u16::try_from(self.v_null_dac).ok()?,
+            v_pi_dac: u16::try_from(self.v_pi_dac).ok()?,
+        })
     }
 
     /// Builds the single MOD command carrying the complete current drive
@@ -1308,7 +1360,7 @@ impl StageAModulationPlugin {
         if i64::from(peak) > self.max_level {
             return Err(format!(
                 "optical peak {peak} exceeds the max limit {}; raise the max limit or lower the \
-                 operating band / a / I_k / Vπ",
+                 operating band / a / u / Vπ",
                 self.max_level
             ));
         }
@@ -1969,13 +2021,17 @@ impl StageAModulationPlugin {
                         false,
                     ));
                 }
-                // Only the calibrated drive expresses an optical depth; the
-                // manual DAC band and the constant hold do not.
-                if self.method == DriveMethod::Manual || self.mode == Mode::Const {
+                // A1's depth command has one scientific meaning: a calibrated
+                // log-intensity sine. Reject every other mode instead of
+                // silently sweeping a DAC or linear-intensity waveform.
+                if self.method != DriveMethod::Calibrated
+                    || self.mode != Mode::OpticalLogSine
+                    || self.calibration_id.is_none()
+                {
                     return Err(service_error(
                         ServiceErrorCodeV1::InvalidCommand,
-                        "arm a calibrated periodic/optical drive in the modulation plugin \
-                         before sweeping the optical depth",
+                        "apply a calibration and arm OPTICAL_LOG_SINE in the modulation plugin \
+                         before sweeping optical depth a",
                         false,
                     ));
                 }
@@ -2148,6 +2204,7 @@ impl StageAModulationPlugin {
                 valid_for_ms: 1_500,
             },
             calibration_id: self.calibration_id.clone(),
+            optical_drive: self.optical_drive_state(),
         }
     }
 
@@ -2932,7 +2989,7 @@ impl Plugin for StageAModulationPlugin {
                 label: "Drive method".into(),
                 tooltip: Some(
                     "MANUAL defines the DAC band with Power and Min threshold. CALIBRATED \
-                     derives it from V_null, Vπ, I_k, and optical depth a."
+                     derives it from V_null, Vπ, normalized u, and optical depth a."
                         .into(),
                 ),
                 kind: SettingKind::Enum {
@@ -3016,7 +3073,7 @@ impl Plugin for StageAModulationPlugin {
                     key: "v_pi_dac".into(),
                     label: "Vπ (DAC codes, null → max light)".into(),
                     tooltip: Some(
-                        "DAC-code quarter-wave distance from V_null to the excitation \
+                        "DAC-code half-wave-voltage span from V_null to the excitation \
                          maximum. V_null + Vπ must stay within 0..4095."
                             .into(),
                     ),
@@ -3028,10 +3085,11 @@ impl Plugin for StageAModulationPlugin {
                 });
                 modulation_items.push(SettingItem {
                     key: "operating_point".into(),
-                    label: "Operating point I_k (0..1)".into(),
+                    label: "Normalized mean lobe point ū (0..1)".into(),
                     tooltip: Some(
-                        "Calibrated operating illumination as normalised lobe intensity u_k. \
-                         CONST holds its DAC code; the calibrated band is derived around it."
+                        "Dimensionless floor-subtracted cycle mean, not physical A1 flux I_k. \
+                         OPTICAL_LOG_SINE converts it to u_g = ū/I₀(a/2), so sweeping a keeps \
+                         the normalized mean fixed; OPTICAL_LINEAR_SINE uses it as its centre."
                             .into(),
                     ),
                     kind: SettingKind::F64Drag {
@@ -3045,8 +3103,8 @@ impl Plugin for StageAModulationPlugin {
                     key: "depth_a".into(),
                     label: "Optical depth a".into(),
                     tooltip: Some(
-                        "Calibrated log-intensity span a = ln(I_max/I_min). Together with I_k \
-                         it defines the operating band used by every mode."
+                        "Peak-to-trough natural-log contrast a = ln(I_max/I_min). Together with \
+                         the normalized lobe point u it defines the requested optical band."
                             .into(),
                     ),
                     kind: SettingKind::F64Drag {
@@ -3104,7 +3162,7 @@ impl Plugin for StageAModulationPlugin {
                                  the sample beam itself. The sweep cannot work this out: a bright \
                                  and a dark extremum fit the measured curve equally well, and \
                                  only the optics say which one is zero light on the sample. \
-                                 Choosing wrong puts V_null a quarter wave off."
+                                 Choosing wrong puts V_null one half-wave-voltage span off."
                                     .into(),
                             ),
                             kind: SettingKind::Enum {
@@ -3440,7 +3498,7 @@ impl Plugin for StageAModulationPlugin {
                 self.detector_geometry = calibration::DetectorGeometry::from_name(&chosen)
                     .ok_or("unknown detector geometry")?;
                 // The stored fit was resolved against the old geometry; re-fit
-                // rather than leave a V_null that is now a quarter wave out.
+                // rather than leave a V_null that is now one half-wave-voltage span out.
                 if let Some(fit) = self.fit.take() {
                     match calibration::fit_transfer(
                         &fit.points,
@@ -3551,9 +3609,10 @@ impl Plugin for StageAModulationPlugin {
                 Ok(_) => {
                     let drive = self.optical_drive(target);
                     entries.push(StatusEntry::Text(format!(
-                        "{}: a={:.2}, I_k={:.2}, V_null={}, Vπ={} @ {:.3} Hz",
+                        "{}: a={:.2}, ū={:.2}, internal u={:.2}, V_null={}, Vπ={} @ {:.3} Hz",
                         self.mode.name(),
                         drive.depth_a,
+                        self.operating_point,
                         drive.operating_point,
                         self.v_null_dac,
                         self.v_pi_dac,
@@ -4637,7 +4696,7 @@ level = 750
         let names: Vec<&str> = curve.lines.iter().map(|l| l.name.as_str()).collect();
         assert_eq!(names, ["configured lobe", "V_null", "V_null + Vπ"]);
         let lobe = &curve.lines[0].points;
-        // Minimum at V_null, maximum a quarter wave later.
+        // Minimum at V_null, maximum one half-wave-voltage span later.
         let at = |code: f64| {
             lobe.iter()
                 .min_by(|a, b| (a.x - code).abs().total_cmp(&(b.x - code).abs()))
@@ -4657,7 +4716,7 @@ level = 750
         plugin.v_pi_dac = 860;
         plugin.depth_a = 0.5; // must be irrelevant for a constant hold
 
-        // I_k = 1 holds exactly at V_null + Vπ (previously rejected because
+        // u = 1 holds exactly at V_null + Vπ (previously rejected because
         // the modulated band u_k·e^{a/2} > 1 was demanded even for CONST).
         plugin.operating_point = 1.0;
         let (lo, hi, hold) = plugin.dac_band().expect("full-lobe hold");
@@ -4675,6 +4734,58 @@ level = 750
     }
 
     #[test]
+    fn optical_linear_sine_uses_linear_not_logarithmic_headroom() {
+        let mut plugin = live_plugin();
+        plugin.method = DriveMethod::Calibrated;
+        plugin.mode = Mode::OpticalLinearSine;
+        plugin.v_null_dac = 400;
+        plugin.v_pi_dac = 900;
+        plugin.operating_point = 0.4;
+        plugin.depth_a = 2.0;
+
+        // Linear target: u_hi = 0.4 * (1 + tanh(1)) ≈ 0.705, which fits.
+        // Reusing log-sine endpoints would incorrectly test
+        // 0.4 * exp(1) ≈ 1.087 and reject this valid drive.
+        let (_, hi, _) = plugin.dac_band().expect("linear target fits the lobe");
+        let expected = plugin
+            .lobe_inversion()
+            .dac_for_u(0.4 * (1.0 + 1.0_f64.tanh()))
+            .round() as i64;
+        assert_eq!(hi, expected);
+    }
+
+    #[test]
+    fn control_state_publishes_exact_optical_drive_provenance() {
+        let mut plugin = live_plugin();
+        plugin.method = DriveMethod::Calibrated;
+        plugin.mode = Mode::OpticalLogSine;
+        plugin.v_null_dac = 400;
+        plugin.v_pi_dac = 900;
+        plugin.operating_point = 0.4;
+        plugin.depth_a = 1.0;
+        plugin.calibration_id = Some("cal-test".into());
+
+        let state = plugin.control_state();
+        let drive = state.optical_drive.expect("optical provenance");
+        assert_eq!(drive.target, OpticalTargetV1::LogSine);
+        assert_eq!(drive.requested_mean_u_milli, 400);
+        assert_eq!(
+            drive.internal_u_milli,
+            (waveform::log_sine_geometric_pedestal(0.4, 1.0) * 1_000.0).round() as u32
+        );
+        assert_eq!(
+            drive.resolved_mean_u_milli,
+            (waveform::log_sine_cycle_mean(f64::from(drive.internal_u_milli) / 1_000.0, 1.0,)
+                * 1_000.0)
+                .round() as u32
+        );
+        assert_eq!(drive.depth_a_milli, 1_000);
+        assert_eq!(drive.v_null_dac, 400);
+        assert_eq!(drive.v_pi_dac, 900);
+        assert_eq!(state.calibration_id.as_deref(), Some("cal-test"));
+    }
+
+    #[test]
     fn rejected_operating_point_does_not_diverge_from_the_board_target() {
         let mut plugin = live_plugin();
         plugin.method = DriveMethod::Calibrated;
@@ -4686,14 +4797,14 @@ level = 750
 
         let error = plugin
             .set_setting("operating_point", json!(1.0))
-            .expect_err("periodic I_k=1 has no modulation headroom");
+            .expect_err("periodic u=1 has no modulation headroom");
         assert!(error.contains("lobe ceiling"));
         assert_eq!(plugin.operating_point, 0.5);
 
         plugin.set_setting("mode", json!(0)).expect("CONST");
         plugin
             .set_setting("operating_point", json!(1.0))
-            .expect("CONST maps I_k directly");
+            .expect("CONST maps u directly");
         assert_eq!(plugin.dac_band().unwrap(), (2_490, 2_490, 2_490));
     }
 
@@ -4772,7 +4883,8 @@ level = 750
             owner.device_connected()
         });
         plugin.method = DriveMethod::Calibrated;
-        plugin.mode = Mode::Sine;
+        plugin.mode = Mode::OpticalLogSine;
+        plugin.calibration_id = Some("cal-test".into());
         plugin.depth_a = 0.4; // what the operator armed
 
         let acquire = service_request(
@@ -4802,7 +4914,10 @@ level = 750
                 reply.outcome
             );
         }
-        assert!((plugin.depth_a - 1.25).abs() < 1e-9, "sweep drives the depth");
+        assert!(
+            (plugin.depth_a - 1.25).abs() < 1e-9,
+            "sweep drives the depth"
+        );
 
         plugin.end_lease();
         assert!(
@@ -4880,7 +4995,8 @@ level = 750
             owner.device_connected()
         });
         plugin.method = DriveMethod::Calibrated;
-        plugin.mode = Mode::Sine;
+        plugin.mode = Mode::OpticalLogSine;
+        plugin.calibration_id = Some("cal-test".into());
 
         // Without a lease the retarget is refused.
         let unleased = service_request(
@@ -4917,12 +5033,13 @@ level = 750
             },
             None,
         );
-        assert!(matches!(
-            plugin
-                .handle_service_request(&retarget, &live_execution())
-                .outcome,
-            PluginServiceOutcome::Accepted { .. }
-        ));
+        let outcome = plugin
+            .handle_service_request(&retarget, &live_execution())
+            .outcome;
+        assert!(
+            matches!(outcome, PluginServiceOutcome::Accepted { .. }),
+            "retarget outcome: {outcome:?}"
+        );
         assert!((plugin.depth_a - 1.25).abs() < 1e-9);
         wait_until(&plugin, Duration::from_secs(2), |owner| {
             owner
@@ -4931,7 +5048,7 @@ level = 750
                 .lock()
                 .unwrap()
                 .board_mod
-                .starts_with("SINE")
+                .starts_with("WARP")
         });
 
         // The manual DAC band cannot express an optical depth.

@@ -22,7 +22,7 @@
 //! excitation null. That is a physical fact about the port, not a fit
 //! parameter, so [`fit_transfer`] takes the geometry as an **input** and picks
 //! the matching representation. Getting it wrong would place `V_null` a
-//! quarter wave off and run the drive on the inverted branch, so it is asked
+//! one half-wave-voltage span off and run the drive on the inverted branch, so it is asked
 //! rather than guessed.
 //!
 //! Two consequences worth stating, because they remove procedure rather than
@@ -117,7 +117,7 @@ impl DetectorGeometry {
 pub struct TransferFit {
     /// DAC code at the excitation minimum.
     pub v_null_dac: f64,
-    /// DAC codes from `v_null` to the excitation maximum (quarter wave).
+    /// DAC codes from `v_null` to the excitation maximum (one half-wave-voltage span).
     pub v_pi_dac: f64,
     /// Detector volts at the excitation null (`p0`).
     pub offset_volts: f64,
@@ -131,7 +131,7 @@ pub struct TransferFit {
     /// span. `None` when the sweep ran in one direction only.
     pub hysteresis: Option<f64>,
     /// Fraction of one full lobe (`Vπ` codes) the sweep actually covered.
-    /// Below ~1 the quarter-wave distance is extrapolated, not measured.
+    /// Below ~1 the half-wave-voltage span is extrapolated, not measured.
     pub lobe_coverage: f64,
     /// Points discarded as wild before the final fit. A couple is ordinary; a
     /// large share means the sweep, not the model, is the problem.
@@ -201,7 +201,7 @@ pub const MIN_POINTS: usize = 16;
 /// A detector span below this is treated as noise rather than a lobe.
 const MIN_SPAN_VOLTS: f64 = 0.01;
 
-/// Least-squares solution for one candidate quarter wave `w`.
+/// Least-squares solution for one candidate half-wave-voltage span `w`.
 struct Harmonic {
     /// Mean level `A`, and the quadrature amplitudes of `cos`/`sin(πc/w)`.
     mean: f64,
@@ -387,7 +387,7 @@ fn hysteresis_fraction(points: &[SweepPoint], span: f64) -> Option<f64> {
     Some(differences.iter().sum::<f64>() / differences.len() as f64 / span.abs())
 }
 
-/// Scans the quarter wave over every period the sweep could resolve, then
+/// Scans the half-wave-voltage span over every period the sweep could resolve, then
 /// refines. Returns the best `(Vπ, harmonic)`.
 fn fit_period(points: &[SweepPoint], swept_span: f64) -> Option<(f64, Harmonic)> {
     // From four samples per lobe (below that the lobe is aliased) out to a
@@ -489,7 +489,7 @@ pub fn fit_transfer(
     // `A + R·cos(θ − φ)` with `θ = πc/w` is the same curve as
     // `p0 + p1·sin²(π(c − v)/(2w))` with `|p1| = 2R`. Which of the two signs
     // of `p1` applies — and therefore whether the null sits at the phase or a
-    // quarter wave past it — is the geometry question the data cannot answer.
+    // one half-wave-voltage span past it — is the geometry question the data cannot answer.
     let radius = harmonic.amplitude;
     let (v, p0, p1) = match geometry {
         DetectorGeometry::RejectedComplement => (
@@ -636,7 +636,7 @@ mod tests {
     #[test]
     fn geometry_selects_between_the_two_equivalent_representations() {
         // One curve, two readings. Declaring the wrong port must move V_null by
-        // exactly a quarter wave — the failure this input exists to prevent.
+        // exactly one half-wave-voltage span — the failure this input exists to prevent.
         let points = synthetic_sweep(300.0, 1_600.0, 2.4, -2.2, 4_095, 0.0, false);
         let reject =
             fit_transfer(&points, 4_095.0, DetectorGeometry::RejectedComplement).expect("fits");
@@ -758,7 +758,7 @@ mod tests {
     }
 
     #[test]
-    fn lobe_coverage_flags_an_extrapolated_quarter_wave() {
+    fn lobe_coverage_flags_an_extrapolated_half_wave_span() {
         // Sweeping only to code 800 with Vπ = 1600 sees half a lobe.
         let points = synthetic_sweep(0.0, 1_600.0, 2.4, -2.2, 800, 0.001, false);
         let fit =

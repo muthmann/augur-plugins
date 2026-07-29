@@ -45,10 +45,11 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use stage_a_plugin_contract::{
     ClientId, ConnectionStateV1, LeaseId, ModulationCommandV1, ModulationRequestV1,
-    ModulationStateV1, PdqReceiptV1, PdqStartSpecV1, PhotodiodeCommandV1, PhotodiodeRequestV1,
-    PhotodiodeResponseV1, PhotodiodeSummaryV1, RequestId, RunId, SemanticRevision, WaveformV1,
-    CTX_STAGE_A_MODULATION_STATE_V1, CTX_STAGE_A_PHOTODIODE_SUMMARY_V1,
-    SERVICE_STAGE_A_MODULATION_CONTROL_V1, SERVICE_STAGE_A_PHOTODIODE_CONTROL_V1,
+    ModulationStateV1, OpticalTargetV1, PdqReceiptV1, PdqStartSpecV1, PhotodiodeCommandV1,
+    PhotodiodeOpticalSummaryV1, PhotodiodeRequestV1, PhotodiodeResponseV1, PhotodiodeSummaryV1,
+    RequestId, RunId, SemanticRevision, WaveformV1, CTX_STAGE_A_MODULATION_STATE_V1,
+    CTX_STAGE_A_PHOTODIODE_SUMMARY_V1, SERVICE_STAGE_A_MODULATION_CONTROL_V1,
+    SERVICE_STAGE_A_PHOTODIODE_CONTROL_V1,
 };
 
 use crate::phase::{fold_events, fold_events_free_running, MarkerValidationConfig, PhaseFold};
@@ -320,6 +321,9 @@ pub struct StageAA1Plugin {
     // -- recording coordinator --
     output_folder: String,
     measurement_id: String,
+    /// Canonical identifier of the physical cycle-mean local flux point
+    /// `I_k` (for example a row in the illumination calibration/map).
+    flux_point_id: String,
     /// Sweep range `[min_a, max_a]` for this `(I_k, f)` row (automation template).
     min_a: f64,
     max_a: f64,
@@ -380,6 +384,7 @@ impl Default for StageAA1Plugin {
             background_floor: None,
             output_folder: String::new(),
             measurement_id: generate_measurement_id(),
+            flux_point_id: String::new(),
             min_a: 0.0,
             max_a: 2.0,
             duration_s: 10,
@@ -633,12 +638,20 @@ impl StageAA1Plugin {
             .collect()
     }
 
-    /// Optical modulation depth `a` published by the photodiode plugin.
+    /// Fresh optical summary from a connected photodiode owner.
+    fn fresh_optical_summary(&self) -> Option<&PhotodiodeOpticalSummaryV1> {
+        let state = self.photodiode.as_ref()?;
+        if !matches!(state.connection, ConnectionStateV1::Connected { .. })
+            || state.freshness.is_stale_at(now_unix_ms())
+        {
+            return None;
+        }
+        state.optical_summary.as_ref()
+    }
+
+    /// Fresh optical modulation depth `a` published by the photodiode plugin.
     fn measured_a(&self) -> Option<f64> {
-        self.photodiode
-            .as_ref()?
-            .optical_summary
-            .as_ref()
+        self.fresh_optical_summary()
             .map(|summary| summary.measured_log_contrast)
     }
 
@@ -979,6 +992,7 @@ impl StageAA1Plugin {
     fn recording_metadata(&self) -> BTreeMap<String, String> {
         let mut meta = BTreeMap::new();
         meta.insert("a1_measurement_id".into(), self.recording.id.clone());
+        meta.insert("a1_flux_point_id".into(), self.flux_point_id.clone());
         meta.insert("a1_stem".into(), self.recording.stem.clone());
         meta.insert("a1_role".into(), self.recording.role.label().into());
         meta.insert(
@@ -1032,6 +1046,10 @@ impl StageAA1Plugin {
         }
         if self.measurement_id.trim().is_empty() {
             self.note("Set a measurement id before recording");
+            return;
+        }
+        if self.flux_point_id.trim().is_empty() {
+            self.note("Set the physical I_k flux point id before recording");
             return;
         }
         let now_ms = now_unix_ms();
@@ -1316,8 +1334,28 @@ impl StageAA1Plugin {
             self.message = "Set a measurement id before sweeping".into();
             return;
         }
+        if self.flux_point_id.trim().is_empty() {
+            self.message = "Set the physical I_k flux point id before sweeping".into();
+            return;
+        }
         if !self.modulation_connected() {
             self.message = "Modulation owner is not connected — cannot sweep".into();
+            return;
+        }
+        if self
+            .modulation
+            .as_ref()
+            .and_then(|state| state.calibration_id.as_deref())
+            .is_none()
+        {
+            self.message =
+                "Apply a measured Pockels transfer calibration before starting an A1 sweep".into();
+            return;
+        }
+        if self.fresh_optical_summary().is_none() {
+            self.message = "Connect the photodiode and obtain a fresh, marker-bounded optical \
+                            summary from a confirmed I_tot anchor before sweeping"
+                .into();
             return;
         }
         if self.min_a.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
@@ -1499,24 +1537,26 @@ impl StageAA1Plugin {
                         sweep.settled_since_ms = None;
                     }
                     if !start_recording && now_ms >= sweep.settle_deadline_ms {
-                        // Record anyway: the sidecar stores the *measured* a,
-                        // so an unsettled point is still a usable sample.
-                        start_recording = true;
                         settle_timed_out = true;
                     }
                     if start_recording {
                         sweep.phase = SweepPhase::Recording;
                     }
                 }
+                if settle_timed_out {
+                    self.finish_sweep(
+                        context,
+                        format!(
+                            "Sweep aborted at point {}/{}: no fresh, settled optical a at \
+                             target {target:.3} before timeout",
+                            index + 1,
+                            total
+                        ),
+                    );
+                    return;
+                }
                 if start_recording {
                     self.pending_role = Some(RecRole::Normal);
-                    if settle_timed_out {
-                        self.message = format!(
-                            "Sweep point {}/{}: a did not settle at {target:.3} — recording anyway",
-                            index + 1,
-                            total,
-                        );
-                    }
                 }
             }
             SweepPhase::Recording => {
@@ -1818,10 +1858,18 @@ impl StageAA1Plugin {
             .as_ref()
             .and_then(|s| s.acknowledged.as_ref());
         let a1_config = modulation.and_then(|t| t.a1_configuration.as_ref());
-        let optical = self
-            .photodiode
+        let mod_optical = self
+            .modulation
             .as_ref()
-            .and_then(|s| s.optical_summary.as_ref());
+            .and_then(|state| state.optical_drive.as_ref());
+        let optical = self.fresh_optical_summary();
+        if optical.is_none() {
+            return Err(
+                "cannot write a quantitative A1 sidecar without a fresh photodiode optical \
+                 summary from a confirmed I_tot anchor"
+                    .into(),
+            );
+        }
         let roi = self.host_roi.unwrap_or_default();
 
         let raw_path = self
@@ -1833,6 +1881,7 @@ impl StageAA1Plugin {
 
         let doc = SidecarDoc {
             measurement_id: self.recording.id.clone(),
+            flux_point_id: self.flux_point_id.trim().to_owned(),
             file_stem: self.recording.stem.clone(),
             role: self.recording.role.label().into(),
             recorded_at_utc: format_iso_utc(
@@ -1873,6 +1922,22 @@ impl StageAA1Plugin {
             modulation: ModulationSidecar {
                 frequency_hz: self.period_us().map(|t| 1_000_000.0 / t),
                 frequency_source: self.frequency_source().into(),
+                calibration_id: self
+                    .modulation
+                    .as_ref()
+                    .and_then(|state| state.calibration_id.clone()),
+                optical_target: mod_optical.map(|drive| match drive.target {
+                    OpticalTargetV1::LogSine => "log_sine".into(),
+                    OpticalTargetV1::LinearSine => "linear_sine".into(),
+                }),
+                requested_mean_u: mod_optical
+                    .map(|drive| f64::from(drive.requested_mean_u_milli) / 1_000.0),
+                resolved_mean_u: mod_optical
+                    .map(|drive| f64::from(drive.resolved_mean_u_milli) / 1_000.0),
+                internal_u: mod_optical.map(|drive| f64::from(drive.internal_u_milli) / 1_000.0),
+                requested_a: mod_optical.map(|drive| f64::from(drive.depth_a_milli) / 1_000.0),
+                v_null_dac: mod_optical.map(|drive| drive.v_null_dac),
+                v_pi_dac: mod_optical.map(|drive| drive.v_pi_dac),
                 center_dac: a1_config.map(|c| c.center_dac),
                 amplitude_dac: a1_config.map(|c| c.amplitude_dac),
                 waveform: modulation
@@ -1881,9 +1946,19 @@ impl StageAA1Plugin {
             },
             optical: OpticalSidecar {
                 measured_a: optical.map(|o| o.measured_log_contrast),
+                geometric_mean_excitation_volts: optical
+                    .map(|o| (o.excitation_min_volts * o.excitation_max_volts).sqrt()),
+                excitation_min_volts: optical.map(|o| o.excitation_min_volts),
+                excitation_max_volts: optical.map(|o| o.excitation_max_volts),
+                excitation_headroom_volts: optical.map(|o| o.excitation_headroom_volts),
                 low_clip_fraction: optical.map(|o| o.low_clip_fraction),
                 high_clip_fraction: optical.map(|o| o.high_clip_fraction),
                 measured_frequency_hz: optical.and_then(|o| o.measured_frequency_hz),
+                adc_calibration_id: optical.map(|o| o.calibration.adc_calibration_id.clone()),
+                dark_id: optical.map(|o| o.calibration.dark_id.clone()),
+                total_power_anchor_id: optical.map(|o| o.calibration.anchor_id.clone()),
+                dark_volts: optical.map(|o| o.calibration.dark_volts),
+                total_power_volts: optical.map(|o| o.calibration.total_power_volts),
             },
             camera: CameraSidecar {
                 roi_x: roi.x,
@@ -1920,6 +1995,7 @@ impl StageAA1Plugin {
 #[derive(Serialize)]
 struct SidecarDoc {
     measurement_id: String,
+    flux_point_id: String,
     file_stem: String,
     role: String,
     recorded_at_utc: String,
@@ -1985,6 +2061,22 @@ struct ModulationSidecar {
     frequency_hz: Option<f64>,
     frequency_source: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    calibration_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    optical_target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    requested_mean_u: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resolved_mean_u: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    internal_u: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    requested_a: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    v_null_dac: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    v_pi_dac: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     center_dac: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     amplitude_dac: Option<u16>,
@@ -1997,11 +2089,29 @@ struct OpticalSidecar {
     #[serde(skip_serializing_if = "Option::is_none")]
     measured_a: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    geometric_mean_excitation_volts: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    excitation_min_volts: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    excitation_max_volts: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    excitation_headroom_volts: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     low_clip_fraction: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     high_clip_fraction: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     measured_frequency_hz: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adc_calibration_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dark_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total_power_anchor_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dark_volts: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total_power_volts: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -2404,6 +2514,19 @@ impl Plugin for StageAA1Plugin {
                             },
                         },
                         SettingItem {
+                            key: "flux_point_id".into(),
+                            label: "Physical I_k flux point id".into(),
+                            tooltip: Some(
+                                "Canonical id of the cycle-mean local flux calibration/map point. \
+                                 This is physical photons/pixel/s provenance, not the modulation \
+                                 plugin's dimensionless lobe coordinate u."
+                                    .into(),
+                            ),
+                            kind: SettingKind::Text {
+                                default: self.flux_point_id.clone(),
+                            },
+                        },
+                        SettingItem {
                             key: "new_id".into(),
                             label: "New id".into(),
                             tooltip: Some("Generate a fresh default measurement id.".into()),
@@ -2665,6 +2788,7 @@ impl Plugin for StageAA1Plugin {
         match key {
             "output_folder" => Some(json!(self.output_folder)),
             "measurement_id" => Some(json!(self.measurement_id)),
+            "flux_point_id" => Some(json!(self.flux_point_id)),
             "min_a" => Some(json!(self.min_a)),
             "max_a" => Some(json!(self.max_a)),
             "sweep_count" => Some(json!(self.sweep_count)),
@@ -2704,6 +2828,12 @@ impl Plugin for StageAA1Plugin {
                 self.measurement_id = value
                     .as_str()
                     .ok_or("measurement_id must be a string")?
+                    .to_string();
+            }
+            "flux_point_id" => {
+                self.flux_point_id = value
+                    .as_str()
+                    .ok_or("flux_point_id must be a string")?
                     .to_string();
             }
             "new_id" if value.as_bool() == Some(true) => {
@@ -3025,8 +3155,9 @@ export_plugin!(StageAA1Plugin);
 #[cfg(test)]
 mod tests {
     use stage_a_plugin_contract::{
-        OwnerInstanceId, PdqFinalizedReceiptV1, PdqStartedReceiptV1, RequestOutcomeV1,
-        ResponseCommonV1, Sha256V1, StreamIntegrityV1, CONTRACT_VERSION_V1,
+        FreshnessV1, OwnerInstanceId, PdqFinalizedReceiptV1, PdqStartedReceiptV1,
+        PhotodiodeCalibrationV1, PhotodiodeStreamV1, RequestOutcomeV1, ResponseCommonV1, Sha256V1,
+        StreamIntegrityV1, SynchronizationV1, UnsyncedReasonV1, CONTRACT_VERSION_V1,
     };
 
     use super::*;
@@ -3096,6 +3227,61 @@ mod tests {
         }
     }
 
+    fn fresh_photodiode_summary() -> PhotodiodeSummaryV1 {
+        PhotodiodeSummaryV1 {
+            contract_version: CONTRACT_VERSION_V1,
+            owner_instance: OwnerInstanceId::new("pd-test"),
+            service_revision: 1,
+            connection: ConnectionStateV1::Connected {
+                port_label: "mock".into(),
+                firmware_version: Some("test".into()),
+            },
+            lease: None,
+            active_run_id: None,
+            requested_revision: None,
+            acknowledged_revision: None,
+            stream: PhotodiodeStreamV1 {
+                stream_epoch: 1,
+                sample_range: None,
+                sample_rate_hz: Some(20_000),
+                latest_adc_code: Some(1_000),
+                integrity: StreamIntegrityV1::default(),
+                level: None,
+            },
+            active_recording: None,
+            last_finalized_recording: None,
+            optical_summary: Some(PhotodiodeOpticalSummaryV1 {
+                run_id: RunId::from("test-run"),
+                calibration: PhotodiodeCalibrationV1 {
+                    adc_calibration_id: "adc-test".into(),
+                    dark_id: "dark-test".into(),
+                    anchor_id: "itot-test".into(),
+                    dark_volts: 0.05,
+                    total_power_volts: 3.0,
+                },
+                measured_log_contrast: 1.0,
+                log_contrast_stddev: None,
+                excitation_min_volts: 0.8,
+                excitation_max_volts: 0.8 * std::f64::consts::E,
+                excitation_headroom_volts: 0.8,
+                low_clip_fraction: 0.0,
+                high_clip_fraction: 0.0,
+                measured_frequency_hz: Some(1_000.0),
+                fundamental_phase_rad: None,
+                total_harmonic_distortion: None,
+            }),
+            synchronization: SynchronizationV1::Unsynced {
+                reason: UnsyncedReasonV1::NoLease,
+                detail: None,
+            },
+            last_response: None,
+            freshness: FreshnessV1 {
+                observed_at_unix_ms: now_unix_ms(),
+                valid_for_ms: 60_000,
+            },
+        }
+    }
+
     /// A plugin whose period comes from marker spacing (no fallback frequency).
     fn plugin_with_markers() -> StageAA1Plugin {
         StageAA1Plugin {
@@ -3103,6 +3289,8 @@ mod tests {
             frame_width: 10,
             frame_height: 1,
             camera_markers_us: vec![0, 1_000, 2_000, 3_000],
+            flux_point_id: "flux-test".into(),
+            photodiode: Some(fresh_photodiode_summary()),
             ..StageAA1Plugin::default()
         }
     }
@@ -3186,6 +3374,7 @@ mod tests {
         assert_eq!(valid, 4);
         assert!(q_on > 0.9 && q_off > 0.9, "q_on={q_on} q_off={q_off}");
         // Recording a point is still refused without a photodiode-measured a.
+        plugin.photodiode = None;
         assert!(plugin.measured_a().is_none());
         assert!(plugin.record_response_point().is_err());
     }
@@ -3276,8 +3465,14 @@ mod tests {
         // must not record those as if they had come from this run.
         let mut plugin = plugin_with_markers();
         plugin.pilot_windows = Some((
-            PhaseWindow { start: 0.0, end: 0.2 },
-            PhaseWindow { start: 0.5, end: 0.7 },
+            PhaseWindow {
+                start: 0.0,
+                end: 0.2,
+            },
+            PhaseWindow {
+                start: 0.5,
+                end: 0.7,
+            },
         ));
         // No events => the fold carries no signal => the freeze cannot pick
         // windows and must not leave the loaded ones in place.
@@ -3336,6 +3531,8 @@ mod tests {
         let mut plugin = StageAA1Plugin {
             output_folder: folder.display().to_string(),
             measurement_id: "A1-row".into(),
+            flux_point_id: "flux-row-1".into(),
+            photodiode: Some(fresh_photodiode_summary()),
             duration_s: 1,
             pending_role: Some(RecRole::Normal),
             ..StageAA1Plugin::default()
@@ -3625,6 +3822,7 @@ mod tests {
         let doc = plugin.write_sidecar().expect("sidecar path");
         let text = std::fs::read_to_string(&doc).expect("read sidecar");
         assert!(text.contains("measurement_id = \"A1-test\""));
+        assert!(text.contains("flux_point_id = \"flux-test\""));
         assert!(text.contains("[modulation]"));
         assert!(text.contains("[camera]"));
         assert!(text.contains("[files]"));

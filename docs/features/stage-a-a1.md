@@ -34,9 +34,10 @@ folder. A1 makes each recording one button press:
 |---|---|
 | Output folder | where the A1 config sidecar is written (recommended shared experiment root) |
 | Measurement id | one per `(I_k, f)` row; auto-generated default, editable, or press **New id** |
+| Physical `I_k` flux point id | required canonical id of the cycle-mean local flux calibration/map point; never inferred from the modulator's normalized mean `ū` |
 | Sweep min a / max a | the `a`-range for this row; the **Start sweep** button records it, and it is stored in every sidecar |
 | Sweep points (count) | how many amplitudes Start sweep records, spaced evenly over `[min a, max a]` |
-| Sweep settle (s) | dwell the photodiode-measured `a` must hold the target (±10 %, ≥±0.05) before each sweep recording; 30 s cap, then it records anyway |
+| Sweep settle (s) | dwell the fresh photodiode-measured `a` must hold the target (±10 %, ≥±0.05) before each sweep recording; timeout aborts the sweep |
 | Duration (s) | each recording auto-stops and finalizes after this |
 | Start recording (sweep point) | start camera RAW → connect and lease photodiode → start PDQ → auto-stop and save both → sidecar |
 | Start sweep (record all points) | per point: lease the modulation owner → retarget the calibrated drive to `a_i` → settle → one recording (`…_pNN`) → next point |
@@ -54,10 +55,12 @@ matching button — the recording captures whatever `a` is currently set.
 **The sweep is the one scoped exception.** Start sweep leases the modulation
 owner (`SERVICE_STAGE_A_MODULATION_CONTROL_V1`) and, per point, issues
 `ModulationCommandV1::SetOpticalDepth` — which only retargets the *depth* of the
-drive the operator already armed (waveform, frequency, operating point `I_k`,
-and calibration stay untouched; the owner refuses when a manual-DAC or constant
-drive is armed). It renews the lease per point, waits for the
-photodiode-measured `a` to settle, hands the point to the normal recording
+drive the operator already armed (frequency, normalized cycle mean `ū`, and
+calibration stay untouched). The modulation owner accepts this command only
+with an applied measured calibration and `OPTICAL_LOG_SINE`; manual, constant,
+DAC-sine, square, and optical-linear modes are rejected. It renews the lease per
+point, waits for a fresh, marker-bounded photodiode `a` from a confirmed `I_tot`
+anchor to settle, hands the point to the normal recording
 coordinator, and releases the lease at the end or on abort. Sweep points
 require `min a > 0` — record `a≈0` with the background button instead. Sidecars
 of sweep recordings additionally carry `sweep.requested_a`, `sweep.point_index`
@@ -79,10 +82,14 @@ directory (see ADR 009). Point the host output root and the photodiode data root
 at the same experiment directory to co-locate everything; the A1 sidecar records
 the *resolved* paths so the set stays linked either way.
 
-**A1 config sidecar** captures: `measurement_id`, file stem, role, start/finalize
+**A1 config sidecar** captures: `measurement_id`, physical `flux_point_id`, file
+stem, role, start/finalize
 timestamps, duration; the sweep `[min_a, max_a]`; modulation settings from the
-acknowledged snapshot (frequency, center/amplitude DAC, waveform); the
-photodiode-measured `a` (`measured_log_contrast`) and clip fractions; ROI +
+acknowledged snapshot (frequency, center/amplitude DAC, waveform, transfer
+`calibration_id`, optical target, requested and resolved normalized mean `ū`,
+internal `u_g`/`u_c`, requested `a`, `V_null` and `Vπ`); the
+photodiode-measured `a`, extrema, geometric pedestal,
+headroom, clip fractions, dark/ADC ids, and named dark-corrected `I_tot` anchor; ROI +
 masked-pixel count + `N_valid`; trigger info (marker-anchored, marker count,
 measured period); and the resolved paths of the RAW (+ its camera-config sidecar)
 and the PDQ (+ its sidecar). The **pilot** run additionally records the frozen
@@ -195,7 +202,7 @@ still reset everything.
 | camera events, valid pixels | retained **EventStore** over a trailing analysis window; falls back to `frame.events()`, trimmed to the same window |
 | phase-0 markers | rising `frame.external_triggers()` — the host **banks trigger edges from dropped preview frames** into the next processed frame (drain-to-newest and the preview throttle drop whole frames; at low modulation frequencies the survivors alone rarely held 2 markers inside the analysis window) |
 | modulation period `T` | measured from the `EXT_TRIGGER` marker spacing; else the modulation plugin's acknowledged waveform — which, since the board-echo fallback, includes the **operator-armed UI drive**, not only service-path (leased) targets |
-| optical modulation depth `a` | photodiode plugin's optical summary (`measured_log_contrast`) — always the *excitation* contrast, independent of that plugin's display mode (ADR 012) |
+| optical modulation depth `a` | fresh photodiode optical summary (`measured_log_contrast`) from complete marker-bounded cycles and a confirmed `I_tot` anchor — always the *excitation* contrast, independent of display mode (ADR 012) |
 | ROI, masked pixels | augur-rs camera config (`CTX_GLOBAL_SETTINGS`) |
 
 ## Tests

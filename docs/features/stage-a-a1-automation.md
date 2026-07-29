@@ -45,7 +45,8 @@ naming and full parameters. Later, repeat over `f` and over `I_k`.
   `N_valid = |ROI| − |masked|`.
 - Photodiode-measured **`a`** (rejected-complement geometry) published and
   surfaced in A1.
-- Optical drive with a **fixed operating point `I_k`** and swept `a`
+- Optical drive with a **fixed normalized cycle mean `ū`** and swept `a`;
+  physical cycle-mean flux `I_k` is a separately calibrated/verified row quantity
   (`OPTICAL_LOG_SINE`/`OPTICAL_LINEAR_SINE`), power-capped.
 - Events sourced exactly from the retained **EventStore** over a sliding window.
 
@@ -54,8 +55,11 @@ naming and full parameters. Later, repeat over `f` and over `I_k`.
 ### 1. A1 → modulation control path (scoped)
 Re-introduce a *focused* control path (the contract + modulation plugin still
 support it): acquire a modulation lease, set the optical drive
-`(target, I_k, a, f, V_null, Vπ)`, start, stop, release. No full workflow zoo —
-just set-amplitude / start / stop. Fixed `I_k`, only `a` varies within a curve.
+`(target, ū, a, f, V_null, Vπ)`, start, stop, release. No full workflow zoo —
+just set-amplitude / start / stop. The plugin's Bessel normalization preserves
+`ū` to the controller's milli-unit resolution and publishes the resolved mean;
+the independently calibrated physical `I_k` still needs bench feedback and a
+flux-point ID.
 
 ### 2. Settle detection
 Before collecting a point, wait until the photodiode confirms the optical

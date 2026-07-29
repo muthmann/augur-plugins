@@ -14,13 +14,17 @@ optical drive in the modulation plugin; A1 only reads its published settings.
 
 - **Output folder** — where the A1 config sidecar is written (recommended shared experiment root).
 - **Measurement id** — one per `(I_k, f)` pair; auto-generated default, editable, or press **New id**.
+- **Physical I_k flux point id** — required canonical id of the cycle-mean local flux
+  calibration/map point; separate from normalized modulation mean `ū`.
 - **Duration (s)** — each recording auto-stops and finalizes after this.
 - **Start recording** — starts camera RAW, then connects/leases the photodiode and starts PDQ;
   the timer begins after both acknowledge. It auto-finalizes PDQ first, camera second, then writes
   the sidecar. **Stop** saves the current recording early (and aborts a running sweep).
 - **Start sweep** — records **Sweep points (count)** amplitudes spanning `[Sweep min a, Sweep max a]`
   (min > 0): per point it renews the modulation lease, issues `SetOpticalDepth`, waits for the
-  measured `a` to hold the target for **Sweep settle (s)** (30 s cap, then records anyway), and runs
+  fresh marker-bounded measured `a` to hold the target for **Sweep settle (s)**; timeout aborts
+  rather than recording an unsettled point. The modulation owner also requires an applied
+  transfer calibration and `OPTICAL_LOG_SINE`, and runs
   one normal recording. Sidecars carry `sweep.requested_a` / `point_index` / `point_total`.
 - The record/sweep buttons are disabled until an output folder is selected.
 

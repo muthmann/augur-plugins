@@ -89,6 +89,15 @@ pub struct ContrastEstimate {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum EstimateError {
+    /// The rejected-complement geometry has no explicitly confirmed,
+    /// traceable total-power anchor.
+    MissingTotalPowerAnchor,
+    /// No marker-bounded window containing at least two complete modulation
+    /// cycles fits inside the retained sample budget.
+    IncompleteModulationCycles {
+        marker_count: usize,
+        max_samples: usize,
+    },
     /// Fewer samples than the estimator can use robustly.
     TooFewSamples { count: usize, minimum: usize },
     /// The window touches the ADC rails — `a` would be silently wrong.
@@ -110,6 +119,17 @@ pub enum EstimateError {
 impl std::fmt::Display for EstimateError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::MissingTotalPowerAnchor => f.write_str(
+                "no confirmed, named total-power anchor; excitation contrast a is withheld",
+            ),
+            Self::IncompleteModulationCycles {
+                marker_count,
+                max_samples,
+            } => write!(
+                f,
+                "no marker-bounded window with at least two complete cycles fits in \
+                 {max_samples} samples ({marker_count} usable markers)"
+            ),
             Self::TooFewSamples { count, minimum } => {
                 write!(f, "only {count} samples (minimum {minimum})")
             }

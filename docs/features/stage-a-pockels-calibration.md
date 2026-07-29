@@ -46,8 +46,8 @@ gets brighter, does the photodiode reading go up or down?* Stage-A's photodiode
 sits on the PBS **reject** port and reads the light the sample does not get,
 `I_pd = I_tot − I_exc`, so it falls as the sample brightens — and reads its
 **maximum** at `V_null`. That is `REJECT PORT`, the default. `DIRECT` is for a
-detector watching the sample beam itself. Declaring it wrong places `V_null` a
-quarter wave off and runs the drive on the inverted branch.
+detector watching the sample beam itself. Declaring it wrong places `V_null`
+one half-wave-voltage span off and runs the drive on the inverted branch.
 
 **The shape needs no dark measurement and no anchor.** `p_0` absorbs the dark
 level and any DC offset; `p_1` absorbs the front-end gain. `V_null` and `Vπ`

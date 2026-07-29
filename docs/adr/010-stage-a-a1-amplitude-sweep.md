@@ -18,7 +18,7 @@ Two structural gaps blocked this:
 1. **No semantic "set depth" command.** The modulation service only exposed
    `SetWaveform` (raw DAC band) and `PrepareA1`. Sweeping `a` through raw DAC
    values would duplicate the optical-inversion math (ADR 008) and the
-   calibration state (`V_null`, `Vπ`, `u_k`) outside their owner.
+   calibration state (`V_null`, `Vπ`, requested mean `ū`) outside their owner.
 2. **Momentary buttons never reached the live worker.** The host runs a UI
    mirror and a live worker per plugin; button presses land on the mirror via
    `set_setting(key, true)`, while the worker only receives the settings
@@ -31,10 +31,11 @@ Two structural gaps blocked this:
 addition, additive to V1). Under an automation lease the modulation owner
 re-derives its armed drive with the new depth through the same
 `drive_command()` builder the operator path uses; everything else (waveform
-shape, frequency, `u_k`, calibration, power cap) stays as armed. The owner
-rejects the command when no device link is open, when the armed drive cannot
-express a depth (manual DAC method, constant mode), or when the derived drive
-violates its own safety validation. The command is applied immediately
+shape, frequency, requested `ū`, calibration, power cap) stays as armed. For
+each depth, the owner derives and wire-quantizes the internal
+`u_g=ū/I_0(a/2)`. The owner rejects the command when no device link is open,
+when the armed drive is not calibrated `OPTICAL_LOG_SINE`, or when the derived
+drive violates its own safety validation. The command is applied immediately
 (`Applied`), not revision-tracked: the sweep's ground truth for "the drive is
 really there" is the photodiode-measured `a`, not a firmware ACK.
 
@@ -42,12 +43,23 @@ really there" is the photodiode-measured `a`, not a firmware ACK.
 ADR 009 coordinator: `AcquiringLease → (per point) SettingDepth → Settling →
 Recording → …release`. Per point it renews the modulation lease, retargets the
 depth, waits until the photodiode-measured `a` holds the target tolerance
-(±10 %, at least ±0.05) for the configured dwell (30 s cap, then it records
-anyway — the sidecar stores the measured `a`), and hands off to the unchanged
+(±10 %, at least ±0.05) for the configured dwell and hands off to the unchanged
 recording coordinator (`…_pNN` stem tag, `sweep.requested_a` / `point_index` /
 `point_total` in the sidecar). Any rejection, timeout, or failed point aborts
 the sweep and releases the lease (`safe_off = false` — the drive holds; safety
 remains the owner's lease-expiry job).
+
+**2026-07-28 amendment:** `SetOpticalDepth` is accepted only for an applied
+measured calibration and `OPTICAL_LOG_SINE`; accepting DAC, square, linear, or
+unidentified hand-entered lobe parameters under the same semantic command made
+`a` ambiguous. A1 also requires a connected, fresh photodiode optical summary
+from complete marker-bounded cycles and a confirmed named `I_tot` anchor.
+Failure to settle before the deadline now aborts the sweep instead of recording
+an invalid point. A required `flux_point_id` carries the physical cycle-mean
+`I_k` provenance separately from the Bessel-normalized modulation mean `ū`;
+the config sidecar records requested/resolved `ū`, quantized internal `u_g`,
+requested `a`, target, `V_null`, `Vπ`, and transfer calibration ID from the
+additive modulation snapshot.
 
 **3. Press counters for momentary buttons.** Every A1 button exports a
 monotonic press counter from `get_setting`; `set_setting` interprets `true` as

@@ -10,7 +10,7 @@
 Laser-modulation control for the Stage-A bench with two orthogonal axes:
 
 - **Drive method** defines the DAC operating band. `MANUAL` uses Power + Min threshold;
-  `CALIBRATED` derives it from `V_null`, `Vπ`, `I_k`, and optical depth `a`.
+  `CALIBRATED` derives it from `V_null`, `Vπ`, normalized cycle mean `ū`, and optical depth `a`.
 - **Mode** defines the shape that fills the band: `CONST`, `DAC_SINE`, `SQUARE`,
   `OPTICAL_LOG_SINE`, or `OPTICAL_LINEAR_SINE`. All five remain available under both methods.
 
@@ -18,17 +18,18 @@ The always-visible **max limit** is the hard DAC ceiling for every manual and ca
 The settings schema shows only the selected method's parameter block and refreshes when Method
 changes; Manual is the default.
 
-| Mode | Manual band `[min, power]` | Calibrated band from `I_k`, `a`, `V_null`, `Vπ` |
+| Mode | Manual band `[min, power]` | Calibrated band from `ū`, `a`, `V_null`, `Vπ` |
 |---|---|---|
-| `CONST` | hold `power` | hold the DAC code for `I_k` |
+| `CONST` | hold `power` | hold the DAC code for `ū` |
 | `DAC_SINE` | DAC sine across the band | DAC sine across the band |
 | `SQUARE` | DAC square across the band | DAC square across the band |
-| `OPTICAL_LOG_SINE` | intensity log-sine across the band | intensity log-sine about `I_k` |
-| `OPTICAL_LINEAR_SINE` | intensity linear-sine across the band | intensity linear-sine about `I_k` |
+| `OPTICAL_LOG_SINE` | intensity log-sine across the band | mean `ū`, converted to `u_g=ū/I_0(a/2)` |
+| `OPTICAL_LINEAR_SINE` | intensity linear-sine across the band | centre/mean `u_c=ū` |
 
 Manual optical modes reuse the persisted `V_null`/`Vπ` lobe parameters and derive effective
-`(I_k, a)` from the manual DAC band through the forward `sin²` transfer. Both optical modes then
+`(u, a)` from the manual DAC band through the forward `sin²` transfer. Both optical modes then
 use the same inversion path described in [Optical waveform drive](./stage-a-optical-waveform.md).
+`ū` is dimensionless and must not be confused with physical cycle-mean A1 flux `I_k`.
 
 `V_null`/`Vπ` are measured, not typed: the Calibration section sweeps settled `CONST` codes
 against the photodiode and fits the lobe — see
@@ -53,13 +54,18 @@ board *reports* (`MOD` reply + 2 Hz `STATUS` poll), not merely the commanded val
 - Safety invariants enforced plugin-side: `min_level ≤ level ≤ max_level` for Manual and every
   resolved calibrated/optical peak must be `≤ max_level`; invalid drives are refused.
 - Status and commanded summaries include Method and the resolved `(lo, hi, hold)` DAC band.
+- `ModulationStateV1.optical_drive` publishes the exact resolved optical
+  target, requested and resolved normalized mean `ū`, internal `u_g`/`u_c`,
+  requested `a`, `V_null`, and `Vπ` as an additive V1 field; A1 sidecars no
+  longer have to infer these from DAC endpoints.
 - `mock` port runs the firmware-faithful `MockController` in-process for hardware-free tests.
 - The workflow-owner service and `WaveformV1` automation path remain exact-waveform contracts and
   do not use the UI Drive method.
 - **`SetOpticalDepth`** (ADR 010): under an automation lease the service can retarget the *depth*
-  `a` of the drive the operator armed — same `drive_command()` builder as the UI path, everything
-  else untouched. Refused with no device link, a manual-DAC method, or a constant mode; the derived
-  drive still passes all safety validation. Used by the A1 amplitude sweep.
+  `a` through the same `drive_command()` builder as the UI path. It is accepted only with an
+  applied transfer calibration and armed `OPTICAL_LOG_SINE`; no device link, manual/constant,
+  DAC/square/linear modes, or an unidentified hand-entered lobe are refused. Used by the A1
+  amplitude sweep.
 - **Link watchdog**: the device thread exits after 5 consecutive serial failures (marking the
   device disconnected/faulted), and the control tick reaps a finished device thread and
   auto-reconnects with a 2 s backoff while `connect` stays requested. Previously a wedged or dead

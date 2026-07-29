@@ -699,6 +699,12 @@ pub struct StageAPhotodiodePlugin {
     port_hint: String,
     mode: Mode,
     reference_volts: f64,
+    /// Stable provenance identifier for the measured full-extinction
+    /// total-power reading in `reference_volts`.
+    reference_anchor_id: String,
+    /// Explicit operator confirmation that `reference_volts` is a measured
+    /// full-extinction anchor for the current optical configuration.
+    reference_confirmed: bool,
     /// Measured dark level in photodiode volts (beam blocked). Applied to both
     /// the detector samples and the `reference_volts` anchor, so it cancels out
     /// of the rejected-complement contrast rather than biasing it — its job is
@@ -800,6 +806,8 @@ impl Default for StageAPhotodiodePlugin {
             port_hint: "auto".into(),
             mode: Mode::Raw,
             reference_volts: 3.3,
+            reference_anchor_id: String::new(),
+            reference_confirmed: false,
             dark_volts: 0.0,
             window_s: 10.0,
             avg_samples: 4,
@@ -1252,6 +1260,8 @@ impl StageAPhotodiodePlugin {
             "adc": { "bits": 12, "full_scale_volts": ADC_FULL_SCALE_VOLTS },
             "display_mode": self.mode.name(),
             "reference_volts": self.reference_volts,
+            "reference_anchor_id": self.reference_anchor_id,
+            "reference_confirmed": self.reference_confirmed,
             "integrity": {
                 "resync_bytes": summary.integrity.skipped_bytes,
                 "crc_failures": summary.integrity.crc_failures,
@@ -1513,7 +1523,7 @@ impl StageAPhotodiodePlugin {
         }
     }
 
-    /// Live optical log-contrast `a` from the trailing ring window.
+    /// Live optical log-contrast `a` from a marker-bounded ring window.
     ///
     /// The detector sits behind the PBS reject port and measures the rejected
     /// complement `I_pd = I_tot - I_exc` — that is a property of the optical
@@ -1528,9 +1538,10 @@ impl StageAPhotodiodePlugin {
     /// `a`, so letting a display toggle change its meaning would silently
     /// retarget the sweep and write a wrong `measured_a` into every sidecar.
     ///
-    /// `None` when there is no valid window or no valid total-power anchor.
-    fn optical_summary(&self, samples: &VecDeque<u16>) -> Option<PhotodiodeOpticalSummaryV1> {
-        self.optical_summary_result(samples).ok()
+    /// `None` when there is no valid whole-cycle window or no explicitly
+    /// confirmed total-power anchor.
+    fn optical_summary(&self, state: &SharedState) -> Option<PhotodiodeOpticalSummaryV1> {
+        self.optical_summary_result(state).ok()
     }
 
     /// [`Self::optical_summary`], keeping the rejection reason so the status
@@ -1538,10 +1549,47 @@ impl StageAPhotodiodePlugin {
     /// showing nothing.
     fn optical_summary_result(
         &self,
-        samples: &VecDeque<u16>,
+        state: &SharedState,
     ) -> Result<PhotodiodeOpticalSummaryV1, EstimateError> {
-        let start = samples.len().saturating_sub(CONTRAST_WINDOW_SAMPLES);
-        let window: Vec<u16> = samples.iter().skip(start).copied().collect();
+        if !self.reference_confirmed || self.reference_anchor_id.trim().is_empty() {
+            return Err(EstimateError::MissingTotalPowerAnchor);
+        }
+
+        let ring_end = state.ring_first_index + state.samples.len() as u64;
+        let markers: Vec<u64> = state
+            .markers
+            .iter()
+            .copied()
+            .filter(|index| *index >= state.ring_first_index && *index <= ring_end)
+            .collect();
+        if markers.len() < 3 {
+            return Err(EstimateError::IncompleteModulationCycles {
+                marker_count: markers.len(),
+                max_samples: CONTRAST_WINDOW_SAMPLES,
+            });
+        }
+
+        // End on the newest complete phase-0 boundary. Start at least two
+        // complete cycles earlier, then include as many older whole cycles as
+        // fit in the bounded estimator window.
+        let end_index = *markers.last().expect("three markers checked");
+        let mut start_marker = markers.len() - 3;
+        if end_index.saturating_sub(markers[start_marker]) as usize > CONTRAST_WINDOW_SAMPLES {
+            return Err(EstimateError::IncompleteModulationCycles {
+                marker_count: markers.len(),
+                max_samples: CONTRAST_WINDOW_SAMPLES,
+            });
+        }
+        while start_marker > 0
+            && end_index.saturating_sub(markers[start_marker - 1]) as usize
+                <= CONTRAST_WINDOW_SAMPLES
+        {
+            start_marker -= 1;
+        }
+        let start_index = markers[start_marker];
+        let start = start_index.saturating_sub(state.ring_first_index) as usize;
+        let end = end_index.saturating_sub(state.ring_first_index) as usize;
+        let window: Vec<u16> = state.samples.range(start..end).copied().collect();
         let calibration = self.adc_calibration();
         // `ContrastGeometry::RejectedComplement` wants the *dark-corrected*
         // I_tot, and the estimator dark-corrects the detector samples. The
@@ -1570,9 +1618,9 @@ impl StageAPhotodiodePlugin {
                 } else {
                     "dark-none".into()
                 },
-                anchor_id: "reference-volts".into(),
+                anchor_id: self.reference_anchor_id.clone(),
                 dark_volts: calibration.dark_volts,
-                total_power_volts: self.reference_volts,
+                total_power_volts: self.reference_volts - self.dark_volts,
             },
             measured_log_contrast: estimate.a,
             log_contrast_stddev: None,
@@ -1585,7 +1633,11 @@ impl StageAPhotodiodePlugin {
             excitation_headroom_volts: estimate.v_min_volts,
             low_clip_fraction: estimate.low_clip_fraction,
             high_clip_fraction: estimate.high_clip_fraction,
-            measured_frequency_hz: None,
+            measured_frequency_hz: (state.rate_hz > 0).then(|| {
+                let cycles = markers.len() - 1 - start_marker;
+                let period_samples = end_index.saturating_sub(start_index) as f64 / cycles as f64;
+                f64::from(state.rate_hz) / period_samples
+            }),
             fundamental_phase_rad: None,
             total_harmonic_distortion: None,
         })
@@ -1595,7 +1647,7 @@ impl StageAPhotodiodePlugin {
     /// keeping the rejection reason so the caller can explain a withheld `a`.
     fn latest_optical_result(&self) -> Option<Result<PhotodiodeOpticalSummaryV1, EstimateError>> {
         let state = self.shared.lock().ok()?;
-        (!state.samples.is_empty()).then(|| self.optical_summary_result(&state.samples))
+        (!state.samples.is_empty()).then(|| self.optical_summary_result(&state))
     }
 
     fn control_summary(&self) -> PhotodiodeSummaryV1 {
@@ -1606,7 +1658,7 @@ impl StageAPhotodiodePlugin {
                     end_sample_index_exclusive: state.ring_first_index + state.samples.len() as u64,
                     sample_count: state.samples.len() as u64,
                 });
-                let optical_summary = self.optical_summary(&state.samples);
+                let optical_summary = self.optical_summary(&state);
                 let level = self.current_level(&state);
                 let connection = if self.connected() {
                     ConnectionStateV1::Connected {
@@ -1827,6 +1879,8 @@ impl StageAPhotodiodePlugin {
             "adc": { "bits": 12, "full_scale_volts": ADC_FULL_SCALE_VOLTS },
             "display_mode": self.mode.name(),
             "reference_volts": self.reference_volts,
+            "reference_anchor_id": self.reference_anchor_id,
+            "reference_confirmed": self.reference_confirmed,
             "dark_volts": self.dark_volts,
             "time_base": "t_s = sample_index / sample_rate_hz, device clock, segment-relative",
             "integrity": integrity,
@@ -2758,6 +2812,30 @@ impl Plugin for StageAPhotodiodePlugin {
                             },
                         },
                         SettingItem {
+                            key: "reference_anchor_id".into(),
+                            label: "I_tot anchor id".into(),
+                            tooltip: Some(
+                                "Stable identifier for the measured full-extinction reference \
+                                 (for example the calibration/run id)."
+                                    .into(),
+                            ),
+                            kind: SettingKind::Text {
+                                default: self.reference_anchor_id.clone(),
+                            },
+                        },
+                        SettingItem {
+                            key: "reference_confirmed".into(),
+                            label: "I_tot measured and current".into(),
+                            tooltip: Some(
+                                "Confirm only after measuring I_tot for the current optical \
+                                 configuration. Changing the value or anchor id clears this."
+                                    .into(),
+                            ),
+                            kind: SettingKind::Bool {
+                                default: self.reference_confirmed,
+                            },
+                        },
+                        SettingItem {
                             key: "dark_volts".into(),
                             label: "Dark level".into(),
                             tooltip: Some(
@@ -2964,6 +3042,8 @@ impl Plugin for StageAPhotodiodePlugin {
                 Some(json!(index))
             }
             "reference_volts" => Some(json!(self.reference_volts)),
+            "reference_anchor_id" => Some(json!(self.reference_anchor_id)),
+            "reference_confirmed" => Some(json!(self.reference_confirmed)),
             "window_s" => Some(json!(self.window_s)),
             "avg_samples" => Some(json!(self.avg_samples)),
             "show_markers" => Some(json!(self.show_markers)),
@@ -3027,7 +3107,36 @@ impl Plugin for StageAPhotodiodePlugin {
             }
             "reference_volts" => {
                 let volts = value.as_f64().ok_or("reference_volts must be a number")?;
-                self.reference_volts = volts.clamp(0.0, ADC_FULL_SCALE_VOLTS);
+                let volts = volts.clamp(0.0, ADC_FULL_SCALE_VOLTS);
+                if self.reference_volts != volts {
+                    self.reference_volts = volts;
+                    self.reference_confirmed = false;
+                }
+                Ok(())
+            }
+            "reference_anchor_id" => {
+                let anchor_id = value
+                    .as_str()
+                    .ok_or("reference_anchor_id must be a string")?
+                    .trim()
+                    .to_owned();
+                if self.reference_anchor_id != anchor_id {
+                    self.reference_anchor_id = anchor_id;
+                    self.reference_confirmed = false;
+                }
+                Ok(())
+            }
+            "reference_confirmed" => {
+                let confirmed = value
+                    .as_bool()
+                    .ok_or("reference_confirmed must be a boolean")?;
+                if confirmed && self.reference_anchor_id.trim().is_empty() {
+                    return Err("set a non-empty I_tot anchor id before confirming".into());
+                }
+                if confirmed && self.reference_volts <= self.dark_volts {
+                    return Err("I_tot must be above the measured dark level".into());
+                }
+                self.reference_confirmed = confirmed;
                 Ok(())
             }
             "show_markers" => {
@@ -3342,6 +3451,8 @@ mod tests {
         let mut plugin = StageAPhotodiodePlugin::default();
         plugin.set_runtime_role(PluginRuntimeRole::LiveWorker);
         plugin.effects_allowed = true;
+        plugin.reference_anchor_id = "test-itot".into();
+        plugin.reference_confirmed = true;
         plugin
     }
 
@@ -3351,9 +3462,24 @@ mod tests {
         (0..count)
             .map(|i| {
                 let phase = 2.0 * std::f64::consts::PI * (i as f64) * 8.0 / count as f64;
-                (center + amplitude * phase.sin()).round().clamp(0.0, 4_095.0) as u16
+                (center + amplitude * phase.sin())
+                    .round()
+                    .clamp(0.0, 4_095.0) as u16
             })
             .collect()
+    }
+
+    fn state_with_cycles(samples: VecDeque<u16>, cycles: usize) -> SharedState {
+        let count = samples.len();
+        let mut state = SharedState {
+            rate_hz: 20_000,
+            samples,
+            ..SharedState::default()
+        };
+        state.markers = (0..=cycles)
+            .map(|cycle| (cycle * count / cycles) as u64)
+            .collect();
+        state
     }
 
     #[test]
@@ -3363,18 +3489,18 @@ mod tests {
         // scientific quantity. A1's amplitude sweep settles on this value.
         let mut plugin = live_plugin();
         plugin.reference_volts = 3.0;
-        let samples = rejected_port_samples(1_600.0, 700.0, 4_096);
+        let state = state_with_cycles(rejected_port_samples(1_600.0, 700.0, 4_096), 8);
 
         plugin.mode = Mode::Raw;
-        let raw = plugin.optical_summary(&samples).expect("raw display");
+        let raw = plugin.optical_summary(&state).expect("raw display");
         plugin.mode = Mode::Excitation;
-        let excitation = plugin
-            .optical_summary(&samples)
-            .expect("excitation display");
+        let excitation = plugin.optical_summary(&state).expect("excitation display");
 
         assert_eq!(raw.measured_log_contrast, excitation.measured_log_contrast);
-        assert_eq!(raw.calibration.anchor_id, "reference-volts");
-        assert_eq!(excitation.calibration.anchor_id, "reference-volts");
+        assert_eq!(raw.calibration.anchor_id, "test-itot");
+        assert_eq!(excitation.calibration.anchor_id, "test-itot");
+        assert!((raw.calibration.total_power_volts - 3.0).abs() < 1e-12);
+        assert!((raw.measured_frequency_hz.expect("marker frequency") - 39.0625).abs() < 1e-12);
 
         // And it really is the complement contrast, not ln(v_max/v_min) of the
         // detector trace.
@@ -3387,17 +3513,55 @@ mod tests {
     }
 
     #[test]
+    fn optical_contrast_requires_a_confirmed_anchor_and_complete_cycles() {
+        let mut plugin = live_plugin();
+        plugin.reference_volts = 3.0;
+        let mut state = state_with_cycles(rejected_port_samples(1_600.0, 700.0, 4_096), 8);
+
+        plugin.reference_confirmed = false;
+        assert_eq!(
+            plugin.optical_summary_result(&state),
+            Err(EstimateError::MissingTotalPowerAnchor)
+        );
+
+        plugin.reference_confirmed = true;
+        state.markers = VecDeque::from([0, 512]);
+        assert_eq!(
+            plugin.optical_summary_result(&state),
+            Err(EstimateError::IncompleteModulationCycles {
+                marker_count: 2,
+                max_samples: CONTRAST_WINDOW_SAMPLES,
+            })
+        );
+    }
+
+    #[test]
+    fn changing_the_total_power_anchor_invalidates_confirmation() {
+        let mut plugin = live_plugin();
+        plugin
+            .set_setting("reference_volts", json!(2.9))
+            .expect("reference");
+        assert!(!plugin.reference_confirmed);
+
+        plugin.reference_confirmed = true;
+        plugin
+            .set_setting("reference_anchor_id", json!("itot-next"))
+            .expect("anchor id");
+        assert!(!plugin.reference_confirmed);
+    }
+
+    #[test]
     fn captured_dark_level_reaches_the_estimator_and_is_named() {
         let mut plugin = live_plugin();
         plugin.reference_volts = 3.0;
-        let samples = rejected_port_samples(1_600.0, 700.0, 4_096);
+        let state = state_with_cycles(rejected_port_samples(1_600.0, 700.0, 4_096), 8);
 
-        let undarkened = plugin.optical_summary(&samples).expect("no dark yet");
+        let undarkened = plugin.optical_summary(&state).expect("no dark yet");
         assert_eq!(undarkened.calibration.dark_id, "dark-none");
         assert_eq!(undarkened.calibration.dark_volts, 0.0);
 
         plugin.dark_volts = 0.05;
-        let darkened = plugin.optical_summary(&samples).expect("with dark");
+        let darkened = plugin.optical_summary(&state).expect("with dark");
         assert_eq!(darkened.calibration.dark_id, "dark-measured");
         assert_eq!(darkened.calibration.dark_volts, 0.05);
         // A DC dark offset is common to the detector samples and to the
@@ -3679,7 +3843,7 @@ mod tests {
         railed.ingest(0, 20_000, 0, &[4_095; 8]);
         let clipped = plugin.current_level(&railed).expect("still reports");
         assert!(clipped.clipped);
-        assert!(plugin.optical_summary(&railed.samples).is_none());
+        assert!(plugin.optical_summary(&railed).is_none());
     }
 
     #[test]

@@ -32,8 +32,8 @@ The mode is a **display** choice only. It selects what the chart and the sample 
 never changes a published quantity (ADR 012).
 
 - **RAW** — ADC code and volts (`V = code · 3.3 / 4095`).
-- **EXCITATION** — the diode sits behind the PBS in the excitation path and measures the light
-  removed from the beam (`I_pd = I_tot − I_exc`), so the plugin inverts against the user-set
+- **EXCITATION** — the diode sits at the PBS reject port and measures the light
+  removed from the sample beam (`I_pd = I_tot − I_exc`), so the plugin inverts against the user-set
   reference: `I_exc = I_tot − I_pd`, with `I_tot` given in photodiode volts.
 
 ## Optical log-contrast `a`
@@ -45,14 +45,21 @@ so the estimator always runs the `RejectedComplement` geometry against `referenc
 amplitude sweep settles on this value, so a display toggle must not be able to move it (ADR 012).
 
 - **Reference I_tot** (`reference_volts`) is the total-power anchor: the PD reading with the full
-  beam diverted into the diode. Until it is set to a real measurement, `a` is withheld.
+  beam diverted into the diode. A non-empty **anchor id** and explicit
+  **measured and current** confirmation are required. Changing the value or id
+  clears confirmation; until all three agree, `a` is withheld.
 - **Dark level** (`dark_volts`) + the **Capture dark** button: block the beam and press; the mean of
   the current cache becomes the dark level. It is applied to the detector samples *and* to the
   `I_tot` anchor, so it cancels out of the complement rather than biasing `a` — its job is to keep
   the two sides consistent and to record the calibration the reading was taken under. `dark_id` in
   the sidecar reads `dark-measured` or `dark-none` accordingly.
-- The estimator is **fail-closed**: it refuses on ADC clipping, on no headroom above dark, and when
-  the anchor is not above the measured signal. A refusal is shown as `a unavailable: <reason>`
+- The estimator uses only marker-bounded windows containing at least **two
+  complete modulation cycles**, ending on phase 0. It no longer estimates
+  extrema from an arbitrary trailing sample count; a low-frequency trace that
+  does not fit the bounded window is withheld rather than phase biased.
+- The estimator is **fail-closed**: it refuses on a missing/unconfirmed anchor,
+  incomplete cycles, ADC clipping, no headroom above dark, and when the anchor
+  is not above the measured signal. A refusal is shown as `a unavailable: <reason>`
   rather than a missing row — a wrong `a` is worse than no `a`.
 
 ## Chart

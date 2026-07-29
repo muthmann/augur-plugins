@@ -42,16 +42,31 @@ capped at 192 bytes, too small to upload a 256-code table inline.
    commanded value.
 6. **Keep drive method orthogonal to waveform mode (2026-07-23 amendment).**
    `MANUAL` defines a DAC band from Power + Min threshold; `CALIBRATED` derives
-   one from `V_null`, `Vπ`, `I_k`, and `a`. All five waveform modes remain
+   one from `V_null`, `Vπ`, normalized `u`, and `a`. All five waveform modes remain
    available with both methods. Manual optical modes pass their DAC endpoints
-   through the forward `sin²` transfer to derive `(I_k, a)`, then reuse the same
+   through the forward `sin²` transfer to derive `(u, a)`, then reuse the same
    inversion path. The separate `max_level` setting is the hard ceiling for
    every drive; it is no longer merely the upper bound of the Power slider.
 7. **Treat constant hold separately from modulation headroom (2026-07-23
-   amendment).** `CONST` maps `I_k` directly through the inverse lobe and ignores
-   `a`; periodic modes retain the `I_k·exp(a/2) ≤ 1` ceiling. A rejected
+   amendment).** `CONST` maps `u` directly through the inverse lobe and ignores
+   `a`; periodic modes retain target-specific headroom. A rejected
    calibrated setting is rolled back so displayed settings always describe the
    command that can actually be sent.
+8. **Separate normalized transfer coordinate from physical flux and preserve
+   its mean (2026-07-28 amendment).** The UI setting is the normalized
+   cycle mean `ū`; it is never called the physical A1 flux `I_k`. Log-sine
+   generation derives `u_g=ū/I_0(a/2)` before sending the existing WARP
+   parameters. The internal value is quantized to the existing `u_k_milli`
+   wire field, and the acknowledged state publishes both requested and resolved
+   means, so sweeping `a` removes the analytic mean shift and makes the small
+   quantization residual explicit. Finite `I_floor`
+   still makes physical contrast smaller than the requested floor-subtracted
+   contrast. A1 therefore records a separate physical `flux_point_id`,
+   measured photodiode `a` remains authoritative, and the measured finite-floor
+   LUT remains required when the analytic residual exceeds the error budget.
+   `ModulationStateV1.optical_drive` publishes requested and resolved `ū`,
+   internal `u_g`/`u_c`, requested `a`, target and lobe codes as an additive V1
+   provenance field.
 
 ## Consequences
 
