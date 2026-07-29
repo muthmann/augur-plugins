@@ -25,6 +25,17 @@
 > §3 coordinator with `sweep.requested_a` / `point_index` / `point_total` in
 > the sidecar. Remaining below: scout/randomized order, multi-`f`/`I_k`
 > iteration, the `UNIDENTIFIABLE` rule, and the `a50` fit.
+>
+> **Update (2026-07-25):** the *second* workflow — **exact event count**, holding
+> one measured depth `a₀` across the frequency sweep — now has its own blocks
+> (ADR 013, [brief](./stage-a-a1-event-count.md)): a closed-loop **Find a₀** per
+> frequency (§1–§2 applied the other way round — measure, then correct the
+> *commanded* depth) and a **Record a₀ point** that replays the locked depth under
+> the lease through the §3 coordinator. The multi-`f` iteration below stays
+> deliberately manual there: randomising the frequency order, interleaving a
+> low-frequency reference and repeating independent blocks are scientific ordering
+> decisions, so A1 exposes them as per-frequency button presses rather than one
+> opaque run.
 
 ## Goal
 

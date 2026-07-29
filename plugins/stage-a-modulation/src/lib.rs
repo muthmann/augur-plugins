@@ -909,6 +909,9 @@ pub struct StageAModulationPlugin {
     /// The operator's armed `depth_a`, parked while a lease drives the optical
     /// depth (A1's amplitude sweep) and restored by [`Self::end_lease`].
     armed_depth_a: Option<f64>,
+    /// The operator's armed `frequency_hz`, parked while a lease drives the
+    /// frequency (A1's frequency sweep) and restored by [`Self::end_lease`].
+    armed_frequency_hz: Option<f64>,
     /// Dimensionless, floor-subtracted **cycle-mean** lobe coordinate
     /// `ū ∈ (0,1]`; not the physical A1 flux point `I_k`.
     operating_point: f64,
@@ -983,6 +986,7 @@ impl Default for StageAModulationPlugin {
             frequency_hz: 10.0,
             depth_a: 0.5,
             armed_depth_a: None,
+            armed_frequency_hz: None,
             operating_point: 0.5,
             v_null_dac: 0,
             v_pi_dac: 2_048,
@@ -2060,6 +2064,63 @@ impl StageAModulationPlugin {
                 self.shared.bump();
                 self.immediate_response(request, RequestOutcomeV1::Applied, None)
             }
+            ModulationCommandV1::SetDriveFrequency { frequency_millihz } => {
+                self.require_lease(request)?;
+                if self.link.is_none() {
+                    return Err(service_error(
+                        ServiceErrorCodeV1::NotConnected,
+                        "the modulation owner is not connected to the device",
+                        false,
+                    ));
+                }
+                let frequency_hz = *frequency_millihz as f64 / 1_000.0;
+                // The same band `drive_command` clamps to; refuse rather than
+                // silently record a different frequency than the one asked for.
+                if !(0.01..=2_000.0).contains(&frequency_hz) {
+                    return Err(service_error(
+                        ServiceErrorCodeV1::InvalidCommand,
+                        format!(
+                            "frequency {frequency_hz:.3} Hz outside the supported \
+                             0.01..=2000 Hz"
+                        ),
+                        false,
+                    ));
+                }
+                // A constant hold has no frequency, and the manual DAC band is
+                // not the calibrated drive this path retargets.
+                if self.method == DriveMethod::Manual || self.mode == Mode::Const {
+                    return Err(service_error(
+                        ServiceErrorCodeV1::InvalidCommand,
+                        "arm a calibrated periodic/optical drive in the modulation plugin \
+                         before sweeping the frequency",
+                        false,
+                    ));
+                }
+                let previous = self.frequency_hz;
+                self.frequency_hz = frequency_hz;
+                let command = match self.drive_command() {
+                    Ok(command) => command,
+                    Err(error) => {
+                        self.frequency_hz = previous;
+                        return Err(service_error(
+                            ServiceErrorCodeV1::DeviceRejected,
+                            format!("frequency {frequency_hz:.3} Hz rejected: {error}"),
+                            false,
+                        ));
+                    }
+                };
+                // As for the depth: park the operator's own frequency on the
+                // first retarget only, so `end_lease` hands back what they
+                // armed rather than the sweep's last point.
+                self.armed_frequency_hz.get_or_insert(previous);
+                *self.shared.pending.lock().expect("pending lock") = Some(PendingOperation {
+                    commands: vec![command],
+                    purpose: "MOD",
+                    meta: None,
+                });
+                self.shared.bump();
+                self.immediate_response(request, RequestOutcomeV1::Applied, None)
+            }
             ModulationCommandV1::PrepareA1 { configuration } => {
                 self.require_lease(request)?;
                 let revision = self.requested_revision(request)?;
@@ -2217,8 +2278,15 @@ impl StageAModulationPlugin {
     /// restores through `Sweep::restore`; this is the leased equivalent.
     fn end_lease(&mut self) {
         self.lease = None;
-        if let Some(depth) = self.armed_depth_a.take() {
+        let depth = self.armed_depth_a.take();
+        let frequency = self.armed_frequency_hz.take();
+        if let Some(depth) = depth {
             self.depth_a = depth;
+        }
+        if let Some(frequency) = frequency {
+            self.frequency_hz = frequency;
+        }
+        if depth.is_some() || frequency.is_some() {
             // Re-arm the board only if nobody else now owns the DAC;
             // `send_modulation` is itself guarded.
             self.send_modulation();

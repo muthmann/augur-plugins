@@ -295,6 +295,19 @@ pub enum ModulationCommandV1 {
     SetOpticalDepth {
         depth_a_milli: u32,
     },
+    /// Retarget the armed drive's *frequency*, leaving everything else — the
+    /// waveform shape, the depth, the operating point and the calibration — as
+    /// the operator armed it. The frequency counterpart of
+    /// [`ModulationCommandV1::SetOpticalDepth`], and the same scoping rules
+    /// apply: leased only, rejected when the link is closed or the armed drive
+    /// has no frequency to retarget (manual DAC method, constant mode).
+    ///
+    /// A1's frequency sweep drives this. The owner parks the operator's armed
+    /// frequency on the first one and restores it when the lease ends, so a
+    /// finished sweep does not leave the bench on its last point.
+    SetDriveFrequency {
+        frequency_millihz: u64,
+    },
     PrepareA1 {
         configuration: A1AcquisitionConfigV1,
     },
@@ -458,6 +471,14 @@ pub struct PdqStartSpecV1 {
     pub expected_sample_rate_hz: Option<u32>,
     pub expected_stream_epoch: Option<u64>,
     pub metadata: BTreeMap<String, String>,
+    /// Absolute directory the workflow client wants this recording written
+    /// below, so a coordinated run can put every file in one measurement
+    /// folder instead of the owner's own data directory. `None` keeps the
+    /// owner's configured data directory. `pdq_path`/`sidecar_path` stay
+    /// relative to whichever root applies, and the owner still refuses
+    /// traversal and symlinked path components below it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -572,6 +593,18 @@ pub struct PhotodiodeOpticalSummaryV1 {
     pub measured_frequency_hz: Option<f64>,
     pub fundamental_phase_rad: Option<f64>,
     pub total_harmonic_distortion: Option<f64>,
+    /// Duration of the trailing window `measured_log_contrast` was estimated
+    /// over. A consumer that *commands* a depth and then reads this value back
+    /// has to wait at least this long, or it averages the previous depth in.
+    /// Additive in V1: absent from older owners, ignored by older consumers.
+    #[serde(default)]
+    pub window_seconds: Option<f64>,
+    /// Whole modulation cycles that window covered, from the phase-0 markers.
+    /// `a` is peak-to-peak, so below one cycle the owner withholds it entirely
+    /// rather than publish a phase-dependent under-estimate. `None` when there
+    /// is no marker period to measure against.
+    #[serde(default)]
+    pub covered_cycles: Option<f64>,
 }
 
 /// Settled detector level over the newest averaging window, in **raw detector
@@ -619,6 +652,11 @@ pub struct PhotodiodeSummaryV1 {
     pub requested_revision: Option<SemanticRevision>,
     pub acknowledged_revision: Option<SemanticRevision>,
     pub stream: PhotodiodeStreamV1,
+    /// Directory the owner resolves relative PDQ/sidecar paths against. `None`
+    /// when it is unset, in which case every recording command is rejected —
+    /// automation clients check this before they start a coordinated run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_dir: Option<String>,
     pub active_recording: Option<PdqStartedReceiptV1>,
     pub last_finalized_recording: Option<PdqFinalizedReceiptV1>,
     pub optical_summary: Option<PhotodiodeOpticalSummaryV1>,

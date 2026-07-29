@@ -83,9 +83,21 @@ const SPECTRUM_MIN_SAMPLES: usize = 256;
 const SPECTRUM_MAX_SAMPLES: usize = 16_384;
 /// The firmware's default stream rate; the mock mirrors it.
 const MOCK_RATE_HZ: u32 = 20_000;
-/// Trailing samples used for the live optical log-contrast `a`. Sized like the
-/// spectrum window so a handful of modulation cycles are always covered.
+/// Floor on the trailing samples used for the live optical log-contrast `a`,
+/// and the fallback window when no phase-0 markers give a period. Sized like
+/// the spectrum window: 16 384 samples ≈ 0.82 s at 20 kSa/s.
+#[cfg(test)]
 const CONTRAST_WINDOW_SAMPLES: usize = 16_384;
+/// Whole modulation cycles the contrast window is sized to cover.
+///
+/// `a` is a *peak-to-peak* quantity, so a window shorter than one cycle sees
+/// only an arc of the waveform and under-reports it — and a consumer that
+/// divides by the measured `a` (A1's `a₀` lock) then inflates its drive against
+/// that bias. A fixed 0.82 s window is below one cycle for every `f < 1.2 Hz`,
+/// i.e. exactly the sub-hertz plateau reference the A1 protocol needs. The
+/// markers give the period on the same sample clock, so size the window from
+/// them instead.
+const CONTRAST_WINDOW_CYCLES: f64 = 8.0;
 const MOCK_BLOCK_SAMPLES: usize = 256;
 /// Cap on retained phase-0 markers (bounds the overlay + frequency window).
 const MAX_MARKERS: usize = 4_096;
@@ -171,6 +183,16 @@ struct SharedState {
     /// `Marker` stream frames. Used for the opt-in trigger overlay and to derive
     /// the modulation frequency.
     markers: VecDeque<u64>,
+    /// Newest phase-0 marker index seen, retained or already evicted, and the
+    /// spacing to the one before it.
+    ///
+    /// The retained markers alone cannot measure a period longer than the ring:
+    /// once the ring holds less than one cycle it holds at most one marker, so
+    /// the mean spacing is undefined exactly where knowing the period matters
+    /// most. Markers arrive one at a time, so remember the interval as it goes
+    /// past instead of trying to recover it from what survived eviction.
+    last_marker_index: Option<u64>,
+    marker_period_estimate: Option<f64>,
     latest: Option<u16>,
     /// Cumulative firmware-side drop counter (latest header value).
     device_dropped: u32,
@@ -218,6 +240,8 @@ impl Default for SharedState {
             samples: VecDeque::new(),
             cells: VecDeque::new(),
             markers: VecDeque::new(),
+            last_marker_index: None,
+            marker_period_estimate: None,
             latest: None,
             device_dropped: 0,
             crc_failures: 0,
@@ -252,6 +276,10 @@ impl SharedState {
             self.samples.clear();
             self.cells.clear();
             self.markers.clear();
+            // The sample clock restarts with the segment, so a spacing
+            // measured across the discontinuity is meaningless.
+            self.last_marker_index = None;
+            self.marker_period_estimate = None;
             self.ring_first_index = first_index;
             self.rate_hz = rate_hz;
         }
@@ -312,6 +340,12 @@ impl SharedState {
         {
             return; // ignore duplicate stamps
         }
+        if let Some(previous) = self.last_marker_index {
+            if sample_index > previous {
+                self.marker_period_estimate = Some((sample_index - previous) as f64);
+            }
+        }
+        self.last_marker_index = Some(sample_index);
         self.markers.push_back(sample_index);
         while self.markers.len() > MAX_MARKERS {
             self.markers.pop_front();
@@ -319,11 +353,32 @@ impl SharedState {
         self.last_update_unix_ms = now_unix_ms();
     }
 
+    /// How many trailing samples the optical log-contrast is estimated over,
+    /// with the whole modulation cycles that window covers.
+    ///
+    /// `a` is peak-to-peak, so the window has to span whole cycles: sized to
+    /// [`CONTRAST_WINDOW_CYCLES`] of the marker-measured period, floored at
+    /// [`CONTRAST_WINDOW_SAMPLES`] so nothing gets shorter than today at high
+    /// `f`, and capped by what the ring actually retains. `covered_cycles` is
+    /// `None` when there is no period to measure against — then the caller can
+    /// only fall back to the fixed window and say so.
+    #[cfg(test)]
+    fn contrast_window(&self) -> (usize, Option<f64>) {
+        let available = self.samples.len();
+        let Some(period) = self.marker_period_samples() else {
+            return (available.min(CONTRAST_WINDOW_SAMPLES), None);
+        };
+        let wanted = (period * CONTRAST_WINDOW_CYCLES).ceil() as usize;
+        let window = wanted.max(CONTRAST_WINDOW_SAMPLES).min(available);
+        (window, Some(window as f64 / period))
+    }
+
     /// Mean marker spacing in samples, i.e. the modulation period on the device
     /// clock — the trigger *defining* the frequency. `None` with < 2 markers.
     fn marker_period_samples(&self) -> Option<f64> {
         if self.markers.len() < 2 {
-            return None;
+            // Below one retained cycle only the remembered interval is left.
+            return self.marker_period_estimate;
         }
         let first = *self.markers.front()?;
         let last = *self.markers.back()?;
@@ -931,10 +986,16 @@ impl StageAPhotodiodePlugin {
         Ok(PathBuf::from(self.data_dir.trim()))
     }
 
-    /// Resolves a workflow-owned relative evidence path beneath the configured
-    /// data directory. Existing or newly created parent components must be
-    /// real directories, never symlinks.
-    fn resolve_control_path(&self, label: &str, extension: &str) -> Result<PathBuf, String> {
+    /// Resolves a workflow-owned relative evidence path beneath `root_override`
+    /// when the client named one, else beneath the configured data directory.
+    /// Existing or newly created parent components must be real directories,
+    /// never symlinks — that holds for either root.
+    fn resolve_control_path(
+        &self,
+        label: &str,
+        extension: &str,
+        root_override: Option<&str>,
+    ) -> Result<PathBuf, String> {
         let relative = Path::new(label);
         if relative.as_os_str().is_empty()
             || relative.is_absolute()
@@ -950,12 +1011,24 @@ impl StageAPhotodiodePlugin {
             return Err(format!("workflow path must use the .{extension} extension"));
         }
 
-        let root = self.resolved_data_dir()?;
+        // A client-named root replaces the data directory entirely: a
+        // coordinated run keeps every file of one measurement together, and
+        // the owner's own Data section then has no bearing on it.
+        let root = match root_override.map(str::trim).filter(|root| !root.is_empty()) {
+            Some(root) => {
+                let root = PathBuf::from(root);
+                if !root.is_absolute() {
+                    return Err("workflow recording root must be an absolute path".into());
+                }
+                root
+            }
+            None => self.resolved_data_dir()?,
+        };
         std::fs::create_dir_all(&root)
             .map_err(|err| format!("creating {} failed: {err}", root.display()))?;
         let root = root
             .canonicalize()
-            .map_err(|err| format!("resolving data directory failed: {err}"))?;
+            .map_err(|err| format!("resolving recording directory failed: {err}"))?;
         let mut parent = root.clone();
         if let Some(relative_parent) = relative.parent() {
             for component in relative_parent.components() {
@@ -987,7 +1060,7 @@ impl StageAPhotodiodePlugin {
                     .canonicalize()
                     .map_err(|err| format!("resolving {} failed: {err}", parent.display()))?;
                 if !canonical.starts_with(&root) {
-                    return Err("workflow path escapes the configured data directory".into());
+                    return Err("workflow path escapes the recording directory".into());
                 }
             }
         }
@@ -1045,11 +1118,12 @@ impl StageAPhotodiodePlugin {
                 true,
             ));
         }
+        let root = specification.root_dir.as_deref();
         let pdq_path = self
-            .resolve_control_path(&specification.pdq_path, "pdq")
+            .resolve_control_path(&specification.pdq_path, "pdq", root)
             .map_err(|message| service_error(ServiceErrorCodeV1::InvalidPath, message, false))?;
         let sidecar_path = self
-            .resolve_control_path(&specification.sidecar_path, "json")
+            .resolve_control_path(&specification.sidecar_path, "json", root)
             .map_err(|message| service_error(ServiceErrorCodeV1::InvalidPath, message, false))?;
         if pdq_path == sidecar_path {
             return Err(service_error(
@@ -1565,31 +1639,24 @@ impl StageAPhotodiodePlugin {
         if markers.len() < 3 {
             return Err(EstimateError::IncompleteModulationCycles {
                 marker_count: markers.len(),
-                max_samples: CONTRAST_WINDOW_SAMPLES,
+                max_samples: state.samples.len(),
             });
         }
 
         // End on the newest complete phase-0 boundary. Start at least two
-        // complete cycles earlier, then include as many older whole cycles as
-        // fit in the bounded estimator window.
+        // complete cycles earlier, then include up to the configured number of
+        // older complete cycles. At low frequency this grows with the measured
+        // period instead of truncating the waveform to a fixed sample count.
         let end_index = *markers.last().expect("three markers checked");
-        let mut start_marker = markers.len() - 3;
-        if end_index.saturating_sub(markers[start_marker]) as usize > CONTRAST_WINDOW_SAMPLES {
-            return Err(EstimateError::IncompleteModulationCycles {
-                marker_count: markers.len(),
-                max_samples: CONTRAST_WINDOW_SAMPLES,
-            });
-        }
-        while start_marker > 0
-            && end_index.saturating_sub(markers[start_marker - 1]) as usize
-                <= CONTRAST_WINDOW_SAMPLES
-        {
-            start_marker -= 1;
-        }
+        let desired_cycles = CONTRAST_WINDOW_CYCLES as usize;
+        let start_marker = markers.len().saturating_sub(desired_cycles + 1);
         let start_index = markers[start_marker];
         let start = start_index.saturating_sub(state.ring_first_index) as usize;
         let end = end_index.saturating_sub(state.ring_first_index) as usize;
         let window: Vec<u16> = state.samples.range(start..end).copied().collect();
+        let rate_hz = f64::from(state.rate_hz.max(1));
+        let covered_cycles = Some((markers.len() - 1 - start_marker) as f64);
+        let window_seconds = end_index.saturating_sub(start_index) as f64 / rate_hz;
         let calibration = self.adc_calibration();
         // `ContrastGeometry::RejectedComplement` wants the *dark-corrected*
         // I_tot, and the estimator dark-corrects the detector samples. The
@@ -1640,6 +1707,8 @@ impl StageAPhotodiodePlugin {
             }),
             fundamental_phase_rad: None,
             total_harmonic_distortion: None,
+            window_seconds: Some(window_seconds),
+            covered_cycles,
         })
     }
 
@@ -1747,6 +1816,9 @@ impl StageAPhotodiodePlugin {
             requested_revision: self.requested_revision,
             acknowledged_revision: self.acknowledged_revision,
             stream,
+            // Automation clients need this to refuse a coordinated run before
+            // it starts the camera, instead of failing at BeginRecording.
+            data_dir: Some(self.data_dir.trim().to_owned()).filter(|folder| !folder.is_empty()),
             active_recording,
             last_finalized_recording: self.last_finalized_recording.clone(),
             optical_summary,
@@ -3458,7 +3530,7 @@ mod tests {
 
     /// A clean rejected-port sine: the detector swings around `center` while
     /// the excitation is its complement against `I_tot`.
-    fn rejected_port_samples(center: f64, amplitude: f64, count: usize) -> VecDeque<u16> {
+    fn rejected_port_samples(center: f64, amplitude: f64, count: usize) -> Vec<u16> {
         (0..count)
             .map(|i| {
                 let phase = 2.0 * std::f64::consts::PI * (i as f64) * 8.0 / count as f64;
@@ -3469,17 +3541,122 @@ mod tests {
             .collect()
     }
 
-    fn state_with_cycles(samples: VecDeque<u16>, cycles: usize) -> SharedState {
-        let count = samples.len();
-        let mut state = SharedState {
-            rate_hz: 20_000,
-            samples,
-            ..SharedState::default()
-        };
-        state.markers = (0..=cycles)
-            .map(|cycle| (cycle * count / cycles) as u64)
-            .collect();
+    /// [`rejected_port_samples`] ingested into a ring, with one phase-0 marker
+    /// per cycle when `mark_cycles` — the estimator sizes its window from them.
+    fn rejected_port_state(
+        center: f64,
+        amplitude: f64,
+        count: usize,
+        mark_cycles: bool,
+    ) -> SharedState {
+        let mut state = SharedState::default();
+        state.ingest(
+            0,
+            20_000,
+            0,
+            &rejected_port_samples(center, amplitude, count),
+        );
+        if mark_cycles {
+            // `rejected_port_samples` puts 8 whole cycles in `count` samples.
+            let period = (count / 8) as u64;
+            for cycle in 0..=8 {
+                state.push_marker(cycle * period);
+            }
+        }
         state
+    }
+
+    /// A slow sine streamed for `total` samples into a ring that only retains
+    /// `retained` of them, with one phase-0 marker per cycle delivered as the
+    /// stream goes past — so markers are evicted exactly as they are on the
+    /// bench when the period outgrows the monitor cache.
+    fn slow_sine_state(period_samples: u64, retained: usize, total: usize) -> SharedState {
+        let mut state = SharedState {
+            cache_seconds: retained as f64 / 20_000.0,
+            ..Default::default()
+        };
+        let block = 4_000;
+        let mut index = 0usize;
+        while index < total {
+            let end = (index + block).min(total);
+            let codes: Vec<u16> = (index..end)
+                .map(|i| {
+                    let phase = 2.0 * std::f64::consts::PI * (i as f64) / period_samples as f64;
+                    (1_600.0 + 700.0 * phase.sin()).round() as u16
+                })
+                .collect();
+            state.ingest(index as u64, 20_000, 0, &codes);
+            let mut marker = index.next_multiple_of(period_samples as usize) as u64;
+            while (marker as usize) <= end {
+                state.push_marker(marker);
+                marker += period_samples;
+            }
+            index = end;
+        }
+        state
+    }
+
+    #[test]
+    fn a_window_shorter_than_one_cycle_withholds_a_instead_of_under_reporting_it() {
+        // `a` is peak-to-peak. Below one full cycle the robust extrema see an
+        // arc of the sine, so `a` comes out low — and A1's a₀ lock divides by
+        // it, inflating its drive against a bias it cannot see. Fail closed.
+        let mut plugin = live_plugin();
+        plugin.reference_volts = 3.0;
+
+        // 0.5 Hz at 20 kSa/s = 40 000 samples per cycle; retain 0.6 of one.
+        let partial = slow_sine_state(40_000, 24_000, 200_000);
+        let error = plugin
+            .optical_summary_result(&partial)
+            .expect_err("a partial cycle must not publish an a");
+        assert!(
+            matches!(error, EstimateError::IncompleteModulationCycles { .. }),
+            "unexpected rejection: {error:?}"
+        );
+
+        // Two whole cycles of the same drive: published, and the window is
+        // reported so a consumer can wait it out before trusting a re-read.
+        let whole = slow_sine_state(40_000, 80_000, 200_000);
+        let summary = plugin
+            .optical_summary(&whole)
+            .expect("two whole cycles estimate");
+        let expected = ((3.0_f64 - (1_600.0 - 700.0) * (3.3 / 4_095.0))
+            / (3.0 - (1_600.0 + 700.0) * (3.3 / 4_095.0)))
+            .ln();
+        assert!(
+            (summary.measured_log_contrast - expected).abs() < 0.02,
+            "a={} expected~{expected}",
+            summary.measured_log_contrast
+        );
+        assert!((summary.measured_frequency_hz.expect("markers") - 0.5).abs() < 0.01);
+        assert!((summary.window_seconds.expect("window") - 4.0).abs() < 0.01);
+        assert!(summary.covered_cycles.expect("cycles") >= 1.0);
+    }
+
+    #[test]
+    fn the_contrast_window_grows_to_cover_whole_cycles_at_low_frequency() {
+        // A fixed 16 384-sample window is 0.82 s: below one cycle for every
+        // f < 1.2 Hz, which is where the A1 plateau reference lives.
+        let fast = rejected_port_state(1_600.0, 700.0, 4_096, true);
+        let (window, cycles) = fast.contrast_window();
+        assert_eq!(window, 4_096, "high f keeps the whole retained ring");
+        assert!(cycles.expect("markers") >= 8.0);
+
+        let slow = slow_sine_state(40_000, 400_000, 400_000);
+        let (window, cycles) = slow.contrast_window();
+        assert_eq!(
+            window,
+            (CONTRAST_WINDOW_CYCLES as usize) * 40_000,
+            "the window is sized from the marker period, not fixed"
+        );
+        assert!((cycles.expect("markers") - CONTRAST_WINDOW_CYCLES).abs() < 0.01);
+
+        // Without markers there is no period to size against: fall back to the
+        // fixed window and report no cycle count rather than guess one.
+        let mut unmarked = slow_sine_state(40_000, 400_000, 400_000);
+        unmarked.markers.clear();
+        unmarked.marker_period_estimate = None;
+        assert_eq!(unmarked.contrast_window(), (CONTRAST_WINDOW_SAMPLES, None));
     }
 
     #[test]
@@ -3489,7 +3666,7 @@ mod tests {
         // scientific quantity. A1's amplitude sweep settles on this value.
         let mut plugin = live_plugin();
         plugin.reference_volts = 3.0;
-        let state = state_with_cycles(rejected_port_samples(1_600.0, 700.0, 4_096), 8);
+        let state = rejected_port_state(1_600.0, 700.0, 4_096, true);
 
         plugin.mode = Mode::Raw;
         let raw = plugin.optical_summary(&state).expect("raw display");
@@ -3516,7 +3693,7 @@ mod tests {
     fn optical_contrast_requires_a_confirmed_anchor_and_complete_cycles() {
         let mut plugin = live_plugin();
         plugin.reference_volts = 3.0;
-        let mut state = state_with_cycles(rejected_port_samples(1_600.0, 700.0, 4_096), 8);
+        let mut state = rejected_port_state(1_600.0, 700.0, 4_096, true);
 
         plugin.reference_confirmed = false;
         assert_eq!(
@@ -3526,13 +3703,13 @@ mod tests {
 
         plugin.reference_confirmed = true;
         state.markers = VecDeque::from([0, 512]);
-        assert_eq!(
+        assert!(matches!(
             plugin.optical_summary_result(&state),
             Err(EstimateError::IncompleteModulationCycles {
                 marker_count: 2,
-                max_samples: CONTRAST_WINDOW_SAMPLES,
+                max_samples: 4_096,
             })
-        );
+        ));
     }
 
     #[test]
@@ -3554,7 +3731,7 @@ mod tests {
     fn captured_dark_level_reaches_the_estimator_and_is_named() {
         let mut plugin = live_plugin();
         plugin.reference_volts = 3.0;
-        let state = state_with_cycles(rejected_port_samples(1_600.0, 700.0, 4_096), 8);
+        let state = rejected_port_state(1_600.0, 700.0, 4_096, true);
 
         let undarkened = plugin.optical_summary(&state).expect("no dark yet");
         assert_eq!(undarkened.calibration.dark_id, "dark-none");
@@ -4375,6 +4552,109 @@ mod tests {
         assert!(plugin.set_setting("mode", json!("RAW")).is_err());
     }
 
+    /// A workflow client that names its own recording root gets the PDQ written
+    /// there, and the owner's Data directory stops being involved at all — that
+    /// is what lets one coordinated run keep every file in one folder.
+    #[test]
+    fn a_client_named_root_overrides_the_data_directory() {
+        let dir = temp_dir("client-root");
+        let mut plugin = live_plugin();
+        plugin.port_hint = "mock".into();
+        // Deliberately unset: it must not be consulted.
+        plugin.data_dir = String::new();
+        plugin.connect();
+        let acquire = service_request(
+            &plugin,
+            20,
+            "workflow-a",
+            PhotodiodeCommandV1::AcquireLease { ttl_ms: 10_000 },
+            None,
+        );
+        assert!(matches!(
+            plugin
+                .handle_service_request(&acquire, &live_execution())
+                .outcome,
+            PluginServiceOutcome::Accepted { .. }
+        ));
+
+        let begin = service_request(
+            &plugin,
+            21,
+            "workflow-a",
+            PhotodiodeCommandV1::BeginRecording {
+                specification: PdqStartSpecV1 {
+                    pdq_path: "A1-row/run_pd.pdq".into(),
+                    sidecar_path: "A1-row/run_pd.json".into(),
+                    expected_sample_rate_hz: None,
+                    expected_stream_epoch: None,
+                    metadata: BTreeMap::new(),
+                    root_dir: Some(dir.display().to_string()),
+                },
+            },
+            Some(1),
+        );
+        assert!(
+            matches!(
+                plugin
+                    .handle_service_request(&begin, &live_execution())
+                    .outcome,
+                PluginServiceOutcome::Accepted { .. }
+            ),
+            "a client-named root must not need the owner's data directory"
+        );
+        assert!(dir.join("A1-row/run_pd.pdq").is_file());
+
+        // Traversal is still refused below a client-named root.
+        let escape = service_request(
+            &plugin,
+            22,
+            "workflow-a",
+            PhotodiodeCommandV1::BeginRecording {
+                specification: PdqStartSpecV1 {
+                    pdq_path: "../escape.pdq".into(),
+                    sidecar_path: "A1-row/escape.json".into(),
+                    expected_sample_rate_hz: None,
+                    expected_stream_epoch: None,
+                    metadata: BTreeMap::new(),
+                    root_dir: Some(dir.display().to_string()),
+                },
+            },
+            Some(2),
+        );
+        assert!(matches!(
+            plugin
+                .handle_service_request(&escape, &live_execution())
+                .outcome,
+            PluginServiceOutcome::Rejected { .. }
+        ));
+
+        // A relative root is refused outright.
+        let relative_root = service_request(
+            &plugin,
+            23,
+            "workflow-a",
+            PhotodiodeCommandV1::BeginRecording {
+                specification: PdqStartSpecV1 {
+                    pdq_path: "A1-row/other_pd.pdq".into(),
+                    sidecar_path: "A1-row/other_pd.json".into(),
+                    expected_sample_rate_hz: None,
+                    expected_stream_epoch: None,
+                    metadata: BTreeMap::new(),
+                    root_dir: Some("relative/root".into()),
+                },
+            },
+            Some(3),
+        );
+        assert!(matches!(
+            plugin
+                .handle_service_request(&relative_root, &live_execution())
+                .outcome,
+            PluginServiceOutcome::Rejected { .. }
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn named_recording_rejects_unsafe_paths_and_returns_final_receipt() {
         let dir = temp_dir("named");
@@ -4407,6 +4687,7 @@ mod tests {
                     expected_sample_rate_hz: None,
                     expected_stream_epoch: None,
                     metadata: BTreeMap::new(),
+                    root_dir: None,
                 },
             },
             Some(1),
@@ -4429,6 +4710,7 @@ mod tests {
                     expected_sample_rate_hz: None,
                     expected_stream_epoch: None,
                     metadata: BTreeMap::from([("workflow".into(), "A1".into())]),
+                    root_dir: None,
                 },
             },
             Some(1),
@@ -4478,6 +4760,7 @@ mod tests {
                     expected_sample_rate_hz: None,
                     expected_stream_epoch: None,
                     metadata: BTreeMap::new(),
+                    root_dir: None,
                 },
             },
             Some(3),
@@ -4518,6 +4801,7 @@ mod tests {
                     expected_sample_rate_hz: None,
                     expected_stream_epoch: None,
                     metadata: BTreeMap::new(),
+                    root_dir: None,
                 },
             },
             Some(1),
