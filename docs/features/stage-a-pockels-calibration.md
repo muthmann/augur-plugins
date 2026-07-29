@@ -120,8 +120,8 @@ deviation, because those are themselves dragged out by the very points being
 looked for. `6 × median` is roughly 4σ for Gaussian noise, so ordinary scatter
 survives untouched.
 
-This matters because of how the numbers actually behave on a bench. Measured on
-a realistic small-signal sweep (90 mV span, `Vπ = 860`, 2.4 lobes):
+This matters because of how the numbers behave in synthetic stress tests. The
+following table is test-model output, not a bench measurement:
 
 | Condition | Residual | Fitted `Vπ` |
 |---|---|---|
@@ -138,6 +138,15 @@ to three codes — and it is invisible in the plot. That is why the residual
 bad reason. A residual that stays high after rejection, with a visibly poor
 overlay, is the real signal — and as the last row shows, it comes with a `Vπ`
 that is wrong in a way the plot makes obvious.
+
+There is deliberately no absolute minimum voltage. The earlier implementation
+rejected every detector span below **10 mV**, while the real Stage-A
+photodiode commonly reads only about **0.5–15 mV**. The fit now compares the
+between-code sweep span with the median `peak_to_peak_volts` measured inside
+the settled CONST windows. A repeatable millivolt-scale lobe is accepted; a
+putative lobe no larger than the detector's own typical within-window
+excursion is rejected as unresolved. The regression suite includes a 4 mV
+transfer that the old threshold always refused.
 
 The fit is **never** applied automatically, and applying re-validates the
 resulting drive: a calibration that cannot be armed is rolled back rather than
@@ -197,8 +206,9 @@ host does take from the worker.
 
 - `calibration.rs` unit tests recover a known lobe from **both** ports, across
   a multi-lobe sweep, and with a null at code 0; they check the geometry input
-  selects between the two equivalent representations, and that flat sweeps,
-  short sweeps, and out-of-range lobes are refused.
+  selects between the two equivalent representations, accept a resolved
+  sub-10-mV transfer, and ensure flat/noise-level sweeps, short sweeps, and
+  out-of-range lobes are refused.
 - An end-to-end test runs the sweep against the mock board, synthesizing the
   light the reject-port detector *would* report for whatever code the board is
   actually holding — ground truth for commanding, settle gating, point

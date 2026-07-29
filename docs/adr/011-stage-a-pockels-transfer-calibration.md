@@ -107,13 +107,13 @@ The first cut refused to apply a fit whose residual exceeded 2 % of the detector
 span. On the bench that gate fired at 20.8 % on a sweep whose plot looked
 correct, and withheld a usable calibration.
 
-Measuring the failure modes on a realistic small-signal sweep settled it: 5 mV
-of noise gives 3.1 %, drift 3.2 %, hysteresis 5.5 % — but a **single stray
-point gives 9.9 % while leaving `Vπ` accurate to three codes**. Residual and
-correctness are not the same axis, so a residual threshold is the wrong thing to
-block on. (A genuinely wrong fit — an amplifier compressing the top of the
-range — gives 15.2 % *and* a `Vπ` off by 250 codes, which the plot shows
-plainly.)
+Synthetic failure-mode sweeps show the distinction: 5 mV of injected noise
+gives 3.1 %, drift 3.2 %, hysteresis 5.5 % — but a **single stray point gives
+9.9 % while leaving `Vπ` accurate to three codes**. These are test-model
+outputs, not bench measurements. Residual and correctness are not the same
+axis, so a residual threshold is the wrong thing to block on. (A compressed
+synthetic waveform gives 15.2 % *and* a `Vπ` off by 250 codes, which the plot
+shows plainly.)
 
 Two changes follow. The fit now runs twice, dropping points beyond `6 × median`
 absolute residual before refitting — a median cut, because mean and standard
@@ -125,6 +125,15 @@ coverage gate was dead code and was removed rather than kept.
 Applying still re-validates the resulting drive and rolls back if it cannot be
 armed. The sweep restores the pre-sweep drive on every exit path, and refuses to
 run while a lease or protocol owns the DAC.
+
+The original fit also rejected every detector swing below a fixed 10 mV. That
+is incompatible with the observed Stage-A operating range of roughly
+0.5–15 mV and confuses small absolute scale with absence of information. The
+absolute threshold is removed. The only signal gate is now relative: the
+between-code sweep span and the fitted lobe span must exceed the median raw
+peak-to-peak excursion measured inside the settled CONST windows. This accepts
+repeatable millivolt-scale transfers while still refusing structure that is no
+larger than the acquisition noise witness.
 
 ### 8. `ModulationStateV1.calibration_id` — one additive V1 field
 

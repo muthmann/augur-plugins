@@ -167,9 +167,12 @@ impl TransferFit {
 pub enum FitError {
     /// Fewer points than parameters can be resolved from.
     TooFewPoints { count: usize, minimum: usize },
-    /// The detector never moved: no lobe to fit (light blocked, no drive
-    /// reaching the cell, or the sweep span sits in a flat region).
-    NoModulation,
+    /// The between-code signal span is not larger than the detector's typical
+    /// within-window excursion, so the sweep does not resolve a lobe.
+    NoModulation {
+        signal_span_volts: f64,
+        noise_span_volts: f64,
+    },
     /// A fitted lobe exists but no `[V_null, V_null+Vπ]` fits inside the
     /// commandable range, so no monotonic branch is usable.
     NoLobeInRange { v_pi_dac: f64 },
@@ -181,9 +184,14 @@ impl std::fmt::Display for FitError {
             Self::TooFewPoints { count, minimum } => {
                 write!(f, "only {count} sweep points (minimum {minimum})")
             }
-            Self::NoModulation => f.write_str(
-                "the detector level did not change across the sweep; check the light path, \
-                 the HV amplifier, and that the photodiode is connected",
+            Self::NoModulation {
+                signal_span_volts,
+                noise_span_volts,
+            } => write!(
+                f,
+                "detector sweep span {signal_span_volts:.6} V does not exceed the typical \
+                 within-window excursion {noise_span_volts:.6} V; check the light path and HV \
+                 amplifier, or reduce detector noise / increase averaging"
             ),
             Self::NoLobeInRange { v_pi_dac } => write!(
                 f,
@@ -198,8 +206,24 @@ impl std::error::Error for FitError {}
 
 /// Smallest usable sweep: four points per fitted parameter.
 pub const MIN_POINTS: usize = 16;
-/// A detector span below this is treated as noise rather than a lobe.
-const MIN_SPAN_VOLTS: f64 = 0.01;
+
+/// Median raw peak-to-peak excursion inside one settled CONST window.
+///
+/// This is the scale a between-code transfer curve has to beat. Unlike the
+/// former absolute 10 mV cut, it follows the detector gain and acquisition
+/// noise, so millivolt-scale but repeatable Pockels sweeps remain usable.
+fn typical_window_noise(points: &[SweepPoint]) -> f64 {
+    let mut spans: Vec<f64> = points
+        .iter()
+        .map(|point| point.peak_to_peak_volts)
+        .filter(|span| span.is_finite() && *span >= 0.0)
+        .collect();
+    if spans.is_empty() {
+        return 0.0;
+    }
+    spans.sort_by(f64::total_cmp);
+    spans[spans.len() / 2]
+}
 
 /// Least-squares solution for one candidate half-wave-voltage span `w`.
 struct Harmonic {
@@ -461,8 +485,16 @@ pub fn fit_transfer(
     let profile = smoothed_profile(points);
     let min_volts = profile.iter().map(|(_, v)| *v).fold(f64::MAX, f64::min);
     let max_volts = profile.iter().map(|(_, v)| *v).fold(f64::MIN, f64::max);
-    if max_volts - min_volts < MIN_SPAN_VOLTS {
-        return Err(FitError::NoModulation);
+    let observed_span = max_volts - min_volts;
+    let noise_span = typical_window_noise(points);
+    if !observed_span.is_finite()
+        || observed_span <= f64::EPSILON
+        || (noise_span > 0.0 && observed_span <= noise_span)
+    {
+        return Err(FitError::NoModulation {
+            signal_span_volts: observed_span.max(0.0),
+            noise_span_volts: noise_span,
+        });
     }
 
     let swept_lo = profile.first().map(|(code, _)| *code).unwrap_or(0.0);
@@ -475,7 +507,10 @@ pub fn fit_transfer(
     // what is left, so the reported residual describes the curve rather than
     // the worst sample.
     let (w, harmonic, rejected_points) = {
-        let first = fit_period(points, swept_span).ok_or(FitError::NoModulation)?;
+        let first = fit_period(points, swept_span).ok_or(FitError::NoModulation {
+            signal_span_volts: observed_span,
+            noise_span_volts: noise_span,
+        })?;
         let kept = without_outliers(points, first.0, &first.1);
         if kept.len() < points.len() && kept.len() >= MIN_POINTS {
             match fit_period(&kept, swept_span) {
@@ -503,8 +538,11 @@ pub fn fit_transfer(
             2.0 * radius,
         ),
     };
-    if p1.abs() < MIN_SPAN_VOLTS {
-        return Err(FitError::NoModulation);
+    if !p1.is_finite() || p1.abs() <= f64::EPSILON || (noise_span > 0.0 && p1.abs() <= noise_span) {
+        return Err(FitError::NoModulation {
+            signal_span_volts: p1.abs(),
+            noise_span_volts: noise_span,
+        });
     }
 
     let v_null = select_lobe(v, w, max_code).ok_or(FitError::NoLobeInRange { v_pi_dac: w })?;
@@ -716,10 +754,40 @@ mod tests {
                 clipped: false,
             })
             .collect();
-        assert_eq!(
+        assert!(matches!(
             fit_transfer(&points, 4_095.0, DetectorGeometry::RejectedComplement),
-            Err(FitError::NoModulation)
+            Err(FitError::NoModulation { .. })
+        ));
+    }
+
+    #[test]
+    fn accepts_a_repeatable_sub_10mv_transfer() {
+        // The real detector commonly operates between roughly 0.5 and 15 mV.
+        // A repeatable 4 mV lobe was rejected by the former absolute 10 mV
+        // threshold even though it is twice the measured window excursion.
+        let points = synthetic_sweep(300.0, 1_600.0, 0.010, -0.004, 4_095, 0.000_05, true);
+        let fit = fit_transfer(&points, 4_095.0, DetectorGeometry::RejectedComplement)
+            .expect("a resolved millivolt-scale lobe must fit");
+
+        assert!(
+            (fit.v_pi_dac - 1_600.0).abs() < 10.0,
+            "Vπ = {}",
+            fit.v_pi_dac
         );
+        assert!(fit.span_volts.abs() < 0.010);
+        assert!(fit.span_volts.abs() > 0.003);
+    }
+
+    #[test]
+    fn refuses_apparent_modulation_below_the_window_noise() {
+        let points = synthetic_sweep(300.0, 1_600.0, 0.008, 0.0, 4_095, 0.000_4, false);
+        assert!(matches!(
+            fit_transfer(&points, 4_095.0, DetectorGeometry::Direct),
+            Err(FitError::NoModulation {
+                noise_span_volts,
+                ..
+            }) if (noise_span_volts - 0.002).abs() < 1e-12
+        ));
     }
 
     #[test]
