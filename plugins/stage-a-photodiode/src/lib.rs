@@ -64,6 +64,12 @@ const STATUS_VIEW_ID: &str = "stage-a-photodiode.status.view";
 
 const ADC_FULL_SCALE_VOLTS: f64 = 3.3;
 const ADC_MAX_CODE: f64 = 4_095.0;
+/// Drag increment for manually entered photodiode calibration voltages.
+///
+/// The host derives the displayed decimal precision from this increment. The
+/// Stage-A detector normally operates around 0.0005–0.015 V, so the former
+/// 10 mV / 1 mV increments hid physically relevant values.
+const VOLTAGE_INPUT_STEP_VOLTS: f64 = 0.000_001;
 /// Default monitor cache, in seconds of samples at the active stream rate
 /// (user-settable 1–130 s).
 const DEFAULT_CACHE_SECONDS: f64 = 20.0;
@@ -911,13 +917,13 @@ impl StageAPhotodiodePlugin {
         };
         if mean >= self.reference_volts {
             return Err(format!(
-                "dark level {mean:.4} V is not below the I_tot reference \
-                 {:.4} V — is the beam actually blocked?",
+                "dark level {mean:.6} V is not below the I_tot reference \
+                 {:.6} V — is the beam actually blocked?",
                 self.reference_volts
             ));
         }
         self.dark_volts = mean;
-        self.last_save_note = Some(format!("dark level captured: {mean:.4} V"));
+        self.last_save_note = Some(format!("dark level captured: {mean:.6} V"));
         Ok(())
     }
 
@@ -2873,13 +2879,14 @@ impl Plugin for StageAPhotodiodePlugin {
                             label: "Reference I_tot".into(),
                             tooltip: Some(
                                 "Total power reference for EXCITATION mode, in photodiode volts: \
-                             the PD reading with the full beam diverted into the diode"
+                             the PD reading with the full beam diverted into the diode. The field \
+                             accepts 1 µV increments; Capture dark does not set this value."
                                     .into(),
                             ),
                             kind: SettingKind::F64Drag {
                                 min: 0.0,
                                 max: ADC_FULL_SCALE_VOLTS,
-                                speed: 0.01,
+                                speed: VOLTAGE_INPUT_STEP_VOLTS,
                                 default: self.reference_volts,
                             },
                         },
@@ -2911,15 +2918,15 @@ impl Plugin for StageAPhotodiodePlugin {
                             key: "dark_volts".into(),
                             label: "Dark level".into(),
                             tooltip: Some(
-                                "Measured dark level in photodiode volts (beam blocked). The \
-                             detector is DC-coupled, so the published contrast a is biased low \
-                             while this is 0."
+                                "Measured detector offset in photodiode volts with the beam \
+                             blocked. The field accepts 1 µV increments; Capture dark can fill \
+                             it from the current sample cache."
                                     .into(),
                             ),
                             kind: SettingKind::F64Drag {
                                 min: 0.0,
                                 max: ADC_FULL_SCALE_VOLTS,
-                                speed: 0.001,
+                                speed: VOLTAGE_INPUT_STEP_VOLTS,
                                 default: self.dark_volts,
                             },
                         },
@@ -2927,8 +2934,10 @@ impl Plugin for StageAPhotodiodePlugin {
                             key: "capture_dark".into(),
                             label: "Capture dark".into(),
                             tooltip: Some(
-                                "Block the beam, then press: takes the mean of the current cache \
-                             as the dark level."
+                                "Block the beam and wait until earlier illuminated samples have \
+                             left the cache, then press. Uses the mean of every sample currently \
+                             retained in the cache as Dark level; it does not measure I_tot or \
+                             start a separate acquisition."
                                     .into(),
                             ),
                             kind: SettingKind::Button { enabled: true },
@@ -3799,6 +3808,42 @@ mod tests {
         let err = plugin.capture_dark().expect_err("beam clearly not blocked");
         assert!(err.contains("is not below the I_tot reference"), "{err}");
         assert_eq!(plugin.dark_volts, 0.0);
+    }
+
+    #[test]
+    fn capture_dark_uses_the_mean_of_the_retained_cache() {
+        let mut plugin = live_plugin();
+        plugin.reference_volts = 0.015;
+        if let Ok(mut state) = plugin.shared.lock() {
+            state.ingest(0, 20_000, 0, &[4, 6, 8]);
+        }
+
+        plugin.capture_dark().expect("blocked-beam cache accepted");
+
+        let expected = code_to_volts(6.0);
+        assert!((plugin.dark_volts - expected).abs() < f64::EPSILON);
+        assert_eq!(
+            plugin.last_save_note.as_deref(),
+            Some("dark level captured: 0.004835 V")
+        );
+    }
+
+    #[test]
+    fn calibration_voltage_inputs_accept_microvolt_steps() {
+        let schema = StageAPhotodiodePlugin::default().settings_schema();
+
+        for key in ["reference_volts", "dark_volts"] {
+            let item = schema
+                .sections
+                .iter()
+                .flat_map(|section| section.items.iter())
+                .find(|item| item.key == key)
+                .unwrap_or_else(|| panic!("missing {key} setting"));
+            let SettingKind::F64Drag { speed, .. } = &item.kind else {
+                panic!("{key} must remain an F64Drag setting");
+            };
+            assert_eq!(*speed, VOLTAGE_INPUT_STEP_VOLTS);
+        }
     }
 
     #[test]

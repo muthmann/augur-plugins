@@ -45,14 +45,18 @@ so the estimator always runs the `RejectedComplement` geometry against `referenc
 amplitude sweep settles on this value, so a display toggle must not be able to move it (ADR 012).
 
 - **Reference I_tot** (`reference_volts`) is the total-power anchor: the PD reading with the full
-  beam diverted into the diode. A non-empty **anchor id** and explicit
+  beam diverted into the diode. The input accepts 1 µV steps (six decimal places in volts), which
+  covers the usual 0.0005–0.015 V detector range. A non-empty **anchor id** and explicit
   **measured and current** confirmation are required. Changing the value or id
   clears confirmation; until all three agree, `a` is withheld.
 - **Dark level** (`dark_volts`) + the **Capture dark** button: block the beam and press; the mean of
-  the current cache becomes the dark level. It is applied to the detector samples *and* to the
-  `I_tot` anchor, so it cancels out of the complement rather than biasing `a` — its job is to keep
-  the two sides consistent and to record the calibration the reading was taken under. `dark_id` in
-  the sidecar reads `dark-measured` or `dark-none` accordingly.
+  every sample currently retained in the monitor cache becomes the dark level. This is not a new
+  fixed-duration acquisition and it does not measure or modify `I_tot`: after blocking the beam,
+  wait at least one configured cache duration so earlier illuminated samples have aged out. The
+  dark input also accepts 1 µV steps for a manual correction. The value is applied to the detector
+  samples *and* to the `I_tot` anchor, so it cancels out of the complement rather than biasing `a`
+  — its job is to keep the two sides consistent and to record the calibration the reading was
+  taken under. `dark_id` in the sidecar reads `dark-measured` or `dark-none` accordingly.
 - The estimator uses only marker-bounded windows containing at least **two
   complete modulation cycles**, ending on phase 0. It no longer estimates
   extrema from an arbitrary trailing sample count; a low-frequency trace that
