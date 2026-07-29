@@ -22,10 +22,13 @@ capped at 192 bytes, too small to upload a 256-code table inline.
 
 1. **Own the inversion in the modulation plugin.** `waveform.rs` computes a
    256-entry DAC warp table from an `OpticalTarget` (`LogSine`/`LinearSine`), the
-   requested depth `a`, and a `LobeInversion { v_null_dac, v_pi_dac }`. It refuses
+   requested depth `a`, and a `LobeInversion { v_null_dac, v_pi_dac }` (built from
+   the two observed endpoint codes since
+   [ADR 016](016-stage-a-lobe-endpoints-not-a-distance.md)). It refuses
    (never clamps) a drive whose codes leave `0..4095`.
-2. **Keep the inversion parameters settable.** `V_null` and `Vπ` are entered in
-   DAC codes; no measurement rig is required to start. The scientifically clean
+2. **Keep the measured lobe endpoints settable.** `V_null` and `V_peak` are
+   entered as absolute DAC codes and the internal `Vπ` span is derived from
+   them (ADR 016); no measurement rig is required to start. The scientifically clean
    **measured LUT** (sweep constant codes, log the photodiode, freeze the table)
    is a documented follow-up that drops in behind the same `warp_table` interface.
 3. **Send parameters, not the table, over the wire.** The compact
