@@ -917,8 +917,10 @@ pub struct StageAModulationPlugin {
     operating_point: f64,
     /// DAC code at the excitation minimum of one monotonic Pockels lobe.
     v_null_dac: i64,
-    /// DAC-code quarter-wave distance from `v_null` to the excitation maximum.
-    v_pi_dac: i64,
+    /// DAC code at the excitation maximum of that lobe. An absolute code like
+    /// `v_null_dac`, not a distance: the quarter wave `Vπ` is derived from the
+    /// pair (see [`waveform::LobeInversion::resolve`]).
+    v_peak_dac: i64,
     // -- measured transfer calibration --
     /// Bench detector geometry. Not inferable from a sweep — see
     /// [`calibration::DetectorGeometry`].
@@ -927,7 +929,7 @@ pub struct StageAModulationPlugin {
     sweep: Option<CalibrationSweep>,
     /// Last completed fit, awaiting review and an explicit apply.
     fit: Option<calibration::TransferFit>,
-    /// Set once a fit has been applied to `v_null_dac`/`v_pi_dac`; published on
+    /// Set once a fit has been applied to `v_null_dac`/`v_peak_dac`; published on
     /// the contract so a consumer's sidecar can cite the inversion in use.
     calibration_id: Option<String>,
     /// Directory for the archived calibration record; empty means "apply the
@@ -989,7 +991,7 @@ impl Default for StageAModulationPlugin {
             armed_frequency_hz: None,
             operating_point: 0.5,
             v_null_dac: 0,
-            v_pi_dac: 2_048,
+            v_peak_dac: 2_048,
             detector_geometry: calibration::DetectorGeometry::RejectedComplement,
             sweep: None,
             fit: None,
@@ -1120,11 +1122,25 @@ impl StageAModulationPlugin {
         self.shared.bump();
     }
 
-    fn lobe_inversion(&self) -> waveform::LobeInversion {
-        waveform::LobeInversion {
-            v_null_dac: self.v_null_dac as f64,
-            v_pi_dac: self.v_pi_dac as f64,
-        }
+    /// The lobe the two configured codes name, or why they name none.
+    ///
+    /// Resolved against the **DAC's** range, not the operator's `max_level`
+    /// ceiling: where the crystal nulls and peaks is a fact about the bench, and
+    /// a ceiling that cuts the lobe short still leaves the codes below it
+    /// perfectly drivable (a MANUAL band inside the ceiling must keep working).
+    /// What the ceiling constrains is the codes actually emitted, which
+    /// [`Self::dac_band`] checks.
+    fn resolved_lobe(&self) -> Result<waveform::ResolvedLobe, String> {
+        waveform::LobeInversion::resolve(
+            self.v_null_dac as f64,
+            self.v_peak_dac as f64,
+            MAX_DAC_CODE as f64,
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    fn lobe_inversion(&self) -> Result<waveform::LobeInversion, String> {
+        self.resolved_lobe().map(|lobe| lobe.inversion)
     }
 
     /// Resolves the selected method into the DAC band used by every waveform.
@@ -1140,28 +1156,29 @@ impl StageAModulationPlugin {
         if !u_k.is_finite() || u_k <= 0.0 || u_k > 1.0 {
             return Err("operating point must be in (0, 1]".into());
         }
-        let inversion = self.lobe_inversion();
-        if !inversion.v_pi_dac.is_finite() || inversion.v_pi_dac <= 0.0 {
-            return Err("Vπ must be finite and positive".into());
-        }
+        let inversion = self.lobe_inversion()?;
 
-        // Constant hold at I_k modulates nothing: no ±a/2 headroom applies, so
-        // the full (0, 1] range of u_k is expressible (I_k = 1 holds exactly at
-        // V_null + Vπ). Requiring the modulated band here silently froze the
-        // drive at the last accepted code whenever u_k·e^{a/2} exceeded 1.
-        if self.mode == Mode::Const {
-            let hold = inversion.dac_for_u(u_k).round() as i64;
-            if hold < 0 {
+        // Every code the inversion emits lies between the two endpoints, and
+        // `resolve` has already placed both inside the DAC range — so the floor
+        // can no longer be breached and only the operator's ceiling is left to
+        // check. One guard, naming the settings that actually exist.
+        let under_ceiling = |code: i64, what: &str| -> Result<i64, String> {
+            if code > self.max_level {
                 return Err(format!(
-                    "calibrated hold code {hold} is below 0; re-measure V_null/Vπ"
-                ));
-            }
-            if hold > self.max_level {
-                return Err(format!(
-                    "calibrated hold {hold} exceeds the max limit {}; raise the max limit or lower I_k / Vπ",
+                    "{what} needs DAC code {code}, above the max limit {}; raise the max limit \
+                     or lower I_k / a",
                     self.max_level
                 ));
             }
+            Ok(code)
+        };
+
+        // Constant hold at I_k modulates nothing: no ±a/2 headroom applies, so
+        // the full (0, 1] range of u_k is expressible (I_k = 1 holds exactly at
+        // V_peak). Requiring the modulated band here silently froze the drive
+        // at the last accepted code whenever u_k·e^{a/2} exceeded 1.
+        if self.mode == Mode::Const {
+            let hold = under_ceiling(inversion.dac_for_u(u_k).round() as i64, "the constant hold")?;
             return Ok((hold, hold, hold));
         }
 
@@ -1177,25 +1194,20 @@ impl StageAModulationPlugin {
         }
 
         let lo = inversion.dac_for_u(u_lo).round() as i64;
-        let hi = inversion.dac_for_u(u_hi).round() as i64;
+        let hi = under_ceiling(
+            inversion.dac_for_u(u_hi).round() as i64,
+            "the modulation peak",
+        )?;
         let hold = inversion.dac_for_u(u_k).round() as i64;
-        if lo < 0 {
-            return Err(format!(
-                "calibrated lower DAC code {lo} is below 0; re-measure V_null/Vπ"
-            ));
-        }
-        if hi > self.max_level {
-            return Err(format!(
-                "calibrated peak {hi} exceeds the max limit {}; raise the max limit or lower a / I_k / Vπ",
-                self.max_level
-            ));
-        }
         Ok((lo, hi, hold))
     }
 
-    fn optical_drive(&self, target: waveform::OpticalTarget) -> waveform::OpticalDrive {
-        let inversion = self.lobe_inversion();
-        match self.method {
+    fn optical_drive(
+        &self,
+        target: waveform::OpticalTarget,
+    ) -> Result<waveform::OpticalDrive, String> {
+        let inversion = self.lobe_inversion()?;
+        Ok(match self.method {
             DriveMethod::Manual => {
                 let hi = self.level.clamp(0, self.max_level);
                 let lo = self.min_level.clamp(0, hi);
@@ -1207,7 +1219,7 @@ impl StageAModulationPlugin {
                 operating_point: self.operating_point,
                 inversion,
             },
-        }
+        })
     }
 
     /// Builds the single MOD command carrying the complete current drive
@@ -1235,7 +1247,11 @@ impl StageAModulationPlugin {
                 // fit on one command line.
                 self.optical_warp_table(target)
                     .map_err(|error| format!("optical drive: {error}"))?;
-                let drive = self.optical_drive(target);
+                let drive = self.optical_drive(target)?;
+                // The firmware rebuilds the table from `v_null` and the *quarter
+                // wave*, so the derived distance goes on the wire, not the peak
+                // code the operator configures.
+                let inversion = drive.inversion;
                 Command::new("MOD")
                     .field("wave", "WARP")
                     .field("freq_mhz", freq_mhz)
@@ -1245,8 +1261,8 @@ impl StageAModulationPlugin {
                         "u_k_milli",
                         (drive.operating_point * 1_000.0).round() as i64,
                     )
-                    .field("v_null", self.v_null_dac)
-                    .field("v_pi", self.v_pi_dac)
+                    .field("v_null", inversion.v_null_dac.round() as i64)
+                    .field("v_pi", inversion.v_pi_dac.round() as i64)
             }
         })
     }
@@ -1305,7 +1321,7 @@ impl StageAModulationPlugin {
     /// without distorting the target, so an over-limit drive is refused.
     fn optical_warp_table(&self, target: waveform::OpticalTarget) -> Result<Vec<u16>, String> {
         let table = self
-            .optical_drive(target)
+            .optical_drive(target)?
             .warp_table()
             .map_err(|error| error.to_string())?;
         let peak = table.iter().copied().max().unwrap_or(0);
@@ -1573,14 +1589,16 @@ impl StageAModulationPlugin {
             self.calibration_status = "nothing to apply: measure a transfer curve first".into();
             return;
         };
-        let previous = (self.v_null_dac, self.v_pi_dac);
+        let previous = (self.v_null_dac, self.v_peak_dac);
         self.v_null_dac = fit.v_null_dac.round().clamp(0.0, MAX_DAC_CODE as f64) as i64;
-        self.v_pi_dac = fit.v_pi_dac.round().clamp(1.0, MAX_DAC_CODE as f64) as i64;
+        // The fit reports the quarter wave; the settings hold the peak code the
+        // operator can see on the plot.
+        self.v_peak_dac = fit.v_peak_dac().round().clamp(0.0, MAX_DAC_CODE as f64) as i64;
         // The applied lobe must still produce a legal drive; a calibration that
         // cannot be armed is not an improvement.
         if let Err(error) = self.validate_drive() {
             self.v_null_dac = previous.0;
-            self.v_pi_dac = previous.1;
+            self.v_peak_dac = previous.1;
             self.calibration_status = format!("not applied: {error}");
             return;
         }
@@ -1592,8 +1610,10 @@ impl StageAModulationPlugin {
         };
         self.calibration_id = Some(calibration_id);
         self.calibration_status = format!(
-            "applied V_null {} / Vπ {}{archived}",
-            self.v_null_dac, self.v_pi_dac
+            "applied V_null {} / V_peak {} (Vπ {} codes){archived}",
+            self.v_null_dac,
+            self.v_peak_dac,
+            self.v_peak_dac - self.v_null_dac
         );
         self.send_modulation();
         self.shared.bump();
@@ -2397,18 +2417,15 @@ impl StageAModulationPlugin {
         };
 
         let Some(fit) = self.fit.as_ref() else {
-            let inversion = self.lobe_inversion();
-            let mut lines = vec![Series1dLine {
-                name: "configured lobe".into(),
-                points: sample_curve(1.0, 0.0, inversion),
-            }];
-            lines.push(marker("V_null", inversion.v_null_dac, 0.0, 1.0));
-            lines.push(marker(
-                "V_null + Vπ",
-                inversion.v_null_dac + inversion.v_pi_dac,
-                0.0,
-                1.0,
-            ));
+            let mut lines = Vec::new();
+            if let Ok(inversion) = self.lobe_inversion() {
+                lines.push(Series1dLine {
+                    name: "configured lobe".into(),
+                    points: sample_curve(1.0, 0.0, inversion),
+                });
+                lines.push(marker("V_null", inversion.v_null_dac, 0.0, 1.0));
+                lines.push(marker("V_peak", inversion.v_peak_dac(), 0.0, 1.0));
+            }
             return Series1dV1 {
                 x_label: "DAC code".into(),
                 y_label: "normalised transmission u (not yet measured)".into(),
@@ -2444,15 +2461,16 @@ impl StageAModulationPlugin {
         ];
         // The configured lobe on the fit's own scale: after applying they
         // coincide, and any divergence is the un-applied difference.
-        let configured = self.lobe_inversion();
-        if configured != fit.inversion() {
-            lines.push(Series1dLine {
-                name: "configured lobe".into(),
-                points: sample_curve(fit.span_volts, fit.offset_volts, configured),
-            });
+        if let Ok(configured) = self.lobe_inversion() {
+            if configured != fit.inversion() {
+                lines.push(Series1dLine {
+                    name: "configured lobe".into(),
+                    points: sample_curve(fit.span_volts, fit.offset_volts, configured),
+                });
+            }
         }
         lines.push(marker("V_null", fit.v_null_dac, lo, hi));
-        lines.push(marker("V_null + Vπ", fit.v_null_dac + fit.v_pi_dac, lo, hi));
+        lines.push(marker("V_peak", fit.v_peak_dac(), lo, hi));
         Series1dV1 {
             x_label: "DAC code".into(),
             y_label: "photodiode [V]".into(),
@@ -3068,7 +3086,7 @@ impl Plugin for StageAModulationPlugin {
             DriveMethod::Calibrated => {
                 modulation_items.push(SettingItem {
                     key: "v_null_dac".into(),
-                    label: "V_null (DAC code at min light)".into(),
+                    label: "V_null (DAC code at MIN light)".into(),
                     tooltip: Some(
                         "DAC code where excitation light bottoms out (sin² = 0) on one \
                          monotonic Pockels lobe. Measure it; do not trust nominal Vπ."
@@ -3081,17 +3099,19 @@ impl Plugin for StageAModulationPlugin {
                     },
                 });
                 modulation_items.push(SettingItem {
-                    key: "v_pi_dac".into(),
-                    label: "Vπ (DAC codes, null → max light)".into(),
+                    key: "v_peak_dac".into(),
+                    label: "V_peak (DAC code at MAX light)".into(),
                     tooltip: Some(
-                        "DAC-code quarter-wave distance from V_null to the excitation \
-                         maximum. V_null + Vπ must stay within 0..4095."
+                        "DAC code where excitation light is brightest, on the same lobe as \
+                         V_null. Both fields are codes you read off a sweep — the quarter \
+                         wave Vπ = |V_peak − V_null| is derived, never typed. I_k = 1 holds \
+                         exactly here and I_k = 0 at V_null."
                             .into(),
                     ),
                     kind: SettingKind::I64Drag {
-                        min: 1,
+                        min: 0,
                         max: MAX_DAC_CODE,
-                        default: self.v_pi_dac,
+                        default: self.v_peak_dac,
                     },
                 });
                 modulation_items.push(SettingItem {
@@ -3300,7 +3320,7 @@ impl Plugin for StageAModulationPlugin {
             "depth_a" => Some(json!(self.depth_a)),
             "operating_point" => Some(json!(self.operating_point)),
             "v_null_dac" => Some(json!(self.v_null_dac)),
-            "v_pi_dac" => Some(json!(self.v_pi_dac)),
+            "v_peak_dac" => Some(json!(self.v_peak_dac)),
             "detector_geometry" => {
                 let index = calibration::DetectorGeometry::VARIANTS
                     .iter()
@@ -3483,16 +3503,25 @@ impl Plugin for StageAModulationPlugin {
                 }
                 Ok(())
             }
-            "v_pi_dac" => {
-                let v_pi_dac = value
+            // `v_pi_dac` is the pre-endpoint key: a *distance* from V_null. Kept
+            // settable so a stored config still loads, converted on the way in.
+            // It is deliberately absent from `settings_schema`, so nothing new
+            // can be authored against the form that caused the mix-up.
+            "v_peak_dac" | "v_pi_dac" => {
+                let entered = value
                     .as_i64()
-                    .ok_or("v_pi_dac must be an integer")?
-                    .clamp(1, MAX_DAC_CODE);
-                let previous = self.v_pi_dac;
-                self.v_pi_dac = v_pi_dac;
+                    .ok_or("v_peak_dac must be an integer")?
+                    .clamp(0, MAX_DAC_CODE);
+                let v_peak_dac = if key == "v_pi_dac" {
+                    (self.v_null_dac + entered).clamp(0, MAX_DAC_CODE)
+                } else {
+                    entered
+                };
+                let previous = self.v_peak_dac;
+                self.v_peak_dac = v_peak_dac;
                 if self.method == DriveMethod::Calibrated || self.mode.optical_target().is_some() {
                     if let Err(error) = self.validate_drive() {
-                        self.v_pi_dac = previous;
+                        self.v_peak_dac = previous;
                         return Err(error);
                     }
                     self.send_modulation();
@@ -3605,6 +3634,36 @@ impl Plugin for StageAModulationPlugin {
             self.method.name(),
             self.mode.name()
         )));
+        if self.method == DriveMethod::Calibrated || self.mode.optical_target().is_some() {
+            // Spell the lobe out in the operator's own units. A wrong endpoint
+            // shows up here immediately — the code I_k = 1 maps to is the code
+            // where the light should be brightest, and nothing in between may
+            // overshoot it.
+            entries.push(StatusEntry::Text(match self.resolved_lobe() {
+                Ok(lobe) => {
+                    let inversion = lobe.inversion;
+                    format!(
+                        "Lobe: Vπ = {:.0} codes — I_k 0 → {:.0} (min light), 0.5 → {:.0}, \
+                         1 → {:.0} (max light){}",
+                        inversion.v_pi_dac,
+                        inversion.dac_for_u(0.0),
+                        inversion.dac_for_u(0.5),
+                        inversion.dac_for_u(1.0),
+                        if lobe.folded {
+                            format!(
+                                ", folded onto the ascending branch V_null {:.0} → V_peak {:.0} \
+                                 (the pair was entered running downward in code)",
+                                inversion.v_null_dac,
+                                inversion.v_peak_dac()
+                            )
+                        } else {
+                            String::new()
+                        }
+                    )
+                }
+                Err(error) => format!("Lobe invalid: {error}"),
+            }));
+        }
         match self.dac_band() {
             Ok((lo, hi, hold)) => entries.push(StatusEntry::Text(format!(
                 "Resolved DAC band: {lo}..{hi} (hold {hold}, {} codes peak-to-peak)",
@@ -3615,20 +3674,19 @@ impl Plugin for StageAModulationPlugin {
             ))),
         }
         if let Some(target) = self.mode.optical_target() {
-            match self.optical_warp_table(target) {
-                Ok(_) => {
-                    let drive = self.optical_drive(target);
+            match (self.optical_warp_table(target), self.optical_drive(target)) {
+                (Ok(_), Ok(drive)) => {
                     entries.push(StatusEntry::Text(format!(
-                        "{}: a={:.2}, I_k={:.2}, V_null={}, Vπ={} @ {:.3} Hz",
+                        "{}: a={:.2}, I_k={:.2}, V_null={:.0}, V_peak={:.0} @ {:.3} Hz",
                         self.mode.name(),
                         drive.depth_a,
                         drive.operating_point,
-                        self.v_null_dac,
-                        self.v_pi_dac,
+                        drive.inversion.v_null_dac,
+                        drive.inversion.v_peak_dac(),
                         self.frequency_hz,
                     )));
                 }
-                Err(error) => {
+                (Err(error), _) | (_, Err(error)) => {
                     entries.push(StatusEntry::Text(format!("Optical drive invalid: {error}")))
                 }
             }
@@ -4080,7 +4138,7 @@ level = 750
         assert!(!manual.iter().any(|key| key == "depth_a"));
         assert!(!manual.iter().any(|key| key == "operating_point"));
         assert!(!manual.iter().any(|key| key == "v_null_dac"));
-        assert!(!manual.iter().any(|key| key == "v_pi_dac"));
+        assert!(!manual.iter().any(|key| key == "v_peak_dac"));
 
         let schema = plugin.settings_schema();
         let mode = schema.sections[0]
@@ -4118,7 +4176,7 @@ level = 750
         assert!(calibrated.iter().any(|key| key == "depth_a"));
         assert!(calibrated.iter().any(|key| key == "operating_point"));
         assert!(calibrated.iter().any(|key| key == "v_null_dac"));
-        assert!(calibrated.iter().any(|key| key == "v_pi_dac"));
+        assert!(calibrated.iter().any(|key| key == "v_peak_dac"));
     }
 
     #[test]
@@ -4133,10 +4191,10 @@ level = 750
         // pure hold since the full-lobe fix).
         plugin.mode = Mode::Sine;
         plugin.v_null_dac = 200;
-        plugin.v_pi_dac = 1_600;
+        plugin.v_peak_dac = 1_800;
         plugin.operating_point = 0.4;
         plugin.depth_a = 0.8;
-        let inversion = plugin.lobe_inversion();
+        let inversion = plugin.lobe_inversion().expect("a real lobe");
         let expected_lo = inversion
             .dac_for_u(plugin.operating_point * (-0.5 * plugin.depth_a).exp())
             .round() as i64;
@@ -4149,18 +4207,26 @@ level = 750
             (expected_lo, expected_hi, expected_hold)
         );
 
+        // The ceiling still bites the emitted codes — but the lobe itself stays
+        // valid, so a MANUAL band under the ceiling keeps working.
         plugin.max_level = expected_hi - 1;
         assert!(plugin
             .dac_band()
             .unwrap_err()
-            .contains("exceeds the max limit"));
+            .contains("above the max limit"));
+        plugin.method = DriveMethod::Manual;
+        plugin.level = plugin.max_level;
+        assert!(
+            plugin.dac_band().is_ok(),
+            "a manual band inside the ceiling"
+        );
     }
 
     #[test]
     fn manual_optical_drive_is_derived_from_the_slider_band() {
         let mut plugin = live_plugin();
         plugin.v_null_dac = 200;
-        plugin.v_pi_dac = 1_600;
+        plugin.v_peak_dac = 1_800;
         plugin.min_level = 600;
         plugin.level = 1_500;
         plugin.depth_a = 5.0;
@@ -4170,7 +4236,7 @@ level = 750
             waveform::OpticalTarget::LogSine,
             waveform::OpticalTarget::LinearSine,
         ] {
-            let drive = plugin.optical_drive(target);
+            let drive = plugin.optical_drive(target).expect("a real lobe");
             let table = plugin
                 .optical_warp_table(target)
                 .expect("valid manual band");
@@ -4196,7 +4262,7 @@ level = 750
         plugin.min_level = 600;
         plugin.level = 1_500;
         plugin.v_null_dac = 200;
-        plugin.v_pi_dac = 1_600;
+        plugin.v_peak_dac = 1_800;
         plugin.operating_point = 0.4;
         plugin.depth_a = 0.8;
 
@@ -4355,7 +4421,7 @@ level = 750
         );
         plugin.set_setting("calibrate_apply", json!(true)).unwrap();
         assert_eq!(plugin.v_null_dac, 300);
-        assert!((plugin.v_pi_dac - 1_600).abs() <= 10);
+        assert!((plugin.v_peak_dac - plugin.v_null_dac - 1_600).abs() <= 10);
         assert!(plugin.calibration_id.is_some());
         assert!(plugin.control_state().calibration_id.is_some());
     }
@@ -4398,7 +4464,7 @@ level = 750
                 "min_level",
                 "mode",
                 "v_null_dac",
-                "v_pi_dac",
+                "v_peak_dac",
             ] {
                 let value = plugin.get_setting(key).expect("exported");
                 plugin.set_setting(key, value).expect("re-applies");
@@ -4598,9 +4664,9 @@ level = 750
             plugin.calibration_status
         );
         assert!(
-            (plugin.v_pi_dac - 860).abs() <= 10,
+            (plugin.v_peak_dac - plugin.v_null_dac - 860).abs() <= 10,
             "Vpi {}",
-            plugin.v_pi_dac
+            plugin.v_peak_dac - plugin.v_null_dac
         );
     }
 
@@ -4698,12 +4764,12 @@ level = 750
     fn the_curve_view_shows_the_configured_lobe_before_any_measurement() {
         let mut plugin = live_plugin();
         plugin.set_setting("v_null_dac", json!(400)).unwrap();
-        plugin.set_setting("v_pi_dac", json!(900)).unwrap();
+        plugin.set_setting("v_peak_dac", json!(1_300)).unwrap();
         let curve = plugin.curve_dataset();
         // Normalised until something has actually been measured.
         assert!(curve.y_label.contains("normalised"));
         let names: Vec<&str> = curve.lines.iter().map(|l| l.name.as_str()).collect();
-        assert_eq!(names, ["configured lobe", "V_null", "V_null + Vπ"]);
+        assert_eq!(names, ["configured lobe", "V_null", "V_peak"]);
         let lobe = &curve.lines[0].points;
         // Minimum at V_null, maximum a quarter wave later.
         let at = |code: f64| {
@@ -4716,13 +4782,103 @@ level = 750
         assert!(at(1_300.0) > 0.99, "u at V_null+Vπ = {}", at(1_300.0));
     }
 
+    /// The bench failure of 2026-07-28: brightest light at `I_k = 0.5` and a
+    /// null at `I_k = 1`, because the *code* of the maximum was entered where a
+    /// distance from `V_null` was expected. With both endpoints being codes,
+    /// `I_k` cannot turn over — `I_k = 1` lands on the measured maximum.
+    #[test]
+    fn i_k_rises_all_the_way_to_the_measured_maximum() {
+        let mut plugin = live_plugin();
+        plugin.method = DriveMethod::Calibrated;
+        plugin.mode = Mode::Const;
+        // Codes read off the bench: dimmest at 1600, brightest at 3200.
+        plugin.v_null_dac = 1_600;
+        plugin.v_peak_dac = 3_200;
+
+        let truth = waveform::LobeInversion {
+            v_null_dac: 1_600.0,
+            v_pi_dac: 1_600.0,
+        };
+        let mut previous = f64::MIN;
+        for step in 1..=100 {
+            plugin.operating_point = f64::from(step) / 100.0;
+            let (_, _, hold) = plugin.dac_band().expect("every I_k is drivable");
+            let light = truth.u_for_dac(hold as f64);
+            assert!(
+                light >= previous - 1e-6,
+                "light turned over at I_k = {}: {light}",
+                plugin.operating_point
+            );
+            previous = light;
+        }
+        assert!(previous > 0.999, "I_k = 1 is not the maximum: {previous}");
+        plugin.operating_point = 1.0;
+        assert_eq!(plugin.dac_band().unwrap().2, 3_200);
+    }
+
+    #[test]
+    fn a_stored_quarter_wave_migrates_to_the_peak_code() {
+        // Configs written before the endpoint form hold `v_pi_dac`, a distance.
+        let mut plugin = live_plugin();
+        plugin.method = DriveMethod::Calibrated;
+        plugin.v_null_dac = 1_630;
+        plugin
+            .set_setting("v_pi_dac", json!(860))
+            .expect("migrates");
+        assert_eq!(plugin.v_peak_dac, 2_490);
+        // And it is gone from the schema, so nothing new is authored against it.
+        let keys: Vec<String> = plugin
+            .settings_schema()
+            .sections
+            .iter()
+            .flat_map(|section| section.items.iter().map(|item| item.key.clone()))
+            .collect();
+        assert!(!keys.iter().any(|key| key == "v_pi_dac"));
+    }
+
+    #[test]
+    fn the_status_pane_spells_out_where_i_k_lands() {
+        let mut plugin = live_plugin();
+        plugin.method = DriveMethod::Calibrated;
+        plugin.v_null_dac = 1_630;
+        plugin.v_peak_dac = 2_490;
+        let status = plugin
+            .status_entries()
+            .iter()
+            .filter_map(|entry| match entry {
+                StatusEntry::Text(text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(status.contains("Vπ = 860 codes"), "{status}");
+        assert!(status.contains("0 → 1630"), "{status}");
+        assert!(status.contains("1 → 2490"), "{status}");
+
+        // A pair entered running downward is reported as folded, not silently
+        // driven on a branch the operator did not name.
+        plugin.v_null_dac = 3_000;
+        plugin.v_peak_dac = 2_000;
+        let status = plugin
+            .status_entries()
+            .iter()
+            .filter_map(|entry| match entry {
+                StatusEntry::Text(text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(status.contains("folded"), "{status}");
+        assert!(status.contains("1 → 2000"), "{status}");
+    }
+
     #[test]
     fn calibrated_const_hold_spans_the_full_lobe_without_a_headroom() {
         let mut plugin = live_plugin();
         plugin.method = DriveMethod::Calibrated;
         plugin.mode = Mode::Const;
         plugin.v_null_dac = 1_630;
-        plugin.v_pi_dac = 860;
+        plugin.v_peak_dac = 2_490;
         plugin.depth_a = 0.5; // must be irrelevant for a constant hold
 
         // I_k = 1 holds exactly at V_null + Vπ (previously rejected because
@@ -4748,7 +4904,7 @@ level = 750
         plugin.method = DriveMethod::Calibrated;
         plugin.mode = Mode::Sine;
         plugin.v_null_dac = 1_630;
-        plugin.v_pi_dac = 860;
+        plugin.v_peak_dac = 2_490;
         plugin.depth_a = 0.5;
         plugin.operating_point = 0.5;
 
@@ -4777,7 +4933,7 @@ level = 750
         plugin.method = DriveMethod::Calibrated;
         plugin.mode = Mode::Const;
         plugin.v_null_dac = 1_630;
-        plugin.v_pi_dac = 860;
+        plugin.v_peak_dac = 2_490;
 
         plugin
             .set_setting("operating_point", json!(1.0))

@@ -3,13 +3,15 @@
 - **Crate:** `plugins/stage-a-modulation` (`calibration.rs`)
 - **Depends on:** `stage-a-photodiode` publishing `PhotodiodeStreamV1.level`
 - **Status:** built
-- **ADR:** [ADR 011](../adr/011-stage-a-pockels-transfer-calibration.md)
+- **ADR:** [ADR 011](../adr/011-stage-a-pockels-transfer-calibration.md),
+  [ADR 016](../adr/016-stage-a-lobe-endpoints-not-a-distance.md) (what the two
+  settings ask for)
 - **Knowledge base:** `methodology/pockels-waveform-linearisation.md` §4,
   `setup/optical-path.md`
 
 ## Why
 
-`V_null` and `Vπ` drive every calibrated waveform through the optical inversion
+`V_null` and `V_peak` drive every calibrated waveform through the optical inversion
 ([Stage-A Optical Waveform Drive](./stage-a-optical-waveform.md)), but they were
 two bare number fields whose tooltip said *"measure it; do not trust nominal
 Vπ"* — with no way to measure it. Nothing in the UI connected a DAC code to an
@@ -158,9 +160,11 @@ measured rather than extrapolated by the time a fit exists.
 
 A `LineSeriesWindow` host view, `Pockels transfer curve`:
 
-- **before any sweep** — the lobe the *configured* `V_null`/`Vπ` claim, on a
-  normalised `u` axis, with markers at `V_null` and `V_null + Vπ`. This works
+- **before any sweep** — the lobe the *configured* `V_null`/`V_peak` claim, on a
+  normalised `u` axis, with markers at `V_null` and `V_peak`. This works
   with no hardware attached and is the answer to "what are these two numbers".
+  The markers are the settings themselves: both are absolute DAC codes, so the
+  plot can be read straight back into the two fields (ADR 016).
 - **after a fit** — `measured ↑`, `measured ↓`, the fitted curve, and (while
   they differ) the configured lobe on the fit's own scale, in detector volts.
 

@@ -17,11 +17,13 @@
 //!   input because the event camera responds to changes in `ln I`.
 //! - [`OpticalTarget::LinearSine`] — `I_d = I_c (1 + m sin ωt)`, `m = tanh(a/2)`.
 //!
-//! The inversion parameters `V_null` and `Vπ` are expressed in **DAC codes** and
-//! are settable: the engineer should not rely on nominal `Vπ` but sweep settled
-//! constant DAC codes, measure the actual optical transfer, and enter the frozen
-//! `V_null` / `Vπ` of one monotonic lobe. A fully measured lookup table can
-//! replace this analytic inversion later behind the same interface.
+//! The lobe is configured as the two **DAC codes an operator can observe** —
+//! where the light is dimmest (`V_null`) and where it is brightest (`V_peak`) —
+//! and `Vπ` is derived from the pair by [`LobeInversion::resolve`]. The engineer
+//! should not rely on nominal `Vπ` but sweep settled constant DAC codes, measure
+//! the actual optical transfer, and freeze those two codes. A fully measured
+//! lookup table can replace this analytic inversion later behind the same
+//! interface.
 
 use std::f64::consts::PI;
 
@@ -41,6 +43,10 @@ pub enum OpticalTarget {
 }
 
 /// Frozen inversion of one monotonic Pockels/PBS lobe, in DAC codes.
+///
+/// Built from the two codes an operator can actually observe on the bench via
+/// [`LobeInversion::resolve`], never from a typed-in distance — see the error
+/// type for why.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LobeInversion {
     /// DAC code where the excitation light is at its minimum (`sin² = 0`).
@@ -49,7 +55,110 @@ pub struct LobeInversion {
     pub v_pi_dac: f64,
 }
 
+/// One monotonic lobe resolved from a measured `(min, max)` pair of codes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ResolvedLobe {
+    pub inversion: LobeInversion,
+    /// The observed pair ran *downward* in code, so the drive uses the
+    /// equivalent ascending branch — the one that rises into the very maximum
+    /// that was measured. Worth reporting: the codes driven are not the ones
+    /// the operator typed.
+    pub folded: bool,
+}
+
+/// Why two observed codes do not name a drivable lobe.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LobeError {
+    /// The two codes coincide: no measurable lobe, so nothing to invert.
+    Degenerate { code: f64 },
+    /// Neither the observed branch nor its ascending equivalent fits inside
+    /// `0..=max_code`.
+    Unreachable {
+        v_null: f64,
+        v_peak: f64,
+        max_code: f64,
+    },
+}
+
+impl std::fmt::Display for LobeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Degenerate { code } => write!(
+                f,
+                "V_null and V_peak are both {code:.0}: sweep the DAC and read off the codes where \
+                 the light is dimmest and brightest"
+            ),
+            Self::Unreachable {
+                v_null,
+                v_peak,
+                max_code,
+            } => write!(
+                f,
+                "no monotonic lobe between V_null {v_null:.0} and V_peak {v_peak:.0} fits inside \
+                 0..={max_code:.0}; raise the max limit or pick a lobe further down the range"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for LobeError {}
+
 impl LobeInversion {
+    /// Resolves the two codes an operator can *observe* — the DAC code at the
+    /// excitation minimum and the one at the excitation maximum — into the
+    /// ascending lobe the drive inverts.
+    ///
+    /// Both inputs are absolute codes, deliberately. The earlier form paired an
+    /// absolute `V_null` with `Vπ` as a *distance* from it, and a distance is
+    /// not what an operator reads off a sweep: entering the brightest **code**
+    /// as `Vπ` doubles the half wave whenever the null sits near half the peak
+    /// code, which puts maximum light at `I_k ≈ 0.5` and a null back at
+    /// `I_k = 1`. Two observed codes cannot be mixed up that way, and they make
+    /// `I_k = 1` land exactly on the measured maximum by construction.
+    pub fn resolve(v_null: f64, v_peak: f64, max_code: f64) -> Result<ResolvedLobe, LobeError> {
+        if !v_null.is_finite() || !v_peak.is_finite() {
+            return Err(LobeError::Degenerate { code: v_null });
+        }
+        let span = v_peak - v_null;
+        // Sub-code separation is meaningless on a 12-bit DAC.
+        if span.abs() < 1.0 {
+            return Err(LobeError::Degenerate { code: v_null });
+        }
+        let v_pi_dac = span.abs();
+        let fits = |null: f64| null >= -0.5 && null + v_pi_dac <= max_code + 0.5;
+        // `sin²` repeats every `2Vπ` and every branch is a mirror of its
+        // neighbour, so a pair measured running downward in code names the same
+        // physical lobe as the ascending branch one full period below — which
+        // ends on the maximum that was actually measured. Prefer that one; fall
+        // back to the branch rising out of the observed null only if it is what
+        // fits inside the commandable range.
+        let (v_null_dac, folded) = if span > 0.0 && fits(v_null) {
+            (v_null, false)
+        } else if fits(v_peak - v_pi_dac) {
+            (v_peak - v_pi_dac, true)
+        } else if fits(v_null) {
+            (v_null, true)
+        } else {
+            return Err(LobeError::Unreachable {
+                v_null,
+                v_peak,
+                max_code,
+            });
+        };
+        Ok(ResolvedLobe {
+            inversion: Self {
+                v_null_dac: v_null_dac.clamp(0.0, (max_code - v_pi_dac).max(0.0)),
+                v_pi_dac,
+            },
+            folded,
+        })
+    }
+
+    /// DAC code at the excitation maximum: where `I_k = 1` lands.
+    pub fn v_peak_dac(&self) -> f64 {
+        self.v_null_dac + self.v_pi_dac
+    }
+
     /// Normalised optical intensity produced by `code` on the configured lobe:
     /// `u = sin²(π(code - V_null) / (2 Vπ))`.
     pub fn u_for_dac(&self, code: f64) -> f64 {
@@ -229,6 +338,84 @@ mod tests {
             operating_point: peak_operating_point(target, depth_a),
             inversion: inversion(),
         }
+    }
+
+    #[test]
+    fn two_observed_codes_put_the_light_maximum_at_i_k_one() {
+        // The property the endpoint form exists to guarantee: whatever pair of
+        // codes was measured, I_k = 1 lands on the measured maximum, I_k = 0 on
+        // the measured minimum, and nothing turns over in between.
+        for (null, peak) in [(200.0, 1_800.0), (0.0, 4_095.0), (1_600.0, 3_200.0)] {
+            let lobe = LobeInversion::resolve(null, peak, 4_095.0).expect("a real lobe");
+            assert!(!lobe.folded);
+            let inversion = lobe.inversion;
+            assert!((inversion.dac_for_u(1.0) - peak).abs() < 1e-9);
+            assert!((inversion.dac_for_u(0.0) - null).abs() < 1e-9);
+            assert!((inversion.u_for_dac(peak) - 1.0).abs() < 1e-9);
+            let mut previous = f64::MIN;
+            for step in 0..=100 {
+                let u = f64::from(step) / 100.0;
+                let light = inversion.u_for_dac(inversion.dac_for_u(u));
+                assert!(light >= previous - 1e-9, "light turned over at u = {u}");
+                previous = light;
+            }
+        }
+    }
+
+    #[test]
+    fn the_brightest_code_typed_as_v_pi_is_what_used_to_peak_at_half() {
+        // Regression witness for the bench report of 2026-07-28. With the null
+        // at half the brightest code, feeding the *absolute* brightest code in
+        // as the quarter-wave distance peaks the light at I_k = 0.5 and returns
+        // it to the null at I_k = 1 — exactly what was observed.
+        let (null, peak) = (1_600.0, 3_200.0);
+        let truth = LobeInversion::resolve(null, peak, 4_095.0)
+            .expect("a real lobe")
+            .inversion;
+        let mistake = LobeInversion {
+            v_null_dac: null,
+            v_pi_dac: peak, // the distance field filled with a code
+        };
+        let light = |u: f64| truth.u_for_dac(mistake.dac_for_u(u));
+        assert!(light(0.5) > 0.99, "peak light at I_k = 0.5: {}", light(0.5));
+        assert!(light(1.0) < 0.01, "null light at I_k = 1: {}", light(1.0));
+        // And the endpoint form is immune to the same typo, because there is no
+        // distance to type: the brightest code *is* the field.
+        assert!((truth.u_for_dac(truth.dac_for_u(1.0)) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_pair_measured_downward_folds_onto_the_branch_into_the_same_peak() {
+        // Peak below null: the same physical lobe, approached from below. The
+        // ascending equivalent must end on the measured maximum.
+        let lobe = LobeInversion::resolve(3_000.0, 2_000.0, 4_095.0).expect("a real lobe");
+        assert!(lobe.folded);
+        assert_eq!(lobe.inversion.v_pi_dac, 1_000.0);
+        assert!((lobe.inversion.v_peak_dac() - 2_000.0).abs() < 1e-9);
+        assert!(lobe.inversion.v_null_dac >= 0.0);
+    }
+
+    #[test]
+    fn a_downward_pair_with_no_room_below_rises_out_of_the_observed_null() {
+        // 500 → 100 would fold to a null at −300; the branch above the observed
+        // null is the one that fits.
+        let lobe = LobeInversion::resolve(500.0, 100.0, 4_095.0).expect("a real lobe");
+        assert!(lobe.folded);
+        assert_eq!(lobe.inversion.v_null_dac, 500.0);
+        assert_eq!(lobe.inversion.v_peak_dac(), 900.0);
+    }
+
+    #[test]
+    fn refuses_a_degenerate_or_unreachable_pair() {
+        assert!(matches!(
+            LobeInversion::resolve(1_000.0, 1_000.0, 4_095.0),
+            Err(LobeError::Degenerate { .. })
+        ));
+        // A lobe wider than the commandable range fits nowhere.
+        assert!(matches!(
+            LobeInversion::resolve(0.0, 3_000.0, 2_000.0),
+            Err(LobeError::Unreachable { .. })
+        ));
     }
 
     #[test]

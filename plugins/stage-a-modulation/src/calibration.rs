@@ -149,6 +149,12 @@ impl TransferFit {
         }
     }
 
+    /// DAC code at the excitation maximum — the second of the two codes the
+    /// drive is configured with.
+    pub fn v_peak_dac(&self) -> f64 {
+        self.v_null_dac + self.v_pi_dac
+    }
+
     /// Detector extremum at the excitation null. On the reject port this is the
     /// detector *maximum* and a **lower bound** on the total-power anchor
     /// `I_tot` — not the anchor itself, because the residual transmitted floor
