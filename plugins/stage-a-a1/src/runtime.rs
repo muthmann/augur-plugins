@@ -56,7 +56,7 @@ use augur_plugin_api::{
 use serde::Serialize;
 use serde_json::{json, Value};
 use stage_a_plugin_contract::{
-    ClientId, ConnectionStateV1, LeaseId, ModulationCommandV1, ModulationRequestV1,
+    ClientId, ConnectionStateV1, LeaseId, LeaseSnapshotV1, ModulationCommandV1, ModulationRequestV1,
     ModulationStateV1, OpticalTargetV1, PdqReceiptV1, PdqStartSpecV1, PhotodiodeCommandV1,
     PhotodiodeOpticalSummaryV1, PhotodiodeRequestV1, PhotodiodeResponseV1, PhotodiodeSummaryV1,
     RequestId, RunId, SemanticRevision, WaveformV1, CTX_STAGE_A_MODULATION_STATE_V1,
@@ -148,6 +148,28 @@ const FREQ_CONFIRM_BASE_MS: u64 = 20_000;
 /// believes the measured period. Below this the mean spacing is still a mixture
 /// of the old and the new drive.
 const FREQ_CONFIRM_CYCLES: f64 = 4.0;
+
+/// Renew a held lease once less than this much of the owner's *granted* window
+/// is left.
+///
+/// Both owners cap the TTL they hand out — a client that dies must not hold the
+/// drive indefinitely, so the cap is a dead-man switch and is right. What that
+/// means here is that the whole-run TTL a leased run asks for is emphatically
+/// not what it gets: ask for forty minutes, be granted a minute. Renewing once
+/// per point was therefore only ever correct for points shorter than the cap.
+/// A longer one (the shipped example protocol has a 40 s row, and every row
+/// also pays the start/stop handshake) ran past the granted deadline mid
+/// recording, and the owner did what an expired lease must do — STOP, output
+/// off. The run then lost the drive, the phase-0 trigger and the photodiode's
+/// optical summary at once, and reported three unrelated-looking failures.
+///
+/// So the run renews against the deadline the owner actually advertises, not
+/// against the one it asked for.
+const LEASE_RENEW_MARGIN_MS: u64 = 20_000;
+/// Shortest gap between two heartbeat renewals of the same lease. The owner's
+/// snapshot lags a renewal by a tick or two, so without this the margin test
+/// re-fires on every control tick until the new deadline comes back.
+const LEASE_RENEW_MIN_INTERVAL_MS: u64 = 2_000;
 
 /// Absolute/relative tolerance for "the measured `a` reached the sweep target".
 fn sweep_tolerance(target_a: f64) -> f64 {
@@ -975,6 +997,11 @@ pub struct StageAA1Plugin {
     /// Output folder the lock table was last read for, so it is re-read only
     /// when the experiment folder changes.
     loaded_locks_folder: Option<String>,
+    // -- lease heartbeats (see LEASE_RENEW_MARGIN_MS) --
+    /// When the modulation lease was last renewed by the heartbeat.
+    mod_renewed_ms: u64,
+    /// When the photodiode lease was last renewed by the heartbeat.
+    pd_renewed_ms: u64,
     // -- momentary-button press forwarding (see PressLatch) --
     press_start: PressLatch,
     press_pilot: PressLatch,
@@ -1055,6 +1082,8 @@ impl Default for StageAA1Plugin {
             protocol: None,
             a0_locks: Vec::new(),
             loaded_locks_folder: None,
+            mod_renewed_ms: 0,
+            pd_renewed_ms: 0,
             press_start: PressLatch::default(),
             press_pilot: PressLatch::default(),
             press_background: PressLatch::default(),
@@ -1219,6 +1248,104 @@ impl StageAA1Plugin {
         self.a0_point_pending = false;
         self.freq_sweep_pending = None;
         self.protocol_pending = false;
+    }
+
+    /// Whether anything the Record section started is still in flight.
+    ///
+    /// The same set [`Self::request_stop`] winds down. A discontinuity that
+    /// arrives between two points of a run is still *inside* that run, so it
+    /// must not be treated as an idle-time reset.
+    fn automation_active(&self) -> bool {
+        self.recording.is_active()
+            || self.sweep.is_some()
+            || self.a0_lock.is_some()
+            || self.freq_sweep.is_some()
+            || self.protocol.is_some()
+    }
+
+    /// The modulation lease this run holds, and how much longer it still needs
+    /// it. Outermost runner first — a nested run inherits the enclosing lease
+    /// id, so the outermost one names the lease and owns the remaining time.
+    ///
+    /// `None` until the owner has granted it: renewing a lease that does not
+    /// exist yet is rejected, and the acquire is already in flight.
+    fn held_modulation_lease(&self) -> Option<(LeaseId, u64)> {
+        if let Some(run) = self.protocol.as_ref().filter(|run| run.lease_granted) {
+            return Some((
+                run.lease_id.clone(),
+                Self::protocol_lease_ttl_ms(&run.plan, run.index),
+            ));
+        }
+        if let Some(sweep) = self.freq_sweep.as_ref().filter(|s| s.lease_granted) {
+            let remaining = sweep.points.len().saturating_sub(sweep.index);
+            return Some((
+                sweep.lease_id.clone(),
+                self.freq_sweep_lease_ttl_ms(remaining, sweep.mode),
+            ));
+        }
+        if let Some(lock) = self.a0_lock.as_ref().filter(|l| l.lease_granted) {
+            return Some((lock.lease_id.clone(), self.a0_lock_lease_ttl_ms()));
+        }
+        if let Some(sweep) = self.sweep.as_ref().filter(|s| s.lease_granted) {
+            let remaining = sweep.total().saturating_sub(sweep.index);
+            return Some((sweep.lease_id.clone(), self.sweep_lease_ttl_ms(remaining)));
+        }
+        None
+    }
+
+    /// Whether `lease` is the one A1 is holding right now, per the owner's own
+    /// snapshot. Renewing on our own bookkeeping alone would keep re-asking
+    /// after the owner had already dropped it.
+    fn owner_holds(lease: Option<&LeaseSnapshotV1>, held: &LeaseId) -> Option<u64> {
+        let lease = lease?;
+        (&lease.lease_id == held && lease.holder.as_str() == A1_PLUGIN_ID)
+            .then_some(lease.expires_at_unix_ms)
+    }
+
+    /// Keep both leases alive against the deadline each owner advertises.
+    ///
+    /// Runs on every control tick, ahead of the runners: the owners cap the TTL
+    /// they grant well below the length of a survey (see
+    /// [`LEASE_RENEW_MARGIN_MS`]), so a run that renewed only when it moved to
+    /// its next point lost the drive in the middle of any point longer than the
+    /// cap.
+    fn drive_lease_heartbeat(&mut self, context: &mut impl RecordingControl) {
+        let now_ms = now_unix_ms();
+        let due = |last_ms: u64, expires_at: u64| {
+            now_ms.saturating_sub(last_ms) >= LEASE_RENEW_MIN_INTERVAL_MS
+                && expires_at.saturating_sub(now_ms) <= LEASE_RENEW_MARGIN_MS
+        };
+
+        if let Some((lease_id, ttl_ms)) = self.held_modulation_lease() {
+            let expires_at = Self::owner_holds(
+                self.modulation.as_ref().and_then(|s| s.lease.as_ref()),
+                &lease_id,
+            );
+            if expires_at.is_some_and(|at| due(self.mod_renewed_ms, at)) {
+                let request =
+                    self.modulation_request(ModulationCommandV1::RenewLease { ttl_ms }, &lease_id);
+                context.request_service(&request);
+                self.mod_renewed_ms = now_ms;
+            }
+        }
+
+        // The photodiode lease covers one recording, and A1 asks for its
+        // duration plus slack — which the owner caps just as hard, so any
+        // recording longer than the cap used to be finalized underneath itself
+        // as `LeaseExpired` and left no optical summary for the sidecar.
+        if self.recording.is_active() && self.recording.lease_granted {
+            let held = self.recording.lease_id.clone();
+            let expires_at = Self::owner_holds(
+                self.photodiode.as_ref().and_then(|s| s.lease.as_ref()),
+                &held,
+            );
+            if expires_at.is_some_and(|at| due(self.pd_renewed_ms, at)) {
+                let ttl_ms = self.photodiode_lease_ttl_ms();
+                let request = self.photodiode_request(PhotodiodeCommandV1::RenewLease { ttl_ms });
+                context.request_service(&request);
+                self.pd_renewed_ms = now_ms;
+            }
+        }
     }
 
     /// Sets the concise operator-facing recording result.
@@ -2211,12 +2338,18 @@ impl StageAA1Plugin {
         ));
     }
 
-    fn acquire_photodiode(&mut self, context: &mut impl RecordingControl) {
-        let ttl_ms = self
-            .recording
+    /// How much longer the photodiode is needed: the recording's own length
+    /// plus the start/stop handshake. The owner caps what it grants, so the
+    /// heartbeat re-asks — see [`LEASE_RENEW_MARGIN_MS`].
+    fn photodiode_lease_ttl_ms(&self) -> u64 {
+        self.recording
             .duration_s
             .saturating_mul(1_000)
-            .saturating_add(60_000);
+            .saturating_add(60_000)
+    }
+
+    fn acquire_photodiode(&mut self, context: &mut impl RecordingControl) {
+        let ttl_ms = self.photodiode_lease_ttl_ms();
         let request = self.photodiode_request(PhotodiodeCommandV1::AcquireLease { ttl_ms });
         self.recording.lease_req = request.request_id;
         context.request_service(&request);
@@ -4241,12 +4374,14 @@ impl StageAA1Plugin {
 
     // ---- declarative protocol runs -------------------------------------
 
-    /// Lease TTL covering the whole protocol, plus a minute of slack.
+    /// How much longer the whole protocol still needs the drive, plus a minute
+    /// of slack.
     ///
-    /// One lease for the whole file, like the frequency ladder: a TTL that
-    /// expired between points would hand the drive back to the operator's
-    /// armed settings mid-survey, and the remaining points would record
-    /// against them without saying so.
+    /// One lease for the whole file, like the frequency ladder: handing the
+    /// drive back to the operator's armed settings mid-survey would let the
+    /// remaining points record against them without saying so. This is what
+    /// A1 *asks* for, not what it gets — the owner caps the TTL it grants, and
+    /// [`Self::drive_lease_heartbeat`] is what actually keeps the lease alive.
     fn protocol_lease_ttl_ms(plan: &protocol::Protocol, from: usize) -> u64 {
         let remaining: f64 = plan.points[from.min(plan.points.len())..]
             .iter()
@@ -5887,7 +6022,14 @@ impl Plugin for StageAA1Plugin {
                 // must not wipe the row's pilot windows, background floor, or
                 // the response points collected across a sweep. The event fold
                 // still resets: that timeline really did restart.
-                if self.recording.is_active() || self.sweep.is_some() {
+                //
+                // Every runner counts, not just a recording in flight: a
+                // protocol or ladder spends the gap between two points
+                // retargeting the drive, and the stop boundary of the point
+                // just finished lands squarely in it. Asking only about the
+                // recording wiped the survey's own pilot windows and
+                // background floor between every pair of points.
+                if self.automation_active() {
                     self.camera_events.clear();
                     self.event_scratch.clear();
                     self.camera_markers_us.clear();
@@ -6029,6 +6171,9 @@ impl Plugin for StageAA1Plugin {
             self.scan_measurement_folder();
             self.load_a0_locks();
         }
+        // Before the runners: a lease that lapses is not the runners' problem
+        // to notice, and the owner safe-offs the drive the moment it does.
+        self.drive_lease_heartbeat(context);
         // Outermost first: the protocol and the frequency sweep each start the
         // stage below them, and each of those starts its own next stage, so one
         // tick carries a hand-off all the way down. They are mutually exclusive
@@ -7313,6 +7458,7 @@ mod tests {
         }
         // Same order as `process_control`: outermost supervisor first, so one
         // tick can carry a hand-off from the ladder down into a recording.
+        plugin.drive_lease_heartbeat(sink);
         plugin.drive_protocol(sink);
         plugin.drive_freq_sweep(sink);
         plugin.drive_a0_lock(sink);
@@ -10104,6 +10250,152 @@ depth_a = 99.0
             plugin.message.contains("depth_a"),
             "the message does not name the offending axis: {}",
             plugin.message
+        );
+
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// The owners cap the lease TTL they grant far below the length of a
+    /// survey, so a run that renewed only when it stepped to its next point
+    /// lost the drive in the middle of any point longer than that cap — the
+    /// owner STOPs and switches the output off, which took the phase-0 trigger
+    /// and the photodiode's optical summary with it.
+    #[test]
+    fn a_long_point_renews_the_modulation_lease_before_the_owner_drops_it() {
+        let folder = temp_folder("protocol-lease-heartbeat");
+        let (mut plugin, _) = protocol_plugin(&folder, TWO_POINT_PROTOCOL);
+        let mut sink = ControlSink::default();
+
+        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+        let lease_req = sink.services[0].request_id;
+        let lease_id = plugin
+            .protocol
+            .as_ref()
+            .expect("the protocol is running")
+            .lease_id
+            .clone();
+        sink.services.clear();
+        control_tick(
+            &mut plugin,
+            inbox_with(vec![accepted(lease_req)]),
+            &mut sink,
+        );
+
+        // The owner granted far less than the whole-survey TTL that was asked
+        // for, and the point is still running.
+        let now_ms = now_unix_ms();
+        if let Some(state) = plugin.modulation.as_mut() {
+            state.lease = Some(LeaseSnapshotV1 {
+                lease_id: lease_id.clone(),
+                holder: ClientId::new(A1_PLUGIN_ID),
+                expires_at_unix_ms: now_ms + LEASE_RENEW_MARGIN_MS / 2,
+                run_id: None,
+            });
+        }
+        sink.services.clear();
+        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+
+        let renewed = sink
+            .services
+            .iter()
+            .filter_map(modulation_command)
+            .any(|command| matches!(command, ModulationCommandV1::RenewLease { .. }));
+        assert!(
+            renewed,
+            "the lease was left to expire underneath the point: {:?}",
+            sink.services
+        );
+
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// A lease with plenty of time left must not be renewed on every tick: the
+    /// control plane runs at 20 Hz and each renewal is a device round trip.
+    #[test]
+    fn a_lease_with_time_left_is_not_renewed_every_tick() {
+        let folder = temp_folder("protocol-lease-quiet");
+        let (mut plugin, _) = protocol_plugin(&folder, TWO_POINT_PROTOCOL);
+        let mut sink = ControlSink::default();
+
+        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+        let lease_req = sink.services[0].request_id;
+        let lease_id = plugin
+            .protocol
+            .as_ref()
+            .expect("the protocol is running")
+            .lease_id
+            .clone();
+        control_tick(
+            &mut plugin,
+            inbox_with(vec![accepted(lease_req)]),
+            &mut sink,
+        );
+        if let Some(state) = plugin.modulation.as_mut() {
+            state.lease = Some(LeaseSnapshotV1 {
+                lease_id,
+                holder: ClientId::new(A1_PLUGIN_ID),
+                expires_at_unix_ms: now_unix_ms() + LEASE_RENEW_MARGIN_MS * 4,
+                run_id: None,
+            });
+        }
+
+        sink.services.clear();
+        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+
+        assert!(
+            !sink
+                .services
+                .iter()
+                .filter_map(modulation_command)
+                .any(|command| matches!(command, ModulationCommandV1::RenewLease { .. })),
+            "a lease that is nowhere near expiry was renewed anyway: {:?}",
+            sink.services
+        );
+
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// Starting and stopping the host recorder is reported as `SourceChanged`,
+    /// twice per recording. Between two points a protocol is not "recording",
+    /// so asking only about the recording treated its own self-inflicted
+    /// boundary as an idle-time reset and wiped the survey's pilot windows,
+    /// background floor and response curve mid-run.
+    #[test]
+    fn a_source_change_between_two_protocol_points_keeps_the_survey_state() {
+        let folder = temp_folder("protocol-discontinuity");
+        let (mut plugin, _) = protocol_plugin(&folder, TWO_POINT_PROTOCOL);
+        let mut sink = ControlSink::default();
+
+        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+        let lease_req = sink.services[0].request_id;
+        control_tick(
+            &mut plugin,
+            inbox_with(vec![accepted(lease_req)]),
+            &mut sink,
+        );
+        plugin.background_floor = Some((0.25, 0.25));
+        plugin.pilot_windows = Some((
+            PhaseWindow {
+                start: 0.1,
+                end: 0.2,
+            },
+            PhaseWindow {
+                start: 0.6,
+                end: 0.7,
+            },
+        ));
+        assert!(!plugin.recording.is_active(), "the point is between stages");
+
+        plugin.on_discontinuity(PluginDiscontinuity::SourceChanged);
+
+        assert_eq!(
+            plugin.background_floor,
+            Some((0.25, 0.25)),
+            "the survey's background reference was wiped between two points"
+        );
+        assert!(
+            plugin.pilot_windows.is_some(),
+            "the survey's pilot windows were wiped between two points"
         );
 
         let _ = std::fs::remove_dir_all(&folder);

@@ -28,7 +28,10 @@
   [ADR 027](../adr/027-stage-a-a1-declarative-protocols.md) (surveys are run
   from a file, and `I_k` becomes a sweepable axis),
   [ADR 028](../adr/028-stage-a-sensor-readout-travels-with-the-measurement.md)
-  (the sensor readout travels with the measurement, column-wise)
+  (the sensor readout travels with the measurement, column-wise),
+  [ADR 029](../adr/029-stage-a-leases-are-renewed-against-the-granted-deadline.md)
+  (a leased run heartbeats against the deadline the owner granted, so a point
+  longer than the owner's TTL cap no longer loses the drive mid-recording)
 - **Automation roadmap:** [Stage-A A1 Automation](./stage-a-a1-automation.md)
 - **Second workflow:** [Stage-A A1 Exact Event Count](./stage-a-a1-event-count.md)
   — hold one *measured* depth `a₀` across the frequency sweep
@@ -308,7 +311,7 @@ drive the operator already armed (frequency, normalized cycle mean `ū`, and
 calibration stay untouched). The modulation owner accepts this command only
 with an applied measured calibration and `OPTICAL_LOG_SINE`; manual, constant,
 DAC-sine, square, and optical-linear modes are rejected. It renews the lease per
-point, waits for a fresh, marker-bounded photodiode `a` from a confirmed `I_tot`
+point *and* on a heartbeat between points, waits for a fresh, marker-bounded photodiode `a` from a confirmed `I_tot`
 anchor to settle, hands the point to the normal recording
 coordinator, and releases the lease at the end or on abort. Sweep points
 require `min a > 0` — record `a≈0` with the background button instead. Sidecars
@@ -318,6 +321,19 @@ last sweep amplitude until the operator's own `depth a` setting is re-applied
 (any modulation settings change re-sends it) — which is exactly why an
 event-count point re-applies its locked depth under the lease instead of trusting
 the drive to still be where a previous action left it (ADR 013).
+
+**Leases are kept alive against the deadline the owner granted, not the one A1
+asked for** (ADR 029). Both owners cap the TTL they hand out — a client that
+dies must not hold the laser — so the whole-run TTL a sweep, a ladder or a
+protocol asks for is *not* what it gets. A1 reads the real
+`expires_at_unix_ms` off the owner's own snapshot and renews on a heartbeat once
+less than 20 s of the granted window is left. Without it, any point longer than
+the cap outlived its lease mid-recording and the owner did what an expired lease
+must do — `STOP`, output off — which then read as three separate faults at once:
+`the modulation owner requires an active automation lease`, `cannot write a
+quantitative A1 sidecar without a fresh photodiode optical summary`, and a
+`Camera: … no trigger signal` line that looked exactly like an unplugged
+`EXT_TRIGGER` cable but was the drive being off.
 
 **Naming.** Files share an `<id>_<timestamp>[_role]` stem under an `<id>/` subfolder
 (`_pilot` / `_background` tag the reference runs, `_ec_f<f>Hz` an event-count point):
