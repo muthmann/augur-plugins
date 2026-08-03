@@ -11,7 +11,7 @@ KD*P, 3×3 mm, 400–850 nm, 5 W.
   - `MANUAL`: **Power** is the peak/operating code and **Min threshold** is the lower endpoint.
   - `CALIBRATED`: `V_null`, `V_peak`, normalized cycle mean `ū`, and optical depth `a` determine the endpoints.
     Both lobe fields are **absolute DAC codes** — where the light is dimmest and where it is
-    brightest — and the quarter wave `Vπ = |V_peak − V_null|` is derived, never typed
+    brightest — and the half-wave span `|V_peak − V_null|` is derived, never typed
     ([ADR 016](../../docs/adr/016-stage-a-lobe-endpoints-not-a-distance.md)).
     Measure them with the built-in transfer sweep — see [Calibration](#calibration--measuring-v_null-and-v_peak).
 - **Mode** independently selects the waveform that fills that band. All five modes are available
@@ -34,7 +34,7 @@ Manual optical modes reuse the stored `V_null`/`V_peak` lobe and derive their ef
 from the slider band through the forward optical transfer.
 
 In calibrated `CONST`, `a` is irrelevant: the hold is
-`V_null + (2Vπ/π)·asin(sqrt(u))`. With `V_null=1630` and `Vπ=860`, this is
+`V_null + (2·span/π)·asin(sqrt(u))`. With `V_null=1630` and a span of `860`, this is
 2490 at `ū=1` and 1685 at `ū=0.01`. This dimensionless `ū` is not the physical
 A1 flux point `I_k`. Periodic modes still need optical
 headroom and reject impossible `ū`/`a` combinations without changing the
@@ -57,18 +57,30 @@ gain, temperature, and the actual electrical load all enter the realised map, so
 4. Read the result in the **Pockels transfer curve** view and the status line, then press
    **Apply to V_null / V_peak**, which writes both endpoint codes. Anything questionable — a high residual, dropped points,
    hysteresis, clipping — appears as a `Check:` line but does not block the apply: the plot is
-   the arbiter, and a single stray sample can inflate the residual fivefold while leaving `Vπ`
+   the arbiter, and a single stray sample can inflate the residual fivefold while leaving the fit
    accurate to a few codes. Wild points are dropped from the fit automatically.
+
+Each point is a real measurement, not a sample: the sweep waits 0.1 s for the cell to settle and
+then takes the photodiode's 20 ms averaged level. Both are durations the sweep and the photodiode
+plugin own, deliberately not sample counts and not the chart's averaging setting — those made the
+precision of the calibration follow the acquisition rate and a display knob
+([ADR 019](../../docs/adr/019-stage-a-calibration-measures-its-own-window.md)).
+
+The `Check:` lines are measured against the fit's own noise, never against zero. Hysteresis is
+compared with what independent point scatter alone would produce, so a noisy bench is not reported
+as a drifting cell. Points that reach an end of the detector's range truncate the reported detector
+extrema but not `V_null`/`V_peak`, and the fix for them is detector **gain** — on the reject port it is
+the dark end that hits the bottom rail, so attenuation is backwards.
 
 The view also works *before* any measurement: it draws the lobe your current `V_null`/`V_peak`
 claim, on a normalised axis, with markers at `V_null` and `V_peak` — the two settings themselves,
 so the plot reads straight back into the two fields. The status pane states the same thing in
-codes: `Lobe: Vπ = 860 codes — u 0 → 1630 (min light), 0.5 → 2060, 1 → 2490 (max light)`.
+codes: `Lobe: half-wave span 860 codes — u 0 → 1630 (min light), 0.5 → 2060, 1 → 2490 (max light)`.
 
 Two properties worth knowing:
 
 - `V_null`/`V_peak` need **no** dark measurement and **no** total-power anchor — the fitted offset and
-  amplitude absorb the dark level and the front-end gain.
+  amplitude absorb any DC offset and the front-end gain.
 - The detector level at the null is reported as a **lower bound** on the total-power anchor
   `I_tot`, *not* as the anchor. On the reject port the residual transmitted floor is not separable
   from it; freezing a real anchor needs a transmitted-port power measurement.

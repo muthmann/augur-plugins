@@ -146,6 +146,13 @@ for plugin_dir in "${repo_root}"/plugins/*; do
     installed_library_path="${install_dir}/$(basename "${library_path}")"
     cp "${library_path}" "${installed_library_path}"
     rewrite_macos_install_name "${installed_library_path}"
+    # Operator-facing example files a plugin ships alongside its library (A1's
+    # recording protocols). The bench has the installed folder, not the repo,
+    # so an example the settings panel points at has to travel with the plugin.
+    if [[ -d "${plugin_dir}/protocols" ]]; then
+        rm -rf "${install_dir}/protocols"
+        cp -R "${plugin_dir}/protocols" "${install_dir}/protocols"
+    fi
     echo "Installed ${plugin_id} -> ${install_dir}"
     installed=$((installed + 1))
 done

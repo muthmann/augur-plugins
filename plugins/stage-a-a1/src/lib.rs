@@ -4,10 +4,13 @@
 //! PDQ writer. Hardware ownership remains with the Stage-A modulation and
 //! photodiode plugins; this code only validates and analyses immutable inputs.
 
+mod csv;
 pub mod phase;
+pub mod protocol;
 pub mod rates;
 pub mod response_curve;
 mod runtime;
+pub mod sensor;
 pub mod types;
 
 pub use runtime::StageAA1Plugin;

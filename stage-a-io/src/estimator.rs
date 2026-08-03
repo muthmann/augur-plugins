@@ -26,6 +26,11 @@
 //! - refuses to produce a value at all when the window clips (top/bottom of
 //!   the ADC range), has no headroom above dark, or the total-power anchor is
 //!   below the measured signal — a wrong `a` is worse than no `a`.
+//!
+//! Rail detection is *span-relative*: the near-rail margin is capped at a small
+//! fraction of the window's own peak-to-peak span, so a detector operating a few
+//! millivolts above zero is not mistaken for one truncating at the bottom rail.
+//! The rails themselves stay guarded at every gain.
 
 use serde::{Deserialize, Serialize};
 
@@ -132,44 +137,55 @@ impl std::fmt::Display for EstimateError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::MissingTotalPowerAnchor => f.write_str(
-                "no confirmed, named total-power anchor; excitation contrast a is withheld",
+                "no total power I_tot has been observed yet — let the photodiode stream for a \
+                 moment; it learns I_tot from the brightest reading it sees, which the Pockels \
+                 transfer sweep produces exactly",
             ),
             Self::IncompleteModulationCycles {
                 marker_count,
                 max_samples,
             } => write!(
                 f,
-                "no marker-bounded window with at least two complete cycles fits in \
-                 {max_samples} samples ({marker_count} usable markers)"
+                "no stretch of samples covers two whole modulation cycles between triggers \
+                 ({marker_count} trigger(s) in the last {max_samples} samples) — lower the \
+                 frequency, or raise the photodiode cache length"
             ),
-            Self::TooFewSamples { count, minimum } => {
-                write!(f, "only {count} samples (minimum {minimum})")
-            }
+            Self::TooFewSamples { count, minimum } => write!(
+                f,
+                "only {count} samples have arrived so far, and {minimum} are needed — wait a \
+                 moment, or check the photodiode stream is running"
+            ),
             Self::Clipped {
                 low_fraction_permille,
                 high_fraction_permille,
             } => write!(
                 f,
-                "ADC clipping: {low_fraction_permille}‰ low / {high_fraction_permille}‰ high"
+                "the signal is hitting the ends of the detector's range \
+                 ({low_fraction_permille}‰ at the bottom, {high_fraction_permille}‰ at the top) \
+                 — lower the drive amplitude or the detector gain"
             ),
-            Self::NoHeadroomAboveDark => {
-                f.write_str("dark-corrected minimum is not positive; a is undefined")
-            }
+            Self::NoHeadroomAboveDark => f.write_str(
+                "the signal never rises above the dark level — check the dark level is right and \
+                 that light is reaching the detector",
+            ),
             Self::TotalPowerBelowSignal {
                 total_power_volts,
                 detector_max_volts,
             } => write!(
                 f,
-                "total-power anchor {total_power_volts:.4} V is not above the detector \
-                 maximum {detector_max_volts:.4} V; a is undefined"
+                "the excitation never dims below the brightest the detector has been \
+                 (I_tot {total_power_volts:.4} V vs. {detector_max_volts:.4} V now), so there is \
+                 no complement left to take a contrast of — run the Pockels transfer sweep so the \
+                 detector sees the excitation null and learns the real I_tot"
             ),
             Self::WindowShorterThanCycle {
                 covered_cycles,
                 window_seconds,
             } => write!(
                 f,
-                "the {window_seconds:.2} s window covers only {covered_cycles:.2} modulation \
-                 cycles; a needs at least one full cycle — raise the cache length"
+                "the photodiode only watches {window_seconds:.2} s at a time, which is \
+                 {covered_cycles:.2} of a modulation cycle — it needs at least one whole cycle, \
+                 so raise the photodiode cache length"
             ),
         }
     }
@@ -178,13 +194,47 @@ impl std::fmt::Display for EstimateError {
 impl std::error::Error for EstimateError {}
 
 pub const MIN_SAMPLES: usize = 64;
-/// Codes within this margin of the rails count as clipped.
+/// Codes within this margin of the rails count as clipped — but never more
+/// than [`CLIP_MARGIN_SPAN_FRACTION`] of the window's own span.
 pub const CLIP_MARGIN_CODES: u16 = 4;
+/// Largest share of the observed peak-to-peak span the rail margin may claim.
+///
+/// The margin exists to catch a waveform that is *about* to truncate at a rail,
+/// which only makes sense while it is small compared to the signal. The Stage-A
+/// reject-port detector operates around 0.5–15 mV, i.e. inside the bottom ~20
+/// codes of the 12-bit range, where a fixed 4-code margin covers a third of a
+/// perfectly good sine and refused every millivolt-scale window as clipped.
+/// Capping it against the span keeps the guard on volt-scale signals, and
+/// leaves the true rails (code 0 and full scale) guarded at every gain.
+const CLIP_MARGIN_SPAN_FRACTION: f64 = 0.05;
 /// Reject the window when more than 1‰ of samples clip.
 pub const MAX_CLIP_FRACTION: f64 = 0.001;
 /// Robust extrema: 1st / 99th percentile.
 const LOW_PERCENTILE: f64 = 0.01;
 const HIGH_PERCENTILE: f64 = 0.99;
+
+/// Rail margin for a window whose observed excursion is `span_codes`: the fixed
+/// code margin, shrunk so it can never swallow a signal that legitimately sits
+/// close to a rail. Returns 0 for spans narrower than
+/// `1 / CLIP_MARGIN_SPAN_FRACTION` codes, which leaves exactly the rails
+/// themselves classified as clipped.
+///
+/// Shared with the photodiode owner's published level, which faces the same
+/// question one window at a time: the Stage-A reject-port detector runs a few
+/// codes above zero, and a fixed margin calls every one of those windows
+/// truncated.
+pub fn near_rail_margin(span_codes: u16) -> u16 {
+    let allowed = (f64::from(span_codes) * CLIP_MARGIN_SPAN_FRACTION).floor();
+    allowed.min(f64::from(CLIP_MARGIN_CODES)) as u16
+}
+
+/// [`near_rail_margin`] for a window still held as raw codes.
+fn clip_margin_codes(codes: &[u16]) -> u16 {
+    let (min, max) = codes.iter().fold((u16::MAX, u16::MIN), |(lo, hi), &code| {
+        (lo.min(code), hi.max(code))
+    });
+    near_rail_margin(max.saturating_sub(min))
+}
 
 /// Estimates the excitation log-contrast from one settled, phase-attributed
 /// ADC window. The window must span at least a few full modulation cycles;
@@ -203,10 +253,9 @@ pub fn estimate_contrast(
         });
     }
 
-    let low_clip_threshold = CLIP_MARGIN_CODES;
-    let high_clip_threshold = calibration
-        .full_scale_code
-        .saturating_sub(CLIP_MARGIN_CODES);
+    let margin = clip_margin_codes(codes);
+    let low_clip_threshold = margin;
+    let high_clip_threshold = calibration.full_scale_code.saturating_sub(margin);
     let low_clipped = codes.iter().filter(|&&c| c <= low_clip_threshold).count();
     let high_clipped = codes.iter().filter(|&&c| c >= high_clip_threshold).count();
     let low_clip_fraction = low_clipped as f64 / codes.len() as f64;
@@ -397,5 +446,50 @@ mod tests {
             estimate_contrast(&codes, &AdcCalibration::default(), ContrastGeometry::Direct)
                 .expect("spiked");
         assert!((clean.a - spiked.a).abs() < 0.005);
+    }
+
+    #[test]
+    fn accepts_the_millivolt_scale_reject_port_window() {
+        // The Stage-A reject-port detector operates around 0.5–15 mV, i.e. the
+        // whole waveform lives inside the bottom ~20 codes of the 12-bit range
+        // (0.806 mV per code). None of those codes is the bottom rail, so the
+        // window must estimate rather than be refused as clipped.
+        let calibration = AdcCalibration::default();
+        let per_code = calibration.volts_per_code;
+        let detector_low = 0.000_5;
+        let detector_high = 0.015;
+        let center = (detector_high + detector_low) / 2.0 / per_code;
+        let amplitude = (detector_high - detector_low) / 2.0 / per_code;
+        let codes = sine_codes(center, amplitude, 4_096);
+        let total_power_volts = 0.015_5;
+
+        let estimate = estimate_contrast(
+            &codes,
+            &calibration,
+            ContrastGeometry::RejectedComplement { total_power_volts },
+        )
+        .expect("a millivolt-scale reject-port window must estimate");
+        assert!(
+            estimate.a > 0.0 && estimate.a.is_finite(),
+            "a = {}",
+            estimate.a
+        );
+    }
+
+    #[test]
+    fn still_rejects_a_window_pinned_at_the_bottom_rail() {
+        // Same millivolt scale, but driven below zero: the waveform truncates
+        // at code 0 and `a` would be biased high, so the refusal must survive
+        // the span-relative margin.
+        let codes = sine_codes(4.0, 9.0, 4_096);
+        let err = estimate_contrast(
+            &codes,
+            &AdcCalibration::default(),
+            ContrastGeometry::RejectedComplement {
+                total_power_volts: 0.015_5,
+            },
+        )
+        .expect_err("a rail-pinned window must be refused");
+        assert!(matches!(err, EstimateError::Clipped { .. }), "{err:?}");
     }
 }

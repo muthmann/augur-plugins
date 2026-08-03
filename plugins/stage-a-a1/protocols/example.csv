@@ -1,0 +1,71 @@
+# Stage-A A1 recording protocol — one row per recording.
+#
+# Point the A1 plugin's "Protocol file" at a file like this and press "Run the
+# protocol". Every row is recorded exactly as written, in the order written, so
+# the survey is reproducible from this file alone.
+#
+# Columns are found BY NAME, so their order does not matter and you can drag
+# them around in a spreadsheet. Blank lines and lines starting with # are
+# skipped. Errors report the line number you see in your editor.
+#
+# Required columns
+#   mean_u        normalized cycle-mean lobe point ū — the brightness (I_k)
+#                 axis. 0.01..=1.0. 1.0 is the top of the Pockels lobe; the
+#                 reachable maximum shrinks as depth_a grows, and the
+#                 modulation plugin shows the current limit next to each
+#                 control. A row the drive cannot reach is skipped and named,
+#                 and the rest of the file still runs.
+#   frequency_hz  modulation frequency, 0.01..=2000.
+#   depth_a       optical depth a = ln(I_max / I_min), 0.01..=6.
+#
+# Optional columns (leave the cell blank on any row to take the default)
+#   duration_s    seconds of camera + photodiode for THIS row. 1..=3600,
+#                 default 10. This is the point of the row-per-recording form:
+#                 low frequencies need several cycles, high ones do not.
+#   settle_s      dwell after retargeting, before recording. 0..=60, default 2.
+#   role          normal (default), pilot, or background.
+#                 pilot     — bright reference; freezes the ON/OFF windows the
+#                             rest of the measurement is scored in. Record it
+#                             early.
+#                 background— unmodulated reference; gives the false-response
+#                             floor. Put it first, at a very shallow depth.
+#   label         free text, used in the status line and the sidecar so you can
+#                 tell later which part of the survey a file came from. Quote it
+#                 if it contains a comma.
+#
+# All three axes are commanded for every row, and the row waits for all three to
+# be acknowledged before it starts recording — so a file never records under
+# parameters it does not state. One modulation lease covers the whole run and
+# your own drive settings are handed back at the end.
+
+label,mean_u,frequency_hz,depth_a,duration_s,settle_s,role
+
+# --- references first: the whole measurement is scored against these ---------
+floor,0.50,10,0.02,20,3,background
+windows,0.50,10,2.00,20,3,pilot
+
+# --- q_p(a) curve at 10 Hz ---------------------------------------------------
+curve-10Hz,0.50,10,0.20,10,2,
+curve-10Hz,0.50,10,0.45,10,2,
+curve-10Hz,0.50,10,0.70,10,2,
+curve-10Hz,0.50,10,1.10,10,2,
+curve-10Hz,0.50,10,1.60,10,2,
+
+# --- frequency ladder at one depth -------------------------------------------
+# Longer at the bottom: 1 Hz needs 30 s to cover enough cycles, 200 Hz does not.
+ladder,0.40,1,0.80,40,4,
+ladder,0.40,5,0.80,25,3,
+ladder,0.40,20,0.80,15,2,
+ladder,0.40,80,0.80,10,2,
+ladder,0.40,200,0.80,10,2,
+
+# --- brightness series at fixed (f, a) — the I_k axis ------------------------
+# Ascending, so the sensor adapts in one direction only. Longer settle: a change
+# in mean illumination is the slowest thing on the bench to settle.
+brightness,0.15,50,0.60,15,6,
+brightness,0.30,50,0.60,15,6,
+brightness,0.45,50,0.60,15,6,
+brightness,0.60,50,0.60,15,6,
+
+# --- a repeat of the first curve point, to expose drift across the run -------
+curve-10Hz-repeat,0.50,10,0.45,10,2,

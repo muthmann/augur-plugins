@@ -9,9 +9,12 @@ read-only by construction; the command port belongs to `stage-a-modulation`.
 
 - **RAW** — shows the ADC code and its voltage, `V = code · 3.3 / 4095`.
 - **EXCITATION** — the photodiode sits in the excitation path behind the PBS and measures the
-  light *removed* from the beam: `I_pd = I_tot − I_exc`. Given the user-set reference **I_tot**
-  (in photodiode volts — the reading with the full beam on the diode), the plugin shows
-  `I_exc = I_tot − I_pd`.
+  light *removed* from the beam: `I_pd = I_tot − I_exc`, so the plugin shows `I_exc = I_tot − I_pd`.
+  `I_tot` is **learned, not entered**: it is the brightest smoothed reading the detector has taken
+  since the port opened, which on the reject port is where the excitation is extinguished. The
+  Pockels transfer sweep drives through that null by construction, so running it once teaches the
+  anchor. There is no dark level either — a DC offset cancels exactly out of the complement.
+  See [ADR 024](../../docs/adr/024-stage-a-photodiode-learns-its-own-anchor.md).
 
 ## Views
 
@@ -34,11 +37,24 @@ plugins control named recordings through the versioned
 receive raw sample arrays through the control plane; finalized PDQ files remain
 the replay and analysis source of truth.
 
-The snapshot's `stream.level` block carries the settled detector level over the
-moving-average window in **raw** detector volts — the ADC map only, never the
-RAW/EXCITATION display transform and never the optical geometry transform. It
+The snapshot's `stream.level` block carries the settled detector level in **raw**
+detector volts — the ADC map only, never the RAW/EXCITATION display transform and
+never the optical geometry transform. It is averaged over a fixed **20 ms**
+owned here and independent of the chart's moving-average setting, because that
+setting is a display preference and this is a measurement: deriving one from the
+other let a default of four samples publish 8 µs per point at 500 kSa/s and
+report a clean Pockels calibration as a 22 % residual
+([ADR 019](../../docs/adr/019-stage-a-calibration-measures-its-own-window.md)).
+It
 also reports the window's peak-to-peak spread and the sample index it ends at,
 so a consumer can prove a reading was taken *after* it changed something without
 a shared clock. Unlike `optical_summary` it never refuses: it stays present
 while the window clips (flagged), because the Pockels transfer sweep needs a
 reading exactly where the reject-port detector is brightest.
+
+When `optical_summary` *is* refused, `optical_unavailable` on the same snapshot
+carries the reason, so a consumer that gates on `a` can name the gate instead of
+reporting absence. Clip detection is span-relative — the near-rail margin is
+capped at 5 % of the window's own peak-to-peak span, so this detector's 0.5–15 mV
+operating range is not mistaken for a waveform truncating at code 0. See
+[ADR 017](../../docs/adr/017-stage-a-rail-detection-and-withheld-a-reasons.md).

@@ -21,6 +21,13 @@
 //!    trimmed depth under the same lease so one atomic frequency point is recorded at
 //!    exactly `a₀`.
 //!
+//!    Where that `a` comes from is one operator setting, [`DepthSource`] (ADR 020). The
+//!    photodiode's measurement is the default and the source of record; it is also
+//!    fail-closed on firmware phase-0 markers, so a bench that never receives them can
+//!    fall back to the modulation owner's *commanded* calibrated depth and run the same
+//!    workflow open loop. Every artefact that carries an `a` carries which source
+//!    produced it.
+//!
 //! 2. **Live sanity quicklooks.** Folding the camera event stream on the modulation
 //!    period `T` (defined by the firmware phase-0 `EXT_TRIGGER`), it renders the
 //!    **rolling half-period response** `S_p(t)` (a live "are events appearing, is the
@@ -41,10 +48,10 @@ use augur_plugin_api::{
     HostOutput, HostViewDescriptor, HostViewKind, HostViewPlacement, HostViewRegistry,
     PathDialogKind, Plugin, PluginCapabilities, PluginControlContext, PluginControlInbox,
     PluginDiscontinuity, PluginFrame, PluginInput, PluginRuntimeRole, PluginServiceOutcome,
-    PluginServiceReply, PluginServiceRequest, RoiV1, Series1dLine, Series1dPoint, Series1dV1,
-    SettingItem, SettingKind, SettingsSchema, SettingsSection, StatusEntry, TableColumn,
-    TableColumnData, TableColumnValues, TableDatasetV1, TableSchema, TableValueType,
-    CTX_GLOBAL_SETTINGS,
+    PluginServiceReply, PluginServiceRequest, RoiV1, SensorMonitoringV1, Series1dLine,
+    Series1dPoint, Series1dV1, SettingItem, SettingKind, SettingsSchema, SettingsSection,
+    StatusEntry, TableColumn, TableColumnData, TableColumnValues, TableDatasetV1, TableSchema,
+    TableValueType, CTX_GLOBAL_SETTINGS, CTX_SENSOR_MONITORING,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -58,8 +65,10 @@ use stage_a_plugin_contract::{
 };
 
 use crate::phase::{fold_events, fold_events_free_running, MarkerValidationConfig, PhaseFold};
+use crate::protocol;
 use crate::rates::{rolling_half_period_response, RollingResponsePoint};
 use crate::response_curve::{auto_windows, response_probability, PhaseWindow, ResponsePoint, Roi};
+use crate::sensor;
 use crate::types::{CameraEvent, Polarity};
 
 const MODULATION_PLUGIN_ID: &str = "stage-a.modulation";
@@ -127,7 +136,6 @@ const COMMANDED_A_MAX: f64 = 6.0;
 const FREQUENCY_MATCH_FRACTION: f64 = 0.01;
 /// Lock table persisted in the output folder, so found depths survive a restart.
 const A0_LOCK_FILE: &str = "a0_locks.json";
-
 /// Frequency points a single run may visit, before the interleaved references.
 const FREQ_SWEEP_MAX_POINTS: usize = 64;
 /// How long the frequency sweep waits for the phase-0 trigger to report the
@@ -169,6 +177,16 @@ fn same_frequency(left: f64, right: f64) -> bool {
 
 fn frequency_label(hz: f64) -> String {
     format!("{hz:.3} Hz")
+}
+
+/// Upper-cases the first character, so a blocker written as a sentence fragment
+/// ("the total power …") can also stand as its own sentence in the status panel.
+fn capitalize_first(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
 }
 
 /// Compact file-safe frequency tag for an event-count point's stem:
@@ -328,6 +346,9 @@ struct Recording {
     cam_rejected: bool,
     pd_pdq_path: Option<String>,
     pd_sidecar_path: Option<String>,
+    /// Compacted sensor readout written into the measurement folder, if the
+    /// host produced any telemetry for this run.
+    sensor_readout_path: Option<String>,
     pd_finalized: bool,
     pd_valid: bool,
     /// The photodiode rejected BeginRecording — skip the finalize and don't
@@ -410,6 +431,13 @@ struct Sweep {
     /// Whether the current point's recording actually started (vs. was
     /// refused by validation before it began).
     point_started: bool,
+    /// Set only on the branch that runs out of points with every one recorded.
+    ///
+    /// An enclosing frequency ladder has to know whether the inner run it
+    /// handed a rung to *finished* or gave up, and it cannot tell from the
+    /// recording coordinator: a sweep that aborts on point 4 of 5 leaves
+    /// `recording_completed_ok` true from point 3.
+    completed_ok: bool,
     last_activity_ms: u64,
     stop_requested: bool,
 }
@@ -488,6 +516,91 @@ struct A0Lock {
     stop_requested: bool,
 }
 
+/// Where the modulation depth `a` that A1 works from comes from.
+///
+/// `a = ln(I_max / I_min)` is a property of the *light*, so the photodiode is
+/// the only source that can state it (ADR 011, and the estimator's own module
+/// docs). That is the default and stays the source of record.
+///
+/// The bench cannot always deliver it, though. The photodiode withholds `a`
+/// whenever its estimator window cannot be proven to cover whole modulation
+/// cycles, which needs firmware phase-0 markers on the stream port; without
+/// them — no trigger cable, a firmware build that does not stamp them, a
+/// frequency low enough that two cycles do not fit in the ring — every gate
+/// that needs `a` refuses, and the whole a₀/sweep workflow is unreachable even
+/// though the drive is calibrated and running.
+///
+/// [`DepthSource::Commanded`] is the pragmatic way through: the modulation
+/// owner already inverts a *measured* Pockels transfer curve (`V_null`, `Vπ`)
+/// to command a depth, and publishes that depth as
+/// `OpticalDriveStateV1::depth_a_milli`. Taking `a` from there is open loop —
+/// it is what the drive asked the cell for, not what the light did, so it
+/// carries the calibration's error and any drift since — but it is a
+/// calibrated number, not a datasheet one, and it lets the workflow run. Every
+/// artefact that records an `a` records which source produced it, so a run
+/// taken this way is never mistaken for a measured one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DepthSource {
+    /// The photodiode's measured excitation log-contrast.
+    #[default]
+    Photodiode,
+    /// The depth the modulation owner's calibrated optical drive is commanding.
+    Commanded,
+}
+
+impl DepthSource {
+    fn from_index(index: u64) -> Self {
+        match index {
+            1 => Self::Commanded,
+            _ => Self::Photodiode,
+        }
+    }
+
+    fn index(self) -> u64 {
+        match self {
+            Self::Photodiode => 0,
+            Self::Commanded => 1,
+        }
+    }
+
+    /// Machine-readable tag written into sidecars and the lock table.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Photodiode => "photodiode_measured",
+            Self::Commanded => "modulation_commanded",
+        }
+    }
+
+    /// The verb the panel uses for a depth from this source: "measured a" is a
+    /// claim about the light and must not be printed for a commanded one.
+    fn verb(self) -> &'static str {
+        match self {
+            Self::Photodiode => "measured",
+            Self::Commanded => "commanded",
+        }
+    }
+
+    /// Whether holding one `a₀` across frequencies requires the closed-loop
+    /// search (ADR 013), or whether commanding it is enough (ADR 021).
+    ///
+    /// The lock exists for one reason: the Pockels inversion is measured once
+    /// and is therefore *static*, so the depth it actually delivers rolls off
+    /// as `f` rises. Holding a **measured** `a₀` across a frequency ladder
+    /// means re-finding the commanded depth that produces it at every point —
+    /// `a_cmd ← a_cmd · a₀/a_measured`, a couple of trials per frequency.
+    ///
+    /// None of that applies to a **commanded** depth, because it *is* the
+    /// number being commanded. A search would command `a₀`, read back `a₀`,
+    /// converge on trial one, and store one identical row per frequency: pure
+    /// ceremony between the operator and a recording, and worse than nothing
+    /// once a stale row from a measured run warm-starts it (`begin_a0_lock`)
+    /// and drags a closed-loop number into an open-loop point.
+    fn needs_a0_lock(self) -> bool {
+        matches!(self, Self::Photodiode)
+    }
+}
+
 /// The result of one lock: the commanded depth that produced the frozen `a₀` at
 /// one frequency. Persisted in `a0_locks.json` and replayed by event-count points.
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
@@ -497,7 +610,7 @@ struct A0LockPoint {
     target_a: f64,
     /// What the drive must be commanded to in order to *measure* `target_a`.
     commanded_a: f64,
-    /// The photodiode-measured `a` averaged over the final trial.
+    /// The `a` observed over the final trial, from `depth_source`.
     measured_a: f64,
     trials: u32,
     /// False when the lock ran out of trials or hit a drive limit; such a row is
@@ -506,6 +619,10 @@ struct A0LockPoint {
     locked_at_unix_ms: u64,
     low_clip_fraction: Option<f64>,
     high_clip_fraction: Option<f64>,
+    /// Which source produced `measured_a`. Lock tables written before the
+    /// setting existed were all photodiode-measured, which is the default.
+    #[serde(default)]
+    depth_source: DepthSource,
 }
 
 /// Order the planned frequencies are actually visited in.
@@ -556,6 +673,44 @@ impl FreqOrder {
     }
 }
 
+/// What the frequency ladder records at each of its frequencies.
+///
+/// The ladder is an outer loop over `f` that leases the drive once and hands
+/// each confirmed frequency to an inner run. What that inner run *is* is the
+/// only thing separating the bench's two multi-frequency experiments, so it is
+/// one enum rather than two copies of the ladder.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum FreqSweepMode {
+    /// One event-count point at the frozen depth `a₀` (ADR 013 / ADR 014):
+    /// the same depth everywhere, so a change in the event count is a
+    /// frequency effect.
+    #[default]
+    A0Point,
+    /// The whole depth sweep over `[min_a, max_a]` at every frequency
+    /// (ADR 023) — one `q_p(a)` curve per `f`, i.e. the `q_p(a, f)` surface
+    /// the offline `a50(f)` fit is read from.
+    DepthSweep,
+}
+
+impl FreqSweepMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::A0Point => "a₀ point",
+            Self::DepthSweep => "depth sweep",
+        }
+    }
+
+    /// Whether a rung has to find a depth before it can record one.
+    ///
+    /// Only the `a₀` experiment does: it replays a single depth that something
+    /// has to have chosen. A depth sweep commands every `a` in its range
+    /// itself and settles on each, so there is nothing for a lock to add — in
+    /// either depth source.
+    fn needs_armed_depth(self) -> bool {
+        matches!(self, Self::A0Point)
+    }
+}
+
 /// One stop of the frequency sweep.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct FreqSweepPoint {
@@ -589,6 +744,8 @@ enum FreqSweepPhase {
 /// stay locked out from the first frequency to the last.
 struct FreqSweep {
     phase: FreqSweepPhase,
+    /// What each rung records — see [`FreqSweepMode`].
+    mode: FreqSweepMode,
     points: Vec<FreqSweepPoint>,
     index: usize,
     lease_id: LeaseId,
@@ -623,6 +780,63 @@ impl FreqSweep {
     }
 }
 
+/// Where a protocol run is within its per-point cycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProtocolPhase {
+    /// AcquireLease sent to the modulation owner; waiting for the grant.
+    AcquiringLease,
+    /// The three retargets for this point are in flight; waiting for all of
+    /// them to come back Applied.
+    Retargeting,
+    /// Dwelling for the point's own settle time before the recording starts.
+    Settling,
+    /// The recording coordinator owns this phase.
+    Recording,
+}
+
+/// One protocol run: walk the parsed points, retargeting all three axes at
+/// each, on a single lease held for the whole file.
+///
+/// It is a supervisor like [`FreqSweep`], not a fourth copy of the recording
+/// machinery: it moves the drive and then hands off to the same
+/// `begin_recording` every button uses. The difference from the sweep buttons
+/// is that a protocol names *every* axis for *every* point, so nothing is left
+/// implicitly at whatever the operator last armed.
+struct ProtocolRun {
+    plan: protocol::Protocol,
+    phase: ProtocolPhase,
+    index: usize,
+    lease_id: LeaseId,
+    lease_granted: bool,
+    lease_req: u64,
+    /// Request ids of the retargets in flight for the current point. A point
+    /// only proceeds once this is empty: the three axes are applied
+    /// independently, and recording after two of them would file the run under
+    /// parameters the bench was not actually at.
+    pending_reqs: Vec<u64>,
+    /// Wall-clock instant the dwell ends.
+    settle_until_ms: u64,
+    /// Points whose retarget or recording failed, with the owner's own reason.
+    ///
+    /// Kept rather than aborting — the rest of the survey is still worth
+    /// having — and kept *with the reason*, because the per-point message is
+    /// overwritten by the next point within the same tick. Without this the
+    /// only thing an unattended run could report at the end was a count.
+    failed: Vec<(usize, String)>,
+    recorded: usize,
+    last_activity_ms: u64,
+    stop_requested: bool,
+    /// Why the current point is being given up, when that was decided in a
+    /// service reply rather than in the tick.
+    skip_reason: Option<String>,
+}
+
+impl ProtocolRun {
+    fn point(&self) -> Option<&protocol::ProtocolPoint> {
+        self.plan.points.get(self.index)
+    }
+}
+
 /// On-disk form of the per-frequency lock table.
 #[derive(Debug, Clone, Default, Serialize, serde::Deserialize)]
 struct A0LockTable {
@@ -653,6 +867,21 @@ pub struct StageAA1Plugin {
     // -- host camera ROI/mask, mirrored from CTX_GLOBAL_SETTINGS --
     host_roi: Option<RoiV1>,
     masked_pixels: HashSet<(u16, u16)>,
+    /// Latest sensor-measured die temperature, pixel dead time and scene
+    /// illumination, mirrored from `CTX_SENSOR_MONITORING` every frame.
+    ///
+    /// Provenance only — never an input to any result. The host publishes it
+    /// solely while streaming from a camera with a monitoring block, so replay
+    /// and offline re-runs of the same data carry `None`, and a plugin whose
+    /// *answers* depended on it would disagree with itself between the two.
+    sensor: Option<SensorMonitoringV1>,
+    /// [`Self::sensor`] frozen when the current recording started.
+    ///
+    /// Written into the sidecar in preference to the live value: these drift
+    /// (the die warms, the room lights change), so the number that belongs to a
+    /// run is the one that held when it began, not the one that happens to be
+    /// current when the file is finalized seconds later.
+    sensor_at_start: Option<SensorMonitoringV1>,
     // -- response curve (auto-windowed Bernoulli q_p) --
     /// Window floor as a fraction of the ON/OFF histogram peak (see `auto_windows`).
     window_floor: f64,
@@ -666,9 +895,9 @@ pub struct StageAA1Plugin {
     // -- recording coordinator --
     output_folder: String,
     measurement_id: String,
-    /// Canonical identifier of the physical cycle-mean local flux point
-    /// `I_k` (for example a row in the illumination calibration/map).
-    flux_point_id: String,
+    /// Where the depth `a` comes from — the photodiode's measurement, or the
+    /// modulation owner's commanded depth. See [`DepthSource`].
+    depth_source: DepthSource,
     /// Sweep range `[min_a, max_a]` for this `(I_k, f)` row (automation template).
     min_a: f64,
     max_a: f64,
@@ -695,6 +924,10 @@ pub struct StageAA1Plugin {
     /// Latched by the Start sweep button, consumed next control tick.
     sweep_pending: bool,
     sweep: Option<Sweep>,
+    /// Whether the most recent inner sweep ran out of points with all of them
+    /// recorded, as opposed to giving up. Read by the frequency ladder to
+    /// decide between advancing and skipping the rung. See [`Sweep::completed_ok`].
+    last_sweep_completed_ok: bool,
     // -- exact event-count depth a₀ (ADR 013) --
     /// The one photodiode-measured log contrast held across the frequency sweep.
     a0_target: f64,
@@ -717,9 +950,25 @@ pub struct StageAA1Plugin {
     /// Insert the lowest planned frequency again after every N points, so drift
     /// across the block shows up as a disagreement between its repeats. 0 = off.
     freq_reference_every: u32,
-    /// Latched by the Start frequency sweep button, consumed next control tick.
-    freq_sweep_pending: bool,
+    /// Latched by whichever frequency-ladder button was pressed, carrying what
+    /// that button asked for. Consumed next control tick.
+    freq_sweep_pending: Option<FreqSweepMode>,
     freq_sweep: Option<FreqSweep>,
+    // -- declarative protocol runs --
+    /// Path of the TOML protocol file to run.
+    protocol_path: String,
+    /// Latched by the Run protocol button, consumed next control tick.
+    protocol_pending: bool,
+    /// Recording length for the *next* run, overriding the panel's setting.
+    ///
+    /// The protocol's own `duration_s` has to win, or a survey's lengths would
+    /// silently come from the UI and the file would not describe what it
+    /// produced. It cannot be written into `duration_s` itself: the host
+    /// re-applies the whole settings snapshot from the UI mirror on every pass,
+    /// so an operator setting assigned on the worker is reverted within the
+    /// frame — the same trap that made the modulation Apply button look dead.
+    pending_duration_s: Option<i64>,
+    protocol: Option<ProtocolRun>,
     /// One converged (or attempted) lock per frequency, newest per frequency
     /// wins; mirrored to `a0_locks.json` in the output folder.
     a0_locks: Vec<A0LockPoint>,
@@ -737,6 +986,8 @@ pub struct StageAA1Plugin {
     press_clear_curve: PressLatch,
     press_find_a0: PressLatch,
     press_freq_sweep: PressLatch,
+    press_freq_depth_sweep: PressLatch,
+    press_run_protocol: PressLatch,
     press_record_a0: PressLatch,
     press_clear_a0: PressLatch,
 }
@@ -758,13 +1009,15 @@ impl Default for StageAA1Plugin {
             frame_height: 0,
             host_roi: None,
             masked_pixels: HashSet::new(),
+            sensor: None,
+            sensor_at_start: None,
             window_floor: DEFAULT_WINDOW_FLOOR,
             response_points: Vec::new(),
             pilot_windows: None,
             background_floor: None,
             output_folder: String::new(),
             measurement_id: generate_measurement_id(),
-            flux_point_id: String::new(),
+            depth_source: DepthSource::Photodiode,
             min_a: 0.0,
             max_a: 2.0,
             duration_s: 10,
@@ -780,6 +1033,7 @@ impl Default for StageAA1Plugin {
             settle_s: 2.0,
             sweep_pending: false,
             sweep: None,
+            last_sweep_completed_ok: false,
             // No numerical a₀ is frozen in the repository: this default is a
             // placeholder the operator replaces with the scout result.
             a0_target: 0.5,
@@ -793,8 +1047,12 @@ impl Default for StageAA1Plugin {
             freq_order: FreqOrder::Alternating,
             freq_seed: 1,
             freq_reference_every: 0,
-            freq_sweep_pending: false,
+            freq_sweep_pending: None,
             freq_sweep: None,
+            protocol_path: String::new(),
+            protocol_pending: false,
+            pending_duration_s: None,
+            protocol: None,
             a0_locks: Vec::new(),
             loaded_locks_folder: None,
             press_start: PressLatch::default(),
@@ -807,6 +1065,8 @@ impl Default for StageAA1Plugin {
             press_clear_curve: PressLatch::default(),
             press_find_a0: PressLatch::default(),
             press_freq_sweep: PressLatch::default(),
+            press_freq_depth_sweep: PressLatch::default(),
+            press_run_protocol: PressLatch::default(),
             press_record_a0: PressLatch::default(),
             press_clear_a0: PressLatch::default(),
         }
@@ -836,6 +1096,7 @@ impl Recording {
             lease_granted: false,
             cam_raw_path: None,
             cam_finalized_path: None,
+            sensor_readout_path: None,
             cam_complete: false,
             cam_rejected: false,
             pd_pdq_path: None,
@@ -861,14 +1122,14 @@ impl Recording {
 
     fn state_label(&self) -> &'static str {
         match self.phase {
-            RecPhase::Idle => "idle",
-            RecPhase::StartingCamera => "starting camera",
-            RecPhase::ConnectingPhotodiode => "connecting photodiode",
-            RecPhase::AcquiringLease => "acquiring lease",
-            RecPhase::StartingPhotodiode => "starting photodiode",
+            RecPhase::Idle => "not recording",
+            RecPhase::StartingCamera => "starting the camera",
+            RecPhase::ConnectingPhotodiode => "connecting the photodiode",
+            RecPhase::AcquiringLease => "reserving the photodiode",
+            RecPhase::StartingPhotodiode => "starting the photodiode",
             RecPhase::Running => "recording",
-            RecPhase::StoppingPhotodiode => "finalizing photodiode",
-            RecPhase::StoppingCamera => "finalizing camera",
+            RecPhase::StoppingPhotodiode => "saving the photodiode data",
+            RecPhase::StoppingCamera => "saving the camera data",
         }
     }
 
@@ -902,6 +1163,62 @@ struct FoldKey {
 impl StageAA1Plugin {
     fn bump(&mut self) {
         self.dataset_generation = self.dataset_generation.wrapping_add(1);
+    }
+
+    /// Releases the live analysis buffers and the fold memoised from them.
+    /// Returns whether anything was actually held.
+    ///
+    /// Assigning fresh `Vec`s rather than calling `clear()` is deliberate: the
+    /// event buffer reaches millions of entries, and `clear()` keeps every byte
+    /// of that capacity reserved.
+    ///
+    /// This is what switching Live analysis off has to do. Merely stopping the
+    /// *filling* left the last window's events live for every later
+    /// `current_fold()`, and the control tick re-folds them — so turning the
+    /// toggle off left the plugin folding millions of stale events on every
+    /// tick, forever. That is the lag that outlived the switch.
+    fn drop_live_buffers(&mut self) -> bool {
+        let held = !self.camera_events.is_empty() || !self.camera_markers_us.is_empty();
+        self.camera_events = Vec::new();
+        self.event_scratch = Vec::new();
+        self.camera_markers_us = Vec::new();
+        self.fold_cache.replace(None);
+        held
+    }
+
+    /// One Stop for everything the Record section can start.
+    ///
+    /// Whatever is in flight — a single recording, a depth sweep, an `a₀`
+    /// lock, a frequency ladder or a protocol — asks it to wind down at its
+    /// next safe point, and any latched-but-not-yet-started press is dropped so
+    /// the stop is not immediately undone by a queued start.
+    fn request_stop(&mut self) {
+        if self.recording.is_active() {
+            self.recording.stop_requested = true;
+        }
+        if let Some(sweep) = self.sweep.as_mut() {
+            sweep.stop_requested = true;
+            self.message = "Sweep stop requested".into();
+        }
+        if let Some(lock) = self.a0_lock.as_mut() {
+            lock.stop_requested = true;
+            self.message = "a₀ lock stop requested".into();
+        }
+        // Before the protocol, so the outer runner's wording wins over the
+        // child it happens to be driving.
+        if let Some(sweep) = self.freq_sweep.as_mut() {
+            sweep.stop_requested = true;
+            self.message = "Frequency sweep stop requested".into();
+        }
+        if let Some(protocol) = self.protocol.as_mut() {
+            protocol.stop_requested = true;
+            self.message = "Protocol stop requested".into();
+        }
+        self.sweep_pending = false;
+        self.a0_lock_pending = false;
+        self.a0_point_pending = false;
+        self.freq_sweep_pending = None;
+        self.protocol_pending = false;
     }
 
     /// Sets the concise operator-facing recording result.
@@ -963,6 +1280,59 @@ impl StageAA1Plugin {
 
     fn is_marker_anchored(&self) -> bool {
         self.camera_markers_us.len() >= 2
+    }
+
+    /// Why there is no modulation frequency to work from, phrased as the
+    /// operator action that fixes it. `None` means the frequency is known.
+    ///
+    /// A frequency comes from two independent places — the phase-0 trigger
+    /// markers, or the drive the modulation plugin has *acknowledged*. Neither
+    /// has anything to do with whether that plugin is connected, which is a
+    /// separate check ([`Self::modulation_connected`]). Reporting "connect the
+    /// modulation plugin" for a missing frequency told operators their bench
+    /// was unplugged when it was not: the usual cause is simply that no
+    /// periodic drive has been armed yet.
+    fn frequency_blocker(&self) -> Option<String> {
+        if self.frequency_hz().is_some() {
+            return None;
+        }
+        let Some(state) = self.modulation.as_ref() else {
+            return Some(
+                "the modulation plugin is not reporting status — enable it in the plugin list"
+                    .into(),
+            );
+        };
+        if !matches!(state.connection, ConnectionStateV1::Connected { .. }) {
+            return Some(format!(
+                "the modulation plugin is {} — connect it",
+                connection_label(&state.connection)
+            ));
+        }
+        // Connected, so the question is what it is being asked to drive.
+        let Some(target) = state.acknowledged.as_ref() else {
+            return Some(
+                "the modulation plugin has not applied a drive yet — set one up there and apply it"
+                    .into(),
+            );
+        };
+        match target.waveform.as_ref() {
+            Some(WaveformV1::Periodic {
+                frequency_millihz, ..
+            }) if *frequency_millihz == 0 => {
+                Some("the modulation drive frequency is set to 0 — raise it".into())
+            }
+            Some(WaveformV1::Periodic { .. }) => None,
+            Some(_) => Some(
+                "the modulation drive is not a repeating waveform, so it has no frequency — \
+                 choose a periodic one"
+                    .into(),
+            ),
+            None => Some(
+                "the modulation plugin has not applied a waveform yet — set one up there and \
+                 apply it"
+                    .into(),
+            ),
+        }
     }
 
     fn frequency_source(&self) -> &'static str {
@@ -1077,9 +1447,122 @@ impl StageAA1Plugin {
     }
 
     /// Fresh optical modulation depth `a` published by the photodiode plugin.
-    fn measured_a(&self) -> Option<f64> {
+    fn photodiode_a(&self) -> Option<f64> {
         self.fresh_optical_summary()
             .map(|summary| summary.measured_log_contrast)
+    }
+
+    /// The depth `a` the modulation owner's calibrated optical drive is
+    /// currently commanding, from its published inversion provenance.
+    ///
+    /// `None` unless the owner is connected and has a calibrated optical drive
+    /// armed: `optical_drive` is published only for `OPTICAL_LOG_SINE` /
+    /// `OPTICAL_LINEAR_SINE` under an identified transfer calibration, which is
+    /// exactly the case in which a commanded `a` means anything at all. A
+    /// manual DAC band or a constant level publishes nothing here, and must not
+    /// be turned into a depth.
+    ///
+    /// Deliberately not freshness-gated. The published depth is what this
+    /// plugin's own `SetOpticalDepth` wrote into the owner a moment ago, not a
+    /// reading off the bench, so it does not go stale the way a measurement
+    /// does — and gating it on the device poll would make the sweep's settle
+    /// check flap between "settled" and "no a" on a slow reply.
+    fn commanded_a(&self) -> Option<f64> {
+        let state = self.modulation.as_ref()?;
+        if !matches!(state.connection, ConnectionStateV1::Connected { .. }) {
+            return None;
+        }
+        let depth = f64::from(state.optical_drive.as_ref()?.depth_a_milli) / 1_000.0;
+        (depth > 0.0).then_some(depth)
+    }
+
+    /// The modulation depth `a` A1 works from, per the operator's chosen
+    /// [`DepthSource`]. Every gate, sweep settle check, plot and sidecar reads
+    /// this one accessor, so the source is chosen in exactly one place.
+    fn depth_a(&self) -> Option<f64> {
+        match self.depth_source {
+            DepthSource::Photodiode => self.photodiode_a(),
+            DepthSource::Commanded => self.commanded_a(),
+        }
+    }
+
+    /// Why there is no `a` to work from, phrased as the operator action that
+    /// fixes it.
+    ///
+    /// Every gate that needs `a` — the a₀ lock, the amplitude sweep, the
+    /// frequency ladder — used to refuse with one fixed sentence naming the two
+    /// most common causes. When the real cause was a third thing (a railed
+    /// window, too few trigger markers, a stale snapshot) that sentence sent the
+    /// operator to re-check an anchor that was already fine. Ask the owner
+    /// instead, and only fall back to the local view of the snapshot.
+    ///
+    /// `None` means `a` is available.
+    fn depth_a_blocker(&self) -> Option<String> {
+        match self.depth_source {
+            DepthSource::Photodiode => self.photodiode_a_blocker(),
+            DepthSource::Commanded => self.commanded_a_blocker(),
+        }
+    }
+
+    fn photodiode_a_blocker(&self) -> Option<String> {
+        if self.photodiode_a().is_some() {
+            return None;
+        }
+        // Every branch names the photodiode gate to fix *and* the way past it,
+        // because a bench that cannot produce a measured `a` at all — no
+        // trigger markers, say — otherwise leaves the operator with a correct
+        // diagnosis and no next step.
+        let fallback = " (or switch \"Depth a source\" to the commanded drive to work open loop)";
+        let Some(state) = self.photodiode.as_ref() else {
+            return Some(format!(
+                "the photodiode plugin is not reporting status — enable it and connect the \
+                 detector{fallback}"
+            ));
+        };
+        if !matches!(state.connection, ConnectionStateV1::Connected { .. }) {
+            return Some(format!(
+                "the photodiode is {} — connect it{fallback}",
+                connection_label(&state.connection)
+            ));
+        }
+        if state.freshness.is_stale_at(now_unix_ms()) {
+            return Some(format!(
+                "the photodiode status snapshot is stale — check that the stream is \
+                 running{fallback}"
+            ));
+        }
+        // The owner's own words: it is the only side that knows which estimator
+        // gate rejected the window.
+        if let Some(reason) = state.optical_unavailable.as_deref() {
+            return Some(format!("{reason}{fallback}"));
+        }
+        Some(format!(
+            "the photodiode is streaming no samples yet — start the stream{fallback}"
+        ))
+    }
+
+    fn commanded_a_blocker(&self) -> Option<String> {
+        if self.commanded_a().is_some() {
+            return None;
+        }
+        let Some(state) = self.modulation.as_ref() else {
+            return Some(
+                "the modulation plugin is not reporting status — enable it to read the commanded \
+                 depth"
+                    .into(),
+            );
+        };
+        if !matches!(state.connection, ConnectionStateV1::Connected { .. }) {
+            return Some(format!(
+                "the modulation plugin is {} — connect it",
+                connection_label(&state.connection)
+            ));
+        }
+        Some(
+            "the modulation plugin is not running a calibrated optical drive — apply a Pockels \
+             calibration and arm OPTICAL_LOG_SINE, or a commanded depth means nothing"
+                .into(),
+        )
     }
 
     /// Current ROI from the host camera config, clamped to the frame.
@@ -1169,11 +1652,15 @@ impl StageAA1Plugin {
         }
     }
 
-    /// Records one response-curve point at the current photodiode-measured `a`.
+    /// Records one response-curve point at the current depth `a`.
     fn record_response_point(&mut self) -> Result<(), String> {
-        let measured_a = self
-            .measured_a()
-            .ok_or("no photodiode-measured a available (connect the photodiode)")?;
+        let measured_a = self.depth_a().ok_or_else(|| {
+            format!(
+                "no modulation depth a available: {}",
+                self.depth_a_blocker()
+                    .unwrap_or_else(|| "no depth source is reporting".into())
+            )
+        })?;
         let (q_on, q_off, cycles, valid_pixels) = self
             .current_response()
             .ok_or("no valid response window yet (need trigger-anchored events and a valid ROI)")?;
@@ -1201,7 +1688,10 @@ impl StageAA1Plugin {
             points
         };
         Series1dV1 {
-            x_label: "Measured modulation depth a = ln(I_max / I_min)".into(),
+            x_label: format!(
+                "Modulation depth a = ln(I_max / I_min) ({})",
+                self.depth_source.verb()
+            ),
             y_label: "Response probability q_p = fraction of pixel-cycles that fired".into(),
             lines: vec![
                 Series1dLine {
@@ -1319,8 +1809,10 @@ impl StageAA1Plugin {
                 ),
                 cell(
                     "a",
-                    self.measured_a()
-                        .map_or_else(|| "—".into(), |a| format!("{a:.3}")),
+                    self.depth_a().map_or_else(
+                        || "—".into(),
+                        |a| format!("{a:.3} ({})", self.depth_source.verb()),
+                    ),
                 ),
                 cell(
                     "s_on",
@@ -1422,7 +1914,6 @@ impl StageAA1Plugin {
     fn recording_metadata(&self) -> BTreeMap<String, String> {
         let mut meta = BTreeMap::new();
         meta.insert("a1_measurement_id".into(), self.recording.id.clone());
-        meta.insert("a1_flux_point_id".into(), self.flux_point_id.clone());
         meta.insert("a1_stem".into(), self.recording.stem.clone());
         meta.insert("a1_role".into(), self.recording.role.label().into());
         meta.insert(
@@ -1455,11 +1946,23 @@ impl StageAA1Plugin {
                 format!("{:.6}", lock.measured_a),
             );
             meta.insert(
+                "a0_lock_depth_source".into(),
+                lock.depth_source.label().into(),
+            );
+            meta.insert(
                 "a0_lock_frequency_hz".into(),
                 format!("{:.6}", lock.frequency_hz),
             );
         }
-        if let Some(a) = self.measured_a() {
+        // The depth this run was driven and judged by, always tagged with where
+        // it came from. `measured_a` keeps its historical meaning — a number the
+        // photodiode actually measured — so an open-loop run simply does not
+        // carry one, rather than carrying a commanded value under that name.
+        meta.insert("depth_a_source".into(), self.depth_source.label().into());
+        if let Some(a) = self.depth_a() {
+            meta.insert("depth_a".into(), format!("{a:.6}"));
+        }
+        if let Some(a) = self.photodiode_a() {
             meta.insert("measured_a".into(), format!("{a:.6}"));
         }
         if let Some(hz) = self.period_us().map(|t| 1_000_000.0 / t) {
@@ -1477,7 +1980,55 @@ impl StageAA1Plugin {
         if let Some(n) = self.valid_pixel_count() {
             meta.insert("n_valid".into(), n.to_string());
         }
+        // Bench conditions, on every run and every role. Each key appears only
+        // when the sensor actually reported that quantity — an absent reading
+        // must not arrive downstream as 0 °C or 0 lux.
+        if let Some(sensor) = self.recorded_sensor() {
+            if let Some(celsius) = sensor.temperature_c {
+                meta.insert("sensor_temperature_c".into(), format!("{celsius:.2}"));
+            }
+            if let Some(dead_time_us) = sensor.pixel_dead_time_us {
+                meta.insert(
+                    "sensor_pixel_dead_time_us".into(),
+                    format!("{dead_time_us:.3}"),
+                );
+            }
+            if let Some(lux) = sensor.illumination_lux {
+                meta.insert("sensor_illumination_lux".into(), format!("{lux:.3}"));
+            }
+            meta.insert(
+                "sensor_reading_age_s".into(),
+                format!("{:.3}", sensor.age_s),
+            );
+        }
         meta
+    }
+
+    /// The sensor reading that belongs to the run being written: the one frozen
+    /// when it started, falling back to the latest if the recording began
+    /// before any frame carried one.
+    fn recorded_sensor(&self) -> Option<SensorMonitoringV1> {
+        self.sensor_at_start.or(self.sensor)
+    }
+
+    /// The measurement id to file this run under, generating one when the
+    /// operator has not typed anything.
+    ///
+    /// A blank id used to refuse the recording. It never had to: the id only
+    /// names a folder and a file stem, and the plugin already ships a generated
+    /// default for exactly that reason. Filling it in here (and writing it back,
+    /// so the panel shows what was used) means an operator who wants their data
+    /// grouped can say so, and one who just wants to record can press record.
+    /// Tested on the raw field, not on `sanitize_stem`'s output: the sanitizer
+    /// substitutes `A1` for anything that reduces to nothing, so asking it
+    /// whether the id was blank always answers no — and every unnamed run would
+    /// silently share one folder called `A1`.
+    fn ensure_measurement_id(&mut self) -> String {
+        if self.measurement_id.trim().is_empty() {
+            self.measurement_id = generate_measurement_id();
+            self.bump();
+        }
+        sanitize_stem(self.measurement_id.trim())
     }
 
     /// Why the photodiode cannot record right now, phrased as the operator
@@ -1517,15 +2068,7 @@ impl StageAA1Plugin {
             return;
         }
         if self.output_folder.trim().is_empty() {
-            self.note("Set an output folder before recording");
-            return;
-        }
-        if self.measurement_id.trim().is_empty() {
-            self.note("Set a measurement id before recording");
-            return;
-        }
-        if self.flux_point_id.trim().is_empty() {
-            self.note("Set the physical I_k flux point id before recording");
+            self.note("Pick an output folder first — that is where the files go");
             return;
         }
         // Checked before the camera starts: every one of these used to surface
@@ -1536,18 +2079,33 @@ impl StageAA1Plugin {
             return;
         }
         let now_ms = now_unix_ms();
-        let id = sanitize_stem(self.measurement_id.trim());
+        // Freeze the bench conditions this run begins under, before any of the
+        // start handshake has had time to move them.
+        self.sensor_at_start = self.sensor;
+        let id = self.ensure_measurement_id();
         // Sweep points get a stable per-point tag so the row's files sort by
         // sweep order as well as by timestamp. Event-count points instead carry
         // their frequency, because one measurement id spans the whole frequency
         // sweep at the single frozen depth a₀.
         let live_hz = self.frequency_hz();
+        // A depth sweep nested inside the frequency ladder repeats its point
+        // indices at every rung, so `_p03` alone would collide across
+        // frequencies within one measurement id. Prefix the ladder's frequency
+        // so the whole q_p(a, f) surface sorts by f, then by depth.
+        let nested_freq_tag = self
+            .freq_sweep
+            .as_ref()
+            .filter(|sweep| sweep.mode == FreqSweepMode::DepthSweep)
+            .map(|sweep| format!("_{}", frequency_tag(sweep.frequency_hz())))
+            .unwrap_or_default();
         let sweep_tag = self
             .sweep
             .as_ref()
             .filter(|sweep| sweep.phase == SweepPhase::Recording)
             .map(|sweep| match sweep.kind {
-                SweepKind::Amplitude => format!("_p{:02}", sweep.index + 1),
+                SweepKind::Amplitude => {
+                    format!("{nested_freq_tag}_p{:02}", sweep.index + 1)
+                }
                 SweepKind::EventCount => {
                     let hz = sweep
                         .lock
@@ -1571,7 +2129,11 @@ impl StageAA1Plugin {
         recording.id = id;
         recording.stem = stem;
         recording.folder = self.output_folder.trim().to_string();
-        recording.duration_s = self.duration_s.max(1) as u64;
+        recording.duration_s = self
+            .pending_duration_s
+            .take()
+            .unwrap_or(self.duration_s)
+            .max(1) as u64;
         // The measurement clock starts only after both recorders acknowledge
         // that they are running.
         recording.start_unix_ms = 0;
@@ -1822,6 +2384,11 @@ impl StageAA1Plugin {
             if let Some(bias) = sibling_toml(&raw) {
                 move_into(&dir, &bias);
             }
+            // The host's sensor telemetry is written as another sibling of the
+            // RAW and used to be left behind entirely, which separated a run
+            // from the bench conditions it was taken under at the first move.
+            // It is rewritten column-wise on the way in — see `sensor`.
+            self.recording.sensor_readout_path = self.gather_sensor_readout(&dir, &raw);
         }
         // PDQ receipts report the *label* A1 asked for, which is relative to the
         // photodiode's data directory — resolve it before touching the file, and
@@ -1834,6 +2401,39 @@ impl StageAA1Plugin {
         {
             self.recording.pd_sidecar_path = Some(move_into(&dir, &sidecar).unwrap_or(sidecar));
         }
+    }
+
+    /// Compacts the host's sensor-telemetry CSV into the measurement folder,
+    /// under the recording's own stem, and removes the original.
+    ///
+    /// Best-effort throughout: a missing or unreadable telemetry file is normal
+    /// (replay, a camera with no monitoring block, a host that did not poll)
+    /// and must not cost the operator the recording that has just finished.
+    fn gather_sensor_readout(&self, dir: &Path, raw: &str) -> Option<String> {
+        let source = Path::new(raw)
+            .file_stem()
+            .map(|stem| {
+                Path::new(raw)
+                    .parent()
+                    .unwrap_or(Path::new("."))
+                    .join(format!("{}.sensor-monitoring.csv", stem.to_string_lossy()))
+            })
+            .filter(|path| path.exists())?;
+        let text = std::fs::read_to_string(&source).ok()?;
+        let readout = sensor::parse_csv(&text);
+        if readout.is_empty() {
+            // Nothing worth keeping, but the wide original is still clutter in
+            // the host's capture folder.
+            let _ = std::fs::remove_file(&source);
+            return None;
+        }
+        let destination = dir.join(format!("{}.sensor.json", self.recording.stem));
+        let json = readout.to_json(&self.recording.id, &self.recording.stem);
+        if std::fs::write(&destination, json).is_err() {
+            return None;
+        }
+        let _ = std::fs::remove_file(&source);
+        Some(destination.display().to_string())
     }
 
     /// Absolute location of a photodiode-reported recording path. Receipts name
@@ -1941,19 +2541,13 @@ impl StageAA1Plugin {
             return;
         }
         if self.output_folder.trim().is_empty() {
-            self.message = "Set an output folder before sweeping".into();
-            return;
-        }
-        if self.measurement_id.trim().is_empty() {
-            self.message = "Set a measurement id before sweeping".into();
-            return;
-        }
-        if self.flux_point_id.trim().is_empty() {
-            self.message = "Set the physical I_k flux point id before sweeping".into();
+            self.message = "Pick an output folder first — that is where the files go".into();
             return;
         }
         if !self.modulation_connected() {
-            self.message = "Modulation owner is not connected — cannot sweep".into();
+            self.message = "The modulation plugin is not connected — connect it to drive the \
+                            depth"
+                .into();
             return;
         }
         if self
@@ -1962,23 +2556,35 @@ impl StageAA1Plugin {
             .and_then(|state| state.calibration_id.as_deref())
             .is_none()
         {
-            self.message =
-                "Apply a measured Pockels transfer calibration before starting an A1 sweep".into();
-            return;
-        }
-        if self.fresh_optical_summary().is_none() {
-            self.message = "Connect the photodiode and obtain a fresh, marker-bounded optical \
-                            summary from a confirmed I_tot anchor before sweeping"
+            self.message = "Run the Pockels calibration in the modulation plugin first — without \
+                            it a commanded depth means nothing"
                 .into();
             return;
         }
+        // Same wording every other gate uses, from the same helper: the owner
+        // knows which estimator gate withheld `a`, and a fixed sentence here
+        // used to send the operator after the wrong thing.
+        if let Some(reason) = self.depth_a_blocker() {
+            self.message = format!(
+                "The sweep needs a {} depth a, but {reason}",
+                self.depth_source.verb()
+            );
+            return;
+        }
+        // The sweep ends in a recording, so ask the recording's own question now
+        // rather than after the drive has already moved to point 1.
+        if let Some(blocker) = self.photodiode_blocker() {
+            self.message = blocker;
+            return;
+        }
         if self.min_a.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
-            self.message =
-                "Set Sweep min a > 0 (a = 0 is the background reference, not a sweep point)".into();
+            self.message = "Set Sweep min a above 0 — a = 0 is the background reference, which \
+                            has its own button"
+                .into();
             return;
         }
         if self.max_a.partial_cmp(&self.min_a) != Some(std::cmp::Ordering::Greater) {
-            self.message = "Sweep needs max a > min a".into();
+            self.message = "Sweep max a must be larger than Sweep min a".into();
             return;
         }
         let points = self.sweep_points();
@@ -2006,15 +2612,12 @@ impl StageAA1Plugin {
             return;
         }
         if self.output_folder.trim().is_empty() {
-            self.message = "Set an output folder before recording".into();
-            return;
-        }
-        if self.measurement_id.trim().is_empty() {
-            self.message = "Set a measurement id before recording".into();
+            self.message = "Pick an output folder first — that is where the files go".into();
             return;
         }
         if !self.modulation_connected() {
-            self.message = "Modulation owner is not connected — cannot drive the depth".into();
+            self.message =
+                "The modulation plugin is not connected — connect it to drive the depth".into();
             return;
         }
         if points.is_empty() {
@@ -2022,6 +2625,10 @@ impl StageAA1Plugin {
             return;
         }
         let now_ms = now_unix_ms();
+        // A verdict belongs to the run that produced it. Clearing it here means
+        // an enclosing ladder can never read the previous rung's outcome if
+        // this one ends without reaching `finish_sweep`.
+        self.last_sweep_completed_ok = false;
         let owns_lease = inherited_lease.is_none();
         let lease_id = inherited_lease.unwrap_or_else(|| {
             LeaseId::new(format!("a1-sweep-{}", format_compact_utc(now_ms / 1_000)))
@@ -2051,6 +2658,7 @@ impl StageAA1Plugin {
             settled_since_ms: None,
             settle_deadline_ms: 0,
             point_started: false,
+            completed_ok: false,
             last_activity_ms: now_ms,
             stop_requested: false,
         });
@@ -2068,14 +2676,11 @@ impl StageAA1Plugin {
         context: &mut impl RecordingControl,
         inherited_lease: Option<LeaseId>,
     ) {
-        let Some(hz) = self.frequency_hz() else {
-            self.message = "No modulation frequency yet — arm the drive first".into();
-            return;
-        };
-        let Some(lock) = self.armed_lock().cloned() else {
+        let Some(lock) = self.armed_a0() else {
             self.message = format!(
-                "No converged a₀ lock for {} — press Find a₀ at this frequency first",
-                frequency_label(hz)
+                "Cannot record the a₀ point: {}",
+                self.armed_a0_blocker()
+                    .unwrap_or_else(|| "no depth is armed".into())
             );
             return;
         };
@@ -2102,6 +2707,7 @@ impl StageAA1Plugin {
     /// Release the modulation lease (if held) and clear the sweep.
     fn finish_sweep(&mut self, context: &mut impl RecordingControl, message: String) {
         if let Some(sweep) = self.sweep.take() {
+            self.last_sweep_completed_ok = sweep.completed_ok;
             if sweep.owns_lease && sweep.lease_granted {
                 let request = self.modulation_request(
                     ModulationCommandV1::ReleaseLease {
@@ -2157,7 +2763,8 @@ impl StageAA1Plugin {
             )
         } else {
             format!(
-                "Event-count point: commanding a = {commanded_a:.3} for a measured a₀ = {target_a:.3}…"
+                "Event-count point: commanding a = {commanded_a:.3} for a {} a₀ = {target_a:.3}…",
+                self.depth_source.verb()
             )
         };
     }
@@ -2251,8 +2858,14 @@ impl StageAA1Plugin {
                     SweepKind::Amplitude => sweep_tolerance(target),
                     SweepKind::EventCount => self.a0_tolerance.max(1e-3),
                 };
+                // With `DepthSource::Commanded` this compares the commanded
+                // depth against itself and settles as soon as the owner has
+                // applied it — which is the honest answer for an open-loop
+                // sweep: nothing on the bench can contradict the command. The
+                // operator's settle dwell below still applies, so the drive
+                // gets its physical time to move either way.
                 let settled = self
-                    .measured_a()
+                    .depth_a()
                     .is_some_and(|measured| (measured - target).abs() <= tolerance);
                 let dwell_ms = (self.settle_s.max(0.0) * 1_000.0) as u64;
                 let mut start_recording = false;
@@ -2315,6 +2928,9 @@ impl StageAA1Plugin {
                         SweepKind::Amplitude => format!("Sweep complete: {total} points recorded"),
                         SweepKind::EventCount => self.message.clone(),
                     };
+                    if let Some(sweep) = self.sweep.as_mut() {
+                        sweep.completed_ok = true;
+                    }
                     self.finish_sweep(context, message);
                 } else {
                     if let Some(sweep) = self.sweep.as_mut() {
@@ -2390,10 +3006,110 @@ impl StageAA1Plugin {
 
     /// The lock that applies to the drive right now: same frequency, converged,
     /// and aimed at the `a₀` currently entered.
+    ///
+    /// "Aimed at the same `a₀`" is judged against the operator's own convergence
+    /// tolerance, not on exact equality. The a₀ field is a drag control with a
+    /// 0.01 step, so a strict comparison disarmed a lock the operator had just
+    /// found the moment they nudged the slider — and then asked them to press
+    /// Find a₀ again, which is what they had done.
     fn armed_lock(&self) -> Option<&A0LockPoint> {
         let hz = self.frequency_hz()?;
+        let tolerance = self.a0_tolerance.max(1e-3);
         self.lock_for_frequency(hz)
-            .filter(|lock| lock.converged && (lock.target_a - self.a0_target).abs() <= 1e-6)
+            .filter(|lock| lock.converged && (lock.target_a - self.a0_target).abs() <= tolerance)
+    }
+
+    /// The depth an `a₀` recording would be made at right now — the one
+    /// question every consumer of the lock table actually asks.
+    ///
+    /// With a measured depth source this is a stored, converged lock: the
+    /// commanded depth that was *found* to produce `a₀` at this frequency, and
+    /// there is no answer until [`Self::begin_a0_lock`] has found one.
+    ///
+    /// With a commanded depth source there is nothing to look up. `a₀` is
+    /// commanded directly, at every frequency, so the answer is always
+    /// available and is synthesised here rather than round-tripped through a
+    /// table of identical rows ([`DepthSource::needs_a0_lock`]). `trials: 0`
+    /// records honestly that no search happened.
+    fn armed_a0(&self) -> Option<A0LockPoint> {
+        if self.depth_source.needs_a0_lock() {
+            return self.armed_lock().cloned();
+        }
+        let hz = self.frequency_hz()?;
+        let target = self.a0_target;
+        (COMMANDED_A_MIN..=COMMANDED_A_MAX)
+            .contains(&target)
+            .then(|| A0LockPoint {
+                frequency_hz: hz,
+                target_a: target,
+                commanded_a: clamp_commanded_a(target),
+                measured_a: target,
+                trials: 0,
+                converged: true,
+                locked_at_unix_ms: now_unix_ms(),
+                low_clip_fraction: None,
+                high_clip_fraction: None,
+                depth_source: self.depth_source,
+            })
+    }
+
+    /// Why no `a₀` recording can be made right now, phrased as the operator
+    /// action that fixes it. `None` means [`Self::armed_a0`] has an answer.
+    fn armed_a0_blocker(&self) -> Option<String> {
+        if self.depth_source.needs_a0_lock() {
+            return self.armed_lock_blocker();
+        }
+        if self.armed_a0().is_some() {
+            return None;
+        }
+        if self.frequency_hz().is_none() {
+            return Some(format!(
+                "there is no modulation frequency yet: {}",
+                self.frequency_blocker()
+                    .unwrap_or_else(|| "no drive is armed".into())
+            ));
+        }
+        Some(format!(
+            "a₀ = {:.3} is outside the drivable {COMMANDED_A_MIN}..={COMMANDED_A_MAX}",
+            self.a0_target
+        ))
+    }
+
+    /// Why the stored locks do not arm a recording at the current frequency,
+    /// phrased as the operator action that fixes it.
+    ///
+    /// The three causes — no lock at this frequency, a lock that did not
+    /// converge, a lock aimed at a different a₀ — used to share one sentence
+    /// telling the operator to press Find a₀, which only helps for the first.
+    fn armed_lock_blocker(&self) -> Option<String> {
+        if self.armed_lock().is_some() {
+            return None;
+        }
+        let Some(hz) = self.frequency_hz() else {
+            return Some(format!(
+                "there is no modulation frequency yet: {}",
+                self.frequency_blocker()
+                    .unwrap_or_else(|| "no drive is armed".into())
+            ));
+        };
+        let label = frequency_label(hz);
+        let Some(lock) = self.lock_for_frequency(hz) else {
+            return Some(format!(
+                "no depth has been found for {label} yet — press Find a₀ at this frequency"
+            ));
+        };
+        if !lock.converged {
+            return Some(format!(
+                "the last Find a₀ at {label} did not reach a₀ (it stopped at a measured {:.3}) — \
+                 press Find a₀ again, or widen the a₀ tolerance",
+                lock.measured_a
+            ));
+        }
+        Some(format!(
+            "the depth found for {label} was aimed at a₀ = {:.3}, and a₀ is now {:.3} — press \
+             Find a₀ again at the new a₀",
+            lock.target_a, self.a0_target
+        ))
     }
 
     fn a0_locks_path(&self) -> Option<PathBuf> {
@@ -2474,6 +3190,18 @@ impl StageAA1Plugin {
             self.message = "A recording, sweep or a₀ lock is already running".into();
             return;
         }
+        // There is nothing to search for when `a` *is* the command: the search
+        // would command a₀, read back a₀ and stop. Say so instead of spending
+        // a lease and a trial to arrive back where the operator already is.
+        if !self.depth_source.needs_a0_lock() {
+            self.message = format!(
+                "No search needed: with the depth coming from the commanded drive, a₀ = {:.3} is \
+                 simply commanded at every frequency. Press \"Record a₀ point\", or \"Record all \
+                 frequencies\" for the whole ladder.",
+                self.a0_target
+            );
+            return;
+        }
         if !self.modulation_connected() {
             self.message = "Modulation owner is not connected — cannot find a₀".into();
             return;
@@ -2486,12 +3214,18 @@ impl StageAA1Plugin {
             return;
         }
         let Some(hz) = self.frequency_hz() else {
-            self.message = "No modulation frequency yet — arm the drive before finding a₀".into();
+            self.message = format!(
+                "Cannot find a₀ without a modulation frequency: {}",
+                self.frequency_blocker()
+                    .unwrap_or_else(|| "no drive is armed".into())
+            );
             return;
         };
-        if self.measured_a().is_none() {
-            self.message =
-                "No photodiode-measured a — connect the photodiode and anchor I_tot first".into();
+        if let Some(reason) = self.depth_a_blocker() {
+            self.message = format!(
+                "Cannot find a₀ without a {} a: {reason}",
+                self.depth_source.verb()
+            );
             return;
         }
         // Refuse before touching the drive, not after eight trials of chasing a
@@ -2592,8 +3326,9 @@ impl StageAA1Plugin {
             lock.last_activity_ms = now_ms;
         }
         self.message = format!(
-            "a₀ lock trial {trial}/{A0_LOCK_MAX_TRIALS}: commanding a = {commanded:.3} for a \
-             measured a₀ = {target:.3}…"
+            "a₀ lock trial {trial}/{A0_LOCK_MAX_TRIALS}: commanding a = {commanded:.3} for a {} \
+             a₀ = {target:.3}…",
+            self.depth_source.verb()
         );
     }
 
@@ -2623,6 +3358,11 @@ impl StageAA1Plugin {
     /// one inside the estimate. Owners that predate the field do not publish
     /// it; then only the operator's settle dwell is available.
     fn optical_window_seconds(&self) -> Option<f64> {
+        // A window only bounds a depth that is read out of it. A commanded
+        // depth is not, so there is nothing here to wait for or to check.
+        if self.depth_source != DepthSource::Photodiode {
+            return None;
+        }
         self.photodiode
             .as_ref()?
             .optical_summary
@@ -2674,24 +3414,52 @@ impl StageAA1Plugin {
     /// otherwise they share nearly all their samples and three of them say no
     /// more than one.
     fn sample_a0_measurement(&mut self, now_ms: u64) {
-        let Some((revision, measured)) = self.photodiode.as_ref().and_then(|summary| {
-            summary
-                .optical_summary
-                .as_ref()
-                .map(|optical| (summary.service_revision, optical.measured_log_contrast))
-        }) else {
+        let Some((revision, measured)) = self.depth_reading() else {
             return;
         };
         let spacing_ms = self.a0_sample_spacing_ms();
+        // The stale-window rule exists because the photodiode's estimate mixes
+        // samples from before and after the depth changed. A commanded depth is
+        // not read out of a window at all — it is the value that was just
+        // applied — so holding it to the same rule would only make the trial
+        // depend on the modulation owner's device-poll cadence, and time out
+        // whenever that owner had nothing new to say.
+        let requires_new_revision = self.depth_source == DepthSource::Photodiode;
         let Some(lock) = self.a0_lock.as_mut() else {
             return;
         };
-        if now_ms < lock.measure_from_ms || lock.sampled_revision == Some(revision) {
+        if now_ms < lock.measure_from_ms
+            || (requires_new_revision && lock.sampled_revision == Some(revision))
+        {
             return;
         }
         lock.sampled_revision = Some(revision);
         lock.samples.push(measured);
         lock.measure_from_ms = now_ms.saturating_add(spacing_ms);
+    }
+
+    /// One depth reading from the active [`DepthSource`], tagged with the
+    /// publishing owner's service revision.
+    ///
+    /// The revision is what makes a reading *independent*: the lock only counts
+    /// values published after it commanded the depth, so a trial never averages
+    /// in the previous one. Both owners bump their revision on every state
+    /// change, so the same rule works for either source.
+    fn depth_reading(&self) -> Option<(u64, f64)> {
+        match self.depth_source {
+            DepthSource::Photodiode => self.photodiode.as_ref().and_then(|summary| {
+                summary
+                    .optical_summary
+                    .as_ref()
+                    .map(|optical| (summary.service_revision, optical.measured_log_contrast))
+            }),
+            DepthSource::Commanded => self.commanded_a().map(|a| {
+                (
+                    self.modulation.as_ref().map_or(0, |s| s.service_revision),
+                    a,
+                )
+            }),
+        }
     }
 
     /// Minimum gap between two readings of one trial.
@@ -2706,6 +3474,11 @@ impl StageAA1Plugin {
 
     /// Photodiode clipping note for a lock message, empty when the windows are clean.
     fn clip_warning(&self) -> String {
+        // A clipped detector window says nothing about a commanded depth, and
+        // appending it to that lock's message would suggest it did.
+        if self.depth_source != DepthSource::Photodiode {
+            return String::new();
+        }
         let Some(optical) = self
             .photodiode
             .as_ref()
@@ -2740,15 +3513,15 @@ impl StageAA1Plugin {
         let mut readings = lock.samples.clone();
         if readings.is_empty() {
             // The owner withholds `a` for a stated reason (clipping, no
-            // headroom, a bad `I_tot` anchor, a sub-cycle window). It does not
-            // publish the reason on the contract, so name the likely ones
-            // rather than leave the operator with "nothing happened".
+            // headroom, a bad `I_tot` anchor, a sub-cycle window). Ask the
+            // blocker for it rather than leaving the operator with "nothing
+            // happened" — and it answers for whichever source is selected.
+            let reason = self
+                .depth_a_blocker()
+                .unwrap_or_else(|| "it published nothing while the lock was measuring".into());
             self.finish_a0_lock(
                 context,
-                "a₀ lock aborted: the photodiode published no a while measuring — it withholds \
-                 one when the window clips, has no headroom above dark, the I_tot anchor is \
-                 below the signal, or the window is shorter than one modulation cycle"
-                    .into(),
+                format!("a₀ lock aborted: no depth a arrived while measuring — {reason}"),
             );
             return;
         }
@@ -2759,8 +3532,9 @@ impl StageAA1Plugin {
             self.finish_a0_lock(
                 context,
                 format!(
-                    "a₀ lock aborted: the photodiode measured a = {measured:.3} — check the I_tot \
-                     anchor and that the drive is modulating"
+                    "a₀ lock aborted: the {} a = {measured:.3} — check the I_tot anchor and that \
+                     the drive is modulating",
+                    self.depth_source.verb()
                 ),
             );
             return;
@@ -2771,7 +3545,7 @@ impl StageAA1Plugin {
             self.finish_a0_lock(
                 context,
                 format!(
-                    "a₀ lock aborted at {}: the measured a is not settled — {} readings spread \
+                    "a₀ lock aborted at {}: the observed a is not settled — {} readings spread \
                      {spread:.3} across {}× the ±{tolerance:.3} tolerance (median {measured:.3}). \
                      Increase Sweep settle (s) or check the drive and the I_tot anchor",
                     frequency_label(hz),
@@ -2797,8 +3571,9 @@ impl StageAA1Plugin {
                 lock.trial += 1;
             }
             self.message = format!(
-                "a₀ lock trial {trial}: measured a = {measured:.3} vs a₀ = {target:.3} — \
-                 correcting the commanded depth to {next:.3}"
+                "a₀ lock trial {trial}: {} a = {measured:.3} vs a₀ = {target:.3} — correcting the \
+                 commanded depth to {next:.3}",
+                self.depth_source.verb()
             );
             self.send_a0_depth(context);
             return;
@@ -2818,22 +3593,29 @@ impl StageAA1Plugin {
             locked_at_unix_ms: now_unix_ms(),
             low_clip_fraction: optical.map(|optical| optical.low_clip_fraction),
             high_clip_fraction: optical.map(|optical| optical.high_clip_fraction),
+            depth_source: self.depth_source,
         });
         let label = frequency_label(hz);
+        // "measures" is a claim about the light. Open loop the lock has only
+        // confirmed that the drive accepted the depth, so say that instead.
+        let verb = match self.depth_source {
+            DepthSource::Photodiode => "measures",
+            DepthSource::Commanded => "is commanded as",
+        };
         let message = if converged {
             format!(
-                "a₀ locked at {label}: commanded a = {commanded:.3} measures a = {measured:.3} \
+                "a₀ locked at {label}: commanded a = {commanded:.3} {verb} a = {measured:.3} \
                  (a₀ = {target:.3}, {trial} trial(s)){}",
                 self.clip_warning()
             )
         } else if railed {
             format!(
                 "a₀ lock stopped at {label}: commanded a = {commanded:.3} is at the drivable limit \
-                 and only measures a = {measured:.3} — lower a₀ or the operating point I_k"
+                 and only {verb} a = {measured:.3} — lower a₀ or the operating point I_k"
             )
         } else {
             format!(
-                "a₀ lock did not converge at {label}: best commanded a = {commanded:.3} measures \
+                "a₀ lock did not converge at {label}: best commanded a = {commanded:.3} {verb} \
                  a = {measured:.3} after {trial} trials — widen the tolerance or check the drive"
             )
         };
@@ -2899,10 +3681,7 @@ impl StageAA1Plugin {
                     let dwell_ms = ((self.settle_s.max(0.0) * 1_000.0) as u64).max(window_ms);
                     // Only summaries published *after* this depth was commanded
                     // count, so the trial never averages the previous depth.
-                    let published = self
-                        .photodiode
-                        .as_ref()
-                        .map(|summary| summary.service_revision);
+                    let published = self.depth_reading().map(|(revision, _)| revision);
                     if let Some(lock) = self.a0_lock.as_mut() {
                         lock.phase = A0LockPhase::Measuring;
                         lock.window_ms = window_ms;
@@ -3067,12 +3846,20 @@ impl StageAA1Plugin {
         points
     }
 
-    /// Lease TTL for the whole ladder: every point pays a lock and a recording.
-    fn freq_sweep_lease_ttl_ms(&self, remaining_points: usize) -> u64 {
-        let per_point_ms = self
-            .a0_lock_lease_ttl_ms()
-            .saturating_add(self.sweep_lease_ttl_ms(1))
-            .saturating_add(FREQ_CONFIRM_BASE_MS);
+    /// Lease TTL for the whole ladder: what one rung costs, times the rungs
+    /// left. A depth-sweep rung is a whole inner sweep, so it is the expensive
+    /// one by a factor of the point count — a TTL sized for an `a₀` point would
+    /// expire mid-curve and hand the drive back to the operator's settings.
+    fn freq_sweep_lease_ttl_ms(&self, remaining_points: usize, mode: FreqSweepMode) -> u64 {
+        let inner_ms = match mode {
+            FreqSweepMode::A0Point => self
+                .a0_lock_lease_ttl_ms()
+                .saturating_add(self.sweep_lease_ttl_ms(1)),
+            FreqSweepMode::DepthSweep => {
+                self.sweep_lease_ttl_ms(self.sweep_count.clamp(2, 64) as usize)
+            }
+        };
+        let per_point_ms = inner_ms.saturating_add(FREQ_CONFIRM_BASE_MS);
         (remaining_points as u64)
             .saturating_mul(per_point_ms)
             .saturating_add(60_000)
@@ -3083,7 +3870,7 @@ impl StageAA1Plugin {
     /// Everything checkable is checked *here*, before the drive moves: a plan
     /// that cannot work at its lowest frequency should say so in a message, not
     /// two hours into a block.
-    fn begin_freq_sweep(&mut self, context: &mut impl RecordingControl) {
+    fn begin_freq_sweep(&mut self, context: &mut impl RecordingControl, mode: FreqSweepMode) {
         if self.recording.is_active()
             || self.sweep.is_some()
             || self.a0_lock.is_some()
@@ -3093,15 +3880,21 @@ impl StageAA1Plugin {
             return;
         }
         if self.output_folder.trim().is_empty() {
-            self.message = "Set an output folder before sweeping the frequency".into();
-            return;
-        }
-        if self.measurement_id.trim().is_empty() {
-            self.message = "Set a measurement id before sweeping the frequency".into();
+            self.message = "Pick an output folder first — that is where the files go".into();
             return;
         }
         if !self.modulation_connected() {
-            self.message = "Modulation owner is not connected — cannot drive the frequency".into();
+            self.message = "The modulation plugin is not connected — connect it to drive the \
+                            frequency"
+                .into();
+            return;
+        }
+        // Every point of the ladder ends in a recording, so ask the recording's
+        // own question here. It used to be asked for the first time three stages
+        // in, at point 1, after the drive had already been retargeted — which is
+        // how the panel came to read "Recording: idle" mid-ladder.
+        if let Some(blocker) = self.photodiode_blocker() {
+            self.message = blocker;
             return;
         }
         // Written through `partial_cmp` so a NaN from the settings drag is
@@ -3112,20 +3905,44 @@ impl StageAA1Plugin {
                 Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
             );
         if !range_ok {
-            self.message = "Frequency sweep needs 0 < min f ≤ max f".into();
+            self.message = "Set Sweep min f above 0 and Sweep max f at or above it".into();
             return;
         }
-        if self.measured_a().is_none() {
-            self.message =
-                "No photodiode-measured a — connect the photodiode and anchor I_tot first".into();
-            return;
-        }
-        let target = self.a0_target;
-        if !(COMMANDED_A_MIN..=COMMANDED_A_MAX).contains(&target) {
+        if let Some(reason) = self.depth_a_blocker() {
             self.message = format!(
-                "a₀ = {target:.3} is outside the drivable {COMMANDED_A_MIN}..={COMMANDED_A_MAX}"
+                "The frequency sweep needs a {} depth a, but {reason}",
+                self.depth_source.verb()
             );
             return;
+        }
+        // Each mode reads a different depth setting, so each validates its own.
+        match mode {
+            FreqSweepMode::A0Point => {
+                let target = self.a0_target;
+                if !(COMMANDED_A_MIN..=COMMANDED_A_MAX).contains(&target) {
+                    self.message = format!(
+                        "a₀ = {target:.3} is outside the drivable \
+                         {COMMANDED_A_MIN}..={COMMANDED_A_MAX}"
+                    );
+                    return;
+                }
+            }
+            FreqSweepMode::DepthSweep => {
+                // Same two questions `begin_sweep` asks of the depth range,
+                // asked here before the drive moves rather than at the first
+                // rung — a ladder that cannot record its inner sweep should say
+                // so on the button press.
+                if self.min_a.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
+                    self.message = "Set Sweep min a above 0 — a = 0 is the background reference, \
+                                    which has its own button"
+                        .into();
+                    return;
+                }
+                if self.max_a.partial_cmp(&self.min_a) != Some(std::cmp::Ordering::Greater) {
+                    self.message = "Sweep max a must be larger than Sweep min a".into();
+                    return;
+                }
+            }
         }
         // The photodiode estimates `a` over one window for all frequencies, so
         // the *lowest* planned frequency decides whether the ladder is
@@ -3134,13 +3951,25 @@ impl StageAA1Plugin {
             self.message = format!("Frequency sweep refused at its lowest point: {reason}");
             return;
         }
-        if !self.is_marker_anchored() {
+        // Only the measured source needs the camera trigger: it is what confirms
+        // each commanded frequency and what anchors the fold the point is scored
+        // in. Commanded mode confirms against the modulation owner instead
+        // (ADR 021), so requiring markers here would refuse a ladder that can
+        // run perfectly well.
+        if self.depth_source.needs_a0_lock() && !self.is_marker_anchored() {
             // Without the phase-0 trigger there is nothing that can confirm the
             // drive actually reached a commanded frequency, and the fold has no
-            // anchor either.
-            self.message = "No phase-0 trigger markers — the sweep cannot confirm a commanded \
-                            frequency. Enable Live analysis and check EXT_TRIGGER"
-                .into();
+            // anchor either. Live analysis off and a missing trigger cable look
+            // identical from the marker count, so name whichever one it is.
+            self.message = if self.live {
+                "No phase-0 trigger markers — the sweep cannot confirm a commanded frequency. \
+                 Check the EXT_TRIGGER wiring from the Teensy to the camera"
+                    .into()
+            } else {
+                "Live analysis is off, so no phase-0 markers are ingested and the sweep cannot \
+                 confirm a commanded frequency. Enable Live analysis"
+                    .into()
+            };
             return;
         }
         let points = self.freq_sweep_points();
@@ -3150,7 +3979,7 @@ impl StageAA1Plugin {
         }
         let now_ms = now_unix_ms();
         let lease_id = LeaseId::new(format!("a1-fsweep-{}", format_compact_utc(now_ms / 1_000)));
-        let ttl_ms = self.freq_sweep_lease_ttl_ms(points.len());
+        let ttl_ms = self.freq_sweep_lease_ttl_ms(points.len(), mode);
         let request =
             self.modulation_request(ModulationCommandV1::AcquireLease { ttl_ms }, &lease_id);
         let lease_req = request.request_id;
@@ -3158,6 +3987,7 @@ impl StageAA1Plugin {
         let total = points.len();
         self.freq_sweep = Some(FreqSweep {
             phase: FreqSweepPhase::AcquiringLease,
+            mode,
             points,
             index: 0,
             lease_id,
@@ -3174,10 +4004,18 @@ impl StageAA1Plugin {
             last_activity_ms: now_ms,
             stop_requested: false,
         });
-        self.message = format!(
-            "Frequency sweep: acquiring the modulation lease for {total} points ({} order)…",
-            self.freq_order.label()
-        );
+        self.message = match mode {
+            FreqSweepMode::A0Point => format!(
+                "Frequency sweep: acquiring the modulation lease for {total} points ({} order)…",
+                self.freq_order.label()
+            ),
+            FreqSweepMode::DepthSweep => format!(
+                "Depth sweep at every frequency: acquiring the modulation lease for {total} × {} \
+                 recordings ({} order)…",
+                self.sweep_count.clamp(2, 64),
+                self.freq_order.label()
+            ),
+        };
     }
 
     /// Release the ladder's lease (if this run holds it) and clear the sweep.
@@ -3212,8 +4050,9 @@ impl StageAA1Plugin {
         let hz = sweep.frequency_hz();
         let (index, total) = (sweep.index, sweep.points.len());
         let is_reference = sweep.point().is_some_and(|point| point.is_reference);
+        let mode = sweep.mode;
 
-        let ttl_ms = self.freq_sweep_lease_ttl_ms(remaining);
+        let ttl_ms = self.freq_sweep_lease_ttl_ms(remaining, mode);
         let renew = self.modulation_request(ModulationCommandV1::RenewLease { ttl_ms }, &lease_id);
         context.request_service(&renew);
         let request = self.modulation_request(
@@ -3252,6 +4091,74 @@ impl StageAA1Plugin {
         );
     }
 
+    /// Hand the current ladder point to the one-point event-count recording.
+    ///
+    /// Reached either from the finished `a₀` search (measured depth source) or
+    /// straight from the confirmed frequency (commanded source, where there is
+    /// no search). Both need the same question answered — *what depth is armed
+    /// at this frequency?* — so both ask [`Self::armed_a0`] and neither knows
+    /// which regime it is in.
+    fn start_freq_sweep_recording(&mut self, context: &mut impl RecordingControl) {
+        let Some((mode, hz, index, total)) = self.freq_sweep.as_ref().map(|sweep| {
+            (
+                sweep.mode,
+                sweep.frequency_hz(),
+                sweep.index,
+                sweep.points.len(),
+            )
+        }) else {
+            return;
+        };
+        // A non-converged lock is stored but never arms a recording, so this is
+        // the single question worth asking for an `a₀` rung.
+        if mode.needs_armed_depth() && self.armed_a0().is_none() {
+            let reason = self
+                .armed_a0_blocker()
+                .unwrap_or_else(|| self.message.clone());
+            self.fail_freq_sweep_point(context, reason);
+            return;
+        }
+        if let Some(sweep) = self.freq_sweep.as_mut() {
+            sweep.phase = FreqSweepPhase::Recording;
+        }
+        let lease = self.freq_sweep.as_ref().map(|sweep| sweep.lease_id.clone());
+        let label = frequency_label(hz);
+        match mode {
+            FreqSweepMode::A0Point => self.begin_a0_point(context, lease),
+            // The inner run is the *unchanged* amplitude sweep, handed this
+            // ladder's lease so the operator's drive settings stay locked out
+            // from the first frequency to the last rather than being handed
+            // back between rungs.
+            FreqSweepMode::DepthSweep => {
+                let points = self.sweep_points();
+                let message = format!(
+                    "Depth sweep {}/{total} at {label}: {} depths…",
+                    index + 1,
+                    points.len()
+                );
+                self.begin_leased_sweep(
+                    context,
+                    SweepKind::Amplitude,
+                    points,
+                    None,
+                    lease,
+                    message,
+                );
+            }
+        }
+        if self.sweep.is_none() {
+            let reason = self.message.clone();
+            self.fail_freq_sweep_point(context, reason);
+            return;
+        }
+        if mode == FreqSweepMode::A0Point {
+            self.message = format!(
+                "Frequency sweep {}/{total}: recording the a₀ point at {label}…",
+                index + 1
+            );
+        }
+    }
+
     /// Give up on the current point and move to the next one.
     ///
     /// A frequency that cannot be locked or recorded does not end the ladder:
@@ -3286,11 +4193,10 @@ impl StageAA1Plugin {
             self.send_freq_sweep_frequency(context);
             return;
         }
-        let (recorded, failed, total, order, seed) = self
-            .freq_sweep
-            .as_ref()
-            .map(|sweep| {
+        let Some((mode, recorded, failed, total, order, seed)) =
+            self.freq_sweep.as_ref().map(|sweep| {
                 (
+                    sweep.mode,
                     sweep.recorded,
                     sweep.failed.clone(),
                     sweep.points.len(),
@@ -3298,11 +4204,22 @@ impl StageAA1Plugin {
                     sweep.seed,
                 )
             })
-            .unwrap_or_default();
-        let mut message = format!(
-            "Frequency sweep complete: {recorded}/{total} points recorded ({} order, seed {seed})",
-            order.label()
-        );
+        else {
+            return;
+        };
+        let mut message = match mode {
+            FreqSweepMode::A0Point => format!(
+                "Frequency sweep complete: {recorded}/{total} points recorded ({} order, seed \
+                 {seed})",
+                order.label()
+            ),
+            FreqSweepMode::DepthSweep => format!(
+                "Depth sweep at every frequency complete: {recorded}/{total} frequencies × {} \
+                 depths recorded ({} order, seed {seed})",
+                self.sweep_count.clamp(2, 64),
+                order.label()
+            ),
+        };
         if !failed.is_empty() {
             let list = failed
                 .iter()
@@ -3310,23 +4227,479 @@ impl StageAA1Plugin {
                 .collect::<Vec<_>>()
                 .join(", ");
             message.push_str(&format!(
-                " — {} skipped: {list}. See the a₀ lock table",
-                failed.len()
+                " — {} skipped: {list}{}",
+                failed.len(),
+                if mode.needs_armed_depth() && self.depth_source.needs_a0_lock() {
+                    ". See the a₀ lock table"
+                } else {
+                    ""
+                }
             ));
         }
         self.finish_freq_sweep(context, message);
+    }
+
+    // ---- declarative protocol runs -------------------------------------
+
+    /// Lease TTL covering the whole protocol, plus a minute of slack.
+    ///
+    /// One lease for the whole file, like the frequency ladder: a TTL that
+    /// expired between points would hand the drive back to the operator's
+    /// armed settings mid-survey, and the remaining points would record
+    /// against them without saying so.
+    fn protocol_lease_ttl_ms(plan: &protocol::Protocol, from: usize) -> u64 {
+        let remaining: f64 = plan.points[from.min(plan.points.len())..]
+            .iter()
+            .map(|point| point.duration_s as f64 + point.settle_s)
+            .sum();
+        // Doubled: every point also spends time on the start/finalize
+        // handshake, which is not in the protocol's own numbers.
+        ((remaining * 2_000.0) as u64).saturating_add(60_000)
+    }
+
+    /// Load, validate and start the protocol named in the settings.
+    ///
+    /// Everything checkable is checked here, before the drive moves — the
+    /// whole point of a protocol is that it runs unattended, so a file that
+    /// cannot work should say so on the button press rather than at 3 a.m.
+    fn begin_protocol(&mut self, context: &mut impl RecordingControl) {
+        if self.recording.is_active()
+            || self.sweep.is_some()
+            || self.a0_lock.is_some()
+            || self.freq_sweep.is_some()
+            || self.protocol.is_some()
+        {
+            self.message = "A recording, sweep or protocol is already running".into();
+            return;
+        }
+        if self.output_folder.trim().is_empty() {
+            self.message = "Pick an output folder first — that is where the files go".into();
+            return;
+        }
+        let path = self.protocol_path.trim().to_owned();
+        if path.is_empty() {
+            self.message = "Choose a protocol file first".into();
+            return;
+        }
+        if !self.modulation_connected() {
+            self.message =
+                "The modulation plugin is not connected — connect it to drive the protocol".into();
+            return;
+        }
+        if let Some(blocker) = self.photodiode_blocker() {
+            self.message = blocker;
+            return;
+        }
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) => {
+                self.message = format!("Cannot read {path}: {error}");
+                return;
+            }
+        };
+        let plan = match protocol::parse_file(&path, &text) {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.message = format!("Protocol rejected — {error}");
+                return;
+            }
+        };
+        // The photodiode measures `a` over one window for every frequency, so
+        // the lowest frequency in the file decides whether the survey is
+        // measurable at all. Refuse the plan, not its 40th point.
+        let lowest = plan
+            .points
+            .iter()
+            .map(|point| point.frequency_hz)
+            .fold(f64::INFINITY, f64::min);
+        if lowest.is_finite() {
+            if let Err(reason) = self.optical_window_covers_a_cycle(lowest) {
+                self.message = format!(
+                    "Protocol refused at its lowest frequency ({}): {reason}",
+                    frequency_label(lowest)
+                );
+                return;
+            }
+        }
+
+        let now_ms = now_unix_ms();
+        let lease_id = LeaseId::new(format!(
+            "a1-protocol-{}",
+            format_compact_utc(now_ms / 1_000)
+        ));
+        let ttl_ms = Self::protocol_lease_ttl_ms(&plan, 0);
+        let request =
+            self.modulation_request(ModulationCommandV1::AcquireLease { ttl_ms }, &lease_id);
+        let lease_req = request.request_id;
+        context.request_service(&request);
+
+        let (means, frequencies, depths) = plan.axis_counts();
+        let total = plan.points.len();
+        let minutes = plan.total_seconds() / 60.0;
+        self.message = format!(
+            "Protocol '{}': {total} recordings ({means} × ū, {frequencies} × f, {depths} × a), \
+             about {minutes:.0} min of bench time — acquiring the modulation lease…",
+            plan.name
+        );
+        self.protocol = Some(ProtocolRun {
+            plan,
+            phase: ProtocolPhase::AcquiringLease,
+            index: 0,
+            lease_id,
+            lease_granted: false,
+            lease_req,
+            pending_reqs: Vec::new(),
+            settle_until_ms: 0,
+            failed: Vec::new(),
+            recorded: 0,
+            last_activity_ms: now_ms,
+            stop_requested: false,
+            skip_reason: None,
+        });
+    }
+
+    /// Release the protocol's lease (if this run holds it) and clear it.
+    fn finish_protocol(&mut self, context: &mut impl RecordingControl, message: String) {
+        if let Some(run) = self.protocol.take() {
+            if run.lease_granted {
+                let request = self.modulation_request(
+                    ModulationCommandV1::ReleaseLease {
+                        safe_off: false,
+                        reason: "a1 protocol finished".into(),
+                    },
+                    &run.lease_id,
+                );
+                context.request_service(&request);
+            }
+        }
+        self.message = message;
+    }
+
+    /// Renew the lease and retarget all three axes at the current point.
+    fn send_protocol_point(&mut self, context: &mut impl RecordingControl) {
+        let Some(run) = self.protocol.as_ref() else {
+            return;
+        };
+        let Some(point) = run.point().cloned() else {
+            return;
+        };
+        let lease_id = run.lease_id.clone();
+        let (index, total) = (run.index, run.plan.points.len());
+        let ttl_ms = Self::protocol_lease_ttl_ms(&run.plan, index);
+
+        let renew = self.modulation_request(ModulationCommandV1::RenewLease { ttl_ms }, &lease_id);
+        context.request_service(&renew);
+
+        // All three axes, every point. A protocol states the whole operating
+        // condition, so nothing is left at whatever the previous point or the
+        // operator happened to leave behind.
+        let mut pending = Vec::with_capacity(3);
+        for command in [
+            ModulationCommandV1::SetOperatingPoint {
+                mean_u_milli: (point.mean_u * 1_000.0).round().clamp(0.0, 1_000.0) as u32,
+            },
+            ModulationCommandV1::SetDriveFrequency {
+                frequency_millihz: (point.frequency_hz * 1_000.0).round().max(0.0) as u64,
+            },
+            ModulationCommandV1::SetOpticalDepth {
+                depth_a_milli: depth_a_milli(point.depth_a),
+            },
+        ] {
+            let request = self.modulation_request(command, &lease_id);
+            pending.push(request.request_id);
+            context.request_service(&request);
+        }
+
+        // The retained markers and events belong to the previous point's
+        // frequency; the measured period is their mean spacing, so leaving
+        // them would confirm this point against a mixture of the two. Pilot
+        // windows are frozen at a phase of the old period and do not transfer.
+        self.camera_markers_us.clear();
+        self.camera_events.clear();
+        self.fold_cache.replace(None);
+        self.pilot_windows = None;
+
+        let now_ms = now_unix_ms();
+        if let Some(run) = self.protocol.as_mut() {
+            run.phase = ProtocolPhase::Retargeting;
+            run.pending_reqs = pending;
+            run.skip_reason = None;
+            run.last_activity_ms = now_ms;
+        }
+        self.message = format!(
+            "Protocol {}/{total} [{}]: ū={:.2}, f={}, a={:.2}…",
+            index + 1,
+            point.block,
+            point.mean_u,
+            frequency_label(point.frequency_hz),
+            point.depth_a,
+        );
+    }
+
+    /// Give up on the current point and move to the next.
+    fn fail_protocol_point(&mut self, context: &mut impl RecordingControl, reason: String) {
+        let Some(run) = self.protocol.as_mut() else {
+            return;
+        };
+        let index = run.index;
+        run.failed.push((index, reason.clone()));
+        let point = run.plan.points[index].clone();
+        self.message = format!(
+            "Protocol point {} (ū={:.2}, f={}, a={:.2}) skipped: {reason}",
+            index + 1,
+            point.mean_u,
+            frequency_label(point.frequency_hz),
+            point.depth_a,
+        );
+        self.advance_protocol(context);
+    }
+
+    /// Step to the next point, or finish.
+    fn advance_protocol(&mut self, context: &mut impl RecordingControl) {
+        let Some(run) = self.protocol.as_mut() else {
+            return;
+        };
+        run.index += 1;
+        run.last_activity_ms = now_unix_ms();
+        if run.index < run.plan.points.len() && !run.stop_requested {
+            self.send_protocol_point(context);
+            return;
+        }
+        let (name, recorded, failed, total) = (
+            run.plan.name.clone(),
+            run.recorded,
+            run.failed.clone(),
+            run.plan.points.len(),
+        );
+        let stopped = run.stop_requested;
+        let mut message = format!(
+            "Protocol '{name}' {}: {recorded}/{total} recorded",
+            if stopped { "stopped" } else { "finished" }
+        );
+        if !failed.is_empty() {
+            // Name the reasons, not just the count: an unattended run's whole
+            // report is this one line.
+            let mut reasons: Vec<String> = failed
+                .iter()
+                .map(|(_, reason)| reason.clone())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            reasons.truncate(3);
+            message.push_str(&format!(
+                " — {} skipped ({})",
+                failed.len(),
+                reasons.join("; ")
+            ));
+        }
+        self.finish_protocol(context, message);
+    }
+
+    /// Advance a protocol run one control tick. Runs outermost: a point it
+    /// starts hands off to the recording coordinator on the same tick.
+    fn drive_protocol(&mut self, context: &mut impl RecordingControl) {
+        if self.protocol.is_none() {
+            if self.protocol_pending {
+                self.protocol_pending = false;
+                self.begin_protocol(context);
+            }
+            return;
+        }
+        if self.protocol_pending {
+            // Say so rather than swallowing the press: Stop is a different
+            // button, and a silently ignored one reads as a dead control.
+            self.protocol_pending = false;
+            self.message = "A protocol is already running — press Stop to end it".into();
+        }
+        let now_ms = now_unix_ms();
+        let (phase, stop_requested, lease_granted, retargets_left, settle_until_ms, last_activity) = {
+            let run = self.protocol.as_ref().expect("run checked above");
+            (
+                run.phase,
+                run.stop_requested,
+                run.lease_granted,
+                run.pending_reqs.len(),
+                run.settle_until_ms,
+                run.last_activity_ms,
+            )
+        };
+
+        // A stop waits for the recording in flight to wind down, then ends the
+        // run — a protocol that abandoned a half-written file would leave a
+        // truncated RAW behind.
+        if stop_requested {
+            if self.recording.is_active() {
+                self.recording.stop_requested = true;
+                return;
+            }
+            self.advance_protocol(context);
+            return;
+        }
+
+        match phase {
+            ProtocolPhase::AcquiringLease => {
+                if !lease_granted {
+                    if now_ms.saturating_sub(last_activity) > REPLY_TIMEOUT_MS {
+                        self.finish_protocol(
+                            context,
+                            "Protocol aborted: the modulation plugin did not grant the lease"
+                                .into(),
+                        );
+                    }
+                    return;
+                }
+                self.send_protocol_point(context);
+            }
+            ProtocolPhase::Retargeting => {
+                if let Some(reason) = self
+                    .protocol
+                    .as_mut()
+                    .and_then(|run| run.skip_reason.take())
+                {
+                    self.fail_protocol_point(context, reason);
+                    return;
+                }
+                if retargets_left > 0 {
+                    if now_ms.saturating_sub(last_activity) > REPLY_TIMEOUT_MS {
+                        self.fail_protocol_point(
+                            context,
+                            "the modulation plugin did not apply the requested drive".into(),
+                        );
+                    }
+                    return;
+                }
+                let settle_ms = self
+                    .protocol
+                    .as_ref()
+                    .and_then(|run| run.point())
+                    .map(|point| (point.settle_s * 1_000.0).round().max(0.0) as u64)
+                    .unwrap_or(0);
+                if let Some(run) = self.protocol.as_mut() {
+                    run.phase = ProtocolPhase::Settling;
+                    run.settle_until_ms = now_ms.saturating_add(settle_ms);
+                    run.last_activity_ms = now_ms;
+                }
+            }
+            ProtocolPhase::Settling => {
+                if now_ms < settle_until_ms {
+                    return;
+                }
+                let duration_s = self
+                    .protocol
+                    .as_ref()
+                    .and_then(|run| run.point())
+                    .map(|point| point.duration_s)
+                    .unwrap_or(self.duration_s);
+                // The point's own duration wins over the panel's: the file says
+                // how long each point runs, and a survey whose lengths silently
+                // came from the UI would not be reproducible from the protocol
+                // alone. Through the override, not `duration_s` — see
+                // `pending_duration_s`.
+                self.pending_duration_s = Some(duration_s);
+                if let Some(run) = self.protocol.as_mut() {
+                    run.phase = ProtocolPhase::Recording;
+                    run.last_activity_ms = now_ms;
+                }
+                // The row says what it is: a protocol can carry its own
+                // background and pilot, so a survey does not need two button
+                // presses before it can be started.
+                let role = self
+                    .protocol
+                    .as_ref()
+                    .and_then(|run| run.point())
+                    .map(|point| match point.role {
+                        protocol::PointRole::Normal => RecRole::Normal,
+                        protocol::PointRole::Pilot => RecRole::Pilot,
+                        protocol::PointRole::Background => RecRole::Background,
+                    })
+                    .unwrap_or(RecRole::Normal);
+                self.begin_recording(context, role);
+                // `begin_recording` refuses through `message` rather than a
+                // result, so a point that never started has to be caught here
+                // or the run would wait on a recording that does not exist.
+                if !self.recording.is_active() {
+                    let reason = self.message.clone();
+                    self.fail_protocol_point(context, reason);
+                }
+            }
+            ProtocolPhase::Recording => {
+                if self.recording.is_active() {
+                    return;
+                }
+                if self.recording_completed_ok {
+                    if let Some(run) = self.protocol.as_mut() {
+                        run.recorded += 1;
+                    }
+                    self.advance_protocol(context);
+                } else {
+                    let reason = self.message.clone();
+                    self.fail_protocol_point(context, reason);
+                }
+            }
+        }
+    }
+
+    /// Routes modulation-service replies belonging to the protocol run.
+    fn on_protocol_reply(&mut self, reply: &PluginServiceReply) -> bool {
+        let Some(run) = self.protocol.as_ref() else {
+            return false;
+        };
+        let lease_req = run.lease_req;
+        let is_retarget = run.pending_reqs.contains(&reply.request_id);
+        if reply.request_id == lease_req {
+            match &reply.outcome {
+                PluginServiceOutcome::Accepted { .. } => {
+                    if let Some(run) = self.protocol.as_mut() {
+                        run.lease_granted = true;
+                        run.last_activity_ms = now_unix_ms();
+                    }
+                }
+                PluginServiceOutcome::Rejected { message, .. } => {
+                    self.message =
+                        format!("Protocol aborted: modulation lease rejected: {message}");
+                    if let Some(run) = self.protocol.as_mut() {
+                        run.stop_requested = true;
+                    }
+                }
+            }
+            return true;
+        }
+        if !is_retarget {
+            return false;
+        }
+        let now_ms = now_unix_ms();
+        match &reply.outcome {
+            PluginServiceOutcome::Accepted { .. } => {
+                if let Some(run) = self.protocol.as_mut() {
+                    run.pending_reqs.retain(|id| *id != reply.request_id);
+                    run.last_activity_ms = now_ms;
+                }
+            }
+            PluginServiceOutcome::Rejected { message, .. } => {
+                // Carry the owner's own wording through to the skip message:
+                // "ū=0.90 rejected: peak exceeds the lobe ceiling" tells the
+                // operator which line of the file to fix, "retarget failed"
+                // does not.
+                if let Some(run) = self.protocol.as_mut() {
+                    run.pending_reqs.clear();
+                    run.skip_reason = Some(message.clone());
+                    run.last_activity_ms = now_ms;
+                }
+            }
+        }
+        true
     }
 
     /// Advance the multi-frequency run one control tick. Runs before the lock
     /// and the point sweep, so a child it starts runs on the same tick.
     fn drive_freq_sweep(&mut self, context: &mut impl RecordingControl) {
         if self.freq_sweep.is_none() {
-            if std::mem::take(&mut self.freq_sweep_pending) {
-                self.begin_freq_sweep(context);
+            if let Some(mode) = self.freq_sweep_pending.take() {
+                self.begin_freq_sweep(context, mode);
             }
             return;
         }
-        self.freq_sweep_pending = false;
+        self.freq_sweep_pending = None;
         let now_ms = now_unix_ms();
         let (phase, stop_requested, lease_granted, freq_applied, last_activity_ms, index, total) = {
             let sweep = self.freq_sweep.as_ref().expect("sweep checked above");
@@ -3415,16 +4788,33 @@ impl StageAA1Plugin {
                     .as_ref()
                     .map(FreqSweep::frequency_hz)
                     .unwrap_or_default();
-                // The trigger *defines* the frequency, so the point only starts
-                // once the markers say the drive is really there — an ACK from
-                // the firmware says the table was accepted, not that the light
-                // is modulating at that rate. Enough markers must have arrived
-                // at the new period for their mean spacing to mean anything.
-                let enough_markers = self.camera_markers_us.len() as f64 >= FREQ_CONFIRM_CYCLES;
-                let confirmed = enough_markers
-                    && self
-                        .frequency_hz()
-                        .is_some_and(|measured| same_frequency(measured, hz));
+                // Which side is entitled to say the drive really reached the new
+                // frequency.
+                //
+                // Measured mode holds out for the camera's phase-0 markers: they
+                // *define* the period, the fold that scores the point is anchored
+                // on them, and an ACK from the firmware only says the table was
+                // accepted, not that the light is modulating at that rate. Enough
+                // markers must have arrived at the new period for their mean
+                // spacing to mean anything.
+                //
+                // Commanded mode asks the modulation owner instead. That is the
+                // same contract it already relies on for the depth — if the
+                // owner's acknowledged waveform is trusted to state `a`, it is
+                // trusted to state `f` — and it does not strand a bench whose
+                // camera trigger is not wired, which is the whole reason the
+                // commanded source exists (ADR 021). The live fold goes
+                // free-running without markers; the recorded RAW and PDQ, which
+                // are what the offline fit reads, are unaffected.
+                let confirmed = if self.depth_source.needs_a0_lock() {
+                    self.camera_markers_us.len() as f64 >= FREQ_CONFIRM_CYCLES
+                        && self
+                            .frequency_hz()
+                            .is_some_and(|measured| same_frequency(measured, hz))
+                } else {
+                    self.acknowledged_frequency_hz()
+                        .is_some_and(|acknowledged| same_frequency(acknowledged, hz))
+                };
                 let deadline = self
                     .freq_sweep
                     .as_ref()
@@ -3433,6 +4823,20 @@ impl StageAA1Plugin {
                 if confirmed {
                     if let Err(reason) = self.optical_window_covers_a_cycle(hz) {
                         self.fail_freq_sweep_point(context, reason);
+                        return;
+                    }
+                    // The search stands between the frequency and the recording
+                    // in exactly one case: an `a₀` rung whose depth is measured.
+                    // A depth sweep commands and settles every `a` in its range
+                    // itself, so there is nothing for a lock to contribute at
+                    // any frequency, in either depth source.
+                    let needs_search = self
+                        .freq_sweep
+                        .as_ref()
+                        .is_some_and(|sweep| sweep.mode.needs_armed_depth())
+                        && self.depth_source.needs_a0_lock();
+                    if !needs_search {
+                        self.start_freq_sweep_recording(context);
                         return;
                     }
                     if let Some(sweep) = self.freq_sweep.as_mut() {
@@ -3446,55 +4850,41 @@ impl StageAA1Plugin {
                         self.fail_freq_sweep_point(context, reason);
                     }
                 } else if now_ms >= deadline {
-                    let measured = self
-                        .frequency_hz()
-                        .map_or_else(|| "—".into(), frequency_label);
-                    self.fail_freq_sweep_point(
-                        context,
+                    let reason = if self.depth_source.needs_a0_lock() {
+                        let measured = self
+                            .frequency_hz()
+                            .map_or_else(|| "—".into(), frequency_label);
                         format!(
                             "the trigger never reported it (measured {measured} from {} markers)",
                             self.camera_markers_us.len()
-                        ),
-                    );
+                        )
+                    } else {
+                        let acknowledged = self
+                            .acknowledged_frequency_hz()
+                            .map_or_else(|| "—".into(), frequency_label);
+                        format!(
+                            "the modulation plugin never acknowledged it (its armed drive still \
+                             reads {acknowledged})"
+                        )
+                    };
+                    self.fail_freq_sweep_point(context, reason);
                 }
             }
             FreqSweepPhase::Locking => {
                 if self.a0_lock.is_some() {
                     return;
                 }
-                let hz = self
-                    .freq_sweep
-                    .as_ref()
-                    .map(FreqSweep::frequency_hz)
-                    .unwrap_or_default();
-                // A non-converged lock is stored but never arms a recording, so
-                // `armed_lock` is the single question worth asking here.
-                if self.armed_lock().is_none() {
-                    let reason = self.message.clone();
-                    self.fail_freq_sweep_point(context, reason);
-                    return;
-                }
-                if let Some(sweep) = self.freq_sweep.as_mut() {
-                    sweep.phase = FreqSweepPhase::Recording;
-                }
-                let lease = self.freq_sweep.as_ref().map(|sweep| sweep.lease_id.clone());
-                self.begin_a0_point(context, lease);
-                if self.sweep.is_none() {
-                    let reason = self.message.clone();
-                    self.fail_freq_sweep_point(context, reason);
-                    return;
-                }
-                self.message = format!(
-                    "Frequency sweep {}/{total}: recording the a₀ point at {}…",
-                    index + 1,
-                    frequency_label(hz),
-                );
+                self.start_freq_sweep_recording(context);
             }
             FreqSweepPhase::Recording => {
                 if self.sweep.is_some() || self.recording.is_active() {
                     return;
                 }
-                if self.recording_completed_ok {
+                // The inner run's own verdict, not the last recording's. A
+                // depth sweep that gives up on point 4 of 5 leaves
+                // `recording_completed_ok` true from point 3, which would have
+                // counted a half-recorded curve as a finished rung.
+                if self.last_sweep_completed_ok {
                     if let Some(sweep) = self.freq_sweep.as_mut() {
                         sweep.recorded += 1;
                     }
@@ -3578,6 +4968,7 @@ impl StageAA1Plugin {
                     map(|lock| format!("{:.3}", lock.commanded_a)),
                 ),
                 column("measured_a", map(|lock| format!("{:.3}", lock.measured_a))),
+                column("depth_source", map(|lock| lock.depth_source.verb().into())),
                 column("trials", map(|lock| lock.trials.to_string())),
                 column(
                     "state",
@@ -3644,6 +5035,7 @@ impl StageAA1Plugin {
         if self.on_sweep_reply(reply)
             || self.on_a0_lock_reply(reply)
             || self.on_freq_sweep_reply(reply)
+            || self.on_protocol_reply(reply)
         {
             return;
         }
@@ -3843,7 +5235,6 @@ impl StageAA1Plugin {
 
         let doc = SidecarDoc {
             measurement_id: self.recording.id.clone(),
-            flux_point_id: self.flux_point_id.trim().to_owned(),
             file_stem: self.recording.stem.clone(),
             role: self.recording.role.label().into(),
             recorded_at_utc: format_iso_utc(
@@ -3855,6 +5246,8 @@ impl StageAA1Plugin {
             ),
             finalized_at_utc: format_iso_utc(now_ms / 1_000),
             duration_s: self.recording.duration_s,
+            depth_a_source: self.depth_source.label().into(),
+            depth_a: self.depth_a(),
             sweep: {
                 let point = self
                     .sweep
@@ -3877,6 +5270,7 @@ impl StageAA1Plugin {
                     target_a: lock.target_a,
                     commanded_a: lock.commanded_a,
                     measured_a_at_lock: lock.measured_a,
+                    depth_source: lock.depth_source.label().into(),
                     frequency_hz_at_lock: lock.frequency_hz,
                     trials: lock.trials,
                     converged: lock.converged,
@@ -3926,7 +5320,7 @@ impl StageAA1Plugin {
                 internal_u: mod_optical.map(|drive| f64::from(drive.internal_u_milli) / 1_000.0),
                 requested_a: mod_optical.map(|drive| f64::from(drive.depth_a_milli) / 1_000.0),
                 v_null_dac: mod_optical.map(|drive| drive.v_null_dac),
-                v_pi_dac: mod_optical.map(|drive| drive.v_pi_dac),
+                v_peak_dac: mod_optical.map(|drive| drive.v_peak_dac),
                 center_dac: a1_config.map(|c| c.center_dac),
                 amplitude_dac: a1_config.map(|c| c.amplitude_dac),
                 waveform: modulation
@@ -3957,6 +5351,20 @@ impl StageAA1Plugin {
                 masked_pixels: self.masked_pixels.len(),
                 n_valid: self.valid_pixel_count(),
             },
+            sensor: self.recorded_sensor().map(|sensor| {
+                let codes = sensor.bias_codes.map(|readback| readback.current);
+                SensorSidecar {
+                    temperature_c: sensor.temperature_c,
+                    pixel_dead_time_us: sensor.pixel_dead_time_us,
+                    illumination_lux: sensor.illumination_lux,
+                    reading_age_s: sensor.age_s,
+                    bias_diff_on: codes.map(|c| c.diff_on),
+                    bias_diff_off: codes.map(|c| c.diff_off),
+                    bias_fo: codes.map(|c| c.fo),
+                    bias_hpf: codes.map(|c| c.hpf),
+                    bias_refr: codes.map(|c| c.refr),
+                }
+            }),
             trigger: TriggerSidecar {
                 marker_anchored: self.is_marker_anchored(),
                 marker_count: self.camera_markers_us.len(),
@@ -3967,6 +5375,7 @@ impl StageAA1Plugin {
                 camera_config_sidecar: camera_bias_sidecar,
                 photodiode_pdq: self.recording.pd_pdq_path.clone(),
                 photodiode_sidecar: self.recording.pd_sidecar_path.clone(),
+                sensor_readout: self.recording.sensor_readout_path.clone(),
             },
         };
 
@@ -3984,12 +5393,22 @@ impl StageAA1Plugin {
 #[derive(Serialize)]
 struct SidecarDoc {
     measurement_id: String,
-    flux_point_id: String,
     file_stem: String,
     role: String,
     recorded_at_utc: String,
     finalized_at_utc: String,
     duration_s: u64,
+    /// The modulation depth this run was driven and judged by, and which source
+    /// produced it (`photodiode_measured` / `modulation_commanded`).
+    ///
+    /// Written on every run, so offline analysis never has to infer the depth's
+    /// provenance from which of `optical.measured_a` and `modulation.requested_a`
+    /// happens to be present. A commanded depth is an open-loop number carrying
+    /// the Pockels calibration's error; a fit that mixes the two sources without
+    /// looking here would silently mix two error budgets.
+    depth_a_source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    depth_a: Option<f64>,
     sweep: SweepSidecar,
     /// Present on **event-count** points: the `a₀` lock this point replayed.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4004,6 +5423,10 @@ struct SidecarDoc {
     modulation: ModulationSidecar,
     optical: OpticalSidecar,
     camera: CameraSidecar,
+    /// Absent when the host had no camera able to measure these (replay,
+    /// imports, a sensor without a monitoring block).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sensor: Option<SensorSidecar>,
     trigger: TriggerSidecar,
     files: FilesSidecar,
 }
@@ -4035,6 +5458,8 @@ struct A0LockSidecar {
     target_a: f64,
     commanded_a: f64,
     measured_a_at_lock: f64,
+    /// Which source `measured_a_at_lock` came from — see `depth_a_source`.
+    depth_source: String,
     frequency_hz_at_lock: f64,
     trials: u32,
     converged: bool,
@@ -4111,7 +5536,7 @@ struct ModulationSidecar {
     #[serde(skip_serializing_if = "Option::is_none")]
     v_null_dac: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    v_pi_dac: Option<u16>,
+    v_peak_dac: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     center_dac: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4161,6 +5586,42 @@ struct CameraSidecar {
     n_valid: Option<usize>,
 }
 
+/// Bench conditions the sensor measured for itself at the start of the run.
+///
+/// Provenance, never an input: the `q_p(a, f)` response depends on the pixel
+/// dead time and on the scene illumination, and the die temperature moves the
+/// biases, so a row that cannot be compared to another has to be identifiable
+/// as such afterwards. Present only when the host was streaming from a camera
+/// with a monitoring block — an offline re-run of the same RAW has no sensor to
+/// ask, and every field stays absent rather than becoming zero.
+#[derive(Serialize)]
+struct SensorSidecar {
+    /// Sensor die temperature, °C.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature_c: Option<f32>,
+    /// Measured pixel dead time (refractory period), µs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pixel_dead_time_us: Option<f32>,
+    /// Scene illumination integrated by the sensor, lux.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    illumination_lux: Option<f32>,
+    /// Seconds between the host's last read of these values and the moment the
+    /// recording started — the host polls at a few hertz, so this is never 0.
+    reading_age_s: f64,
+    /// Absolute programmed bias codes, and the per-unit factory trim the
+    /// host's relative offsets are expressed against.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bias_diff_on: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bias_diff_off: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bias_fo: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bias_hpf: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bias_refr: Option<u8>,
+}
+
 #[derive(Serialize)]
 struct TriggerSidecar {
     marker_anchored: bool,
@@ -4179,6 +5640,11 @@ struct FilesSidecar {
     photodiode_pdq: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     photodiode_sidecar: Option<String>,
+    /// Compacted per-channel sensor readout for this run — the die
+    /// temperature, pixel dead time and illumination the host polled while it
+    /// was recording. Absent when the source had no monitoring block.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sensor_readout: Option<String>,
 }
 
 // ---- free functions --------------------------------------------------------
@@ -4464,7 +5930,24 @@ impl Plugin for StageAA1Plugin {
             self.host_roi = Some(settings.roi);
             self.masked_pixels = settings.masked_pixels.into_iter().collect();
         }
+        // Mirrored above the `live` gate on purpose: these are recorded with
+        // every run, and recordings are made with Live analysis off just as
+        // often as with it on. Absent whenever the host has no camera that can
+        // measure them (replay, imports, a sensor without a monitoring block),
+        // which stays `None` rather than becoming a zero.
+        if let Some(monitoring) = context
+            .get::<SensorMonitoringV1>(CTX_SENSOR_MONITORING)
+            .ok()
+            .flatten()
+        {
+            self.sensor = Some(monitoring);
+        }
         if !self.live {
+            // Drop the analysis buffers on the way out, not just stop filling
+            // them — see `drop_live_buffers`.
+            if self.drop_live_buffers() {
+                self.bump();
+            }
             return;
         }
 
@@ -4546,10 +6029,11 @@ impl Plugin for StageAA1Plugin {
             self.scan_measurement_folder();
             self.load_a0_locks();
         }
-        // Outermost first: the frequency sweep starts the lock or the point it
-        // supervises, and each of those starts its own next stage, so one tick
-        // carries a hand-off all the way down. They are mutually exclusive at
-        // the top, guarded where they begin.
+        // Outermost first: the protocol and the frequency sweep each start the
+        // stage below them, and each of those starts its own next stage, so one
+        // tick carries a hand-off all the way down. They are mutually exclusive
+        // at the top, guarded where they begin.
+        self.drive_protocol(context);
         self.drive_freq_sweep(context);
         self.drive_a0_lock(context);
         self.drive_sweep(context);
@@ -4559,445 +6043,29 @@ impl Plugin for StageAA1Plugin {
     }
 
     fn settings_schema(&self) -> SettingsSchema {
-        // The record/sweep buttons stay disabled until the recording has a
+        // The record buttons stay disabled until the recording has a
         // destination, instead of failing with a status message after a click.
         let can_record = !self.output_folder.trim().is_empty();
+        // Deliberately *not* gated on "is something running": `settings_schema`
+        // is rendered by the UI mirror, and every run — the recording, the
+        // sweeps, the ladder, the protocol — lives on the live worker, which is
+        // the only instance the host calls `process_control` on. A mirror
+        // reading its own always-idle state would disable nothing and mislead
+        // the next reader into thinking it did. The authoritative interlocks
+        // stay worker-side, where each `begin_*` refuses with a message that
+        // names what is already running (ADR 010, same reason as the modulation
+        // plugin's `calibration_offered`).
         SettingsSchema {
             sections: vec![
                 SettingsSection {
-                    label: "Recording".into(),
-                    description: Some(
-                        "Records the camera RAW stream and the photodiode PDQ stream together for \
-                         a fixed duration and writes an A1 config sidecar (.toml) linking them. \
-                         Everything lands under <output folder>/<measurement id>/ and shares an \
-                         <id>_<timestamp> stem: the RAW and PDQ are gathered here once both are \
-                         finalized, wherever their own recorders wrote them. Arm the optical \
-                         drive in the modulation plugin first; A1 only reads its settings — it \
-                         never drives the Teensy. The photodiode must be connected and have a \
-                         data directory set, otherwise the recording is refused before it starts."
-                            .into(),
-                    ),
-                    default_open: true,
-                    items: vec![
-                        SettingItem {
-                            key: "output_folder".into(),
-                            label: "Output folder".into(),
-                            tooltip: Some(
-                                "Experiment directory for this measurement. The config sidecar is \
-                                 written here, and the camera RAW and photodiode PDQ are moved \
-                                 here once finalized, so one measurement is one folder."
-                                    .into(),
-                            ),
-                            kind: SettingKind::Path {
-                                dialog: PathDialogKind::Directory,
-                                default: self.output_folder.clone(),
-                            },
-                        },
-                        SettingItem {
-                            key: "measurement_id".into(),
-                            label: "Measurement id (one per I_k, f pair)".into(),
-                            tooltip: Some(
-                                "Groups every repeat of one illumination/frequency pair. Included \
-                                 in every file name. Edit it freely or press New id."
-                                    .into(),
-                            ),
-                            kind: SettingKind::Text {
-                                default: self.measurement_id.clone(),
-                            },
-                        },
-                        SettingItem {
-                            key: "flux_point_id".into(),
-                            label: "Physical I_k flux point id".into(),
-                            tooltip: Some(
-                                "Canonical id of the cycle-mean local flux calibration/map point. \
-                                 This is physical photons/pixel/s provenance, not the modulation \
-                                 plugin's dimensionless lobe coordinate u."
-                                    .into(),
-                            ),
-                            kind: SettingKind::Text {
-                                default: self.flux_point_id.clone(),
-                            },
-                        },
-                        SettingItem {
-                            key: "new_id".into(),
-                            label: "New id".into(),
-                            tooltip: Some("Generate a fresh default measurement id.".into()),
-                            kind: SettingKind::Button { enabled: true },
-                        },
-                        SettingItem {
-                            key: "min_a".into(),
-                            label: "Sweep min a".into(),
-                            tooltip: Some(
-                                "Low end of the modulation-depth sweep for this (I_k, f) row. \
-                                 Stored in every sidecar as the automation template; A1 does not \
-                                 drive it — you set the drive in the modulation plugin."
-                                    .into(),
-                            ),
-                            kind: SettingKind::F64Drag {
-                                min: 0.0,
-                                max: 10.0,
-                                speed: 0.01,
-                                default: self.min_a,
-                            },
-                        },
-                        SettingItem {
-                            key: "max_a".into(),
-                            label: "Sweep max a".into(),
-                            tooltip: Some(
-                                "High end of the modulation-depth sweep for this (I_k, f) row \
-                                 (also the natural amplitude for the pilot). Stored in every \
-                                 sidecar; A1 does not drive it."
-                                    .into(),
-                            ),
-                            kind: SettingKind::F64Drag {
-                                min: 0.0,
-                                max: 10.0,
-                                speed: 0.01,
-                                default: self.max_a,
-                            },
-                        },
-                        SettingItem {
-                            key: "sweep_count".into(),
-                            label: "Sweep points (count)".into(),
-                            tooltip: Some(
-                                "How many amplitudes the Start sweep button records, spaced \
-                                 evenly from Sweep min a to Sweep max a (inclusive)."
-                                    .into(),
-                            ),
-                            kind: SettingKind::I64Drag {
-                                min: 2,
-                                max: 64,
-                                default: self.sweep_count,
-                            },
-                        },
-                        SettingItem {
-                            key: "settle_s".into(),
-                            label: "Sweep settle (s)".into(),
-                            tooltip: Some(
-                                "After retargeting the drive, the sweep waits until the \
-                                 photodiode-measured a holds the target (±10 %, at least ±0.05) \
-                                 for this long before recording. Gives up after 30 s and records \
-                                 anyway — the sidecar stores the measured a."
-                                    .into(),
-                            ),
-                            kind: SettingKind::F64Drag {
-                                min: 0.0,
-                                max: 60.0,
-                                speed: 0.1,
-                                default: self.settle_s,
-                            },
-                        },
-                        SettingItem {
-                            key: "duration_s".into(),
-                            label: "Duration (s)".into(),
-                            tooltip: Some(
-                                "How long each recording runs before it auto-stops and finalizes."
-                                    .into(),
-                            ),
-                            kind: SettingKind::I64Drag {
-                                min: 1,
-                                max: 3_600,
-                                default: self.duration_s,
-                            },
-                        },
-                        SettingItem {
-                            key: "start_recording".into(),
-                            label: "Start recording (sweep point)".into(),
-                            tooltip: Some(
-                                "Acquire the photodiode lease, start the camera RAW + photodiode \
-                                 PDQ recording, auto-stop after the duration, and write the \
-                                 sidecar. Disabled until an output folder is selected."
-                                    .into(),
-                            ),
-                            kind: SettingKind::Button {
-                                enabled: can_record,
-                            },
-                        },
-                        SettingItem {
-                            key: "start_sweep".into(),
-                            label: "Start sweep (record all points)".into(),
-                            tooltip: Some(
-                                "Sweeps the modulation depth over [Sweep min a, Sweep max a] in \
-                                 the configured number of points: per point A1 leases the \
-                                 modulation owner, retargets the armed calibrated drive, waits \
-                                 for the photodiode-measured a to settle, and records one sweep \
-                                 point (…_pNN) like the Start recording button. Requires the \
-                                 modulation plugin to have a calibrated periodic/optical drive \
-                                 armed and Sweep min a > 0. Disabled until an output folder is \
-                                 selected."
-                                    .into(),
-                            ),
-                            kind: SettingKind::Button {
-                                enabled: can_record,
-                            },
-                        },
-                        SettingItem {
-                            key: "record_pilot".into(),
-                            label: "Record pilot (freeze ON/OFF windows)".into(),
-                            tooltip: Some(
-                                "Records a bright reference for this row into the same folder \
-                                 (…_pilot) and freezes the ON/OFF windows from the current live \
-                                 signal. Set a high, non-saturating a in the modulation plugin \
-                                 first. The frozen windows are reused for the whole row's q_p. \
-                                 Disabled until an output folder is selected."
-                                    .into(),
-                            ),
-                            kind: SettingKind::Button {
-                                enabled: can_record,
-                            },
-                        },
-                        SettingItem {
-                            key: "record_background".into(),
-                            label: "Record background (a≈0 floor)".into(),
-                            tooltip: Some(
-                                "Records an unmodulated reference (…_background) and captures the \
-                                 false-response floor q0 in the current windows. Set a≈0 in the \
-                                 modulation plugin first. Disabled until an output folder is \
-                                 selected."
-                                    .into(),
-                            ),
-                            kind: SettingKind::Button {
-                                enabled: can_record,
-                            },
-                        },
-                        SettingItem {
-                            key: "stop_recording".into(),
-                            label: "Stop (abort recording / sweep)".into(),
-                            tooltip: Some(
-                                "Stop and finalize the current recording before the duration \
-                                 ends; during a sweep this also aborts the remaining points."
-                                    .into(),
-                            ),
-                            kind: SettingKind::Button { enabled: true },
-                        },
-                    ],
-                },
-                SettingsSection {
-                    label: "Exact event-count depth a₀".into(),
-                    description: Some(
-                        "Second Stage-A workflow, on top of the minimum-depth sweep above: hold \
-                         ONE photodiode-measured depth a₀ = ln(I_exc,max / I_exc,min) constant \
-                         across the frequency sweep. Freeze the flux point, camera configuration \
-                         and references first (pilot and background are recorded above), then per \
-                         frequency: set f in the modulation plugin, press Find a₀ — A1 leases the \
-                         drive and trims the *commanded* depth until the photodiode *measures* a₀ \
-                         — and then press Record a₀ point, which re-applies that depth under the \
-                         same lease (so the amplitude cannot change during the recorded interval) \
-                         and records one atomic RAW + PDQ + sidecar point named …_ec_f<f>Hz. The \
-                         found depths are kept per frequency, listed in the a₀ lock table view and \
-                         mirrored to a0_locks.json in the output folder. Randomising the frequency \
-                         order, interleaving the low-frequency reference and repeating blocks stay \
-                         yours — every point is one button press."
-                            .into(),
-                    ),
-                    default_open: false,
-                    items: vec![
-                        SettingItem {
-                            key: "a0_target".into(),
-                            label: "a₀ (measured log contrast)".into(),
-                            tooltip: Some(
-                                "The one photodiode-measured depth held across the whole frequency \
-                                 sweep — never a DAC excursion. Pick it from the low-frequency \
-                                 scout: high enough for several events per pixel per half-cycle, \
-                                 still proportional (not saturated), and refractory-safe at the \
-                                 highest frequency."
-                                    .into(),
-                            ),
-                            kind: SettingKind::F64Drag {
-                                min: COMMANDED_A_MIN,
-                                max: COMMANDED_A_MAX,
-                                speed: 0.01,
-                                default: self.a0_target,
-                            },
-                        },
-                        SettingItem {
-                            key: "a0_tolerance".into(),
-                            label: "a₀ tolerance (absolute)".into(),
-                            tooltip: Some(
-                                "Convergence band on |measured a − a₀| for the lock, and the \
-                                 settle band an event-count point must hold before it records."
-                                    .into(),
-                            ),
-                            kind: SettingKind::F64Drag {
-                                min: 0.002,
-                                max: 0.5,
-                                speed: 0.002,
-                                default: self.a0_tolerance,
-                            },
-                        },
-                        SettingItem {
-                            key: "find_a0".into(),
-                            label: "Find a₀ (lock the drive depth)".into(),
-                            tooltip: Some(
-                                "Leases the modulation owner and iterates commanded a ← commanded \
-                                 a · a₀/measured a until the photodiode-measured depth is a₀ at the \
-                                 current frequency (up to 8 trials, waiting Sweep settle (s) per \
-                                 trial). Records nothing, leaves the drive at the depth it found, \
-                                 and stores it for this frequency. Requires a calibrated \
-                                 periodic/optical drive armed in the modulation plugin and a \
-                                 photodiode-measured a. Disabled until an output folder is selected."
-                                    .into(),
-                            ),
-                            kind: SettingKind::Button {
-                                enabled: can_record,
-                            },
-                        },
-                        SettingItem {
-                            key: "record_a0_point".into(),
-                            label: "Record a₀ point (event-count)".into(),
-                            tooltip: Some(
-                                "Records one atomic frequency point at the locked depth: re-applies \
-                                 the found commanded a under a modulation lease, waits for the \
-                                 measured a to hold a₀, then records camera RAW + photodiode PDQ + \
-                                 sidecar under one run id (…_ec_f<f>Hz). Needs a converged lock for \
-                                 the current frequency and an output folder."
-                                    .into(),
-                            ),
-                            kind: SettingKind::Button {
-                                enabled: can_record,
-                            },
-                        },
-                        SettingItem {
-                            key: "min_f".into(),
-                            label: "Sweep min f (Hz)".into(),
-                            tooltip: Some(
-                                "Lowest frequency of the automatic ladder. It decides whether the \
-                                 ladder is measurable at all: the photodiode needs a contrast \
-                                 window of at least one cycle at this frequency, so raise its \
-                                 Cache length if the sweep refuses to start."
-                                    .into(),
-                            ),
-                            kind: SettingKind::F64Drag {
-                                min: 0.01,
-                                max: 2_000.0,
-                                speed: 0.1,
-                                default: self.min_f,
-                            },
-                        },
-                        SettingItem {
-                            key: "max_f".into(),
-                            label: "Sweep max f (Hz)".into(),
-                            tooltip: Some(
-                                "Highest frequency of the automatic ladder. Check the refractory \
-                                 condition 2·f·a₀/C ≪ 1/τ_refr here — the plugin does not."
-                                    .into(),
-                            ),
-                            kind: SettingKind::F64Drag {
-                                min: 0.01,
-                                max: 2_000.0,
-                                speed: 1.0,
-                                default: self.max_f,
-                            },
-                        },
-                        SettingItem {
-                            key: "freq_count".into(),
-                            label: "Frequency points".into(),
-                            tooltip: Some(
-                                "Points on the ladder, log-spaced and inclusive of both ends: \
-                                 |H(f)| is read per decade, so a linear ladder would spend most of \
-                                 its points on the flat part."
-                                    .into(),
-                            ),
-                            kind: SettingKind::I64Slider {
-                                min: 1,
-                                max: FREQ_SWEEP_MAX_POINTS as i64,
-                                default: i64::from(self.freq_count),
-                                suffix: None,
-                            },
-                        },
-                        SettingItem {
-                            key: "freq_order".into(),
-                            label: "Frequency order".into(),
-                            tooltip: Some(
-                                "Order the ladder is visited in. Low-to-high confounds frequency \
-                                 with anything that drifts through the block (bleaching, thermal \
-                                 bias drift), so prefer alternating or a seeded random order — \
-                                 both are recorded in the sidecar."
-                                    .into(),
-                            ),
-                            kind: SettingKind::Enum {
-                                variants: vec![
-                                    "ascending".into(),
-                                    "descending".into(),
-                                    "alternating".into(),
-                                    "random (seeded)".into(),
-                                ],
-                                default: self.freq_order.index() as usize,
-                            },
-                        },
-                        SettingItem {
-                            key: "freq_seed".into(),
-                            label: "Random order seed".into(),
-                            tooltip: Some(
-                                "Seed for the random order, so the executed schedule is \
-                                 reproducible and can be frozen in the session plan. Recorded in \
-                                 every point's sidecar."
-                                    .into(),
-                            ),
-                            kind: SettingKind::I64Drag {
-                                min: 1,
-                                max: 9_999,
-                                default: self.freq_seed as i64,
-                            },
-                        },
-                        SettingItem {
-                            key: "freq_reference_every".into(),
-                            label: "Low-f reference every N points".into(),
-                            tooltip: Some(
-                                "Re-visit the lowest planned frequency after every N points, so \
-                                 drift across the block shows up as a disagreement between its \
-                                 repeats. 0 disables it."
-                                    .into(),
-                            ),
-                            kind: SettingKind::I64Slider {
-                                min: 0,
-                                max: 10,
-                                default: i64::from(self.freq_reference_every),
-                                suffix: None,
-                            },
-                        },
-                        SettingItem {
-                            key: "start_freq_sweep".into(),
-                            label: "Start frequency sweep (find a₀ + record per f)".into(),
-                            tooltip: Some(
-                                "Runs the whole ladder unattended on one modulation lease: per \
-                                 frequency it retargets the drive, waits for the phase-0 trigger \
-                                 to confirm the new period, locks a₀ closed-loop, and records one \
-                                 atomic RAW + PDQ + sidecar point. A frequency whose a₀ cannot be \
-                                 reached is skipped and named in the summary rather than ending \
-                                 the ladder. The operator's own frequency and depth come back when \
-                                 the lease is released. References (pilot, background, I_tot \
-                                 anchor) and the flux point stay yours — and pilot windows are \
-                                 dropped at every frequency change, because windows frozen at one \
-                                 period do not transfer to another."
-                                    .into(),
-                            ),
-                            kind: SettingKind::Button {
-                                enabled: can_record,
-                            },
-                        },
-                        SettingItem {
-                            key: "clear_a0_locks".into(),
-                            label: "Clear a₀ lock table".into(),
-                            tooltip: Some(
-                                "Drops every stored per-frequency lock and rewrites \
-                                 a0_locks.json. Use it after changing the flux point, the \
-                                 calibration or a₀ itself."
-                                    .into(),
-                            ),
-                            kind: SettingKind::Button { enabled: true },
-                        },
-                    ],
-                },
-                SettingsSection {
                     label: "Live analysis".into(),
                     description: Some(
-                        "Live sanity quicklook. Folds the camera event stream on the modulation \
-                         period T (defined by the firmware phase-0 EXT_TRIGGER) and renders the \
-                         rolling half-period response S_p(t): events per valid pixel in the \
-                         trailing T/2, ON and OFF separately. Use it to confirm events are \
-                         appearing and the ON/OFF timing looks sane before recording. Nothing is \
-                         recorded here."
+                        "A live look at the camera events folded against the modulation cycle. \
+                         Nothing is saved from here — but almost everything else reads it, so \
+                         it belongs at the top rather than buried below the recording controls.\n\n\
+                         Leave it ON. The frequency sweep and the protocol both need it to see \
+                         the phase-0 trigger, and the response curve below scores its points \
+                         out of the same buffer."
                             .into(),
                     ),
                     default_open: true,
@@ -5006,8 +6074,9 @@ impl Plugin for StageAA1Plugin {
                             key: "live".into(),
                             label: "Live analysis".into(),
                             tooltip: Some(
-                                "Fold incoming events into the live plots. Off freezes the plots \
-                                 at their current values. This does not record anything."
+                                "On: read incoming events and triggers and update the plots. \
+                                 Off: the buffer is dropped and nothing is read at all — the \
+                                 frequency sweep and the protocol will refuse to start."
                                     .into(),
                             ),
                             kind: SettingKind::Bool { default: self.live },
@@ -5016,9 +6085,9 @@ impl Plugin for StageAA1Plugin {
                             key: "analysis_window_ms".into(),
                             label: "Analysis window (ms)".into(),
                             tooltip: Some(
-                                "Trailing window pulled exactly from the retained EventStore. \
-                                 Longer windows cover more cycles; bounded by the host event-store \
-                                 memory budget."
+                                "How far back the live plots look. Longer covers more cycles but \
+                                 folds more events on every update — if the plots feel heavy, \
+                                 shorten this first."
                                     .into(),
                             ),
                             kind: SettingKind::I64Drag {
@@ -5030,37 +6099,16 @@ impl Plugin for StageAA1Plugin {
                         SettingItem {
                             key: "clear".into(),
                             label: "Clear captured events".into(),
-                            tooltip: Some(
-                                "Empties the fold buffer and resets the live plots.".into(),
-                            ),
+                            tooltip: Some("Empties the buffer and resets the live plots.".into()),
                             kind: SettingKind::Button { enabled: true },
                         },
-                    ],
-                },
-                SettingsSection {
-                    label: "Response probability q_p (live quicklook)".into(),
-                    description: Some(
-                        "Live view of the response-curve metric q_p: the fraction of valid \
-                         pixel-cycles that fire at least once in the ON/OFF phase window (unlike \
-                         S_p, each pixel-cycle counts at most once). The ON/OFF windows come from \
-                         the row's pilot when one has been recorded (frozen, in the Recording \
-                         section) and otherwise from the trigger-anchored fold automatically — each \
-                         window grows out from its histogram peak until events drop below the \
-                         window floor or the opposite polarity takes over. Press Record point at \
-                         each amplitude to append a q_p(a) dot at the photodiode-measured a. The \
-                         ROI and masked pixels come from the camera config. The authoritative fit \
-                         is computed offline from the recordings; this is a quicklook."
-                            .into(),
-                    ),
-                    default_open: false,
-                    items: vec![
                         SettingItem {
                             key: "window_floor".into(),
-                            label: "Window floor (fraction of peak)".into(),
+                            label: "Window width threshold".into(),
                             tooltip: Some(
-                                "Each ON/OFF window grows out from its histogram peak until events \
-                                 fall below this fraction of the peak (or the opposite polarity \
-                                 takes over). 0.10 = stop at 10 % of the peak."
+                                "How the bright and dark windows are found automatically: each \
+                                 one widens out from its busiest moment until the event rate \
+                                 drops below this fraction of the peak. 0.10 = stop at 10 %."
                                     .into(),
                             ),
                             kind: SettingKind::F64Drag {
@@ -5072,19 +6120,518 @@ impl Plugin for StageAA1Plugin {
                         },
                         SettingItem {
                             key: "record_point".into(),
-                            label: "Record point (at current a)".into(),
+                            label: "Add response-curve point (at the current depth)".into(),
                             tooltip: Some(
-                                "Computes q_on/q_off for the current buffer against the \
-                                 auto-detected windows and appends a point at the \
-                                 photodiode-measured a."
+                                "Adds one dot to the response curve, using the events in the \
+                                 live buffer and the depth measured right now. A preview to \
+                                 check the shape looks sensible — saves no files, and the real \
+                                 fit is done afterwards from the recorded ones."
                                     .into(),
                             ),
                             kind: SettingKind::Button { enabled: true },
                         },
                         SettingItem {
                             key: "clear_curve".into(),
-                            label: "Clear response curve".into(),
-                            tooltip: Some("Drops the recorded response-curve points.".into()),
+                            label: "Clear the response curve".into(),
+                            tooltip: Some("Removes all the dots from the curve.".into()),
+                            kind: SettingKind::Button { enabled: true },
+                        },
+                    ],
+                },
+                SettingsSection {
+                    label: "Modulation depth a".into(),
+                    description: Some(
+                        "Where the depth a comes from. Everything that needs a depth — the \
+                         sweeps, the protocol, the response curve — reads this one setting.\n\n\
+                         The photodiode is the honest source: it watches the light itself. But \
+                         it only reports a depth when it can prove its window covers whole \
+                         modulation cycles, which needs the phase-0 trigger markers on the \
+                         photodiode's own stream. Without them (no trigger, or a frequency so \
+                         low that two cycles do not fit in the photodiode's cache) it reports \
+                         nothing and every button refuses.\n\n\
+                         The commanded drive gets you running in that case: the modulation \
+                         plugin already inverts your measured Pockels curve to command a depth, \
+                         so the number is calibrated — it just is not checked against the light. \
+                         Runs recorded this way are tagged as such in their description file."
+                            .into(),
+                    ),
+                    default_open: true,
+                    items: vec![SettingItem {
+                        key: "depth_source".into(),
+                        label: "Depth a source".into(),
+                        tooltip: Some(
+                            "Photodiode: use the depth the photodiode measures (accurate, needs \
+                             the trigger markers). Modulation drive: use the depth the modulation \
+                             plugin is commanding (works without the photodiode, but open loop — \
+                             it is not verified against the light)."
+                                .into(),
+                        ),
+                        kind: SettingKind::Enum {
+                            variants: vec![
+                                "photodiode (measured)".into(),
+                                "modulation drive (commanded, open loop)".into(),
+                            ],
+                            default: self.depth_source.index() as usize,
+                        },
+                    }],
+                },
+                SettingsSection {
+                    label: "Record".into(),
+                    description: Some(
+                        "Everything that writes files, in one place. Each measurement gets its \
+                         own folder holding the camera file, the photodiode file, the sensor \
+                         readout and a description file, all sharing one name.\n\n\
+                         Four ways to run, all using the settings below and whatever the \
+                         modulation plugin currently has armed for the axes they do not sweep:\n\
+                         • Record once — one recording, exactly as the bench stands now.\n\
+                         • Sweep a — a range of depths at the armed frequency.\n\
+                         • Sweep f — a range of frequencies at the armed depth.\n\
+                         • Sweep a × f — every depth at every frequency (the q_p(a, f) surface).\n\n\
+                         You need an output folder, a connected photodiode, and the modulation \
+                         plugin running the light. The measurement id is filled in for you if \
+                         you leave it blank."
+                            .into(),
+                    ),
+                    default_open: true,
+                    items: vec![
+                        SettingItem {
+                            key: "output_folder".into(),
+                            label: "Output folder".into(),
+                            tooltip: Some(
+                                "Where the recordings go. Each measurement gets its own subfolder \
+                                 in here. Required."
+                                    .into(),
+                            ),
+                            kind: SettingKind::Path {
+                                dialog: PathDialogKind::Directory,
+                                default: self.output_folder.clone(),
+                            },
+                        },
+                        SettingItem {
+                            key: "measurement_id".into(),
+                            label: "Measurement id".into(),
+                            tooltip: Some(
+                                "Names the subfolder and every file in it. Use one id for all the \
+                                 repeats that belong together. Optional — leave it blank and one \
+                                 is generated when you press record."
+                                    .into(),
+                            ),
+                            kind: SettingKind::Text {
+                                default: self.measurement_id.clone(),
+                            },
+                        },
+                        SettingItem {
+                            key: "new_id".into(),
+                            label: "New id".into(),
+                            tooltip: Some(
+                                "Put a fresh generated id in the field above, so the next \
+                                 recording starts a new measurement folder."
+                                    .into(),
+                            ),
+                            kind: SettingKind::Button { enabled: true },
+                        },
+                        SettingItem {
+                            key: "duration_s".into(),
+                            label: "Duration (s)".into(),
+                            tooltip: Some(
+                                "How many seconds each recording lasts before it stops and saves \
+                                 itself. Applies to every button here."
+                                    .into(),
+                            ),
+                            kind: SettingKind::I64Drag {
+                                min: 1,
+                                max: 3_600,
+                                default: self.duration_s,
+                            },
+                        },
+                        SettingItem {
+                            key: "settle_s".into(),
+                            label: "Settle time (s)".into(),
+                            tooltip: Some(
+                                "After changing the depth or the frequency, wait this long with \
+                                 the reading holding steady before recording. Longer is safer if \
+                                 your signal drifts. Ignored by Record once, which records what \
+                                 is already there."
+                                    .into(),
+                            ),
+                            kind: SettingKind::F64Drag {
+                                min: 0.0,
+                                max: 60.0,
+                                speed: 0.1,
+                                default: self.settle_s,
+                            },
+                        },
+                        SettingItem {
+                            key: "min_a".into(),
+                            label: "Depth axis: min a".into(),
+                            tooltip: Some(
+                                "Shallowest depth the a sweep records. Must be above 0 — a = 0 \
+                                 is the background reference, which has its own button."
+                                    .into(),
+                            ),
+                            kind: SettingKind::F64Drag {
+                                min: 0.0,
+                                max: 10.0,
+                                speed: 0.01,
+                                default: self.min_a,
+                            },
+                        },
+                        SettingItem {
+                            key: "max_a".into(),
+                            label: "Depth axis: max a".into(),
+                            tooltip: Some("Deepest depth the a sweep records.".into()),
+                            kind: SettingKind::F64Drag {
+                                min: 0.0,
+                                max: 10.0,
+                                speed: 0.01,
+                                default: self.max_a,
+                            },
+                        },
+                        SettingItem {
+                            key: "sweep_count".into(),
+                            label: "Depth axis: points".into(),
+                            tooltip: Some(
+                                "How many depths the a sweep records, spread evenly from min a \
+                                 to max a."
+                                    .into(),
+                            ),
+                            kind: SettingKind::I64Drag {
+                                min: 2,
+                                max: 64,
+                                default: self.sweep_count,
+                            },
+                        },
+                        SettingItem {
+                            key: "a0_target".into(),
+                            label: "Frequency axis: the depth a to hold".into(),
+                            tooltip: Some(
+                                "Sweep f records every frequency at this one depth, so a change \
+                                 in the event count comes from the frequency and not from the \
+                                 depth. Not used by Sweep a or Sweep a × f, which command each \
+                                 depth themselves.\n\n\
+                                 With the photodiode depth source the drive does not hold a depth \
+                                 by itself as f changes, so it is re-found by measurement at \
+                                 every frequency — see the a₀ section below."
+                                    .into(),
+                            ),
+                            kind: SettingKind::F64Drag {
+                                min: COMMANDED_A_MIN,
+                                max: COMMANDED_A_MAX,
+                                speed: 0.01,
+                                default: self.a0_target,
+                            },
+                        },
+                        SettingItem {
+                            key: "min_f".into(),
+                            label: "Frequency axis: min f (Hz)".into(),
+                            tooltip: Some(
+                                "Lowest frequency the f sweep records. It also decides whether \
+                                 the run is measurable at all: the photodiode needs whole \
+                                 modulation cycles inside its cache, so a very low value is \
+                                 refused up front rather than mid-run."
+                                    .into(),
+                            ),
+                            kind: SettingKind::F64Drag {
+                                min: 0.01,
+                                max: 2_000.0,
+                                speed: 0.1,
+                                default: self.min_f,
+                            },
+                        },
+                        SettingItem {
+                            key: "max_f".into(),
+                            label: "Frequency axis: max f (Hz)".into(),
+                            tooltip: Some(
+                                "Highest frequency to record. Check yourself that the sensor can \
+                                 follow it."
+                                    .into(),
+                            ),
+                            kind: SettingKind::F64Drag {
+                                min: 0.01,
+                                max: 2_000.0,
+                                speed: 1.0,
+                                default: self.max_f,
+                            },
+                        },
+                        SettingItem {
+                            key: "freq_count".into(),
+                            label: "Frequency axis: points".into(),
+                            tooltip: Some(
+                                "How many frequencies to record, spaced by decade rather than by \
+                                 hertz — a Bode ladder is read per decade."
+                                    .into(),
+                            ),
+                            kind: SettingKind::I64Drag {
+                                min: 1,
+                                max: FREQ_SWEEP_MAX_POINTS as i64,
+                                default: i64::from(self.freq_count),
+                            },
+                        },
+                        SettingItem {
+                            key: "freq_order".into(),
+                            label: "Frequency axis: order".into(),
+                            tooltip: Some(
+                                "The order the frequencies are visited in. Anything but ascending \
+                                 separates a real frequency effect from slow drift across the \
+                                 block, because neighbouring points are no longer neighbours in \
+                                 time."
+                                    .into(),
+                            ),
+                            kind: SettingKind::Enum {
+                                variants: vec![
+                                    "ascending".into(),
+                                    "alternating (low, high, low…)".into(),
+                                    "shuffled".into(),
+                                ],
+                                default: self.freq_order.index() as usize,
+                            },
+                        },
+                        SettingItem {
+                            key: "freq_seed".into(),
+                            label: "Frequency axis: shuffle seed".into(),
+                            tooltip: Some(
+                                "Makes the shuffled order repeatable: the same seed always gives \
+                                 the same order. Ignored unless the order is shuffled."
+                                    .into(),
+                            ),
+                            kind: SettingKind::I64Drag {
+                                min: 1,
+                                max: 1_000_000,
+                                default: self.freq_seed as i64,
+                            },
+                        },
+                        SettingItem {
+                            key: "freq_reference_every".into(),
+                            label: "Frequency axis: repeat the lowest every N".into(),
+                            tooltip: Some(
+                                "Re-records the lowest frequency after every N points, so drift \
+                                 across the block shows up as a disagreement between its \
+                                 repeats. 0 = off."
+                                    .into(),
+                            ),
+                            kind: SettingKind::I64Drag {
+                                min: 0,
+                                max: 10,
+                                default: i64::from(self.freq_reference_every),
+                            },
+                        },
+                        SettingItem {
+                            key: "start_recording".into(),
+                            label: "Record once".into(),
+                            tooltip: Some(
+                                "One recording with the light exactly as the modulation plugin \
+                                 has it armed right now. Nothing is retargeted and nothing \
+                                 settles first."
+                                    .into(),
+                            ),
+                            kind: SettingKind::Button {
+                                enabled: can_record,
+                            },
+                        },
+                        SettingItem {
+                            key: "start_sweep".into(),
+                            label: "Sweep a".into(),
+                            tooltip: Some(
+                                "Records one file at each depth from min a to max a, at the \
+                                 armed frequency. Settles on each depth before recording it."
+                                    .into(),
+                            ),
+                            kind: SettingKind::Button {
+                                enabled: can_record,
+                            },
+                        },
+                        SettingItem {
+                            key: "start_freq_sweep".into(),
+                            label: "Sweep f".into(),
+                            tooltip: Some(
+                                "Records one file at each frequency from min f to max f, all at \
+                                 the depth set above (\"the depth a to hold\"). With the \
+                                 photodiode depth source that depth is re-found by measurement at \
+                                 every frequency, because the drive does not hold it by itself as \
+                                 f changes; with the commanded source it is simply commanded."
+                                    .into(),
+                            ),
+                            kind: SettingKind::Button {
+                                enabled: can_record,
+                            },
+                        },
+                        SettingItem {
+                            key: "start_freq_depth_sweep".into(),
+                            label: "Sweep a × f".into(),
+                            tooltip: Some(
+                                "The whole surface: every depth in the a range, at every \
+                                 frequency in the f range. That is (frequency points × depth \
+                                 points) recordings — check both counts and the duration before \
+                                 starting. Files are named …_f<f>Hz_pNN so the surface sorts by \
+                                 frequency and then by depth."
+                                    .into(),
+                            ),
+                            kind: SettingKind::Button {
+                                enabled: can_record,
+                            },
+                        },
+                        SettingItem {
+                            key: "record_pilot".into(),
+                            label: "Record pilot (freezes the ON/OFF windows)".into(),
+                            tooltip: Some(
+                                "A bright reference recording whose ON/OFF windows are reused by \
+                                 every later recording in the same measurement, so the whole row \
+                                 is scored consistently."
+                                    .into(),
+                            ),
+                            kind: SettingKind::Button {
+                                enabled: can_record,
+                            },
+                        },
+                        SettingItem {
+                            key: "record_background".into(),
+                            label: "Record background (a ≈ 0 reference)".into(),
+                            tooltip: Some(
+                                "An unmodulated reference giving the false-response floor the \
+                                 later points are measured above."
+                                    .into(),
+                            ),
+                            kind: SettingKind::Button {
+                                enabled: can_record,
+                            },
+                        },
+                        SettingItem {
+                            key: "stop_recording".into(),
+                            label: "Stop".into(),
+                            tooltip: Some(
+                                "Stops whatever is running — a recording, a sweep, a ladder or a \
+                                 protocol — at its next safe point, so the file in flight is \
+                                 still finished and saved."
+                                    .into(),
+                            ),
+                            kind: SettingKind::Button { enabled: true },
+                        },
+                    ],
+                },
+                SettingsSection {
+                    label: "Protocol (run a survey from a file)".into(),
+                    description: Some(
+                        "The buttons above sweep one axis with the others left wherever they \
+                         happen to be. A protocol names every axis for every recording instead, \
+                         in a file that travels with the results.\n\n\
+                         **CSV — one row per recording.** Columns: mean_u (the brightness / I_k \
+                         axis), frequency_hz, depth_a, plus optional duration_s, settle_s, role \
+                         (normal / pilot / background) and label. Columns are found by name so \
+                         their order does not matter; blank lines and # comments are skipped, \
+                         and a blank cell falls back to the default. Because each row carries \
+                         its own duration, a 1 Hz point can record for 40 s and a 200 Hz point \
+                         for 10 — and a file can start with its own background and pilot.\n\n\
+                         **TOML — blocks and ranges.** [[block]] with a list or \
+                         { min, max, points } range on each axis, expanded to their product. \
+                         More compact for a dense regular sweep. Points run ū outermost, then f, \
+                         then a, which settles the slow axis least often.\n\n\
+                         Either way: all three axes are commanded at every point and the point \
+                         waits for all three to be acknowledged before recording, so nothing is \
+                         ever filed under parameters the file does not state. One modulation \
+                         lease covers the whole run and your armed settings are handed back at \
+                         the end. A point the drive cannot reach is skipped and named rather \
+                         than stopping the survey.\n\n\
+                         Commented examples ship with the plugin, at \
+                         ~/.augur/plugins/stage-a-a1/protocols/ — example.csv and example.toml."
+                            .into(),
+                    ),
+                    default_open: false,
+                    items: vec![
+                        SettingItem {
+                            key: "protocol_path".into(),
+                            label: "Protocol file".into(),
+                            tooltip: Some(
+                                ".csv (one row per recording) or .toml (blocks and ranges) — the \
+                                 reader is chosen by the extension. Read and fully validated \
+                                 when you press Run, so a bad value is reported with its line \
+                                 number before the drive moves."
+                                    .into(),
+                            ),
+                            kind: SettingKind::Path {
+                                dialog: PathDialogKind::OpenFile,
+                                default: self.protocol_path.clone(),
+                            },
+                        },
+                        SettingItem {
+                            key: "run_protocol".into(),
+                            label: "Run the protocol".into(),
+                            tooltip: Some(
+                                "Reads and validates the file, then records every point in it. \
+                                 The status line reports how many recordings and roughly how long \
+                                 it will take before the first one starts, and tracks progress \
+                                 after that.\n\n\
+                                 Use Stop in the Record section to end it early — the recording \
+                                 in flight is still finished and saved."
+                                    .into(),
+                            ),
+                            kind: SettingKind::Button {
+                                enabled: can_record,
+                            },
+                        },
+                    ],
+                },
+                SettingsSection {
+                    label: "Advanced: hold one depth across frequencies (a₀)".into(),
+                    description: Some(
+                        "Only needed with the photodiode depth source. The drive does not \
+                         deliver the same depth at every frequency by itself, so before \
+                         recording a frequency point the plugin adjusts it until the photodiode \
+                         measures a₀. That search is what Find a₀ does, and Sweep f runs it \
+                         automatically at every frequency.\n\n\
+                         With the commanded depth source there is nothing to search for and \
+                         none of this is used. The depths found are saved per frequency in the \
+                         output folder and survive a restart."
+                            .into(),
+                    ),
+                    default_open: false,
+                    items: vec![
+                        SettingItem {
+                            key: "a0_tolerance".into(),
+                            label: "a₀ tolerance".into(),
+                            tooltip: Some(
+                                "How close the measured depth has to get to a₀ before the search \
+                                 calls it done. Tighter takes longer and can fail on a noisy \
+                                 reading."
+                                    .into(),
+                            ),
+                            kind: SettingKind::F64Drag {
+                                min: 0.002,
+                                max: 0.5,
+                                speed: 0.002,
+                                default: self.a0_tolerance,
+                            },
+                        },
+                        SettingItem {
+                            key: "find_a0".into(),
+                            label: "Find a₀ (at the armed frequency)".into(),
+                            tooltip: Some(
+                                "Searches for the drive depth that makes the photodiode measure \
+                                 a₀ at the frequency currently armed, and remembers it."
+                                    .into(),
+                            ),
+                            kind: SettingKind::Button { enabled: true },
+                        },
+                        SettingItem {
+                            key: "record_a0_point".into(),
+                            label: "Record a₀ point".into(),
+                            tooltip: Some(
+                                "Records one file at the depth Find a₀ found for the armed \
+                                 frequency."
+                                    .into(),
+                            ),
+                            kind: SettingKind::Button {
+                                enabled: can_record,
+                            },
+                        },
+                        SettingItem {
+                            key: "clear_a0_locks".into(),
+                            label: "Forget saved depths".into(),
+                            tooltip: Some(
+                                "Throws away every depth Find a₀ has found. Do this after \
+                                 changing the illumination, the calibration, or a₀ itself — the \
+                                 old depths no longer apply."
+                                    .into(),
+                            ),
                             kind: SettingKind::Button { enabled: true },
                         },
                     ],
@@ -5097,7 +6644,7 @@ impl Plugin for StageAA1Plugin {
         match key {
             "output_folder" => Some(json!(self.output_folder)),
             "measurement_id" => Some(json!(self.measurement_id)),
-            "flux_point_id" => Some(json!(self.flux_point_id)),
+            "depth_source" => Some(json!(self.depth_source.index())),
             "min_a" => Some(json!(self.min_a)),
             "max_a" => Some(json!(self.max_a)),
             "sweep_count" => Some(json!(self.sweep_count)),
@@ -5129,6 +6676,9 @@ impl Plugin for StageAA1Plugin {
             "freq_seed" => Some(json!(self.freq_seed)),
             "freq_reference_every" => Some(json!(self.freq_reference_every)),
             "start_freq_sweep" => Some(self.press_freq_sweep.value()),
+            "start_freq_depth_sweep" => Some(self.press_freq_depth_sweep.value()),
+            "protocol_path" => Some(json!(self.protocol_path)),
+            "run_protocol" => Some(self.press_run_protocol.value()),
             // New id regenerates the measurement id locally; the id itself is
             // what synchronizes, so the press must not be forwarded (both
             // instances would generate different ids).
@@ -5151,14 +6701,12 @@ impl Plugin for StageAA1Plugin {
                     .ok_or("measurement_id must be a string")?
                     .to_string();
             }
-            "flux_point_id" => {
-                self.flux_point_id = value
-                    .as_str()
-                    .ok_or("flux_point_id must be a string")?
-                    .to_string();
-            }
             "new_id" if value.as_bool() == Some(true) => {
                 self.measurement_id = generate_measurement_id();
+            }
+            "depth_source" => {
+                self.depth_source =
+                    DepthSource::from_index(value.as_u64().ok_or("depth_source must be an index")?);
             }
             "min_a" => {
                 self.min_a = value
@@ -5210,33 +6758,30 @@ impl Plugin for StageAA1Plugin {
                     self.sweep_pending = true;
                 }
             }
+            "start_freq_sweep" => {
+                if self.press_freq_sweep.accept(&value) {
+                    self.freq_sweep_pending = Some(FreqSweepMode::A0Point);
+                }
+            }
+            "start_freq_depth_sweep" => {
+                if self.press_freq_depth_sweep.accept(&value) {
+                    self.freq_sweep_pending = Some(FreqSweepMode::DepthSweep);
+                }
+            }
             "stop_recording" => {
                 if self.press_stop.accept(&value) {
-                    if self.recording.is_active() {
-                        self.recording.stop_requested = true;
-                    }
-                    if let Some(sweep) = self.sweep.as_mut() {
-                        sweep.stop_requested = true;
-                        self.message = "Sweep stop requested".into();
-                    }
-                    if let Some(lock) = self.a0_lock.as_mut() {
-                        lock.stop_requested = true;
-                        self.message = "a₀ lock stop requested".into();
-                    }
-                    // Last, so its wording wins: a stop during a ladder is a
-                    // stop of the ladder, whatever child was mid-flight.
-                    if let Some(sweep) = self.freq_sweep.as_mut() {
-                        sweep.stop_requested = true;
-                        self.message = "Frequency sweep stop requested".into();
-                    }
-                    self.sweep_pending = false;
-                    self.a0_lock_pending = false;
-                    self.a0_point_pending = false;
-                    self.freq_sweep_pending = false;
+                    self.request_stop();
                 }
             }
             "live" => {
                 self.live = value.as_bool().ok_or("live must be a boolean")?;
+                if !self.live {
+                    // Immediately, not on the next frame: with no camera
+                    // running there is no next frame, and the operator who just
+                    // switched this off is the one waiting for the plots to
+                    // stop being slow.
+                    self.drop_live_buffers();
+                }
             }
             "analysis_window_ms" => {
                 self.analysis_window_ms = value
@@ -5246,9 +6791,7 @@ impl Plugin for StageAA1Plugin {
             }
             "clear" => {
                 if self.press_clear.accept(&value) {
-                    self.camera_events.clear();
-                    self.event_scratch.clear();
-                    self.camera_markers_us.clear();
+                    self.drop_live_buffers();
                 }
             }
             "window_floor" => {
@@ -5320,9 +6863,15 @@ impl Plugin for StageAA1Plugin {
                     .ok_or("freq_reference_every must be an integer")?
                     .min(10) as u32;
             }
-            "start_freq_sweep" => {
-                if self.press_freq_sweep.accept(&value) {
-                    self.freq_sweep_pending = true;
+            "protocol_path" => {
+                self.protocol_path = value
+                    .as_str()
+                    .ok_or("protocol_path must be a string")?
+                    .to_string();
+            }
+            "run_protocol" => {
+                if self.press_run_protocol.accept(&value) {
+                    self.protocol_pending = true;
                 }
             }
             "clear_a0_locks" => {
@@ -5347,6 +6896,25 @@ impl Plugin for StageAA1Plugin {
             value: self.recording.state_label().into(),
             color: None,
         }];
+        if let Some(run) = self.protocol.as_ref() {
+            entries.push(StatusEntry::Text(format!(
+                "Protocol '{}': point {}/{} — {} recorded, {} skipped",
+                run.plan.name,
+                (run.index + 1).min(run.plan.points.len()),
+                run.plan.points.len(),
+                run.recorded,
+                run.failed.len(),
+            )));
+            // The per-point message is overwritten within the tick that skips a
+            // point, so the most recent reason lives here instead of scrolling
+            // past unread.
+            if let Some((index, reason)) = run.failed.last() {
+                entries.push(StatusEntry::Text(format!(
+                    "Last skipped point {}: {reason}",
+                    index + 1
+                )));
+            }
+        }
         if self.recording.is_active() {
             if let Some(remaining) = self.recording.remaining_s(now_unix_ms()) {
                 entries.push(StatusEntry::Text(format!(
@@ -5357,15 +6925,22 @@ impl Plugin for StageAA1Plugin {
         }
         if let Some(sweep) = &self.freq_sweep {
             let phase = match sweep.phase {
-                FreqSweepPhase::AcquiringLease => "leasing modulation",
-                FreqSweepPhase::SettingFrequency => "retargeting frequency",
-                FreqSweepPhase::ConfirmingFrequency => "confirming from the trigger",
-                FreqSweepPhase::Locking => "locking a₀",
-                FreqSweepPhase::Recording => "recording",
+                FreqSweepPhase::AcquiringLease => "taking control of the drive",
+                FreqSweepPhase::SettingFrequency => "changing the frequency",
+                FreqSweepPhase::ConfirmingFrequency => "checking the frequency really changed",
+                FreqSweepPhase::Locking => "finding the depth a₀",
+                FreqSweepPhase::Recording => match sweep.mode {
+                    // The inner sweep prints its own point-by-point line below,
+                    // so this one only has to say which stage of the *ladder*
+                    // the run is in.
+                    FreqSweepMode::A0Point => "recording",
+                    FreqSweepMode::DepthSweep => "recording the depth curve",
+                },
             };
             let point = sweep.point();
             entries.push(StatusEntry::Text(format!(
-                "Frequency sweep {}/{} at {}{} — {phase} ({} recorded, {} skipped)",
+                "Frequency ladder ({}) {}/{} at {}{} — {phase} ({} done, {} skipped)",
+                sweep.mode.label(),
                 sweep.index + 1,
                 sweep.points.len(),
                 frequency_label(sweep.frequency_hz()),
@@ -5380,17 +6955,17 @@ impl Plugin for StageAA1Plugin {
         }
         if let Some(sweep) = &self.sweep {
             let phase = match sweep.phase {
-                SweepPhase::AcquiringLease => "leasing modulation",
-                SweepPhase::SettingDepth => "retargeting drive",
-                SweepPhase::Settling => "settling",
+                SweepPhase::AcquiringLease => "taking control of the drive",
+                SweepPhase::SettingDepth => "changing the depth",
+                SweepPhase::Settling => "waiting for the depth to settle",
                 SweepPhase::Recording => "recording",
             };
             let label = match sweep.kind {
-                SweepKind::Amplitude => "Sweep",
-                SweepKind::EventCount => "Event-count point",
+                SweepKind::Amplitude => "Depth sweep",
+                SweepKind::EventCount => "a₀ point",
             };
             entries.push(StatusEntry::Text(format!(
-                "{label}: point {}/{} commanding a = {:.3} for a measured {:.3} ({phase})",
+                "{label}: point {}/{}, asking for a = {:.3} to measure {:.3} ({phase})",
                 sweep.index + 1,
                 sweep.total(),
                 sweep.commanded_a(),
@@ -5399,13 +6974,13 @@ impl Plugin for StageAA1Plugin {
         }
         if let Some(lock) = &self.a0_lock {
             let phase = match lock.phase {
-                A0LockPhase::AcquiringLease => "leasing modulation",
-                A0LockPhase::SettingDepth => "commanding depth",
+                A0LockPhase::AcquiringLease => "taking control of the drive",
+                A0LockPhase::SettingDepth => "setting the depth",
                 A0LockPhase::Measuring => "measuring",
             };
             entries.push(StatusEntry::Text(format!(
-                "a₀ lock at {}: trial {}/{A0_LOCK_MAX_TRIALS} commanding a = {:.3} for a₀ = {:.3} \
-                 ({phase}, {} sample(s))",
+                "Find a₀ at {}: try {}/{A0_LOCK_MAX_TRIALS}, asking for a = {:.3} to measure a₀ = \
+                 {:.3} ({phase}, {} reading(s))",
                 frequency_label(lock.frequency_hz),
                 lock.trial,
                 lock.commanded_a,
@@ -5416,87 +6991,150 @@ impl Plugin for StageAA1Plugin {
         if !self.message.is_empty() {
             entries.push(StatusEntry::Text(self.message.clone()));
         }
+        // Each fact appears once. The panel used to state a missing frequency on
+        // three separate lines — the transient message, this line, and the a₀
+        // readiness line — which reads as three problems instead of one.
+        let no_frequency = self.frequency_hz().is_none();
         match self.period_us() {
             Some(period_us) => {
-                let source = self.frequency_source();
+                let source = match self.frequency_source() {
+                    "trigger" => "measured from the trigger",
+                    _ => "as set in the modulation plugin",
+                };
                 entries.push(StatusEntry::Text(format!(
-                    "T = {:.3} ms ({:.3} Hz, {source})",
-                    period_us / 1_000.0,
+                    "Frequency: {:.3} Hz ({source}) — one cycle is {:.3} ms",
                     1_000_000.0 / period_us,
+                    period_us / 1_000.0,
                 )));
             }
-            None => entries.push(StatusEntry::Text(
-                "No modulation period (connect modulation or the EXT_TRIGGER)".into(),
-            )),
+            None => entries.push(StatusEntry::Text(format!(
+                "Frequency: unknown. {}",
+                capitalize_first(
+                    &self
+                        .frequency_blocker()
+                        .unwrap_or_else(|| "no drive is armed".into())
+                )
+            ))),
         }
-        let anchor = if self.is_marker_anchored() {
-            format!(
-                "{} phase-0 markers (trigger-anchored)",
-                self.camera_markers_us.len()
-            )
+        // With Live analysis off nothing is ingested at all, so an event count
+        // and a pixel count describe the switch rather than the bench. Say only
+        // what is true.
+        entries.push(StatusEntry::Text(if !self.live {
+            "Camera: Live analysis is OFF — no events or triggers are being read".into()
         } else {
-            "free-running (no EXT_TRIGGER)".into()
-        };
-        entries.push(StatusEntry::Text(format!(
-            "{} events, {} valid pixels; {anchor}",
-            self.camera_events.len(),
-            self.valid_pixel_count().unwrap_or(0)
-        )));
-        entries.push(StatusEntry::Text(match self.measured_a() {
-            Some(a) => format!("a = {a:.3} (photodiode)"),
-            None => {
-                let detail = self
-                    .photodiode
-                    .as_ref()
-                    .map(|summary| connection_label(&summary.connection))
-                    .unwrap_or("no snapshot");
-                format!("a = — (photodiode: {detail})")
-            }
+            let anchor = if self.is_marker_anchored() {
+                format!("{} triggers seen", self.camera_markers_us.len())
+            } else {
+                "no trigger signal — check the cable from the Teensy to the camera".into()
+            };
+            format!(
+                "Camera: {} events, {} usable pixels; {anchor}",
+                self.camera_events.len(),
+                self.valid_pixel_count().unwrap_or(0)
+            )
         }));
+        let depth_label = match self.depth_source {
+            DepthSource::Photodiode => "Measured depth a",
+            DepthSource::Commanded => "Commanded depth a (open loop, not measured)",
+        };
+        entries.push(StatusEntry::Text(match self.depth_a() {
+            Some(a) => format!("{depth_label} = {a:.3}"),
+            // Name the gate, not just its effect: every a₀ and sweep button
+            // refuses on this value, so the panel has to say what to fix. A
+            // colon, not a dash: the reason carries a dash of its own.
+            None => format!(
+                "{depth_label}: not available. {}",
+                capitalize_first(
+                    &self
+                        .depth_a_blocker()
+                        .unwrap_or_else(|| "no depth source has sent anything yet".into())
+                )
+            ),
+        }));
+        // Silent when the host reports nothing (replay, or a camera without a
+        // monitoring block) rather than printing three dashes.
+        if let Some(sensor) = self.sensor {
+            let mut parts = Vec::new();
+            if let Some(celsius) = sensor.temperature_c {
+                parts.push(format!("{celsius:.1} °C"));
+            }
+            if let Some(dead_time_us) = sensor.pixel_dead_time_us {
+                parts.push(format!("{dead_time_us:.1} µs dead time"));
+            }
+            if let Some(lux) = sensor.illumination_lux {
+                parts.push(format!("{lux:.0} lx"));
+            }
+            if !parts.is_empty() {
+                entries.push(StatusEntry::Text(format!(
+                    "Sensor: {} (read {:.1} s ago; recorded with every run)",
+                    parts.join(", "),
+                    sensor.age_s
+                )));
+            }
+        }
         if let Some((on, off)) = self.latest_rolling() {
             entries.push(StatusEntry::Text(format!(
-                "S_on = {on:.4}, S_off = {off:.4} (events/pixel per T/2)"
+                "Events per pixel per half-cycle: {on:.4} bright, {off:.4} dark"
             )));
         }
-        let source = if self.windows_are_frozen() {
-            "pilot-frozen"
-        } else {
-            "auto"
-        };
-        let windows = self.current_windows().map_or_else(
-            || "windows —".into(),
-            |(on, off)| {
-                format!(
-                    "windows ({source}) ON [{:.2},{:.2}) OFF [{:.2},{:.2})",
-                    on.start, on.end, off.start, off.end
-                )
-            },
-        );
-        let valid = self
-            .valid_pixel_count()
-            .map_or_else(|| "—".into(), |n| n.to_string());
-        entries.push(StatusEntry::Text(format!(
-            "Response curve: {windows}, N_valid = {valid}, {} point(s)",
-            self.response_points.len()
-        )));
+        // Silent until there is something to report: at rest this line said
+        // "0 point(s), no bright/dark windows yet", which is just the absence of
+        // the two facts above it.
+        let windows = self.current_windows();
+        if !self.response_points.is_empty() || windows.is_some() {
+            let source = if self.windows_are_frozen() {
+                "from the pilot"
+            } else {
+                "found automatically"
+            };
+            let windows = windows.map_or_else(
+                || "no bright/dark windows yet".into(),
+                |(on, off)| {
+                    format!(
+                        "bright/dark windows {source} (bright {:.2}–{:.2}, dark {:.2}–{:.2} of a \
+                         cycle)",
+                        on.start, on.end, off.start, off.end
+                    )
+                },
+            );
+            entries.push(StatusEntry::Text(format!(
+                "Response curve: {} point(s), {windows}",
+                self.response_points.len()
+            )));
+        }
         if let Some((q0_on, q0_off)) = self.background_floor {
             entries.push(StatusEntry::Text(format!(
-                "Background floor: q0_on = {q0_on:.3}, q0_off = {q0_off:.3}"
+                "Background floor recorded: {q0_on:.3} bright, {q0_off:.3} dark"
             )));
         }
-        entries.push(StatusEntry::Text(match self.armed_lock() {
-            Some(lock) => format!(
-                "a₀ = {:.3} armed at {}: commanded a = {:.3} (measured {:.3}); {} lock(s) stored",
+        // Open loop there is no lock table and nothing was searched for, so the
+        // line says what will happen rather than reporting a saved-depth count
+        // that is structurally always zero.
+        entries.push(StatusEntry::Text(match (self.armed_a0(), no_frequency) {
+            (Some(lock), _) if !self.depth_source.needs_a0_lock() => format!(
+                "Ready to record at a₀ = {:.3}: the drive is commanded to a = {:.3} at {} — no \
+                 search needed, press \"Record a₀ point\" or \"Record all frequencies\".",
+                lock.target_a,
+                lock.commanded_a,
+                frequency_label(lock.frequency_hz),
+            ),
+            (Some(lock), _) => format!(
+                "Ready to record at a₀ = {:.3}: at {} the drive is set to a = {:.3} and the \
+                 photodiode measures {:.3}. {} depth(s) saved.",
                 lock.target_a,
                 frequency_label(lock.frequency_hz),
                 lock.commanded_a,
                 lock.measured_a,
                 self.a0_locks.len()
             ),
-            None => format!(
-                "a₀ = {:.3}: no lock for this frequency — press Find a₀; {} lock(s) stored",
-                self.a0_target,
-                self.a0_locks.len()
+            // Without a frequency nothing about a₀ can be judged yet, and the
+            // Frequency line above already says what to fix. Point at it rather
+            // than repeating it.
+            (None, true) => "a₀ points: waiting for a frequency (above).".into(),
+            (None, false) => format!(
+                "Not ready to record an a₀ point — {}.",
+                self.armed_a0_blocker()
+                    .unwrap_or_else(|| "no depth is armed".into()),
             ),
         }));
         entries
@@ -5521,7 +7159,7 @@ impl Plugin for StageAA1Plugin {
                             column("measurement_id", "Measurement id"),
                             column("remaining", "Remaining"),
                             column("frequency", "Frequency"),
-                            column("a", "a (photodiode)"),
+                            column("a", "a (depth)"),
                             column("s_on", "S_on"),
                             column("s_off", "S_off"),
                             column("events", "Events"),
@@ -5557,7 +7195,8 @@ impl Plugin for StageAA1Plugin {
                             column("frequency", "Frequency"),
                             column("target_a", "a₀ (target)"),
                             column("commanded_a", "Commanded a"),
-                            column("measured_a", "Measured a"),
+                            column("measured_a", "Observed a"),
+                            column("depth_source", "a from"),
                             column("trials", "Trials"),
                             column("state", "State"),
                             column("locked_at", "Locked at (UTC)"),
@@ -5674,6 +7313,7 @@ mod tests {
         }
         // Same order as `process_control`: outermost supervisor first, so one
         // tick can carry a hand-off from the ladder down into a recording.
+        plugin.drive_protocol(sink);
         plugin.drive_freq_sweep(sink);
         plugin.drive_a0_lock(sink);
         plugin.drive_sweep(sink);
@@ -5692,6 +7332,21 @@ mod tests {
                 payload: Value::Null,
             },
         }
+    }
+
+    /// A control inbox carrying just these service replies.
+    fn inbox_with(service_replies: Vec<PluginServiceReply>) -> PluginControlInbox {
+        PluginControlInbox {
+            service_replies,
+            ..PluginControlInbox::default()
+        }
+    }
+
+    /// The modulation command inside a routed service request, if it is one.
+    fn modulation_command(request: &PluginServiceRequest) -> Option<ModulationCommandV1> {
+        serde_json::from_value::<ModulationRequestV1>(request.payload.clone())
+            .ok()
+            .map(|envelope| envelope.command)
     }
 
     fn rejected(request_id: u64, message: &str) -> PluginServiceReply {
@@ -5733,6 +7388,24 @@ mod tests {
             },
             calibration_id: Some("pockels-test".into()),
             optical_drive: None,
+        }
+    }
+
+    /// A connected modulation owner running a calibrated optical drive at
+    /// `depth_a`, published at `revision`.
+    fn commanded_modulation(revision: u64, depth_a: f64) -> ModulationStateV1 {
+        ModulationStateV1 {
+            service_revision: revision,
+            optical_drive: Some(stage_a_plugin_contract::OpticalDriveStateV1 {
+                target: OpticalTargetV1::LogSine,
+                requested_mean_u_milli: 500,
+                resolved_mean_u_milli: 500,
+                internal_u_milli: 500,
+                depth_a_milli: (depth_a * 1_000.0).round() as u32,
+                v_null_dac: 100,
+                v_peak_dac: 800,
+            }),
+            ..connected_modulation()
         }
     }
 
@@ -5785,6 +7458,7 @@ mod tests {
                 window_seconds: Some(0.001),
                 covered_cycles: Some(8.0),
             }),
+            optical_unavailable: None,
             synchronization: stage_a_plugin_contract::SynchronizationV1::Unsynced {
                 reason: stage_a_plugin_contract::UnsyncedReasonV1::NoLease,
                 detail: None,
@@ -5881,6 +7555,594 @@ mod tests {
         max_ticks
     }
 
+    /// The bench that motivated the commanded source: the photodiode streams
+    /// fine but withholds `a` because no phase-0 markers ever arrive, so no
+    /// window can be proven to cover whole modulation cycles.
+    fn photodiode_without_triggers() -> PhotodiodeSummaryV1 {
+        PhotodiodeSummaryV1 {
+            optical_summary: None,
+            optical_unavailable: Some(
+                "no stretch of samples covers two whole modulation cycles between triggers \
+                 (0 trigger(s) in the last 3446784 samples) — lower the frequency, or raise the \
+                 photodiode cache length"
+                    .into(),
+            ),
+            ..photodiode_measuring(1, 0.5)
+        }
+    }
+
+    #[test]
+    fn a_withheld_photodiode_depth_names_the_commanded_fallback() {
+        // The photodiode's own reason has to survive verbatim — it is the only
+        // side that knows which gate refused — but a bench with no trigger
+        // markers at all cannot act on it, so the way past must be on the same
+        // line as the diagnosis.
+        let mut plugin = plugin_with_markers();
+        plugin.photodiode = Some(photodiode_without_triggers());
+
+        let blocker = plugin.depth_a_blocker().expect("a withheld a has a reason");
+        assert!(
+            blocker.contains("two whole modulation cycles"),
+            "the owner's own words must survive: {blocker}"
+        );
+        assert!(
+            blocker.contains("Depth a source"),
+            "and must name the setting that gets past it: {blocker}"
+        );
+    }
+
+    #[test]
+    fn the_commanded_source_reports_a_depth_with_no_photodiode_at_all() {
+        let mut plugin = plugin_with_markers();
+        plugin.photodiode = None;
+        plugin.modulation = Some(commanded_modulation(1, 0.75));
+        plugin.depth_source = DepthSource::Commanded;
+
+        assert_eq!(plugin.depth_a(), Some(0.75));
+        assert!(
+            plugin.depth_a_blocker().is_none(),
+            "the commanded drive is a depth source in its own right"
+        );
+    }
+
+    #[test]
+    fn the_commanded_source_refuses_a_drive_that_is_not_calibrated() {
+        // Without a calibrated optical drive the owner publishes no inversion,
+        // and a "commanded a" would be a DAC number wearing a physical name.
+        let mut plugin = plugin_with_markers();
+        plugin.photodiode = None;
+        plugin.modulation = Some(connected_modulation());
+        plugin.depth_source = DepthSource::Commanded;
+
+        assert!(plugin.depth_a().is_none());
+        let blocker = plugin.depth_a_blocker().expect("a reason");
+        assert!(
+            blocker.contains("calibration") && blocker.contains("OPTICAL_LOG_SINE"),
+            "{blocker}"
+        );
+    }
+
+    /// An acknowledged periodic drive at `hz`, i.e. what the modulation owner
+    /// publishes once it has really applied a commanded frequency.
+    fn acknowledged_sine(hz: f64) -> stage_a_plugin_contract::ModulationTargetV1 {
+        stage_a_plugin_contract::ModulationTargetV1 {
+            revision: SemanticRevision(1),
+            waveform: Some(WaveformV1::Periodic {
+                waveform: stage_a_plugin_contract::PeriodicWaveformV1::Sine,
+                min_dac: 100,
+                max_dac: 900,
+                frequency_millihz: (hz * 1_000.0).round() as u64,
+            }),
+            a1_configuration: None,
+            acquisition_running: true,
+            board_dac_code: None,
+            firmware_configuration_revision: None,
+        }
+    }
+
+    /// A plugin ready to record a₀ points open loop: calibrated commanded
+    /// drive, no photodiode, and — deliberately — no camera trigger markers.
+    fn plugin_commanded_a0(folder: &Path) -> StageAA1Plugin {
+        StageAA1Plugin {
+            frame_width: 10,
+            frame_height: 1,
+            depth_source: DepthSource::Commanded,
+            photodiode: Some(fresh_photodiode_summary()),
+            modulation: Some(commanded_modulation(1, 0.5)),
+            output_folder: folder.display().to_string(),
+            measurement_id: "A1-cmd".into(),
+            settle_s: 0.0,
+            a0_target: 0.5,
+            a0_tolerance: 0.02,
+            ..StageAA1Plugin::default()
+        }
+    }
+
+    #[test]
+    fn find_a0_refuses_to_search_for_a_depth_it_is_commanding() {
+        // The search commands a₀, reads back a₀ and stops — one identical row
+        // per frequency and nothing learned. Refuse and say so rather than
+        // spending a lease and a trial to arrive where the operator already is.
+        let dir = temp_folder("commanded-find");
+        let mut plugin = plugin_commanded_a0(&dir);
+        let mut sink = ControlSink::default();
+
+        plugin.set_setting("find_a0", json!(true)).expect("press");
+        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+
+        assert!(plugin.a0_lock.is_none(), "no search may start");
+        assert!(
+            sink.services.is_empty(),
+            "and no lease may be taken for it: {:?}",
+            sink.services.len()
+        );
+        assert!(
+            plugin.message.contains("No search needed"),
+            "{}",
+            plugin.message
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_commanded_a0_point_is_armed_without_any_lock() {
+        // `Record a₀ point` and the ladder both ask one question — what depth
+        // is armed here — and open loop the answer needs no stored table.
+        let dir = temp_folder("commanded-armed");
+        let mut plugin = plugin_commanded_a0(&dir);
+        // 1 kHz from the modulation owner's acknowledged drive; no markers.
+        plugin.modulation = Some(ModulationStateV1 {
+            acknowledged: Some(acknowledged_sine(1_000.0)),
+            ..commanded_modulation(1, 0.5)
+        });
+
+        assert!(
+            !plugin.is_marker_anchored(),
+            "no camera trigger in this test"
+        );
+        assert!(
+            plugin.armed_a0_blocker().is_none(),
+            "{:?}",
+            plugin.armed_a0_blocker()
+        );
+        let armed = plugin.armed_a0().expect("an armed depth");
+        assert!((armed.commanded_a - 0.5).abs() < 1e-9);
+        assert!((armed.frequency_hz - 1_000.0).abs() < 1e-6);
+        assert_eq!(armed.trials, 0, "no search happened, and it must say so");
+        assert_eq!(armed.depth_source, DepthSource::Commanded);
+        assert!(
+            plugin.a0_locks.is_empty(),
+            "and nothing was written to the lock table"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_commanded_ladder_records_every_point_without_a_lock_or_a_trigger() {
+        // The whole simplification in one test: no photodiode `a`, no camera
+        // markers, no Find a₀ — the ladder still leases once, walks the
+        // frequencies confirming each against the modulation owner, and records
+        // a point at a₀ at every one of them.
+        let dir = temp_folder("commanded-ladder");
+        let mut plugin = plugin_commanded_a0(&dir);
+        plugin.min_f = 10.0;
+        plugin.max_f = 1_000.0;
+        plugin.freq_count = 3;
+        plugin.freq_order = FreqOrder::Ascending;
+        plugin.duration_s = 1;
+
+        let mut sink = ControlSink::default();
+        plugin
+            .set_setting("start_freq_sweep", json!(true))
+            .expect("press");
+        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+        assert!(
+            plugin.freq_sweep.is_some(),
+            "the ladder must start with no trigger: {}",
+            plugin.message
+        );
+
+        let mut recorded = Vec::new();
+        for _ in 0..400 {
+            let Some((phase, target_hz, lease_req, freq_req, granted, applied)) =
+                plugin.freq_sweep.as_ref().map(|sweep| {
+                    (
+                        sweep.phase,
+                        sweep.frequency_hz(),
+                        sweep.lease_req,
+                        sweep.freq_req,
+                        sweep.lease_granted,
+                        sweep.freq_applied,
+                    )
+                })
+            else {
+                break;
+            };
+            let mut replies = Vec::new();
+            match phase {
+                FreqSweepPhase::AcquiringLease if !granted => replies.push(accepted(lease_req)),
+                FreqSweepPhase::SettingFrequency if !applied && freq_req != 0 => {
+                    // The owner acknowledges the new frequency. In commanded
+                    // mode that ack — not the camera trigger — is what confirms
+                    // the point, so nothing here ever writes a marker.
+                    plugin.modulation = Some(ModulationStateV1 {
+                        acknowledged: Some(acknowledged_sine(target_hz)),
+                        ..commanded_modulation(2, 0.5)
+                    });
+                    replies.push(accepted(freq_req));
+                }
+                FreqSweepPhase::Locking => {
+                    panic!("the commanded ladder must never enter the search phase")
+                }
+                FreqSweepPhase::Recording => {
+                    if let Some(sweep) = plugin.sweep.as_ref() {
+                        if !sweep.depth_applied && sweep.depth_req != 0 {
+                            replies.push(accepted(sweep.depth_req));
+                        }
+                    }
+                    // Short-circuit the recording coordinator once the point has
+                    // started: this test is about the ladder, and the
+                    // coordinator has tests of its own.
+                    if plugin.recording.is_active()
+                        && plugin
+                            .sweep
+                            .as_ref()
+                            .is_some_and(|sweep| sweep.point_started)
+                    {
+                        plugin.recording = Recording::idle();
+                        plugin.recording_completed_ok = true;
+                        recorded.push(target_hz);
+                    }
+                }
+                _ => {}
+            }
+            control_tick(
+                &mut plugin,
+                PluginControlInbox {
+                    service_replies: replies,
+                    ..PluginControlInbox::default()
+                },
+                &mut sink,
+            );
+        }
+
+        assert!(
+            plugin.freq_sweep.is_none(),
+            "the ladder must finish: {}",
+            plugin.message
+        );
+        assert_eq!(
+            recorded.len(),
+            3,
+            "every planned point records: {recorded:?}"
+        );
+        assert!(
+            plugin.message.contains("3/3 points recorded"),
+            "{}",
+            plugin.message
+        );
+        assert!(
+            plugin.a0_locks.is_empty(),
+            "and the lock table stays empty — nothing was searched for"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_nested_sweep_records_every_depth_at_every_frequency_on_one_lease() {
+        // The q_p(a, f) surface in one press: the outer ladder walks the
+        // frequencies, and each rung runs the *whole* inner depth sweep. No a₀
+        // and no search are involved at any point.
+        let dir = temp_folder("nested-sweep");
+        let mut plugin = plugin_commanded_a0(&dir);
+        plugin.min_f = 10.0;
+        plugin.max_f = 100.0;
+        plugin.freq_count = 2;
+        plugin.freq_order = FreqOrder::Ascending;
+        plugin.min_a = 0.5;
+        plugin.max_a = 1.5;
+        plugin.sweep_count = 3;
+        plugin.duration_s = 1;
+
+        let mut sink = ControlSink::default();
+        plugin
+            .set_setting("start_freq_depth_sweep", json!(true))
+            .expect("press");
+        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+        assert!(
+            plugin.freq_sweep.is_some(),
+            "the nested sweep must start: {}",
+            plugin.message
+        );
+
+        // (frequency, depth index) of every recording that actually started.
+        let mut recorded: Vec<(f64, usize)> = Vec::new();
+        for _ in 0..600 {
+            let Some((phase, mode, target_hz, lease_req, freq_req, granted, applied)) =
+                plugin.freq_sweep.as_ref().map(|sweep| {
+                    (
+                        sweep.phase,
+                        sweep.mode,
+                        sweep.frequency_hz(),
+                        sweep.lease_req,
+                        sweep.freq_req,
+                        sweep.lease_granted,
+                        sweep.freq_applied,
+                    )
+                })
+            else {
+                break;
+            };
+            assert_eq!(mode, FreqSweepMode::DepthSweep);
+            assert_ne!(
+                phase,
+                FreqSweepPhase::Locking,
+                "a depth sweep never needs an a₀ search"
+            );
+            let mut replies = Vec::new();
+            match phase {
+                FreqSweepPhase::AcquiringLease if !granted => replies.push(accepted(lease_req)),
+                FreqSweepPhase::SettingFrequency if !applied && freq_req != 0 => {
+                    plugin.modulation = Some(ModulationStateV1 {
+                        acknowledged: Some(acknowledged_sine(target_hz)),
+                        ..commanded_modulation(2, 0.5)
+                    });
+                    replies.push(accepted(freq_req));
+                }
+                FreqSweepPhase::Recording => {
+                    if let Some(sweep) = plugin.sweep.as_ref() {
+                        let (depth_req, depth_applied, index, commanded) = (
+                            sweep.depth_req,
+                            sweep.depth_applied,
+                            sweep.index,
+                            sweep.commanded_a(),
+                        );
+                        if !depth_applied && depth_req != 0 {
+                            // The owner applies the depth this point asked for,
+                            // which is what the settle check then reads back.
+                            plugin.modulation = Some(ModulationStateV1 {
+                                acknowledged: Some(acknowledged_sine(target_hz)),
+                                ..commanded_modulation(3, commanded)
+                            });
+                            replies.push(accepted(depth_req));
+                        }
+                        if plugin.recording.is_active() && sweep.point_started {
+                            plugin.recording = Recording::idle();
+                            plugin.recording_completed_ok = true;
+                            recorded.push((target_hz, index));
+                        }
+                    }
+                }
+                _ => {}
+            }
+            control_tick(
+                &mut plugin,
+                PluginControlInbox {
+                    service_replies: replies,
+                    ..PluginControlInbox::default()
+                },
+                &mut sink,
+            );
+        }
+
+        assert!(
+            plugin.freq_sweep.is_none(),
+            "the nested sweep must finish: {}",
+            plugin.message
+        );
+        assert_eq!(
+            recorded.len(),
+            6,
+            "2 frequencies × 3 depths: {recorded:?} — {}",
+            plugin.message
+        );
+        // Every frequency saw its whole curve, in depth order.
+        assert_eq!(
+            recorded.iter().map(|(_, index)| *index).collect::<Vec<_>>(),
+            vec![0, 1, 2, 0, 1, 2]
+        );
+        assert!((recorded[0].0 - 10.0).abs() < 1e-6, "{recorded:?}");
+        assert!((recorded[3].0 - 100.0).abs() < 1e-6, "{recorded:?}");
+        assert!(
+            plugin
+                .message
+                .contains("2/2 frequencies × 3 depths recorded"),
+            "{}",
+            plugin.message
+        );
+
+        // One lease for the whole block: the inner sweeps inherit it, so the
+        // operator's drive cannot move between rungs.
+        let leases = sink
+            .services
+            .iter()
+            .filter_map(|request| {
+                serde_json::from_value::<ModulationRequestV1>(request.payload.clone()).ok()
+            })
+            .filter(|envelope| matches!(envelope.command, ModulationCommandV1::AcquireLease { .. }))
+            .count();
+        assert_eq!(
+            leases, 1,
+            "exactly one lease acquisition for the whole block"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_nested_sweep_point_is_named_by_frequency_and_depth() {
+        // `_p03` alone repeats at every rung, so the surface would collide
+        // inside one measurement id.
+        let dir = temp_folder("nested-name");
+        let mut plugin = plugin_commanded_a0(&dir);
+        plugin.freq_sweep = Some(FreqSweep {
+            phase: FreqSweepPhase::Recording,
+            mode: FreqSweepMode::DepthSweep,
+            points: vec![FreqSweepPoint {
+                frequency_hz: 50.0,
+                is_reference: false,
+            }],
+            index: 0,
+            lease_id: LeaseId::new("nested"),
+            lease_granted: true,
+            lease_req: 0,
+            freq_req: 0,
+            freq_applied: true,
+            confirm_deadline_ms: 0,
+            skip_reason: None,
+            failed: Vec::new(),
+            recorded: 0,
+            order: FreqOrder::Ascending,
+            seed: 1,
+            last_activity_ms: 0,
+            stop_requested: false,
+        });
+        plugin.sweep = Some(Sweep {
+            phase: SweepPhase::Recording,
+            kind: SweepKind::Amplitude,
+            points: vec![
+                SweepPoint {
+                    commanded_a: 1.0,
+                    expected_a: 1.0,
+                };
+                3
+            ],
+            lock: None,
+            index: 2,
+            lease_id: LeaseId::new("nested"),
+            lease_granted: true,
+            lease_req: 0,
+            owns_lease: false,
+            depth_req: 0,
+            depth_applied: true,
+            settled_since_ms: None,
+            settle_deadline_ms: 0,
+            point_started: false,
+            completed_ok: false,
+            last_activity_ms: 0,
+            stop_requested: false,
+        });
+
+        let mut sink = ControlSink::default();
+        plugin.begin_recording(&mut sink, RecRole::Normal);
+        let stem = plugin.recording.stem.clone();
+        assert!(stem.ends_with("_f50Hz_p03"), "stem: {stem}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn every_run_records_the_bench_conditions_the_sensor_measured() {
+        let mut plugin = plugin_with_markers();
+        plugin.sensor = Some(SensorMonitoringV1 {
+            pixel_dead_time_us: Some(102.5),
+            illumination_lux: Some(742.0),
+            temperature_c: Some(41.25),
+            bias_codes: Some(augur_plugin_api::SensorBiasReadbackV1 {
+                current: augur_plugin_api::SensorBiasCodesV1 {
+                    diff_on: 115,
+                    diff_off: 52,
+                    fo: 55,
+                    hpf: 0,
+                    refr: 20,
+                },
+                factory_default: augur_plugin_api::SensorBiasCodesV1::default(),
+            }),
+            age_s: 0.25,
+        });
+        // Frozen at start: the die warms and the room lights move, so what
+        // belongs to a run is what held when it began.
+        plugin.sensor_at_start = plugin.sensor;
+        plugin.sensor = Some(SensorMonitoringV1 {
+            temperature_c: Some(99.0),
+            ..plugin.sensor.expect("set above")
+        });
+
+        let meta = plugin.recording_metadata();
+        assert_eq!(
+            meta.get("sensor_temperature_c").map(String::as_str),
+            Some("41.25"),
+            "the start snapshot wins over the drifted live one"
+        );
+        assert_eq!(
+            meta.get("sensor_pixel_dead_time_us").map(String::as_str),
+            Some("102.500")
+        );
+        assert_eq!(
+            meta.get("sensor_illumination_lux").map(String::as_str),
+            Some("742.000")
+        );
+        assert_eq!(
+            meta.get("sensor_reading_age_s").map(String::as_str),
+            Some("0.250")
+        );
+
+        plugin.recording.id = "A1-sensor".into();
+        plugin.recording.stem = "A1-sensor_20260731-000000".into();
+        plugin.recording.folder = std::env::temp_dir().display().to_string();
+        plugin.recording.duration_s = 5;
+        let doc = plugin.write_sidecar().expect("sidecar path");
+        let text = std::fs::read_to_string(&doc).expect("read sidecar");
+        assert!(text.contains("[sensor]"), "{text}");
+        assert!(text.contains("temperature_c = 41.25"), "{text}");
+        assert!(text.contains("pixel_dead_time_us = 102.5"), "{text}");
+        assert!(text.contains("illumination_lux = 742.0"), "{text}");
+        assert!(text.contains("bias_refr = 20"), "{text}");
+        let _ = std::fs::remove_file(&doc);
+    }
+
+    #[test]
+    fn a_quantity_the_sensor_cannot_report_is_absent_rather_than_zero() {
+        // Replay, decoded imports and cameras without a monitoring block have
+        // no sensor to ask. A 0 °C die or 0 lx scene would be read downstream
+        // as a measurement.
+        let mut plugin = plugin_with_markers();
+        assert!(plugin.recorded_sensor().is_none());
+        let meta = plugin.recording_metadata();
+        assert!(!meta.contains_key("sensor_temperature_c"));
+        assert!(!meta.contains_key("sensor_illumination_lux"));
+
+        // A sensor that reports only some of the three is equally honest.
+        plugin.sensor_at_start = Some(SensorMonitoringV1 {
+            temperature_c: Some(38.0),
+            age_s: 0.1,
+            ..SensorMonitoringV1::default()
+        });
+        let meta = plugin.recording_metadata();
+        assert_eq!(
+            meta.get("sensor_temperature_c").map(String::as_str),
+            Some("38.00")
+        );
+        assert!(!meta.contains_key("sensor_illumination_lux"));
+        assert!(!meta.contains_key("sensor_pixel_dead_time_us"));
+    }
+
+    #[test]
+    fn a_run_records_which_source_its_depth_came_from() {
+        let mut plugin = plugin_with_markers();
+        plugin.photodiode = None;
+        plugin.modulation = Some(commanded_modulation(1, 0.75));
+        plugin.depth_source = DepthSource::Commanded;
+
+        let meta = plugin.recording_metadata();
+        assert_eq!(
+            meta.get("depth_a_source").map(String::as_str),
+            Some("modulation_commanded")
+        );
+        assert_eq!(meta.get("depth_a").map(String::as_str), Some("0.750000"));
+        assert!(
+            !meta.contains_key("measured_a"),
+            "`measured_a` names a measurement, and there was none"
+        );
+
+        plugin.depth_source = DepthSource::Photodiode;
+        plugin.photodiode = Some(photodiode_measuring(1, 0.42));
+        let meta = plugin.recording_metadata();
+        assert_eq!(
+            meta.get("depth_a_source").map(String::as_str),
+            Some("photodiode_measured")
+        );
+        assert_eq!(meta.get("measured_a").map(String::as_str), Some("0.420000"));
+    }
+
     fn pd_reply(request_id: u64, receipt: Option<PdqReceiptV1>) -> PluginServiceReply {
         let response = PhotodiodeResponseV1 {
             common: ResponseCommonV1 {
@@ -5934,6 +8196,7 @@ mod tests {
             active_recording: None,
             last_finalized_recording: None,
             optical_summary: None,
+            optical_unavailable: None,
             synchronization: SynchronizationV1::Unsynced {
                 reason: stage_a_plugin_contract::UnsyncedReasonV1::NoLease,
                 detail: None,
@@ -6001,6 +8264,7 @@ mod tests {
                 window_seconds: Some(0.008),
                 covered_cycles: Some(8.0),
             }),
+            optical_unavailable: None,
             synchronization: SynchronizationV1::Unsynced {
                 reason: UnsyncedReasonV1::NoLease,
                 detail: None,
@@ -6020,7 +8284,6 @@ mod tests {
             frame_width: 10,
             frame_height: 1,
             camera_markers_us: vec![0, 1_000, 2_000, 3_000],
-            flux_point_id: "flux-test".into(),
             photodiode: Some(fresh_photodiode_summary()),
             ..StageAA1Plugin::default()
         }
@@ -6106,7 +8369,7 @@ mod tests {
         assert!(q_on > 0.9 && q_off > 0.9, "q_on={q_on} q_off={q_off}");
         // Recording a point is still refused without a photodiode-measured a.
         plugin.photodiode = None;
-        assert!(plugin.measured_a().is_none());
+        assert!(plugin.depth_a().is_none());
         assert!(plugin.record_response_point().is_err());
     }
 
@@ -6262,7 +8525,6 @@ mod tests {
         let mut plugin = StageAA1Plugin {
             output_folder: folder.display().to_string(),
             measurement_id: "A1-row".into(),
-            flux_point_id: "flux-row-1".into(),
             photodiode: Some(fresh_photodiode_summary()),
             duration_s: 1,
             pending_role: Some(RecRole::Normal),
@@ -6494,6 +8756,7 @@ mod tests {
             settled_since_ms: None,
             settle_deadline_ms: 0,
             point_started: true,
+            completed_ok: false,
             last_activity_ms: 0,
             stop_requested: false,
         });
@@ -6753,7 +9016,7 @@ mod tests {
         plugin.freq_count = 2;
         plugin.freq_order = FreqOrder::Ascending;
         photodiode_window(&mut plugin, 0.02);
-        plugin.freq_sweep_pending = true;
+        plugin.freq_sweep_pending = Some(FreqSweepMode::A0Point);
         let mut sink = ControlSink::default();
 
         let recorded = run_freq_sweep_to_completion(&mut plugin, &mut sink, 0.6, 4_000);
@@ -6819,7 +9082,7 @@ mod tests {
         plugin.freq_count = 2;
         plugin.freq_order = FreqOrder::Ascending;
         photodiode_window(&mut plugin, 0.02);
-        plugin.freq_sweep_pending = true;
+        plugin.freq_sweep_pending = Some(FreqSweepMode::A0Point);
         let mut sink = ControlSink::default();
         control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
 
@@ -6929,7 +9192,7 @@ mod tests {
                 optical.window_seconds = Some(1.0); // 0.1 cycles at 0.1 Hz
             }
         }
-        plugin.freq_sweep_pending = true;
+        plugin.freq_sweep_pending = Some(FreqSweepMode::A0Point);
         let mut sink = ControlSink::default();
         control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
 
@@ -6962,6 +9225,7 @@ mod tests {
         ));
         plugin.freq_sweep = Some(FreqSweep {
             phase: FreqSweepPhase::AcquiringLease,
+            mode: FreqSweepMode::A0Point,
             points: vec![FreqSweepPoint {
                 frequency_hz: 50.0,
                 is_reference: false,
@@ -7017,6 +9281,83 @@ mod tests {
         assert!(
             plugin.message.contains("0.40 cycles") && plugin.message.contains("cache length"),
             "message: {}",
+            plugin.message
+        );
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn a0_gates_quote_the_owners_reason_for_withholding_a() {
+        // The old refusal named the anchor and the cable whatever the real cause
+        // was, which sent the operator to re-check a calibration that was
+        // already fine. Whatever gate the owner closed has to reach the panel.
+        let folder = temp_folder("blocker");
+        let mut plugin = plugin_locking(1.0, &folder);
+        plugin.a0_target = 0.5;
+        if let Some(summary) = plugin.photodiode.as_mut() {
+            summary.optical_summary = None;
+            summary.optical_unavailable = Some("ADC clipping: 307‰ low / 0‰ high".into());
+        }
+
+        plugin.a0_lock_pending = true;
+        let mut sink = ControlSink::default();
+        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+
+        assert!(plugin.a0_lock.is_none(), "the lock must not start");
+        assert!(
+            plugin.message.contains("307‰ low"),
+            "the a₀ refusal must quote the owner: {}",
+            plugin.message
+        );
+        // And without pressing anything: the resting panel says the same thing.
+        let status = plugin
+            .status_entries()
+            .into_iter()
+            .filter_map(|entry| match entry {
+                StatusEntry::Text(text) => Some(text),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            status.contains("307‰ low"),
+            "the status panel must name the gate: {status}"
+        );
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn the_status_panel_names_live_analysis_when_it_is_off() {
+        // "0 events, free-running" describes the toggle, not the bench, and the
+        // frequency sweep refuses on the marker count it produces.
+        let folder = temp_folder("liveoff");
+        let mut plugin = plugin_locking(1.0, &folder);
+        plugin.live = false;
+        plugin.camera_markers_us.clear();
+        // Clear the gates that sit *before* the marker check, so the refusal
+        // under test is the marker one and not the optical-window one.
+        plugin.min_f = 1.0;
+        plugin.max_f = 1.0;
+        photodiode_window(&mut plugin, 4.0);
+
+        let status = plugin
+            .status_entries()
+            .into_iter()
+            .filter_map(|entry| match entry {
+                StatusEntry::Text(text) => Some(text),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(status.contains("Live analysis is OFF"), "status: {status}");
+
+        plugin.freq_sweep_pending = Some(FreqSweepMode::A0Point);
+        let mut sink = ControlSink::default();
+        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+        assert!(plugin.freq_sweep.is_none(), "the sweep must not start");
+        assert!(
+            plugin.message.contains("Live analysis"),
+            "the sweep refusal must name the toggle: {}",
             plugin.message
         );
         let _ = std::fs::remove_dir_all(&folder);
@@ -7160,6 +9501,7 @@ mod tests {
             locked_at_unix_ms: now_unix_ms(),
             low_clip_fraction: Some(0.0),
             high_clip_fraction: Some(0.0),
+            depth_source: DepthSource::Photodiode,
         });
         let mut sink = ControlSink::default();
 
@@ -7204,6 +9546,7 @@ mod tests {
             locked_at_unix_ms: 1_784_764_800_000,
             low_clip_fraction: Some(0.0),
             high_clip_fraction: Some(0.0),
+            depth_source: DepthSource::Photodiode,
         };
         plugin.sweep = Some(Sweep {
             phase: SweepPhase::Recording,
@@ -7223,6 +9566,7 @@ mod tests {
             settled_since_ms: None,
             settle_deadline_ms: 0,
             point_started: true,
+            completed_ok: false,
             last_activity_ms: 0,
             stop_requested: false,
         });
@@ -7274,6 +9618,7 @@ mod tests {
             locked_at_unix_ms: now_unix_ms(),
             low_clip_fraction: None,
             high_clip_fraction: None,
+            depth_source: DepthSource::Photodiode,
         };
         plugin.store_lock(point(1_000.0, 0.83)).expect("saved");
         plugin.store_lock(point(50.0, 0.52)).expect("saved");
@@ -7293,7 +9638,10 @@ mod tests {
         assert_eq!(other.a0_locks.len(), 2);
         let reloaded = other.lock_for_frequency(1_000.0).expect("reloaded lock");
         assert!((reloaded.commanded_a - 0.86).abs() < 1e-9);
-        assert_eq!(other.a0_locks_dataset().columns.len(), 7);
+        assert_eq!(other.a0_locks_dataset().columns.len(), 8);
+        // A table written before the depth-source setting existed loads as the
+        // photodiode-measured rows it was: the field defaults, it is not lost.
+        assert_eq!(reloaded.depth_source, DepthSource::Photodiode);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -7334,6 +9682,539 @@ mod tests {
         );
     }
 
+    /// Turning Live analysis off used to leave the last analysis window in
+    /// place — up to millions of events — and the control tick keeps folding
+    /// whatever is in the buffer. So the plots stayed slow after the switch was
+    /// off again, which is exactly what the operator reported.
+    #[test]
+    fn turning_live_analysis_off_releases_the_event_buffer() {
+        let mut plugin = plugin_with_markers();
+        plugin.live = true;
+        plugin.camera_events = (0..50_000)
+            .map(|index| CameraEvent {
+                x: 0,
+                y: 0,
+                timestamp_us: index,
+                polarity: Polarity::On,
+            })
+            .collect();
+        plugin.camera_markers_us = (0..100).map(|index| index * 1_000).collect();
+        // Prime the memoised fold so the stale one cannot survive either.
+        let _ = plugin.current_fold();
+
+        plugin.set_setting("live", json!(false)).expect("live off");
+
+        assert!(plugin.camera_events.is_empty());
+        assert!(plugin.camera_markers_us.is_empty());
+        assert!(
+            plugin.camera_events.capacity() == 0,
+            "the buffer kept {} events' worth of capacity reserved",
+            plugin.camera_events.capacity()
+        );
+        assert!(
+            plugin.fold_cache.borrow().is_none(),
+            "a stale fold survived"
+        );
+    }
+
+    /// The Clear button and the off switch must leave the plugin in the same
+    /// state — they are the same operation.
+    #[test]
+    fn clearing_captured_events_releases_the_same_buffers() {
+        let mut plugin = plugin_with_markers();
+        plugin.live = true;
+        plugin.camera_events = vec![CameraEvent {
+            x: 0,
+            y: 0,
+            timestamp_us: 1,
+            polarity: Polarity::On,
+        }];
+        plugin.camera_markers_us = vec![0, 1_000];
+
+        plugin.set_setting("clear", json!(true)).expect("clear");
+
+        assert!(plugin.camera_events.is_empty());
+        assert!(plugin.camera_markers_us.is_empty());
+        assert!(plugin.fold_cache.borrow().is_none());
+    }
+
+    /// `settings_schema` is rendered by the UI mirror, which never runs
+    /// `process_control` — so every run lives on an instance the panel cannot
+    /// see. Gating a button on "is something running" therefore disables
+    /// nothing and lies to the next reader; the interlocks belong worker-side.
+    #[test]
+    fn buttons_are_not_gated_on_state_the_ui_mirror_cannot_see() {
+        let mut mirror = StageAA1Plugin {
+            output_folder: "/tmp/a1-mirror".into(),
+            ..StageAA1Plugin::default()
+        };
+        mirror.set_runtime_role(PluginRuntimeRole::UiMirror);
+
+        let enabled_of = |plugin: &StageAA1Plugin, key: &str| {
+            plugin
+                .settings_schema()
+                .sections
+                .iter()
+                .flat_map(|section| section.items.iter())
+                .find(|item| item.key == key)
+                .and_then(|item| match item.kind {
+                    SettingKind::Button { enabled } => Some(enabled),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("missing button {key}"))
+        };
+
+        let buttons = [
+            "start_recording",
+            "start_sweep",
+            "start_freq_sweep",
+            "start_freq_depth_sweep",
+            "run_protocol",
+        ];
+        let before: Vec<bool> = buttons.iter().map(|key| enabled_of(&mirror, key)).collect();
+        assert!(before.iter().all(|enabled| *enabled), "{before:?}");
+
+        // Now make the *worker-side* state look busy. The mirror renders the
+        // same either way, because it never sees any of this.
+        mirror.recording.phase = RecPhase::StartingCamera;
+        let after: Vec<bool> = buttons.iter().map(|key| enabled_of(&mirror, key)).collect();
+        assert_eq!(before, after, "a button was gated on worker-only state");
+
+        // Without an output folder they *are* disabled — that is mirrored
+        // state, so it is a legitimate gate.
+        mirror.output_folder = String::new();
+        for key in buttons {
+            assert!(!enabled_of(&mirror, key), "{key} ignored the output folder");
+        }
+    }
+
+    /// The Sweep f button and the depth it holds have to be in the same place:
+    /// the button used to be in Record while `a₀` sat in a collapsed section.
+    #[test]
+    fn the_depth_sweep_f_holds_sits_beside_the_frequency_axis() {
+        let schema = StageAA1Plugin::default().settings_schema();
+        let record = schema
+            .sections
+            .iter()
+            .find(|section| section.label == "Record")
+            .expect("a single Record section");
+        for key in ["a0_target", "min_f", "max_f", "start_freq_sweep"] {
+            assert!(
+                record.items.iter().any(|item| item.key == key),
+                "{key} is not in the Record section"
+            );
+        }
+    }
+
+    /// The protocol's own duration must not be written into the panel setting:
+    /// the host re-applies the mirror's snapshot every pass, so it would be
+    /// reverted within the frame and the operator's value would flicker.
+    #[test]
+    fn a_protocol_duration_overrides_without_touching_the_panel_setting() {
+        let folder = temp_folder("protocol-duration-override");
+        let (mut plugin, _) = protocol_plugin(&folder, TWO_POINT_PROTOCOL);
+        plugin.duration_s = 999;
+        let mut sink = ControlSink::default();
+
+        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+        let lease_req = sink.services[0].request_id;
+        sink.services.clear();
+        control_tick(
+            &mut plugin,
+            inbox_with(vec![accepted(lease_req)]),
+            &mut sink,
+        );
+        let retargets: Vec<u64> = sink
+            .services
+            .iter()
+            .filter(|request| {
+                matches!(
+                    modulation_command(request),
+                    Some(
+                        ModulationCommandV1::SetOperatingPoint { .. }
+                            | ModulationCommandV1::SetDriveFrequency { .. }
+                            | ModulationCommandV1::SetOpticalDepth { .. }
+                    )
+                )
+            })
+            .map(|request| request.request_id)
+            .collect();
+        control_tick(
+            &mut plugin,
+            inbox_with(retargets.into_iter().map(accepted).collect()),
+            &mut sink,
+        );
+        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+
+        assert_eq!(
+            plugin.recording.duration_s, 3,
+            "the protocol's duration lost"
+        );
+        assert_eq!(
+            plugin.duration_s, 999,
+            "the protocol overwrote the operator's own duration setting"
+        );
+        // And it is consumed, so the next hand-driven recording is the panel's.
+        assert!(plugin.pending_duration_s.is_none());
+
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// A protocol file on disk, and a plugin ready to run it.
+    fn protocol_plugin(folder: &Path, body: &str) -> (StageAA1Plugin, PathBuf) {
+        std::fs::create_dir_all(folder).expect("protocol folder");
+        let path = folder.join("protocol.toml");
+        std::fs::write(&path, body).expect("write protocol");
+        let mut plugin = plugin_with_markers();
+        plugin.modulation = Some(connected_modulation());
+        plugin.photodiode = Some(ready_photodiode());
+        plugin.output_folder = folder.display().to_string();
+        plugin.measurement_id = "A1-proto".into();
+        plugin.protocol_path = path.display().to_string();
+        plugin.protocol_pending = true;
+        (plugin, path)
+    }
+
+    const TWO_POINT_PROTOCOL: &str = r#"
+name = "two-point"
+
+[defaults]
+duration_s = 3
+settle_s = 0.0
+
+[[block]]
+name = "pair"
+mean_u = [0.4, 0.6]
+frequency_hz = 25.0
+depth_a = 0.7
+"#;
+
+    /// The reason a protocol exists rather than three nested button presses:
+    /// every point states its whole operating condition, so all three axes are
+    /// commanded at every point instead of being left wherever the last one
+    /// happened to leave them. `I_k` (ū) is the axis the buttons could not
+    /// sweep at all.
+    #[test]
+    fn a_protocol_commands_all_three_axes_at_every_point() {
+        let folder = temp_folder("protocol-axes");
+        let (mut plugin, _) = protocol_plugin(&folder, TWO_POINT_PROTOCOL);
+        let mut sink = ControlSink::default();
+
+        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+        let lease_req = sink
+            .services
+            .iter()
+            .find_map(|request| match modulation_command(request) {
+                Some(ModulationCommandV1::AcquireLease { .. }) => Some(request.request_id),
+                _ => None,
+            })
+            .expect("the protocol takes a modulation lease");
+
+        sink.services.clear();
+        control_tick(
+            &mut plugin,
+            inbox_with(vec![accepted(lease_req)]),
+            &mut sink,
+        );
+
+        let commands: Vec<ModulationCommandV1> = sink
+            .services
+            .iter()
+            .filter_map(modulation_command)
+            .collect();
+        assert!(
+            commands.iter().any(|command| matches!(
+                command,
+                ModulationCommandV1::SetOperatingPoint { mean_u_milli: 400 }
+            )),
+            "the I_k axis was not commanded: {commands:?}"
+        );
+        assert!(
+            commands.iter().any(|command| matches!(
+                command,
+                ModulationCommandV1::SetDriveFrequency {
+                    frequency_millihz: 25_000
+                }
+            )),
+            "the frequency axis was not commanded: {commands:?}"
+        );
+        assert!(
+            commands.iter().any(|command| matches!(
+                command,
+                ModulationCommandV1::SetOpticalDepth { depth_a_milli: 700 }
+            )),
+            "the depth axis was not commanded: {commands:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// Recording before every axis has been acknowledged would file the run
+    /// under parameters the bench was not actually at.
+    #[test]
+    fn a_protocol_point_waits_for_all_three_retargets_before_recording() {
+        let folder = temp_folder("protocol-wait");
+        let (mut plugin, _) = protocol_plugin(&folder, TWO_POINT_PROTOCOL);
+        let mut sink = ControlSink::default();
+
+        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+        let lease_req = sink.services[0].request_id;
+        sink.services.clear();
+        control_tick(
+            &mut plugin,
+            inbox_with(vec![accepted(lease_req)]),
+            &mut sink,
+        );
+
+        let retargets: Vec<u64> = sink
+            .services
+            .iter()
+            .filter(|request| {
+                matches!(
+                    modulation_command(request),
+                    Some(
+                        ModulationCommandV1::SetOperatingPoint { .. }
+                            | ModulationCommandV1::SetDriveFrequency { .. }
+                            | ModulationCommandV1::SetOpticalDepth { .. }
+                    )
+                )
+            })
+            .map(|request| request.request_id)
+            .collect();
+        assert_eq!(retargets.len(), 3);
+
+        // Two of three applied: still not recording.
+        sink.services.clear();
+        control_tick(
+            &mut plugin,
+            inbox_with(vec![accepted(retargets[0]), accepted(retargets[1])]),
+            &mut sink,
+        );
+        assert!(
+            !plugin.recording.is_active(),
+            "recording started with a retarget still outstanding"
+        );
+
+        control_tick(
+            &mut plugin,
+            inbox_with(vec![accepted(retargets[2])]),
+            &mut sink,
+        );
+        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+        assert!(
+            plugin.recording.is_active(),
+            "the point never started recording; message: {}",
+            plugin.message
+        );
+
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// A refused point is the common case in a long survey — a `ū`/`a` pair
+    /// that runs off the top of the lobe. It must cost that point and carry the
+    /// owner's own wording, not abandon the rest of the night's work.
+    #[test]
+    fn a_refused_point_is_skipped_with_the_owners_reason_and_the_run_continues() {
+        let folder = temp_folder("protocol-skip");
+        let (mut plugin, _) = protocol_plugin(&folder, TWO_POINT_PROTOCOL);
+        let mut sink = ControlSink::default();
+
+        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+        let lease_req = sink.services[0].request_id;
+        sink.services.clear();
+        control_tick(
+            &mut plugin,
+            inbox_with(vec![accepted(lease_req)]),
+            &mut sink,
+        );
+        let first_retarget = sink
+            .services
+            .iter()
+            .find(|request| {
+                matches!(
+                    modulation_command(request),
+                    Some(ModulationCommandV1::SetOperatingPoint { .. })
+                )
+            })
+            .expect("operating point retarget")
+            .request_id;
+
+        sink.services.clear();
+        control_tick(
+            &mut plugin,
+            inbox_with(vec![rejected(
+                first_retarget,
+                "operating point ū=0.400 rejected: peak exceeds the lobe ceiling",
+            )]),
+            &mut sink,
+        );
+
+        let run = plugin
+            .protocol
+            .as_ref()
+            .expect("the run abandoned the survey");
+        assert_eq!(run.index, 1, "the run did not move on to the second point");
+        let (index, reason) = run.failed.last().expect("the skip was recorded");
+        assert_eq!(*index, 0);
+        assert!(
+            reason.contains("lobe ceiling"),
+            "the owner's reason was replaced: {reason}"
+        );
+        // And it is on the status pane, because the per-point message has
+        // already been overwritten by the next point.
+        let status = plugin
+            .status_entries()
+            .iter()
+            .filter_map(|entry| match entry {
+                StatusEntry::Text(text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(status.contains("lobe ceiling"), "{status}");
+
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// A protocol whose file is wrong must say so on the button press, before
+    /// the drive has moved — the whole point is that it runs unattended.
+    #[test]
+    fn an_invalid_protocol_is_refused_before_the_drive_moves() {
+        let folder = temp_folder("protocol-invalid");
+        let (mut plugin, _) = protocol_plugin(
+            &folder,
+            r#"
+[[block]]
+mean_u = 0.5
+frequency_hz = 10.0
+depth_a = 99.0
+"#,
+        );
+        let mut sink = ControlSink::default();
+
+        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+
+        assert!(plugin.protocol.is_none(), "a bad protocol started anyway");
+        assert!(
+            sink.services.is_empty(),
+            "the drive was touched before the file was validated: {:?}",
+            sink.services
+        );
+        assert!(
+            plugin.message.contains("depth_a"),
+            "the message does not name the offending axis: {}",
+            plugin.message
+        );
+
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// Each point's own duration governs the recording, not the panel's — a
+    /// survey whose lengths silently came from the UI would not be
+    /// reproducible from the protocol alone.
+    #[test]
+    fn a_point_records_for_the_duration_the_file_asks_for() {
+        let folder = temp_folder("protocol-duration");
+        let (mut plugin, _) = protocol_plugin(&folder, TWO_POINT_PROTOCOL);
+        plugin.duration_s = 999;
+        let mut sink = ControlSink::default();
+
+        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+        let lease_req = sink.services[0].request_id;
+        sink.services.clear();
+        control_tick(
+            &mut plugin,
+            inbox_with(vec![accepted(lease_req)]),
+            &mut sink,
+        );
+        let retargets: Vec<u64> = sink
+            .services
+            .iter()
+            .filter(|request| {
+                matches!(
+                    modulation_command(request),
+                    Some(
+                        ModulationCommandV1::SetOperatingPoint { .. }
+                            | ModulationCommandV1::SetDriveFrequency { .. }
+                            | ModulationCommandV1::SetOpticalDepth { .. }
+                    )
+                )
+            })
+            .map(|request| request.request_id)
+            .collect();
+        control_tick(
+            &mut plugin,
+            inbox_with(retargets.into_iter().map(accepted).collect()),
+            &mut sink,
+        );
+        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+
+        assert_eq!(
+            plugin.recording.duration_s, 3,
+            "the panel's duration overrode the protocol's"
+        );
+
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// The host writes its sensor telemetry beside the RAW and A1 moves the
+    /// recording somewhere else, so the conditions a run was taken under used
+    /// to be separated from the run itself at the first gather. It has to
+    /// arrive in the measurement folder under the measurement's own name.
+    #[test]
+    fn the_sensor_readout_lands_in_the_measurement_folder_under_the_run_name() {
+        let capture = temp_folder("sensor-capture");
+        std::fs::create_dir_all(&capture).expect("capture dir");
+        let raw = capture.join("host-capture.raw");
+        std::fs::write(&raw, b"raw").expect("raw");
+        std::fs::write(
+            capture.join("host-capture.sensor-monitoring.csv"),
+            "schema_version,sample_id,poll_kind,host_elapsed_start_us,host_elapsed_end_us,\
+raw_data_offset_before_bytes,raw_data_offset_after_bytes,illumination_lux,temperature_c,\
+pixel_dead_time_us,bias_diff_on_code,bias_diff_off_code,bias_fo_code,bias_hpf_code,\
+bias_refr_code,status,error\n\
+1,1,full,1000,1200,0,0,140.0,41.5,12.7,10,20,30,40,50,ok,\n\
+1,2,fast,2000,2200,0,0,,,12.8,,,,,,ok,\n",
+        )
+        .expect("telemetry");
+
+        let output = temp_folder("sensor-output");
+        let mut plugin = StageAA1Plugin {
+            output_folder: output.display().to_string(),
+            ..StageAA1Plugin::default()
+        };
+        plugin.recording.folder = output.display().to_string();
+        plugin.recording.id = "A1-sensor".into();
+        plugin.recording.stem = "A1-sensor_20260731-120000".into();
+        plugin.recording.cam_finalized_path = Some(raw.display().to_string());
+
+        plugin.gather_into_measurement_folder();
+
+        let written = plugin
+            .recording
+            .sensor_readout_path
+            .as_deref()
+            .expect("a sensor readout was written");
+        assert!(
+            written.ends_with("A1-sensor_20260731-120000.sensor.json"),
+            "{written}"
+        );
+        assert!(
+            Path::new(written).starts_with(output.join("A1-sensor")),
+            "{written} is outside the measurement folder"
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(written).expect("read")).expect("JSON");
+        assert_eq!(parsed["measurement_id"], "A1-sensor");
+        assert_eq!(parsed["channels"]["pixel_dead_time_us"]["value"][1], 12.8);
+        assert_eq!(parsed["channels"]["temperature_c"]["value"][0], 41.5);
+        // The wide original does not stay behind in the capture folder.
+        assert!(!capture.join("host-capture.sensor-monitoring.csv").exists());
+
+        let _ = std::fs::remove_dir_all(&capture);
+        let _ = std::fs::remove_dir_all(&output);
+    }
+
     #[test]
     fn sidecar_serializes_the_expected_sections() {
         let mut plugin = plugin_with_markers();
@@ -7349,7 +10230,9 @@ mod tests {
         let doc = plugin.write_sidecar().expect("sidecar path");
         let text = std::fs::read_to_string(&doc).expect("read sidecar");
         assert!(text.contains("measurement_id = \"A1-test\""));
-        assert!(text.contains("flux_point_id = \"flux-test\""));
+        // Provenance of `a` is unconditional: offline analysis must never have
+        // to guess whether a run's depth was measured or merely commanded.
+        assert!(text.contains("depth_a_source = \"photodiode_measured\""));
         assert!(text.contains("[modulation]"));
         assert!(text.contains("[camera]"));
         assert!(text.contains("[files]"));
@@ -7419,7 +10302,6 @@ mod tests {
         let mut plugin = StageAA1Plugin {
             output_folder: "/tmp/a1-preflight".into(),
             measurement_id: "A1-row".into(),
-            flux_point_id: "flux-row-1".into(),
             duration_s: 10,
             pending_role: Some(RecRole::Normal),
             photodiode: Some(photodiode),
@@ -7441,6 +10323,244 @@ mod tests {
         );
     }
 
+    /// A connected modulation plugin with no drive applied yet must never be
+    /// reported as disconnected.
+    ///
+    /// The frequency comes from the phase-0 trigger markers or from the
+    /// *acknowledged* drive; neither is the connection state, which is a
+    /// separate check. Conflating them told operators to plug in a bench that
+    /// was already plugged in.
+    #[test]
+    fn a_missing_frequency_is_not_reported_as_a_disconnected_plugin() {
+        let mut plugin = StageAA1Plugin {
+            // Connected, but nothing applied yet, and no markers (Live off).
+            modulation: Some(connected_modulation()),
+            photodiode: Some(fresh_photodiode_summary()),
+            frame_width: 10,
+            frame_height: 1,
+            ..StageAA1Plugin::default()
+        };
+        assert!(plugin.modulation_connected());
+        assert!(plugin.frequency_hz().is_none());
+
+        let blocker = plugin.frequency_blocker().expect("a reason");
+        assert!(
+            blocker.contains("has not applied a drive yet"),
+            "an armed-nothing bench must be named as such: {blocker}"
+        );
+        assert!(
+            !blocker.contains("connect"),
+            "a connected plugin must not be reported as needing connecting: {blocker}"
+        );
+
+        // A genuinely absent owner still says so.
+        plugin.modulation = None;
+        let absent = plugin.frequency_blocker().expect("a reason");
+        assert!(absent.contains("not reporting status"), "{absent}");
+    }
+
+    /// One fact, one line. A missing frequency used to be stated three times.
+    #[test]
+    fn the_status_panel_states_a_missing_frequency_exactly_once() {
+        let plugin = StageAA1Plugin {
+            modulation: Some(connected_modulation()),
+            photodiode: Some(fresh_photodiode_summary()),
+            frame_width: 10,
+            frame_height: 1,
+            ..StageAA1Plugin::default()
+        };
+        let lines: Vec<String> = plugin
+            .status_entries()
+            .into_iter()
+            .map(|entry| match entry {
+                StatusEntry::Text(text) => text,
+                StatusEntry::LabeledValue { label, value, .. } => format!("{label}: {value}"),
+                _ => String::new(),
+            })
+            .collect();
+
+        let explaining = lines
+            .iter()
+            .filter(|line| line.contains("has not applied a drive yet"))
+            .count();
+        assert_eq!(
+            explaining, 1,
+            "the cause belongs on one line, not three: {lines:#?}"
+        );
+        // The a₀ line points at that line instead of restating it.
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("waiting for a frequency")),
+            "{lines:#?}"
+        );
+        // Nothing to say about the response curve at rest.
+        assert!(
+            !lines.iter().any(|line| line.starts_with("Response curve")),
+            "an empty response curve must not take a line: {lines:#?}"
+        );
+    }
+
+    /// An output folder is the only thing an operator must type before they can
+    /// record. The measurement id names a folder and the flux point id is
+    /// provenance; neither has ever been a reason to refuse the run, and every
+    /// fixture in this file used to pre-fill both, which is how the refusal
+    /// survived. Nothing here sets them.
+    #[test]
+    fn recording_needs_only_an_output_folder_not_the_optional_ids() {
+        let mut plugin = StageAA1Plugin {
+            output_folder: "/tmp/a1-no-ids".into(),
+            measurement_id: String::new(),
+            duration_s: 10,
+            pending_role: Some(RecRole::Normal),
+            photodiode: Some(ready_photodiode()),
+            ..StageAA1Plugin::default()
+        };
+        let mut sink = ControlSink::default();
+
+        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+
+        assert_eq!(
+            plugin.recording.phase,
+            RecPhase::StartingCamera,
+            "blank ids must not refuse the recording; message={}",
+            plugin.message
+        );
+        // The generated id is written back, so the panel shows what was used
+        // rather than filing the run under a name the operator cannot see.
+        assert!(
+            !plugin.measurement_id.trim().is_empty(),
+            "a generated id must land in the field the operator reads"
+        );
+        assert_eq!(plugin.recording.id, sanitize_stem(&plugin.measurement_id));
+        assert!(plugin.recording.stem.starts_with(&plugin.recording.id));
+    }
+
+    /// An operator id that is present is kept exactly as it was.
+    #[test]
+    fn a_typed_measurement_id_is_never_replaced_by_a_generated_one() {
+        let mut plugin = StageAA1Plugin {
+            output_folder: "/tmp/a1-typed-id".into(),
+            measurement_id: "row-7".into(),
+            pending_role: Some(RecRole::Normal),
+            photodiode: Some(ready_photodiode()),
+            ..StageAA1Plugin::default()
+        };
+        let mut sink = ControlSink::default();
+
+        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+
+        assert_eq!(plugin.measurement_id, "row-7");
+        assert_eq!(plugin.recording.id, "row-7");
+    }
+
+    /// The whole unattended ladder, with nothing typed in but the folder.
+    ///
+    /// Each point ends in a recording, and `begin_recording` used to refuse a
+    /// blank id — three stages after the ladder had already taken the lease and
+    /// moved the drive. The panel showed the ladder running and the recording
+    /// idle, and every point was skipped.
+    #[test]
+    fn the_frequency_sweep_runs_with_no_ids_typed_in() {
+        let folder = temp_folder("fsweep-no-ids");
+        let mut plugin = plugin_locking(0.6, &folder);
+        plugin.measurement_id = String::new();
+        plugin.a0_target = 0.5;
+        plugin.min_f = 100.0;
+        plugin.max_f = 1_000.0;
+        plugin.freq_count = 2;
+        plugin.freq_order = FreqOrder::Ascending;
+        photodiode_window(&mut plugin, 0.02);
+        plugin.freq_sweep_pending = Some(FreqSweepMode::A0Point);
+        let mut sink = ControlSink::default();
+
+        let recorded = run_freq_sweep_to_completion(&mut plugin, &mut sink, 0.6, 4_000);
+
+        assert_eq!(
+            recorded.len(),
+            2,
+            "every ladder point must record; message: {}",
+            plugin.message
+        );
+        assert!(plugin.message.contains("2/2 points recorded"));
+        assert!(!plugin.measurement_id.trim().is_empty());
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// The a₀ field is a drag control with a 0.01 step. Comparing it to the
+    /// lock's target on exact equality meant one stray pixel of drag disarmed a
+    /// lock that had just converged, and the panel then asked for the very thing
+    /// the operator had done. The operator's own tolerance is the right band.
+    #[test]
+    fn nudging_a0_inside_its_tolerance_keeps_the_lock_armed() {
+        let mut plugin = plugin_with_markers();
+        plugin.a0_target = 0.5;
+        plugin.a0_tolerance = 0.02;
+        plugin.a0_locks.push(A0LockPoint {
+            frequency_hz: plugin.frequency_hz().expect("frequency"),
+            target_a: 0.5,
+            commanded_a: 0.83,
+            measured_a: 0.5,
+            trials: 2,
+            converged: true,
+            locked_at_unix_ms: now_unix_ms(),
+            low_clip_fraction: None,
+            high_clip_fraction: None,
+            depth_source: DepthSource::Photodiode,
+        });
+        assert!(plugin.armed_lock().is_some(), "the fresh lock must arm");
+
+        plugin.a0_target = 0.51;
+        assert!(
+            plugin.armed_lock().is_some(),
+            "a nudge inside the tolerance must not disarm the lock"
+        );
+
+        // Beyond the tolerance it really is a different target, and the refusal
+        // says so instead of asking for a Find a₀ that was already done.
+        plugin.a0_target = 0.70;
+        assert!(plugin.armed_lock().is_none());
+        let blocker = plugin.armed_lock_blocker().expect("a reason");
+        assert!(
+            blocker.contains("0.500") && blocker.contains("0.700"),
+            "the refusal must name both targets: {blocker}"
+        );
+    }
+
+    /// Three different causes used to share one sentence telling the operator to
+    /// press Find a₀ — which only fixes the first of them.
+    #[test]
+    fn a_lock_that_cannot_arm_names_which_of_the_three_causes_it_is() {
+        let mut plugin = plugin_with_markers();
+        plugin.a0_target = 0.5;
+        plugin.a0_tolerance = 0.02;
+        let hz = plugin.frequency_hz().expect("frequency");
+
+        let no_lock = plugin.armed_lock_blocker().expect("a reason");
+        assert!(
+            no_lock.contains("press Find a₀"),
+            "with no lock at all, pressing Find a₀ is the fix: {no_lock}"
+        );
+
+        plugin.a0_locks.push(A0LockPoint {
+            frequency_hz: hz,
+            target_a: 0.5,
+            commanded_a: 6.0,
+            measured_a: 0.31,
+            trials: 8,
+            converged: false,
+            locked_at_unix_ms: now_unix_ms(),
+            low_clip_fraction: None,
+            high_clip_fraction: None,
+            depth_source: DepthSource::Photodiode,
+        });
+        let not_converged = plugin.armed_lock_blocker().expect("a reason");
+        assert!(
+            not_converged.contains("0.310") && not_converged.contains("tolerance"),
+            "a lock that stopped short must report where it stopped: {not_converged}"
+        );
+    }
+
     /// The photodiode's own Data directory is irrelevant to a recording started
     /// from A1: A1 names the destination root, so the run proceeds and the PDQ
     /// is written into A1's measurement folder.
@@ -7451,7 +10571,6 @@ mod tests {
         let mut plugin = StageAA1Plugin {
             output_folder: "/tmp/a1-destination".into(),
             measurement_id: "A1-row".into(),
-            flux_point_id: "flux-row-1".into(),
             duration_s: 10,
             pending_role: Some(RecRole::Normal),
             photodiode: Some(photodiode),
@@ -7528,7 +10647,6 @@ mod tests {
         let mut plugin = StageAA1Plugin {
             output_folder: folder.display().to_string(),
             measurement_id: "A1-row".into(),
-            flux_point_id: "flux-row-1".into(),
             duration_s: 10,
             pending_role: Some(RecRole::Normal),
             photodiode: Some(fresh_photodiode_summary()),

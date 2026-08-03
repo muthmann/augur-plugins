@@ -10,7 +10,25 @@
   duration, named failures),
   [ADR 014](../adr/014-stage-a-a1-frequency-ladder.md) (the unattended ladder),
   [ADR 013](../adr/013-stage-a-a1-event-count-depth-lock.md) (exact-event-count
-  `a₀` lock)
+  `a₀` lock),
+  [ADR 017](../adr/017-stage-a-rail-detection-and-withheld-a-reasons.md) (a
+  withheld `a` names its gate; Live analysis vs. trigger),
+  [ADR 018](../adr/018-stage-a-a1-required-vs-optional-inputs.md) (the output
+  folder is the only required input; every gate is asked before the drive moves;
+  the panel speaks to the operator),
+  [ADR 020](../adr/020-stage-a-a1-depth-source.md) (`a` comes from the
+  photodiode or from the commanded drive, and every artefact says which),
+  [ADR 021](../adr/021-stage-a-a1-no-search-for-a-commanded-depth.md) (no `a₀`
+  search when `a` is the command; the ladder skips it),
+  [ADR 022](../adr/022-stage-a-a1-sensor-conditions-on-every-run.md) (die
+  temperature, pixel dead time and scene illumination on every run),
+  [ADR 023](../adr/023-stage-a-a1-nested-depth-frequency-sweep.md) (the
+  frequency ladder is an outer loop: a whole depth sweep per frequency gives the
+  `q_p(a, f)` surface in one press),
+  [ADR 027](../adr/027-stage-a-a1-declarative-protocols.md) (surveys are run
+  from a file, and `I_k` becomes a sweepable axis),
+  [ADR 028](../adr/028-stage-a-sensor-readout-travels-with-the-measurement.md)
+  (the sensor readout travels with the measurement, column-wise)
 - **Automation roadmap:** [Stage-A A1 Automation](./stage-a-a1-automation.md)
 - **Second workflow:** [Stage-A A1 Exact Event Count](./stage-a-a1-event-count.md)
   — hold one *measured* depth `a₀` across the frequency sweep
@@ -40,22 +58,244 @@ folder. A1 makes each recording one button press:
 
 | Control | Meaning |
 |---|---|
-| Output folder | where the A1 config sidecar is written (recommended shared experiment root) |
-| Measurement id | one per `(I_k, f)` row; auto-generated default, editable, or press **New id** |
-| Physical `I_k` flux point id | required canonical id of the cycle-mean local flux calibration/map point; never inferred from the modulator's normalized mean `ū` |
-| Sweep min a / max a | the `a`-range for this row; the **Start sweep** button records it, and it is stored in every sidecar |
-| Sweep points (count) | how many amplitudes Start sweep records, spaced evenly over `[min a, max a]` |
-| Sweep settle (s) | dwell the fresh photodiode-measured `a` must hold the target (±10 %, ≥±0.05) before each sweep recording; timeout aborts the sweep |
-| Duration (s) | each recording auto-stops and finalizes after this |
-| Start recording (sweep point) | start camera RAW → connect and lease photodiode → start PDQ → auto-stop and save both → sidecar |
-| Start sweep (record all points) | per point: lease the modulation owner → retarget the calibrated drive to `a_i` → settle → one recording (`…_pNN`) → next point |
+| **Depth `a` source** | where every depth-dependent path reads `a` from: the **photodiode** (measured, default) or the **modulation drive** (commanded, open loop) — see below (ADR 020) |
+| Output folder | **the only required field**: where the A1 config sidecar is written (recommended shared experiment root) |
+| Measurement id | one per `(I_k, f)` row; auto-generated default, editable, or press **New id**. Optional — a blank field is filled in on the first recording and written back, so the panel shows the id that was used (ADR 018) |
+| Duration (s) | each recording auto-stops and finalizes after this; applies to every button |
+| Settle time (s) | dwell the depth or frequency must hold after being retargeted, before the recording starts; ignored by **Record once** |
+| Depth axis: min a / max a / points | the `a`-range **Sweep a** walks, stored in every sidecar |
+| Frequency axis: min f / max f / points / order / seed / repeat-lowest | the `f`-ladder **Sweep f** walks: log-spaced, visit order and interleaved reference repeats |
+| **Record once** | one recording with the light exactly as armed: start camera RAW → connect and lease photodiode → start PDQ → auto-stop and save both → sidecar. Nothing is retargeted |
+| **Sweep a** | per point: lease the modulation owner → retarget the calibrated drive to `a_i` → settle → one recording (`…_pNN`) → next |
+| **Sweep f** | one recording per frequency at the same depth — the exact-event-count workflow, see [its brief](./stage-a-a1-event-count.md) |
+| **Sweep a × f** | the **`q_p(a, f)` surface**: the whole depth sweep at every frequency, on one lease — see [below](#the-q_pa-f-surface-in-one-press-adr-023) |
 | Record pilot | records a bright reference (`…_pilot`) **and** freezes the ON/OFF windows for the row from the live signal |
 | Record background | records an unmodulated reference (`…_background`) **and** captures the false-response floor `q0` |
-| Stop (abort recording / sweep) | finalize the current recording early; during a sweep also aborts the remaining points |
-| a₀ / Find a₀ / Record a₀ point / Start frequency sweep | the **exact-event-count** workflow: hold one *measured* depth `a₀` across the frequency sweep, by hand or as an unattended ladder — see [its brief](./stage-a-a1-event-count.md) |
+| **Stop** | stops whatever is running — a recording, a sweep, a ladder or a protocol — at its next safe point, so the file in flight is still finished and saved |
+
+All of it lives in **one Record section**. It used to be spread over three
+(`Recording`, `Depth sweep at every frequency`, `Same depth at every
+frequency`), each carrying part of the settings the others needed — so the
+frequency axis was configured in the a₀ section and read by a button two
+sections above it. **Live analysis** moved to the top of the panel for the same
+reason: almost everything reads it.
 
 The record and sweep buttons stay **disabled until an output folder is
 selected**.
+
+### Where `a` comes from (ADR 020)
+
+`a = ln(I_max/I_min)` is a property of the light, so the photodiode measurement
+is the default and the source of record. It is also **fail-closed**: the
+photodiode publishes no `a` unless it can prove its estimator window covers
+whole modulation cycles, which it does from the firmware phase-0 **marker
+frames** on its own stream port. If those markers never arrive — no trigger, or
+a firmware build that does not stamp them — it refuses forever, with a reason
+that reads like a settings problem:
+
+```
+No stretch of samples covers two whole modulation cycles between triggers
+(0 trigger(s) in the last 3446784 samples) — lower the frequency, or raise the
+photodiode cache length
+```
+
+Zero markers in millions of samples is a missing marker stream, not a short
+window, and no setting fixes it. **Depth `a` source** is the way past:
+
+| Setting | `a` is | Needs | Verified against the light |
+|---|---|---|---|
+| `photodiode (measured)` — default | the photodiode's measured excitation log-contrast | phase-0 markers, a confirmed `I_tot` anchor, an unclipped window | yes |
+| `modulation drive (commanded, open loop)` | the depth the modulation owner's calibrated drive is commanding (`optical_drive.depth_a_milli`) | an applied Pockels calibration and `OPTICAL_LOG_SINE` armed | **no** |
+
+The commanded depth is still a *calibrated* number — the modulation plugin
+inverts the measured `V_null` / `V_peak` curve to produce it — it is simply not
+checked afterwards, so it carries the calibration's error plus any drift since.
+It is not a datasheet value and it is not a DAC excursion: a manual DAC band or
+a constant level publishes no optical drive, and the gates refuse rather than
+inventing a depth.
+
+Open loop there is **nothing to search for**, so `Find a₀` is not used at all and
+the frequency ladder skips it — see [below](#a-and-the-a-ladder-adr-021). The
+photodiode's window-length and clipping checks are skipped in this mode too,
+because neither bounds a commanded depth; the operator's settle dwell still
+applies.
+
+**Every artefact says which source it used**: the sidecar's `depth_a_source` /
+`depth_a`, `[a0_lock].depth_source`, the recorders' `depth_a_source` metadata,
+the `depth_source` field in `a0_locks.json`, and the *a from* column of the a₀
+lock view. `measured_a` keeps its narrow meaning — a number the photodiode
+actually measured — so an open-loop run carries none, rather than carrying a
+commanded value under that name. Runs destined for the final `q_p(a, f)` fit
+should be photodiode-measured.
+
+### `a₀` and the a₀ ladder (ADR 021)
+
+`Find a₀` exists for one reason: the Pockels inversion is measured once and is
+therefore **static**, while the depth the cell delivers **rolls off with
+frequency**. Holding one *measured* `a₀` across a ladder means re-finding the
+commanded depth that produces it at each frequency
+(`a_cmd ← a_cmd · a₀/a_measured`). That is real work — and it only exists for a
+measured depth.
+
+With the **commanded** source the loop measures the number it commands, so the
+correction ratio is exactly 1. A search would command `a₀`, read back `a₀`, stop,
+and store one identical row per frequency. So it is not run:
+
+| | photodiode (measured) | modulation drive (commanded) |
+|---|---|---|
+| `Find a₀` | trims the depth per frequency, stores a lock | **not needed** — disabled, and says so |
+| `Record a₀ point` | replays the stored converged lock | commands `a₀` directly |
+| Ladder per rung | lease → set `f` → **confirm via camera markers** → search → record | lease → set `f` → **confirm via the modulation owner's ACK** → record |
+| `a0_locks.json` | one row per frequency | untouched — nothing was found |
+| Needs camera EXT_TRIGGER + Live analysis | **yes** | no |
+
+The ladder's frequency check follows the same logic. Measured mode holds out for
+the camera's phase-0 markers, because they define the period *and* anchor the
+fold the point is scored in. Commanded mode asks the modulation owner instead —
+the same owner, and the same acknowledged state, it already trusts for `a`. The
+cost is confined to the live quicklook (the `q_p` fold goes free-running without
+markers); the recorded RAW and PDQ that the offline fit reads are unaffected.
+
+**Net effect:** with the commanded source the ladder runs on a bench with no
+photodiode `a`, no camera trigger and Live analysis off — set `a₀`, press
+*Record all frequencies*. The trade is that nothing verifies the light reached
+`a₀` at each frequency, and the roll-off the search corrects is real, so switch
+back to the photodiode once its markers work.
+
+### The `q_p(a, f)` surface in one press (ADR 023)
+
+The frequency ladder is an **outer loop**, and what it records at each rung is a
+mode:
+
+| button | per frequency | produces |
+|---|---|---|
+| *Record all frequencies* | one event-count point at `a₀` | `q_p(a₀, f)` — the same depth everywhere |
+| **Record depth sweep at every frequency** | the **whole** `[min_a, max_a]` sweep | `q_p(a, f)` — one response curve per `f` |
+
+The second is the experiment `a50(f)` is fitted from, and it was previously a
+manual loop: set `f`, press *Record depth sweep*, wait, repeat. It now runs
+unattended as `frequency points × depth points` recordings **on a single lease**,
+so the operator's drive settings stay locked out from the first frequency to the
+last instead of being re-applied between blocks.
+
+It adds **no new settings**. The depth axis is the Recording section
+(`Sweep min a` / `max a` / `points` / settle / duration); the frequency axis is
+the ladder in the a₀ section (`Sweep min f` / `max f` / `points` / order / seed /
+reference repeats). Ordering, the interleaved low-frequency reference,
+per-frequency confirmation, skip-and-report and the summary are all the
+unchanged ADR 014 machinery.
+
+**No `a₀` and no `Find a₀` are involved at any point**, in either depth source —
+a depth sweep commands and settles every `a` in its range itself, so there is
+nothing for a lock to contribute. With the photodiode source each point is still
+fully closed-loop against the measured `a`; it simply has no `a₀`.
+
+Points are named `…_f<f>Hz_pNN`, so the surface sorts by frequency and then by
+depth. A frequency whose curve cannot be recorded is skipped and named in the
+summary rather than stopping the block — and a rung counts as done only when its
+inner sweep recorded *every* point, not when its last recording happened to
+succeed.
+
+### Protocol — a survey from a file (ADR 027)
+
+The four sweep buttons each move one axis and leave the others wherever they
+are. That is right for exploring and wrong for a survey: `I_k` could not be
+swept at all, and what a block recorded lived in the panel rather than in
+anything that travels with the results.
+
+A **protocol** is a file naming every axis for every recording. The reader is
+chosen by extension, and both produce the same flat list of points.
+
+**CSV — one row per recording**, and the one to reach for: it opens in a
+spreadsheet, comes straight out of a script, and each row carries its own
+duration.
+
+```csv
+label,mean_u,frequency_hz,depth_a,duration_s,settle_s,role
+floor,0.50,10,0.02,20,3,background
+windows,0.50,10,2.00,20,3,pilot
+ladder,0.40,1,0.80,40,4,
+ladder,0.40,200,0.80,10,2,
+```
+
+Required: `mean_u`, `frequency_hz`, `depth_a`. Optional: `duration_s`
+(default 10), `settle_s` (default 2), `role` (`normal`/`pilot`/`background`),
+`label`. Columns are located by header name, `#` comments and blank lines are
+skipped, a blank cell falls back to the default, and an error names the file
+line number.
+
+Two capabilities follow from the row form:
+
+- **A different duration per recording** — a 1 Hz point needs 40 s of cycles
+  and a 200 Hz point does not.
+- **A `role` column**, so a file carries its own background floor and pilot and
+  then the points scored against them: a complete measurement rather than one
+  that needs two button presses first.
+
+**TOML — blocks and ranges**, kept for a dense regular sweep:
+
+```toml
+[defaults]
+duration_s = 10
+settle_s   = 2.0
+
+[[block]]
+name         = "frequency-ladder"
+mean_u       = [0.3, 0.6]
+frequency_hz = { min = 1.0, max = 200.0, points = 6, spacing = "log" }
+depth_a      = 0.8
+duration_s   = 20
+```
+
+Each axis takes a single value, an explicit list, or a `{ min, max, points }`
+range with `linear` (default) or `log` spacing; a block records the product of
+its three.
+
+- **`mean_u` is the `I_k` axis** — the normalized cycle-mean lobe point, driven
+  by the new `ModulationCommandV1::SetOperatingPoint`. Dimensionless, not
+  physical flux, but the one control that moves the mean illumination without
+  touching the depth.
+- **Points run `ū` outermost, then `f`, then `a`** — the order of how expensive
+  each change is to settle. Any other nesting spends the run settling.
+- **All three axes are commanded at every point,** and the point waits for all
+  three acknowledgements before recording. A point that inherited an axis from
+  its predecessor would be recorded under parameters the file does not name.
+- **The file's `duration_s` wins** over the panel's, or the survey would not be
+  reproducible from the protocol alone.
+- **Validated up front**: ranges, bounds, the `MAX_POINTS = 4096` product limit
+  and the same whole-cycle window check the ladder makes against its lowest
+  frequency — all on the button press, before the drive moves. The point count
+  and expected bench time are reported first.
+- **A refused point is skipped, not fatal**, carrying the modulation owner's own
+  wording. Because the per-point message is overwritten within the same tick,
+  the reasons are kept on the run and shown in the status pane and the closing
+  summary.
+
+One lease covers the whole file. `plugins/stage-a-a1/protocols/example.toml` is
+a commented file to copy.
+
+### Bench conditions on every run (ADR 022)
+
+Every recording — normal, pilot, background, sweep point, a₀ point — also
+records what the camera measures about itself, from the host's
+`CTX_SENSOR_MONITORING`:
+
+| quantity | sidecar `[sensor]` | recorder metadata |
+|---|---|---|
+| die temperature, °C | `temperature_c` | `sensor_temperature_c` |
+| pixel dead time (refractory period), µs | `pixel_dead_time_us` | `sensor_pixel_dead_time_us` |
+| scene illumination, lux | `illumination_lux` | `sensor_illumination_lux` |
+| staleness of the reading, s | `reading_age_s` | `sensor_reading_age_s` |
+| absolute bias codes | `bias_diff_on/_off/_fo/_hpf/_refr` | — |
+
+All three bear directly on `q_p(a, f)`: the dead time caps events per pixel per
+half-cycle, the lux *is* the physical `I_k` axis, and temperature moves the
+biases. The values are **frozen when the recording starts** (they drift, and the
+sidecar is written at finalize), mirrored even with Live analysis off, and are
+**provenance only** — no A1 result depends on them, or a live run would disagree
+with an offline re-run of the same data. A quantity the sensor cannot report is
+**omitted**, never written as `0`; replay and cameras without a monitoring block
+produce no `[sensor]` section at all.
 
 For manual recordings A1 never drives the Teensy: set the drive (high `a` for
 the pilot, `a≈0` for the background) in the modulation plugin, then press the
@@ -102,19 +342,35 @@ the photodiode Data directory no longer have to be kept aligned by hand:
   A rename on one volume, a size-verified copy across volumes. A file that cannot
   be moved stays where it is and the sidecar points at it there.
 
-**A1 config sidecar** captures: `measurement_id`, physical `flux_point_id`, file
+- **The host's sensor telemetry is compacted in on the way.** The host writes a
+  wide `<raw-stem>.sensor-monitoring.csv` beside the RAW; A1 rewrites it
+  column-wise as `<stem>.sensor.json` in the measurement folder and removes the
+  original. One `{ t_us, value }` pair of arrays per channel, carrying only the
+  polls where that channel was actually read — the channels sample on different
+  schedules, so a row-per-poll table is padding by construction. Bias codes are
+  dropped: the camera's own bias sidecar already carries them. Nothing is
+  resampled or aligned, failed polls are kept as `faults`, and the whole path is
+  best-effort — a source with no monitoring block simply produces no file
+  (ADR 028).
+
+**A1 config sidecar** captures: `measurement_id`, file
 stem, role, start/finalize
 timestamps, duration; the sweep `[min_a, max_a]`; modulation settings from the
 acknowledged snapshot (frequency, center/amplitude DAC, waveform, transfer
-`calibration_id`, optical target, requested and resolved normalized mean `ū`,
-internal `u_g`/`u_c`, requested `a`, `V_null` and `Vπ`); the
+`calibration_id`, optical target, requested and resolved normalized mean `ū`,
+internal `u_g`/`u_c`, requested `a`, `V_null` and `V_peak`); the depth this run
+was driven and judged by with its provenance (`depth_a`, `depth_a_source`); the
 photodiode-measured `a`, extrema, geometric pedestal,
-headroom, clip fractions, dark/ADC ids, and named dark-corrected `I_tot` anchor; ROI +
-masked-pixel count + `N_valid`; trigger info (marker-anchored, marker count,
-measured period); and the resolved paths of the RAW (+ its camera-config sidecar)
-and the PDQ (+ its sidecar). The **pilot** run additionally records the frozen
-ON/OFF windows and the **background** run the floor `q0`, so returning to a
-measurement (folder + id) auto-reloads them for the `q_p` plot.
+headroom, clip fractions, ADC id, and the learned `I_tot` anchor with its
+provenance (ADR 024); ROI +
+masked-pixel count + `N_valid`; the `[sensor]` bench conditions (die temperature,
+pixel dead time, illumination — ADR 022);
+trigger info (marker-anchored, marker count,
+measured period); and the resolved paths of the RAW (+ its camera-config
+sidecar), the PDQ (+ its sidecar) and the `sensor_readout`. The **pilot** run
+additionally records the frozen ON/OFF windows and the **background** run the
+floor `q0`, so returning to a measurement (folder + id) auto-reloads them for
+the `q_p` plot.
 
 **Mechanism.** A small control-plane state machine in `process_control` starts
 the host camera recorder first and waits for its receipt. Only after the host
@@ -163,6 +419,12 @@ press can start the next recording automatically.
 Both fold the camera event stream on `T` (from the firmware phase-0 `EXT_TRIGGER`
 marker spacing, which *defines* the frequency; the modulation acknowledged waveform
 is the only fallback). Enable **Live analysis** to keep them updating.
+
+With **Live analysis** off nothing is ingested at all — no events *and* no
+phase-0 markers — so the status line says so by name rather than reporting
+`0 events; free-running (no EXT_TRIGGER)`, which reads as a wiring fault. The
+frequency ladder refuses on the marker count and distinguishes the two cases in
+its message (ADR 017).
 
 Marker hygiene: preview windows overlap, so the same trigger edge arrives on
 several consecutive frames — the marker buffer is sorted and deduplicated on
@@ -241,8 +503,9 @@ boundary is A1's own pipeline restart and only the event fold resets (ADR 015).
 | camera events, valid pixels | retained **EventStore** over a trailing analysis window; falls back to `frame.events()`, trimmed to the same window |
 | phase-0 markers | rising `frame.external_triggers()` — the host **banks trigger edges from dropped preview frames** into the next processed frame (drain-to-newest and the preview throttle drop whole frames; at low modulation frequencies the survivors alone rarely held 2 markers inside the analysis window) |
 | modulation period `T` | measured from the `EXT_TRIGGER` marker spacing; else the modulation plugin's acknowledged waveform — which, since the board-echo fallback, includes the **operator-armed UI drive**, not only service-path (leased) targets |
-| optical modulation depth `a` | fresh photodiode optical summary (`measured_log_contrast`) from complete marker-bounded cycles and a confirmed `I_tot` anchor — always the *excitation* contrast, independent of display mode (ADR 012) |
+| optical modulation depth `a` | per the **Depth `a` source** setting (ADR 020). *Photodiode* (default): fresh optical summary (`measured_log_contrast`) from complete marker-bounded cycles and a confirmed `I_tot` anchor — always the *excitation* contrast, independent of display mode (ADR 012); when absent, `optical_unavailable` from the same snapshot carries the owner's refusal reason (ADR 017), and A1 appends the way past it. *Commanded*: the modulation owner's `optical_drive.depth_a_milli`, published only for a calibrated optical drive — open loop, tagged as such everywhere it is recorded |
 | ROI, masked pixels | augur-rs camera config (`CTX_GLOBAL_SETTINGS`) |
+| die temperature, pixel dead time, illumination, bias codes | host `CTX_SENSOR_MONITORING` (`SensorMonitoringV1`), mirrored every frame regardless of Live analysis and frozen at recording start. Provenance only — absent on replay, imports and cameras without a monitoring block (ADR 022) |
 
 ## Tests
 
@@ -262,3 +525,26 @@ mid-run keeps the camera recording for the full duration, names the cause in the
 closing message, and still gathers the RAW and its bias sidecar into the
 measurement folder; and a self-inflicted `SourceChanged` during a recording keeps
 the row's response points and pilot windows while still resetting the event fold.
+
+Four more cover the depth source (ADR 020): a withheld photodiode `a` keeps the
+owner's own reason *and* names the setting that gets past it; the commanded
+source reports a depth with no photodiode present at all, and refuses a drive
+that is not a calibrated optical one; and both the recorder metadata and the
+config sidecar carry `depth_a_source` on every run, with `measured_a` present
+only when something actually measured it.
+
+Three cover the simplified ladder (ADR 021): `Find a₀` refuses to search for a
+depth it is commanding and takes no lease doing so; an a₀ point is armed with no
+stored lock and `trials: 0`; and the whole ladder runs to `3/3 points recorded`
+with no photodiode `a`, **no camera trigger markers** and an empty lock table,
+panicking if it ever enters the search phase.
+
+Two cover the bench conditions (ADR 022): the start-of-run snapshot wins over a
+drifted live reading and reaches both the metadata and the sidecar's `[sensor]`
+section; and a quantity the sensor cannot report is omitted rather than written
+as a zero.
+
+Two cover the nested sweep (ADR 023): the whole 2 × 3 block records every depth
+at every frequency in depth order, on exactly **one** lease acquisition, never
+entering the search phase and finishing with `2/2 frequencies × 3 depths`; and a
+nested point's file stem carries both axes (`…_f50Hz_p03`).

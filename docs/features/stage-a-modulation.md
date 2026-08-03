@@ -10,7 +10,8 @@
 Laser-modulation control for the Stage-A bench with two orthogonal axes:
 
 - **Drive method** defines the DAC operating band. `MANUAL` uses Power + Min threshold;
-  `CALIBRATED` derives it from `V_null`, `Vπ`, normalized cycle mean `ū`, and optical depth `a`.
+  `CALIBRATED` derives it from the lobe endpoints `V_null`/`V_peak`, the normalized cycle
+  mean `ū`, and the optical depth `a`.
 - **Mode** defines the shape that fills the band: `CONST`, `DAC_SINE`, `SQUARE`,
   `OPTICAL_LOG_SINE`, or `OPTICAL_LINEAR_SINE`. All five remain available under both methods.
 
@@ -18,7 +19,7 @@ The always-visible **max limit** is the hard DAC ceiling for every manual and ca
 The settings schema shows only the selected method's parameter block and refreshes when Method
 changes; Manual is the default.
 
-| Mode | Manual band `[min, power]` | Calibrated band from `ū`, `a`, `V_null`, `Vπ` |
+| Mode | Manual band `[min, power]` | Calibrated band from `ū`, `a`, `V_null`, `V_peak` |
 |---|---|---|
 | `CONST` | hold `power` | hold the DAC code for `ū` |
 | `DAC_SINE` | DAC sine across the band | DAC sine across the band |
@@ -26,14 +27,34 @@ changes; Manual is the default.
 | `OPTICAL_LOG_SINE` | intensity log-sine across the band | mean `ū`, converted to `u_g=ū/I_0(a/2)` |
 | `OPTICAL_LINEAR_SINE` | intensity linear-sine across the band | centre/mean `u_c=ū` |
 
-Manual optical modes reuse the persisted `V_null`/`Vπ` lobe parameters and derive effective
+Manual optical modes reuse the persisted `V_null`/`V_peak` lobe parameters and derive effective
 `(u, a)` from the manual DAC band through the forward `sin²` transfer. Both optical modes then
 use the same inversion path described in [Optical waveform drive](./stage-a-optical-waveform.md).
 `ū` is dimensionless and must not be confused with physical cycle-mean A1 flux `I_k`.
 
-`V_null`/`Vπ` are measured, not typed: the Calibration section sweeps settled `CONST` codes
+`V_null`/`V_peak` are measured, not typed: the Calibration section sweeps settled `CONST` codes
 against the photodiode and fits the lobe — see
-[Pockels transfer calibration](./stage-a-pockels-calibration.md).
+[Pockels transfer calibration](./stage-a-pockels-calibration.md). Both are **absolute DAC codes**
+an operator can point at on the transfer curve; the half-wave span between them is derived and
+never entered, and `Vπ` no longer appears anywhere the operator sets something (ADR 025).
+
+## Achievable ranges — settings clamp, they never refuse
+
+`ū` and `a` are coupled through one constraint: the peak of the swing has to stay under the top of
+the lobe and under the max limit. `waveform::PeakLaw` names how the peak follows from the two, one
+variant per mode (`Constant`, `LogSwing` for the DAC sine/square, `LogSine`, `LinearSine`), and
+solving it for one variable at a time gives the achievable range.
+
+Edits **clamp into that range**; nothing reverts. Only the control the operator just touched is
+limited — dragging `a` up means "more depth", so `a` is what stops and `ū` stays put — and a lobe,
+ceiling or mode change settles brightness first, depth second. Modes and methods are always
+accepted.
+
+Both bounds are live in the control labels (`Optical depth a (0..1.37 at ū=0.50)`) and on the
+status line, along with where the current drive actually peaks. An un-sendable drive is reported as
+`drive not sent: …` rather than blocking the edit. Previously a leftover `a` made an optical mode
+simply unselectable, with an error naming a control the operator was not editing — see
+[ADR 025](../adr/025-stage-a-drive-settings-clamp-not-refuse.md).
 
 Every accepted setting change is transferred to the Teensy **immediately** as one `MOD` command —
 no Apply button, no experiment state machine. The panel shows the modulation and live DAC code the
@@ -56,8 +77,10 @@ board *reports* (`MOD` reply + 2 Hz `STATUS` poll), not merely the commanded val
 - Status and commanded summaries include Method and the resolved `(lo, hi, hold)` DAC band.
 - `ModulationStateV1.optical_drive` publishes the exact resolved optical
   target, requested and resolved normalized mean `ū`, internal `u_g`/`u_c`,
-  requested `a`, `V_null`, and `Vπ` as an additive V1 field; A1 sidecars no
-  longer have to infer these from DAC endpoints.
+  requested `a`, `V_null` and `V_peak` as an additive V1 field; A1 sidecars no
+  longer have to infer these from DAC endpoints. `v_peak_dac` replaced the
+  earlier `v_pi_dac`, and carries the absolute peak code rather than the span
+  (ADR 016, ADR 025).
 - `mock` port runs the firmware-faithful `MockController` in-process for hardware-free tests.
 - The workflow-owner service and `WaveformV1` automation path remain exact-waveform contracts and
   do not use the UI Drive method.
@@ -71,9 +94,19 @@ board *reports* (`MOD` reply + 2 Hz `STATUS` poll), not merely the commanded val
   auto-reconnects with a 2 s backoff while `connect` stays requested. Previously a wedged or dead
   link silently swallowed every queued command — the UI kept accepting mode changes while the
   board held the old waveform.
-- **`protocol_run` forwarding**: the UI mirror records the request and the settings snapshot
-  starts/stops the protocol on the live worker (which owns the device link); only value
-  *transitions* act, so re-applied snapshots cannot restart a finished protocol.
+- **`SetOperatingPoint`** (ADR 027): the leased counterpart for the *operating point* `ū` — the
+  third axis, alongside depth and frequency, and the one that moves the mean illumination without
+  touching the depth. Calibrated method only; the owner parks the operator's own `ū` on the first
+  retarget and restores it when the lease ends. Used by the A1 protocol runner's `I_k` axis.
+  Unlike an interactive edit it **refuses** rather than clamping: a protocol asked for a specific
+  brightness, and quietly recording a different one would put the wrong `ū` in every sidecar.
+- **The applied lobe crosses to the UI mirror** (ADR 026): "Apply to V_null / V_peak" used to do
+  nothing, because the fit lives on the live worker while the settings snapshot is collected from
+  the mirror — so the mirror's stale codes overwrote the applied ones on the next sync. The applied
+  lobe is now published through a process-global generation the mirror adopts.
+- **No protocol section.** The undocumented TOML `MOD`-step runner was removed; declarative
+  recording protocols belong to the A1 plugin, which can also record what they produce
+  ([ADR 027](../adr/027-stage-a-a1-declarative-protocols.md)).
 - **Board-echo `acknowledged` fallback**: the published `ModulationStateV1.acknowledged` now falls
   back to a revision-0 target built from the board's `MOD`/`STATUS` echo (`mod_wave`, `mod_level`,
   `mod_min`, `mod_freq_mhz`) when no service-path acknowledgement exists. UI-driven drives never

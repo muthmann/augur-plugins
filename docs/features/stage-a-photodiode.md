@@ -3,6 +3,15 @@
 - **Crate:** `plugins/stage-a-photodiode` (`augur-plugin-stage-a-photodiode`)
 - **Firmware:** `stage-a-controller` 0.4.0+ (`PDSTREAM_PDA1`), Teensy **stream port** (second CDC port)
 - **Status:** Active (2026-07-16) — replaces the readout half of `stage-a-monitor`
+- **Design:** [ADR 006](../adr/006-stage-a-two-plugin-split.md) (the split),
+  [ADR 012](../adr/012-stage-a-contrast-geometry-is-bench-not-display.md) (the
+  contrast geometry),
+  [ADR 024](../adr/024-stage-a-photodiode-learns-its-own-anchor.md) (the
+  learned total-power anchor; dark cancels),
+  [ADR 017](../adr/017-stage-a-rail-detection-and-withheld-a-reasons.md)
+  (span-relative rail detection; the published refusal reason),
+  [ADR 019](../adr/019-stage-a-calibration-measures-its-own-window.md) (the
+  published level owns its window)
 
 ## What it is
 
@@ -33,38 +42,74 @@ never changes a published quantity (ADR 012).
 
 - **RAW** — ADC code and volts (`V = code · 3.3 / 4095`).
 - **EXCITATION** — the diode sits at the PBS reject port and measures the light
-  removed from the sample beam (`I_pd = I_tot − I_exc`), so the plugin inverts against the user-set
-  reference: `I_exc = I_tot − I_pd`, with `I_tot` given in photodiode volts.
+  removed from the sample beam (`I_pd = I_tot − I_exc`), so the plugin inverts against the learned
+  total-power anchor: `I_exc = I_tot − I_pd`. Nothing to enter — see below.
 
 ## Optical log-contrast `a`
 
 `measured_log_contrast` in the published `PhotodiodeOpticalSummaryV1` is **always** the excitation
 contrast `a = ln(I_exc,max / I_exc,min)`, in **both** display modes. The detector sits behind the
 PBS reject port and measures the complement — that is a property of the bench, not of the display —
-so the estimator always runs the `RejectedComplement` geometry against `reference_volts`. A1's
+so the estimator always runs the `RejectedComplement` geometry against the learned anchor. A1's
 amplitude sweep settles on this value, so a display toggle must not be able to move it (ADR 012).
 
-- **Reference I_tot** (`reference_volts`) is the total-power anchor: the PD reading with the full
-  beam diverted into the diode. The input accepts 1 µV steps (six decimal places in volts), which
-  covers the usual 0.0005–0.015 V detector range. A non-empty **anchor id** and explicit
-  **measured and current** confirmation are required. Changing the value or id
-  clears confirmation; until all three agree, `a` is withheld.
-- **Dark level** (`dark_volts`) + the **Capture dark** button: block the beam and press; the mean of
-  every sample currently retained in the monitor cache becomes the dark level. This is not a new
-  fixed-duration acquisition and it does not measure or modify `I_tot`: after blocking the beam,
-  wait at least one configured cache duration so earlier illuminated samples have aged out. The
-  dark input also accepts 1 µV steps for a manual correction. The value is applied to the detector
-  samples *and* to the `I_tot` anchor, so it cancels out of the complement rather than biasing `a`
-  — its job is to keep the two sides consistent and to record the calibration the reading was
-  taken under. `dark_id` in the sidecar reads `dark-measured` or `dark-none` accordingly.
+- **`I_tot` is learned, not entered** (ADR 024). The plugin latches the highest
+  smoothed detector level it has seen since the port was opened. On the reject
+  port the detector is brightest exactly where the excitation is extinguished,
+  so that reading *is* `I_tot` — and the Pockels transfer sweep, which walks the
+  DAC across the whole lobe, lands on the excitation null by construction. Run
+  the sweep once and the anchor is right. The latch is over completed 64-sample
+  summary-cell means, so one noise spike cannot pin it high, and it survives
+  segment restarts (a rate change or an acquisition handover does not move the
+  optics). Reconnecting the port relearns it. Provenance is published as
+  `anchor_id = "observed-peak@<sample index>"`.
+- **There is no dark level, and that is exact, not an approximation.** With a DC
+  dark offset `D`, the excitation is `(I_tot,obs − D) − (v − D) = I_tot,obs − v`
+  — the offset cancels, because both sides are readings from the same
+  DC-coupled detector. `dark_volts` is fixed at 0 and `dark_id` reads
+  `dark-cancels`. Two unit tests hold this down: one asserts that shifting the
+  whole trace *and* the anchor leaves `a` unchanged to 1e-9, and a companion
+  asserts that correcting only one side *does* move it, so the first cannot pass
+  vacuously.
 - The estimator uses only marker-bounded windows containing at least **two
   complete modulation cycles**, ending on phase 0. It no longer estimates
   extrema from an arbitrary trailing sample count; a low-frequency trace that
   does not fit the bounded window is withheld rather than phase biased.
-- The estimator is **fail-closed**: it refuses on a missing/unconfirmed anchor,
-  incomplete cycles, ADC clipping, no headroom above dark, and when the anchor
-  is not above the measured signal. A refusal is shown as `a unavailable: <reason>`
+- The estimator is **fail-closed**: it refuses when no anchor has been observed
+  yet, on incomplete cycles, on ADC clipping, and when the excitation never dims
+  below the brightest the detector has been — where there is no complement left
+  to take a contrast of, and the fix is to run the transfer sweep. A refusal is shown as `a unavailable: <reason>`
   rather than a missing row — a wrong `a` is worse than no `a`.
+- The refusal reason is also **published** on the contract as
+  `PhotodiodeSummaryV1::optical_unavailable`, so a consumer that gates on `a`
+  (A1's a₀ lock, amplitude sweep and frequency ladder) can name the gate rather
+  than report absence. Set exactly when `optical_summary` is absent and a window
+  existed to judge (ADR 017).
+- Clip detection is **span-relative**: the near-rail margin is capped at 5 % of
+  the window's own peak-to-peak code range. At this detector's 0.5–15 mV
+  operating range the whole waveform sits inside the bottom ~20 of 4095 codes,
+  where the former absolute 4-code margin classified 30 % of a clean sine as
+  clipped and withheld `a` unconditionally. The rails themselves (code 0, full
+  scale) stay guarded at every gain, so a waveform driven below zero is still
+  refused (ADR 017).
+- The same span-relative margin decides `PhotodiodeLevelV1::clipped`, so the
+  Pockels sweep is not told that a detector running a few codes above zero is
+  truncating.
+
+## The published level owns its window
+
+`PhotodiodeStreamV1.level` is the settled detector reading other plugins consume
+— today, the modulation plugin's Pockels transfer sweep, which reads one per
+commanded DAC code. It is averaged over a **fixed 20 ms**, set here and
+independent of every display setting; `sample_count` reports what it was.
+
+It used to be averaged over the chart's moving-average window below. That made a
+display preference set the precision of a physical calibration: at the bench's
+500 kSa/s the default of four samples published **8 µs** of signal per settled
+code, and a clean Pockels curve came back reported as a 22 % residual with 26 %
+"hysteresis" (ADR 019). 20 ms is one mains period, so the boxcar has a null at
+50 Hz and every harmonic of it — and the chart's averaging is once again nothing
+but a chart setting.
 
 ## Chart
 

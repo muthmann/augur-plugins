@@ -9,7 +9,17 @@
   `SetOpticalDepth`), [ADR 009](../adr/009-stage-a-a1-recording-coordinator.md)
   (the RAW + PDQ + sidecar coordinator) and
   [ADR 012](../adr/012-stage-a-contrast-geometry-is-bench-not-display.md) (the
-  geometry the measured `a` is defined in)
+  geometry the measured `a` is defined in) and
+  [ADR 017](../adr/017-stage-a-rail-detection-and-withheld-a-reasons.md) (why a
+  gate refused, and millivolt-scale rail detection) and
+  [ADR 018](../adr/018-stage-a-a1-required-vs-optional-inputs.md) (a lock arms
+  within the operator's own `a₀` tolerance, and a lock that cannot arm names
+  which of the three causes it is) and
+  [ADR 020](../adr/020-stage-a-a1-depth-source.md) (`a` comes from the
+  photodiode or from the commanded drive) and
+  [ADR 021](../adr/021-stage-a-a1-no-search-for-a-commanded-depth.md) (with a
+  commanded depth there is nothing to search for: no `Find a₀`, no lock table,
+  and the ladder confirms each frequency against the modulation owner)
 - **Relates to:** [Stage-A A1 Analysis](./stage-a-a1.md),
   [Stage-A Pockels Transfer Calibration](./stage-a-pockels-calibration.md),
   [Stage-A Photodiode](./stage-a-photodiode.md)
@@ -90,6 +100,47 @@ across frequencies is not automated, i.e. off by default). Then:
    practical) is yours — every point is one button press.
 
 Steps 1–4 are what **Start frequency sweep** automates; see below.
+
+### When a button refuses
+
+Every step from 2 on needs a photodiode-measured `a`, and each of these is
+**fail-closed**: nothing touches the drive until the whole precondition set
+passes. The refusal quotes the photodiode owner's own reason — a missing or
+unconfirmed `I_tot` anchor, too few phase-0 markers in its ring, a window shorter
+than one cycle, a railed window, a stale snapshot — instead of naming the two most
+common causes regardless of the real one (ADR 017). The same reason is on the
+resting status line as `Measured depth a: not available — <reason>`, so it can be
+read without pressing anything, and the reason itself names an action rather than
+an estimator gate (ADR 018).
+
+Some benches cannot produce a measured `a` at all — with no phase-0 markers on
+the photodiode's stream port the estimator refuses whatever the settings say.
+Every one of these refusals therefore also names the way past it: switching
+**Depth `a` source** to the commanded drive (ADR 020).
+
+**Everything on this page below here describes the *measured* workflow.** With a
+commanded depth there is nothing to search for, so the search does not run at
+all (ADR 021): `Find a₀` is disabled and says so, `Record a₀ point` commands `a₀`
+directly, the ladder goes lease → set `f` → confirm → record with no `Locking`
+phase, and `a0_locks.json` stays untouched because nothing was found. The
+ladder also confirms each frequency against the modulation owner's acknowledged
+waveform rather than the camera trigger, so it needs neither EXT_TRIGGER markers
+nor Live analysis. The whole workflow reduces to: set `a₀`, press **Record all
+frequencies**.
+
+The trade is exactly the one the lock exists to remove — nothing verifies the
+light reached `a₀`, and the static inversion delivers less depth as `f` rises —
+so switch back to the photodiode once its markers work.
+
+The ladder additionally needs phase-0 markers on the **camera** side to confirm a
+commanded frequency, which means **Live analysis** must be on. Its refusal says
+which of the two is missing — the toggle or the trigger wiring.
+
+Preconditions a run will hit *later* are checked before the drive moves. The
+ladder and the amplitude sweep both ask the recording's own photodiode question
+up front: taking the lease, retargeting the drive and locking `a₀` only to be
+refused by `begin_recording` at point 1 is what produced a panel reading
+`Frequency sweep 1/7 … — recording` next to `Recording: idle` (ADR 018).
 
 ## The frequency ladder (unattended)
 
@@ -187,12 +238,26 @@ a_\text{cmd} \leftarrow a_\text{cmd}\cdot\frac{a_0}{a_\text{measured}}
 ## The lock table
 
 One row per frequency (a re-lock within 1 % of a stored frequency replaces it):
-frequency, target `a₀`, commanded `a`, measured `a`, trials, state, locked-at.
+frequency, target `a₀`, commanded `a`, observed `a`, **which source that `a`
+came from**, trials, state, locked-at.
 Visible as the **A1 a₀ locks** host view and mirrored to
 `<output folder>/a0_locks.json`, so the found depths survive a restart and can be
 cited offline. A non-converged row is kept for the record but **never** arms a
 recording; a stored lock only arms an event-count point when both its frequency
 **and** its `a₀` still match the current settings.
+
+"Still matches" is judged against the operator's own **a₀ tolerance**, not exact
+equality. `a₀` is a drag control with a 0.01 step, and the earlier `1e-6`
+comparison meant one stray pixel of drag silently disarmed a lock that had just
+converged — after which the panel asked for the `Find a₀` that had already been
+done. The tolerance is already the statement of how close to `a₀` counts as
+`a₀`; applying a stricter rule to the same quantity was never coherent (ADR 018).
+
+When no lock arms, the panel and the *Record a₀ point* refusal name **which** of
+the three causes it is — no lock at this frequency, a lock that stopped short
+(and the measured `a` it stopped at), or a lock aimed at a different `a₀` (naming
+both values) — rather than telling the operator to press `Find a₀` in all three
+cases.
 
 ## Why recording re-applies the depth
 
@@ -225,10 +290,12 @@ frequency sweep at the single frozen depth:
 
 Sub-hertz frequencies keep the decimal as `p` (`f0p5Hz`). The A1 sidecar adds
 `sweep.commanded_a` and an `[a0_lock]` section (`target_a`, `commanded_a`,
-`measured_a_at_lock`, `frequency_hz_at_lock`, `trials`, `converged`,
-`locked_at_utc`); both recorders' own sidecars carry `a0_target`,
-`a0_commanded_a`, `a0_lock_measured_a` and `a0_lock_frequency_hz` as metadata.
-The measured `a` of the recording itself stays in `[optical]` as for every run.
+`measured_a_at_lock`, `depth_source`, `frequency_hz_at_lock`, `trials`,
+`converged`, `locked_at_utc`); both recorders' own sidecars carry `a0_target`,
+`a0_commanded_a`, `a0_lock_measured_a`, `a0_lock_depth_source` and
+`a0_lock_frequency_hz` as metadata. The measured `a` of the recording itself
+stays in `[optical]` as for every run, and its provenance in the top-level
+`depth_a_source` (ADR 020).
 
 ## Choosing `a₀` (still an operator decision)
 

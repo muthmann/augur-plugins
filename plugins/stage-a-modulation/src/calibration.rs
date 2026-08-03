@@ -49,6 +49,15 @@
 //! — the obvious approach — breaks on exactly the sweeps that matter: with a
 //! real `Vπ` near 860 the DAC range holds ~2.4 lobes, so the global minimum
 //! and maximum can sit whole periods apart and the seed is meaningless.
+//!
+//! # Noise is measured, not assumed
+//!
+//! Every judgement about whether a sweep is good — was a lobe resolved at all,
+//! is the up/down difference real drift — is made against the **fit's own RMS
+//! residual**, which is the scatter of the averaged points about the curve.
+//! Nothing here reads `peak_to_peak_volts`, which measures the detector *before*
+//! averaging and therefore says more about the photodiode owner's window length
+//! than about the precision of a point (ADR 019).
 
 use std::f64::consts::PI;
 
@@ -78,7 +87,9 @@ pub struct SweepPoint {
     pub direction: Direction,
     /// Raw detector level in volts, as published by the photodiode owner.
     pub volts: f64,
-    /// Spread over the averaged window; a settle-quality witness.
+    /// Spread over the averaged window. Archived as a settle-quality witness the
+    /// operator can read next to the plot; the fit deliberately does not use it
+    /// (see the module docs).
     pub peak_to_peak_volts: f64,
     pub clipped: bool,
 }
@@ -128,7 +139,8 @@ pub struct TransferFit {
     pub quality: f64,
     pub geometry: DetectorGeometry,
     /// Mean |ascending − descending| at matched codes, as a fraction of the
-    /// span. `None` when the sweep ran in one direction only.
+    /// span. `None` when the sweep ran in one direction only. Judge it against
+    /// [`TransferFit::hysteresis_noise_floor`], never against zero.
     pub hysteresis: Option<f64>,
     /// Fraction of one full lobe (`Vπ` codes) the sweep actually covered.
     /// Below ~1 the half-wave-voltage span is extrapolated, not measured.
@@ -167,17 +179,73 @@ impl TransferFit {
     pub fn detector_volts_at_peak(&self) -> f64 {
         self.offset_volts + self.span_volts
     }
+
+    /// The value [`Self::hysteresis`] takes when the two passes differ by
+    /// nothing but independent point noise.
+    ///
+    /// Both passes measure the same curve, so their difference at a matched code
+    /// is the difference of two independent errors of scale `σ` — and for those,
+    /// `E|Δ| = σ√2 · √(2/π) = 1.128 σ`. The fit already measures `σ` as its RMS
+    /// residual, so the floor comes out of numbers that are on the table.
+    ///
+    /// Without it the metric reports noise as drift: on a real bench sweep whose
+    /// points carried 11.3 mV of scatter against a 50.8 mV lobe, the "hysteresis"
+    /// read 25.7 % against a floor of 25.1 % — a clean, drift-free cell flagged
+    /// as drifting (ADR 019).
+    pub fn hysteresis_noise_floor(&self) -> f64 {
+        let span = self.span_volts.abs();
+        if span <= f64::EPSILON {
+            return f64::INFINITY;
+        }
+        1.128 * self.rms_residual_volts / span
+    }
+
+    /// How far the up/down disagreement stands above what the point noise alone
+    /// explains: [`Self::hysteresis`] over [`Self::hysteresis_noise_floor`].
+    ///
+    /// The ratio lives between two derivable endpoints, which is what makes it
+    /// usable as a test. Write `Δ` for a systematic offset between the passes and
+    /// `σ` for the per-point noise. The metric itself behaves as
+    /// `√(Δ² + (1.128σ)²)`, while the fit — which splits the difference between
+    /// the two passes — carries a residual of `√(Δ²/4 + σ²)`. So:
+    ///
+    /// - **pure noise** (`Δ = 0`) → **1.0**, by construction;
+    /// - **pure drift** (`Δ ≫ σ`) → `Δ / (1.128 · Δ/2)` = **1.77**.
+    ///
+    /// A systematic offset therefore inflates the residual too, and the ratio
+    /// saturates rather than growing without bound — which is exactly why a
+    /// generous multiple of the floor (2×, say) never fires at all. The
+    /// discriminating range is narrow and known, so the threshold belongs inside
+    /// it: [`Self::hysteresis_is_systematic`].
+    ///
+    /// `None` when the sweep ran in one direction only.
+    pub fn hysteresis_above_noise(&self) -> Option<f64> {
+        self.hysteresis
+            .map(|value| value / self.hysteresis_noise_floor())
+    }
+
+    /// Whether the up/down disagreement is drift rather than scatter.
+    ///
+    /// The cut sits between the two endpoints derived in
+    /// [`Self::hysteresis_above_noise`], at the point where the systematic part
+    /// is about 1.5× the point noise — sensitive enough to catch a real lag,
+    /// blind to a bench that is merely noisy.
+    pub fn hysteresis_is_systematic(&self) -> bool {
+        const SYSTEMATIC_ABOVE: f64 = 1.33;
+        self.hysteresis_above_noise()
+            .is_some_and(|ratio| ratio > SYSTEMATIC_ABOVE)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum FitError {
     /// Fewer points than parameters can be resolved from.
     TooFewPoints { count: usize, minimum: usize },
-    /// The between-code signal span is not larger than the detector's typical
-    /// within-window excursion, so the sweep does not resolve a lobe.
+    /// The fitted lobe does not stand above the scatter of the points about it,
+    /// so the sweep does not resolve a lobe.
     NoModulation {
-        signal_span_volts: f64,
-        noise_span_volts: f64,
+        span_volts: f64,
+        residual_volts: f64,
     },
     /// A fitted lobe exists but no `[V_null, V_null+Vπ]` fits inside the
     /// commandable range, so no monotonic branch is usable.
@@ -191,13 +259,13 @@ impl std::fmt::Display for FitError {
                 write!(f, "only {count} sweep points (minimum {minimum})")
             }
             Self::NoModulation {
-                signal_span_volts,
-                noise_span_volts,
+                span_volts,
+                residual_volts,
             } => write!(
                 f,
-                "detector sweep span {signal_span_volts:.6} V does not exceed the typical \
-                 within-window excursion {noise_span_volts:.6} V; check the light path and HV \
-                 amplifier, or reduce detector noise / increase averaging"
+                "the fitted lobe spans {span_volts:.6} V but the points scatter {residual_volts:.6} \
+                 V about it, so no lobe is resolved; check the light path and HV amplifier, or \
+                 reduce detector noise"
             ),
             Self::NoLobeInRange { v_pi_dac } => write!(
                 f,
@@ -213,23 +281,10 @@ impl std::error::Error for FitError {}
 /// Smallest usable sweep: four points per fitted parameter.
 pub const MIN_POINTS: usize = 16;
 
-/// Median raw peak-to-peak excursion inside one settled CONST window.
-///
-/// This is the scale a between-code transfer curve has to beat. Unlike the
-/// former absolute 10 mV cut, it follows the detector gain and acquisition
-/// noise, so millivolt-scale but repeatable Pockels sweeps remain usable.
-fn typical_window_noise(points: &[SweepPoint]) -> f64 {
-    let mut spans: Vec<f64> = points
-        .iter()
-        .map(|point| point.peak_to_peak_volts)
-        .filter(|span| span.is_finite() && *span >= 0.0)
-        .collect();
-    if spans.is_empty() {
-        return 0.0;
-    }
-    spans.sort_by(f64::total_cmp);
-    spans[spans.len() / 2]
-}
+/// Largest `rms_residual / |span|` that still counts as a resolved lobe. See the
+/// gate in [`fit_transfer`] for where the number comes from; above it the sweep
+/// is refused outright, below it the residual only warns.
+const MAX_RESOLVED_QUALITY: f64 = 0.5;
 
 /// Least-squares solution for one candidate half-wave-voltage span `w`.
 struct Harmonic {
@@ -419,11 +474,20 @@ fn hysteresis_fraction(points: &[SweepPoint], span: f64) -> Option<f64> {
 
 /// Scans the half-wave-voltage span over every period the sweep could resolve, then
 /// refines. Returns the best `(Vπ, harmonic)`.
-fn fit_period(points: &[SweepPoint], swept_span: f64) -> Option<(f64, Harmonic)> {
+///
+/// `code_count` is the number of **distinct** codes visited, not the number of
+/// points: a sweep that runs up and back visits each code twice, and counting
+/// the repeats halves the apparent code step and pushes the scan floor below
+/// what the sweep can resolve — straight into aliasing.
+fn fit_period(
+    points: &[SweepPoint],
+    swept_span: f64,
+    code_count: usize,
+) -> Option<(f64, Harmonic)> {
     // From four samples per lobe (below that the lobe is aliased) out to a
     // lobe twice the swept span (a barely-curved arc). Log-spaced, because a
     // fixed step wastes resolution at long periods and misses short ones.
-    let point_spacing = swept_span / points.len().max(2) as f64;
+    let point_spacing = swept_span / code_count.max(2) as f64;
     let w_min = (2.0 * point_spacing).max(1.0);
     let w_max = (2.0 * swept_span).max(w_min * 1.5);
     const SCAN_STEPS: usize = 600;
@@ -492,20 +556,20 @@ pub fn fit_transfer(
     let min_volts = profile.iter().map(|(_, v)| *v).fold(f64::MAX, f64::min);
     let max_volts = profile.iter().map(|(_, v)| *v).fold(f64::MIN, f64::max);
     let observed_span = max_volts - min_volts;
-    let noise_span = typical_window_noise(points);
-    if !observed_span.is_finite()
-        || observed_span <= f64::EPSILON
-        || (noise_span > 0.0 && observed_span <= noise_span)
-    {
+    // Only the degenerate case is refused before fitting — a flat or non-finite
+    // sweep has no curve to measure anything against. Whether a real lobe was
+    // resolved is decided *after* the fit, from the fit's own residual.
+    if !observed_span.is_finite() || observed_span <= f64::EPSILON {
         return Err(FitError::NoModulation {
-            signal_span_volts: observed_span.max(0.0),
-            noise_span_volts: noise_span,
+            span_volts: observed_span.max(0.0),
+            residual_volts: 0.0,
         });
     }
 
     let swept_lo = profile.first().map(|(code, _)| *code).unwrap_or(0.0);
     let swept_hi = profile.last().map(|(code, _)| *code).unwrap_or(max_code);
     let swept_span = (swept_hi - swept_lo).max(1.0);
+    let code_count = profile.len();
 
     // A single stray point — one window caught mid-settle, one stream hiccup —
     // barely moves the fitted period but inflates the RMS residual several
@@ -513,13 +577,13 @@ pub fn fit_transfer(
     // what is left, so the reported residual describes the curve rather than
     // the worst sample.
     let (w, harmonic, rejected_points) = {
-        let first = fit_period(points, swept_span).ok_or(FitError::NoModulation {
-            signal_span_volts: observed_span,
-            noise_span_volts: noise_span,
+        let first = fit_period(points, swept_span, code_count).ok_or(FitError::NoModulation {
+            span_volts: observed_span,
+            residual_volts: 0.0,
         })?;
         let kept = without_outliers(points, first.0, &first.1);
         if kept.len() < points.len() && kept.len() >= MIN_POINTS {
-            match fit_period(&kept, swept_span) {
+            match fit_period(&kept, swept_span, code_count) {
                 Some((w, harmonic)) => (w, harmonic, points.len() - kept.len()),
                 None => (first.0, first.1, 0),
             }
@@ -544,18 +608,38 @@ pub fn fit_transfer(
             2.0 * radius,
         ),
     };
-    if !p1.is_finite() || p1.abs() <= f64::EPSILON || (noise_span > 0.0 && p1.abs() <= noise_span) {
+
+    // Over the points the fit actually used: dividing the kept residual by the
+    // full count would flatter the number.
+    let rms = (harmonic.sse / (points.len() - rejected_points).max(1) as f64).sqrt();
+    // A lobe is resolved when its amplitude stands above the scatter of the
+    // points about it. `p1` and the residual are spans of the *same* averaged
+    // points, so they are directly comparable — which the previous test, against
+    // the median raw within-window excursion, was not: that measures the detector
+    // *before* averaging, so it tracks whatever window the photodiode owner
+    // happens to publish rather than the precision of a point. It came within a
+    // factor of two of refusing a real, clean bench sweep, and would have got
+    // stricter as the owner's window grew (ADR 019).
+    //
+    // The threshold has to leave room on both sides, because a free period
+    // search over pure noise does *not* return an amplitude of zero: with `n`
+    // points the quadrature pair has scale `σ√(2/n)`, and taking the best of a
+    // 600-step scan inflates it by about `√(2 ln 600)`. For the sweeps this
+    // module actually sees (n = 49 and n = 98) that lands the noise-only quality
+    // at 0.7–1.0 — measured at 0.97 in `refuses_a_lobe_that_does_not_stand_above
+    // _the_point_scatter`. A resolved lobe sits far below: the noisiest real
+    // bench record on file reads 0.22. Half-way between, at 0.5, is a plain
+    // statement — the lobe must be at least twice its own scatter — with better
+    // than 2× margin either way.
+    if !p1.is_finite() || p1.abs() <= f64::EPSILON || rms >= MAX_RESOLVED_QUALITY * p1.abs() {
         return Err(FitError::NoModulation {
-            signal_span_volts: p1.abs(),
-            noise_span_volts: noise_span,
+            span_volts: p1.abs(),
+            residual_volts: rms,
         });
     }
 
     let v_null = select_lobe(v, w, max_code).ok_or(FitError::NoLobeInRange { v_pi_dac: w })?;
 
-    // Over the points the fit actually used: dividing the kept residual by the
-    // full count would flatter the number.
-    let rms = (harmonic.sse / (points.len() - rejected_points).max(1) as f64).sqrt();
     Ok(TransferFit {
         v_null_dac: v_null,
         v_pi_dac: w,
@@ -601,12 +685,140 @@ pub fn sweep_codes(
     codes
 }
 
+/// Deterministic per-point scatter in `[-1, 1]`, shared by the fit tests and the
+/// plugin's warning tests.
+///
+/// Not an RNG — failures reproduce — but genuinely *uncorrelated between the two
+/// passes*, which a wobble alternating with the point index is not: with an odd
+/// number of points per pass, matched codes always land on opposite signs, so
+/// what looks like noise is a systematic offset between the passes. That is the
+/// exact thing the hysteresis test has to tell apart, so the fixture must not
+/// quietly be the wrong one.
+#[cfg(test)]
+pub(crate) fn scatter(code: u16, direction: Direction) -> f64 {
+    let mut x = u64::from(code).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ match direction {
+            Direction::Ascending => 0,
+            Direction::Descending => 0xD1B5_4A32_D192_ED03,
+        };
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+    x ^= x >> 33;
+    ((x >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// The sweep the operator recorded on 2026-07-30, verbatim.
+    ///
+    /// A clean 625-code lobe that the plugin then reported as bad: 22 % residual,
+    /// 26 % hysteresis, 34 "clipped" points. Every one of those was an artifact
+    /// of publishing four ADC samples per settled code (ADR 019). Kept as a
+    /// fixture because synthetic sweeps cannot reproduce what a real detector's
+    /// signal-proportional noise does to metrics that are compared against zero.
+    const REAL_SWEEP: &str = include_str!("../testdata/pockels-20260730-083123.json");
+
+    fn real_sweep_points() -> Vec<SweepPoint> {
+        let record: serde_json::Value =
+            serde_json::from_str(REAL_SWEEP).expect("the archived record parses");
+        record["points"]
+            .as_array()
+            .expect("points array")
+            .iter()
+            .map(|point| SweepPoint {
+                code: point["code"].as_u64().expect("code") as u16,
+                direction: match point["direction"].as_str().expect("direction") {
+                    "up" => Direction::Ascending,
+                    "down" => Direction::Descending,
+                    other => panic!("unknown direction {other}"),
+                },
+                volts: point["volts"].as_f64().expect("volts"),
+                peak_to_peak_volts: point["peak_to_peak_volts"].as_f64().expect("p2p"),
+                clipped: point["clipped"].as_bool().expect("clipped"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_recorded_bench_sweep_resolves_its_lobe() {
+        let points = real_sweep_points();
+        assert_eq!(points.len(), 98);
+        let fit =
+            fit_transfer(&points, 3_000.0, DetectorGeometry::RejectedComplement).expect("fits");
+
+        assert!((fit.v_pi_dac - 625.4).abs() < 1.0, "Vπ = {}", fit.v_pi_dac);
+        assert!(
+            (fit.v_null_dac - 711.9).abs() < 1.0,
+            "V_null = {}",
+            fit.v_null_dac
+        );
+        assert!(fit.span_volts < 0.0, "reject port darkens with excitation");
+        assert!(fit.lobe_coverage > 4.0, "coverage = {}", fit.lobe_coverage);
+    }
+
+    #[test]
+    fn the_recorded_sweeps_hysteresis_is_exactly_its_point_noise() {
+        // The load-bearing claim behind the hysteresis noise floor, and the
+        // reason the operator's clean cell was reported as drifting.
+        //
+        // Both passes measure one curve, so at a matched code they differ by two
+        // independent errors of scale σ, for which E|Δ| = 1.128 σ. The fit
+        // measures σ as its RMS residual. If the observed 25.7 % lands on that
+        // prediction, the passes disagree by nothing but noise — there is no
+        // drift to warn about, at any threshold that ignores the noise.
+        let fit = fit_transfer(
+            &real_sweep_points(),
+            3_000.0,
+            DetectorGeometry::RejectedComplement,
+        )
+        .expect("fits");
+
+        let hysteresis = fit.hysteresis.expect("both directions were swept");
+        let floor = fit.hysteresis_noise_floor();
+        assert!(
+            (hysteresis / floor - 1.0).abs() < 0.05,
+            "hysteresis {hysteresis:.4} vs. noise floor {floor:.4}: not explained by noise alone"
+        );
+        assert!(
+            !fit.hysteresis_is_systematic(),
+            "ratio = {:?}",
+            fit.hysteresis_above_noise()
+        );
+    }
+
+    #[test]
+    fn the_hysteresis_ratio_sits_between_its_two_derived_endpoints() {
+        // The threshold in `hysteresis_is_systematic` is only meaningful if the
+        // ratio really does run from 1.0 (pure noise) to 1.77 (pure drift). Both
+        // ends are asserted here, because the cut sits between them and nowhere
+        // else would work.
+        let scattered = fit_transfer(
+            &synthetic_sweep(300.0, 1_600.0, 2.4, -2.2, 4_095, 0.050, true),
+            4_095.0,
+            DetectorGeometry::RejectedComplement,
+        )
+        .expect("fits");
+        let noise_end = scattered.hysteresis_above_noise().expect("both directions");
+        assert!((noise_end - 1.0).abs() < 0.15, "noise end = {noise_end}");
+
+        // Same curve, no scatter, one pass offset wholesale: pure drift.
+        let mut points = synthetic_sweep(300.0, 1_600.0, 2.4, -2.2, 4_095, 0.0, true);
+        for point in &mut points {
+            if point.direction == Direction::Descending {
+                point.volts -= 0.2;
+            }
+        }
+        let drifting =
+            fit_transfer(&points, 4_095.0, DetectorGeometry::RejectedComplement).expect("fits");
+        let drift_end = drifting.hysteresis_above_noise().expect("both directions");
+        assert!((drift_end - 1.772).abs() < 0.15, "drift end = {drift_end}");
+        assert!(drifting.hysteresis_is_systematic());
+    }
+
     /// Synthesizes a sweep of a known lobe as seen through a given port.
-    /// `noise` is a deterministic zig-zag, not an RNG, so failures reproduce.
+    /// `noise` is the amplitude of the deterministic per-point [`scatter`].
     fn synthetic_sweep(
         v_null: f64,
         v_pi: f64,
@@ -622,14 +834,12 @@ mod tests {
         };
         sweep_codes(max_code, 49, both_directions)
             .into_iter()
-            .enumerate()
-            .map(|(index, (code, direction))| {
+            .map(|(code, direction)| {
                 let u = lobe.u_for_dac(f64::from(code));
-                let wobble = if index % 2 == 0 { noise } else { -noise };
                 SweepPoint {
                     code,
                     direction,
-                    volts: offset + span * u + wobble,
+                    volts: offset + span * u + noise * scatter(code, direction),
                     peak_to_peak_volts: 0.002,
                     clipped: false,
                 }
@@ -769,8 +979,8 @@ mod tests {
     #[test]
     fn accepts_a_repeatable_sub_10mv_transfer() {
         // The real detector commonly operates between roughly 0.5 and 15 mV.
-        // A repeatable 4 mV lobe was rejected by the former absolute 10 mV
-        // threshold even though it is twice the measured window excursion.
+        // A repeatable 4 mV lobe was rejected by an absolute 10 mV threshold
+        // even though the points sit tightly on it.
         let points = synthetic_sweep(300.0, 1_600.0, 0.010, -0.004, 4_095, 0.000_05, true);
         let fit = fit_transfer(&points, 4_095.0, DetectorGeometry::RejectedComplement)
             .expect("a resolved millivolt-scale lobe must fit");
@@ -785,15 +995,39 @@ mod tests {
     }
 
     #[test]
-    fn refuses_apparent_modulation_below_the_window_noise() {
+    fn refuses_a_lobe_that_does_not_stand_above_the_point_scatter() {
+        // No lobe at all (span 0), only scatter. A free period search over noise
+        // does not return zero amplitude — it returns the best of 600 tries —
+        // which is exactly why the gate cannot sit at `residual >= span`.
         let points = synthetic_sweep(300.0, 1_600.0, 0.008, 0.0, 4_095, 0.000_4, false);
-        assert!(matches!(
-            fit_transfer(&points, 4_095.0, DetectorGeometry::Direct),
-            Err(FitError::NoModulation {
-                noise_span_volts,
-                ..
-            }) if (noise_span_volts - 0.002).abs() < 1e-12
-        ));
+        let error = fit_transfer(&points, 4_095.0, DetectorGeometry::Direct)
+            .expect_err("noise alone must not pass as a lobe");
+        let FitError::NoModulation {
+            span_volts,
+            residual_volts,
+        } = error
+        else {
+            panic!("{error:?}");
+        };
+        // Pins the noise-only quality the threshold was chosen against: this
+        // fixture reads ~0.97, and the cut at 0.5 keeps a factor of two clear.
+        let noise_quality = residual_volts / span_volts;
+        assert!(
+            (0.6..1.2).contains(&noise_quality),
+            "noise-only quality = {noise_quality}"
+        );
+    }
+
+    #[test]
+    fn a_noisy_but_real_lobe_still_resolves() {
+        // The gate is about resolution, not tidiness: a lobe carrying a fifth of
+        // its own span in scatter — the state the bench was actually in — must
+        // still fit. Only the warnings are allowed to comment on it.
+        let points = synthetic_sweep(700.0, 625.0, 0.058, -0.051, 3_000, 0.011, true);
+        let fit = fit_transfer(&points, 3_000.0, DetectorGeometry::RejectedComplement)
+            .expect("a noisy but resolved lobe must fit");
+        assert!((fit.v_pi_dac - 625.0).abs() < 20.0, "Vπ = {}", fit.v_pi_dac);
+        assert!(fit.quality > 0.1, "quality = {}", fit.quality);
     }
 
     #[test]

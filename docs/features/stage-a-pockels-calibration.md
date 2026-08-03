@@ -5,7 +5,9 @@
 - **Status:** built
 - **ADR:** [ADR 011](../adr/011-stage-a-pockels-transfer-calibration.md),
   [ADR 016](../adr/016-stage-a-lobe-endpoints-not-a-distance.md) (what the two
-  settings ask for)
+  settings ask for),
+  [ADR 019](../adr/019-stage-a-calibration-measures-its-own-window.md) (the
+  measurement window, and judging the sweep against its own noise)
 - **Knowledge base:** `methodology/pockels-waveform-linearisation.md` §4,
   `setup/optical-path.md`
 
@@ -81,12 +83,27 @@ Several nulls are valid when a sweep spans multiple lobes; the fit reports the
 **lowest** one whose `[V_null, V_null + Vπ]` fits inside the max limit — least
 voltage across the crystal, most headroom, and a rule the operator can predict.
 
-## Settling is proven, not timed
+## Each point is a measurement the sweep controls
 
-Every published level carries `end_sample_index` and `sample_count` on the
-device sample clock. A point is accepted only from a window that *began* at
-least `SETTLE_SAMPLES` (2 000 ≈ 100 ms at 20 kSa/s) after its code was
-commanded. No shared wall clock, no sleeps, immune to control-tick jitter.
+Two quantities, both owned deliberately and neither borrowed from a display
+setting (ADR 019):
+
+**Settling is proven, not timed.** Every published level carries
+`end_sample_index` and `sample_count` on the device sample clock. A point is
+accepted only from a window that *began* at least `SETTLE_SECONDS` (0.1 s,
+converted through the photodiode's published sample rate) after its code was
+commanded. No shared wall clock, no sleeps, immune to control-tick jitter. A
+duration and not a sample count, because settling is a property of the HV
+amplifier and the crystal: the former fixed 2 000 samples was written for
+20 kSa/s and silently became 4 ms when the bench moved to 500 kSa/s.
+
+**The level is averaged over 20 ms**, fixed by the photodiode plugin and
+independent of its chart-averaging setting. That setting used to decide it, at a
+default of four samples — 8 µs at 500 kSa/s — which is how a clean bench lobe
+came back with a 22 % residual. 20 ms is one mains period, so the boxcar nulls
+50 Hz and its harmonics.
+
+A point therefore costs ~120 ms, and the full 98-point sweep ~12 s.
 
 ## The sweep owns the DAC while it runs
 
@@ -142,14 +159,32 @@ bad reason. A residual that stays high after rejection, with a visibly poor
 overlay, is the real signal — and as the last row shows, it comes with a `Vπ`
 that is wrong in a way the plot makes obvious.
 
-There is deliberately no absolute minimum voltage. The earlier implementation
-rejected every detector span below **10 mV**, while the real Stage-A
-photodiode commonly reads only about **0.5–15 mV**. The fit now compares the
-between-code sweep span with the median `peak_to_peak_volts` measured inside
-the settled CONST windows. A repeatable millivolt-scale lobe is accepted; a
-putative lobe no larger than the detector's own typical within-window
-excursion is rejected as unresolved. The regression suite includes a 4 mV
-transfer that the old threshold always refused.
+One real bench sweep is kept as a fixture at
+`plugins/stage-a-modulation/testdata/pockels-20260730-083123.json` and asserted
+against directly. Synthetic sweeps carry uniform noise; a real detector's is
+signal-proportional, and every metric that broke on that record was one compared
+against zero (ADR 019). It is worth keeping for the same reason the table above
+is: it is what the failure actually looked like.
+
+There is deliberately no absolute minimum voltage. An early implementation
+rejected every detector span below **10 mV**, while the real Stage-A photodiode
+commonly reads only about **0.5–15 mV**. Its replacement — the between-code span
+against the median `peak_to_peak_volts` — was scale-free but still wrong: that
+compares a span of *means* to a *raw within-window excursion*, so it tightens as
+the averaging window grows, and it cleared a real bench sweep by only a factor of
+1.9.
+
+Both gates are now measured against the fit's **own RMS residual**, the scatter
+of the averaged points about the curve — the same quantity the lobe amplitude is
+in, so the comparison is dimensionally honest and cannot be moved by how the
+photodiode owner happens to average (ADR 019).
+
+A lobe counts as resolved when it stands at **twice its own scatter**
+(`rms < 0.5·|span|`). The margin is not decoration: a free period search over
+pure noise returns an apparent lobe, not zero, landing noise-only quality at
+0.7–1.0 — while the noisiest real record on file reads 0.22. The regression suite
+pins both ends, and includes a 4 mV transfer that the old absolute threshold
+always refused.
 
 The fit is **never** applied automatically, and applying re-validates the
 resulting drive: a calibration that cannot be armed is rolled back rather than
@@ -159,8 +194,26 @@ stored. Warnings surface as `Check:` lines in the status:
 |---|---|
 | residual > 5 % of the span | compare fit and points in the plot before trusting `Vπ` |
 | points dropped | a couple is ordinary; a large share means the sweep is the problem |
-| hysteresis > 5 % | the cell is drifting, or the settle time is too short |
-| clipped points | the extremum they sit on is not where the fit thinks it is |
+| hysteresis past its noise floor | the cell is drifting, or the settle time is too short |
+| points at an end of the detector's range | the reported extrema are truncated; `V_null`/`Vπ` are not |
+
+Two of those are stated carefully, because the obvious versions are wrong.
+
+**Hysteresis is compared against noise, not against zero.** Two independently
+noisy passes over one curve already differ by `1.128 σ` on average, so a bare 5 %
+cut fires on any bench whose points are not far quieter than that — and it did,
+on a drift-free cell. The metric is judged against `1.128 · rms / |span|`, the
+value it takes under noise alone. That ratio runs between two derivable ends:
+**1.0** for pure noise and **1.77** for pure drift, because a systematic offset
+inflates the residual as well. The range is narrow and worth knowing — the
+obvious "warn at 2× the floor" sits above both ends and never fires. The cut is
+at 1.33.
+
+**Clipping is a caveat on the extrema, not a verdict on the lobe.** Rail-touching
+points truncate `detector_volts_at_null`/`_at_peak` and the `I_tot` lower bound;
+`V_null` and `Vπ` come from the shape and barely move. The advice is to change
+the detector **gain** — for a reject-port detector it is the dark end that
+reaches the bottom rail, so adding attenuation is backwards.
 
 There is no separate "lobe coverage" gate: `fit_transfer` already refuses a
 sweep in which no full lobe fits inside the commandable range, so `Vπ` is always

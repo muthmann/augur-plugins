@@ -308,6 +308,25 @@ pub enum ModulationCommandV1 {
     SetDriveFrequency {
         frequency_millihz: u64,
     },
+    /// Retarget the armed drive's *operating point* — the normalized cycle-mean
+    /// lobe coordinate `ū`, in milli-units — leaving the waveform, depth,
+    /// frequency and calibration alone. The third axis alongside
+    /// [`ModulationCommandV1::SetOpticalDepth`] and
+    /// [`ModulationCommandV1::SetDriveFrequency`], and scoped the same way:
+    /// leased only, rejected when the link is closed or the armed drive has no
+    /// operating point to retarget (manual DAC method).
+    ///
+    /// This is what makes an `I_k` sweep possible. `ū` is a *normalized* lobe
+    /// coordinate, not physical flux — but it is the one knob that moves the
+    /// mean illumination without touching the depth, so a protocol that walks
+    /// it walks the bench's brightness axis.
+    ///
+    /// The owner parks the operator's armed `ū` on the first point and restores
+    /// it when the lease ends, so a finished sweep does not leave the bench on
+    /// its last one.
+    SetOperatingPoint {
+        mean_u_milli: u32,
+    },
     PrepareA1 {
         configuration: A1AcquisitionConfigV1,
     },
@@ -373,9 +392,16 @@ pub struct OpticalDriveStateV1 {
     /// field (`u_g` for log-sine, `u_c` for linear-sine).
     pub internal_u_milli: u32,
     pub depth_a_milli: u32,
+    /// DAC code at the excitation minimum of the lobe in use.
     pub v_null_dac: u16,
-    /// Null-to-maximum half-wave-voltage span in DAC codes.
-    pub v_pi_dac: u16,
+    /// DAC code at the excitation maximum of the same lobe.
+    ///
+    /// An absolute code, like `v_null_dac` — not the half-wave *span* between
+    /// them, which the earlier `v_pi_dac` field carried. One lobe is named by
+    /// two codes an operator can point at on the transfer curve, and mixing an
+    /// absolute code with a distance is exactly the confusion this pair exists
+    /// to prevent (ADR 016). The span is `v_peak_dac − v_null_dac`.
+    pub v_peak_dac: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -607,12 +633,17 @@ pub struct PhotodiodeOpticalSummaryV1 {
     pub covered_cycles: Option<f64>,
 }
 
-/// Settled detector level over the newest averaging window, in **raw detector
-/// volts**: the ADC affine map only, before dark subtraction and before any
-/// [`PhotodiodeOpticalSummaryV1`] geometry transform. Unlike the optical
+/// Settled detector level over the owner's **measurement** window, in **raw
+/// detector volts**: the ADC affine map only, before dark subtraction and before
+/// any [`PhotodiodeOpticalSummaryV1`] geometry transform. Unlike the optical
 /// summary this never refuses — it stays present while the window clips (see
 /// `clipped`), because a consumer sweeping a static transfer curve needs a
 /// level exactly where the detector is brightest.
+///
+/// The window is fixed by the owner and **independent of any display setting**;
+/// `sample_count` reports how long it actually was. Deriving it from the chart's
+/// averaging preference instead let a display knob set the precision of the
+/// Pockels transfer calibration downstream (ADR 019).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct PhotodiodeLevelV1 {
     pub mean_volts: f64,
@@ -660,6 +691,17 @@ pub struct PhotodiodeSummaryV1 {
     pub active_recording: Option<PdqStartedReceiptV1>,
     pub last_finalized_recording: Option<PdqFinalizedReceiptV1>,
     pub optical_summary: Option<PhotodiodeOpticalSummaryV1>,
+    /// Why `optical_summary` is absent, in the owner's own words.
+    ///
+    /// A withheld `a` is a fail-closed refusal, not missing data, and every
+    /// automation client that gates on `a` has to be able to tell the operator
+    /// which gate rejected the window — otherwise the only readout is "no `a`"
+    /// and the fix is a guess. Set exactly when `optical_summary` is `None` and
+    /// a window was available to judge.
+    ///
+    /// Additive in V1: absent from older owners, and older consumers ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub optical_unavailable: Option<String>,
     pub synchronization: SynchronizationV1,
     pub last_response: Option<PhotodiodeResponseV1>,
     pub freshness: FreshnessV1,
@@ -820,7 +862,7 @@ mod tests {
                 internal_u_milli: 355,
                 depth_a_milli: 1_000,
                 v_null_dac: 1_630,
-                v_pi_dac: 860,
+                v_peak_dac: 1_160,
             }),
         };
         let encoded = serde_json::to_vec(&snapshot).expect("serializes");

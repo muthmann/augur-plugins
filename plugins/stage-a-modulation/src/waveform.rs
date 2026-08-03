@@ -32,6 +32,14 @@ pub const WARP_TABLE_LEN: usize = 256;
 /// Full-scale DAC code (12-bit).
 pub const DAC_FULL_SCALE: u16 = 4_095;
 
+/// Shallowest optical depth the UI offers. Below this the warp table is
+/// indistinguishable from a constant drive.
+pub const DEPTH_A_MIN: f64 = 0.01;
+/// Deepest optical depth the UI offers, before the lobe is consulted.
+pub const DEPTH_A_MAX: f64 = 6.0;
+/// Dimmest cycle-mean lobe point the UI offers.
+pub const MEAN_U_MIN: f64 = 0.01;
+
 /// Modified Bessel function `I₀(x)` for the Stage-A depth range (`|x| ≤ 3`).
 ///
 /// The positive power series converges rapidly here and avoids adding a
@@ -203,6 +211,122 @@ impl LobeInversion {
     /// increasing lobe.
     pub fn dac_for_u(&self, u: f64) -> f64 {
         self.v_null_dac + (2.0 * self.v_pi_dac / PI) * u.clamp(0.0, 1.0).sqrt().asin()
+    }
+
+    /// Highest normalised intensity a drive may peak at without exceeding the
+    /// operator's DAC ceiling `max_code`.
+    ///
+    /// `u = 1` sits at `v_peak`; a ceiling below that clips the lobe short, and
+    /// the drive has to stay under whatever `u` the ceiling code produces.
+    pub fn peak_intensity_ceiling(&self, max_code: f64) -> f64 {
+        if max_code >= self.v_peak_dac() {
+            return 1.0;
+        }
+        if max_code <= self.v_null_dac {
+            return 0.0;
+        }
+        self.u_for_dac(max_code)
+    }
+}
+
+/// How the peak normalised intensity of a drive follows from its requested
+/// cycle mean `ū` and depth `a`.
+///
+/// Every calibrated mode has one of these, and they are the *only* thing that
+/// limits `a` and `ū`: the swing has to stay under the top of the lobe (and
+/// under the operator's DAC ceiling, expressed as the same `u_max`). Solving
+/// one relation for each variable in turn gives the achievable ranges the UI
+/// shows — and clamps against, instead of refusing the edit and snapping the
+/// control back, which told the operator nothing about where the boundary was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeakLaw {
+    /// A constant hold modulates nothing, so the peak *is* the mean and `a`
+    /// does not enter.
+    Constant,
+    /// Bare DAC sine/square on a calibrated band: `ū · e^{a/2}`.
+    LogSwing,
+    /// [`OpticalTarget::LogSine`], whose pedestal preserves the cycle mean:
+    /// `ū · e^{a/2} / I₀(a/2)`.
+    LogSine,
+    /// [`OpticalTarget::LinearSine`]: `ū · (1 + tanh(a/2))`.
+    LinearSine,
+}
+
+impl PeakLaw {
+    pub fn of(target: OpticalTarget) -> Self {
+        match target {
+            OpticalTarget::LogSine => Self::LogSine,
+            OpticalTarget::LinearSine => Self::LinearSine,
+        }
+    }
+
+    /// Peak normalised intensity of the drive, in lobe coordinate.
+    pub fn peak(self, mean_u: f64, depth_a: f64) -> f64 {
+        let depth_a = depth_a.max(0.0);
+        mean_u * self.swing(depth_a)
+    }
+
+    /// Factor the peak sits above the requested cycle mean. Monotonically
+    /// non-decreasing in `a` in every variant, which is what makes the
+    /// inversions below well defined.
+    fn swing(self, depth_a: f64) -> f64 {
+        match self {
+            Self::Constant => 1.0,
+            Self::LogSwing => (0.5 * depth_a).exp(),
+            Self::LogSine => (0.5 * depth_a).exp() / modified_bessel_i0(0.5 * depth_a),
+            Self::LinearSine => 1.0 + (0.5 * depth_a).tanh(),
+        }
+    }
+
+    /// Deepest `a` expressible at this cycle mean under the ceiling `u_max`.
+    pub fn max_depth_for_mean(self, mean_u: f64, u_max: f64) -> f64 {
+        // Written through `partial_cmp` so a NaN is rejected rather than
+        // silently passing a negated comparison.
+        let usable = |value: f64| value.partial_cmp(&0.0) == Some(std::cmp::Ordering::Greater);
+        if !usable(mean_u) || !usable(u_max) || mean_u > u_max {
+            return 0.0;
+        }
+        let headroom = u_max / mean_u;
+        match self {
+            // Nothing swings, so the UI limit is the only bound.
+            Self::Constant => DEPTH_A_MAX,
+            Self::LogSwing => (2.0 * headroom.ln()).clamp(0.0, DEPTH_A_MAX),
+            // Below twice the mean the swing never reaches the ceiling.
+            Self::LinearSine => {
+                let m = headroom - 1.0;
+                if m >= 1.0 {
+                    DEPTH_A_MAX
+                } else {
+                    (2.0 * m.atanh()).clamp(0.0, DEPTH_A_MAX)
+                }
+            }
+            // No closed form (I₀ grows like e^x/√(2πx)), but `swing` is
+            // monotonic, so bisect it.
+            Self::LogSine => {
+                if self.swing(DEPTH_A_MAX) <= headroom {
+                    return DEPTH_A_MAX;
+                }
+                let (mut lo, mut hi) = (0.0_f64, DEPTH_A_MAX);
+                for _ in 0..64 {
+                    let mid = 0.5 * (lo + hi);
+                    if self.swing(mid) <= headroom {
+                        lo = mid;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                lo
+            }
+        }
+    }
+
+    /// Brightest cycle mean the requested depth leaves room for, under the same
+    /// ceiling. The counterpart of [`PeakLaw::max_depth_for_mean`].
+    pub fn max_mean_for_depth(self, depth_a: f64, u_max: f64) -> f64 {
+        if u_max.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
+            return 0.0;
+        }
+        (u_max / self.swing(depth_a.max(0.0))).clamp(0.0, 1.0)
     }
 }
 
@@ -627,5 +751,139 @@ mod tests {
                 "a={depth_a}: mean={sample_mean}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod range_tests {
+    use super::*;
+
+    /// The whole point of the range helpers: what they report as the boundary
+    /// has to be exactly where `warp_table` stops accepting the drive. If they
+    /// disagree, the UI either offers a drive that is refused or hides one that
+    /// would work.
+    fn table_is_buildable(target: OpticalTarget, mean_u: f64, depth_a: f64) -> bool {
+        let inversion = LobeInversion {
+            v_null_dac: 200.0,
+            v_pi_dac: 1_600.0,
+        };
+        let operating_point = match target {
+            OpticalTarget::LogSine => log_sine_geometric_pedestal(mean_u, depth_a),
+            OpticalTarget::LinearSine => mean_u,
+        };
+        OpticalDrive {
+            target,
+            depth_a,
+            operating_point,
+            inversion,
+        }
+        .warp_table()
+        .is_ok()
+    }
+
+    #[test]
+    fn the_reported_max_depth_is_exactly_where_the_table_stops_building() {
+        for target in [OpticalTarget::LogSine, OpticalTarget::LinearSine] {
+            for mean_u in [0.2, 0.5, 0.8, 0.95] {
+                let max_a = PeakLaw::of(target).max_depth_for_mean(mean_u, 1.0);
+                if max_a >= DEPTH_A_MAX {
+                    continue;
+                }
+                assert!(
+                    table_is_buildable(target, mean_u, max_a - 1e-4),
+                    "{target:?} mean_u={mean_u} refused a just inside the reported max {max_a}"
+                );
+                assert!(
+                    !table_is_buildable(target, mean_u, max_a + 1e-2),
+                    "{target:?} mean_u={mean_u} accepted a past the reported max {max_a}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_reported_max_mean_is_exactly_where_the_table_stops_building() {
+        for target in [OpticalTarget::LogSine, OpticalTarget::LinearSine] {
+            for depth_a in [0.1, 0.5, 1.5, 3.0] {
+                let max_u = PeakLaw::of(target).max_mean_for_depth(depth_a, 1.0);
+                assert!(
+                    table_is_buildable(target, max_u - 1e-4, depth_a),
+                    "{target:?} a={depth_a} refused a mean just inside the reported max {max_u}"
+                );
+                if max_u < 1.0 - 1e-3 {
+                    assert!(
+                        !table_is_buildable(target, max_u + 1e-2, depth_a),
+                        "{target:?} a={depth_a} accepted a mean past the reported max {max_u}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_two_helpers_are_inverses_of_each_other() {
+        for target in [OpticalTarget::LogSine, OpticalTarget::LinearSine] {
+            for mean_u in [0.3, 0.6, 0.9] {
+                let max_a = PeakLaw::of(target).max_depth_for_mean(mean_u, 1.0);
+                if max_a >= DEPTH_A_MAX {
+                    continue;
+                }
+                let back = PeakLaw::of(target).max_mean_for_depth(max_a, 1.0);
+                assert!(
+                    (back - mean_u).abs() < 1e-4,
+                    "{target:?}: mean {mean_u} → a {max_a} → mean {back}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_dac_ceiling_below_v_peak_lowers_the_reachable_intensity() {
+        let inversion = LobeInversion {
+            v_null_dac: 200.0,
+            v_pi_dac: 1_600.0,
+        };
+        // The ceiling at the peak code imposes no limit at all.
+        assert_eq!(inversion.peak_intensity_ceiling(1_800.0), 1.0);
+        assert_eq!(inversion.peak_intensity_ceiling(4_095.0), 1.0);
+        // Halfway up the lobe in code is sin²(π/4) = 0.5 in intensity.
+        let half = inversion.peak_intensity_ceiling(1_000.0);
+        assert!(
+            (half - 0.5).abs() < 1e-9,
+            "u at the half-span code = {half}"
+        );
+        // A ceiling at or below the null leaves nothing drivable.
+        assert_eq!(inversion.peak_intensity_ceiling(200.0), 0.0);
+    }
+
+    #[test]
+    fn the_log_swing_law_matches_the_calibrated_dac_sine_band() {
+        // A calibrated DAC_SINE/SQUARE spans u in [ū·e^{-a/2}, ū·e^{+a/2}], so
+        // its ceiling is reached at exactly a = 2 ln(u_max/ū).
+        let law = PeakLaw::LogSwing;
+        let max_a = law.max_depth_for_mean(0.5, 1.0);
+        assert!((max_a - 2.0 * 2.0_f64.ln()).abs() < 1e-9, "max a = {max_a}");
+        assert!((law.peak(0.5, max_a) - 1.0).abs() < 1e-9);
+        assert!((law.max_mean_for_depth(max_a, 1.0) - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_constant_hold_is_limited_only_by_its_own_brightness() {
+        // CONST modulates nothing, so `a` must not restrict it — requiring the
+        // modulated band here is what used to freeze a calibrated constant
+        // drive at its last accepted code.
+        let law = PeakLaw::Constant;
+        assert_eq!(law.max_depth_for_mean(1.0, 1.0), DEPTH_A_MAX);
+        assert_eq!(law.max_mean_for_depth(5.0, 1.0), 1.0);
+        assert_eq!(law.peak(0.8, 3.0), 0.8);
+    }
+
+    #[test]
+    fn a_mean_above_the_ceiling_reports_no_usable_depth() {
+        // Not a panic and not a silently huge number: the operator has to see
+        // that this operating point is simply out of reach.
+        assert_eq!(PeakLaw::LogSine.max_depth_for_mean(0.9, 0.5), 0.0);
+        assert_eq!(PeakLaw::LinearSine.max_depth_for_mean(0.9, 0.5), 0.0);
+        assert_eq!(PeakLaw::LogSwing.max_depth_for_mean(0.9, 0.5), 0.0);
     }
 }

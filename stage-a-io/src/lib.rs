@@ -34,7 +34,8 @@ pub mod wire;
 
 pub use client::{ClientError, DeviceEvent, StageAClient, StreamIntegrity};
 pub use estimator::{
-    estimate_contrast, AdcCalibration, ContrastEstimate, ContrastGeometry, EstimateError,
+    estimate_contrast, near_rail_margin, AdcCalibration, ContrastEstimate, ContrastGeometry,
+    EstimateError,
 };
 pub use mock::{MockController, MockState, MockWave};
 pub use pdq::{
