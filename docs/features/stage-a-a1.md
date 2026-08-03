@@ -366,8 +366,18 @@ the photodiode Data directory no longer have to be kept aligned by hand:
   schedules, so a row-per-poll table is padding by construction. Bias codes are
   dropped: the camera's own bias sidecar already carries them. Nothing is
   resampled or aligned, failed polls are kept as `faults`, and the whole path is
-  best-effort — a source with no monitoring block simply produces no file
-  (ADR 028).
+  best-effort (ADR 028).
+
+  **The companion CSV only exists if the host is asked for it.** It is governed
+  by the host's own **Record sensor monitoring** checkbox in the recording
+  panel, which A1 cannot set and cannot query — so no telemetry file means no
+  `.sensor.json`, whatever the camera supports. That switch used to reset to off
+  on every app start, which is how a survey could record forty runs and keep the
+  bench conditions of none of them; it is now persisted across restarts
+  (augur-rs). A1 reports it either way: when a finished run wrote no readout,
+  the panel names the switch rather than leaving the absence silent. The
+  single-point die temperature / dead time / illumination in `[sensor]` come
+  from the context bus and are recorded with every run regardless (ADR 022).
 
 **A1 config sidecar** captures: `measurement_id`, file
 stem, role, start/finalize
