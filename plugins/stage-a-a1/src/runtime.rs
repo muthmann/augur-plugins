@@ -997,6 +997,10 @@ pub struct StageAA1Plugin {
     /// Output folder the lock table was last read for, so it is re-read only
     /// when the experiment folder changes.
     loaded_locks_folder: Option<String>,
+    /// Whether the last finished recording produced no sensor readout, so the
+    /// panel can name the host switch that governs it. Observed rather than
+    /// asked: the host does not publish whether it is recording telemetry.
+    last_run_had_no_readout: bool,
     // -- lease heartbeats (see LEASE_RENEW_MARGIN_MS) --
     /// When the modulation lease was last renewed by the heartbeat.
     mod_renewed_ms: u64,
@@ -1082,6 +1086,7 @@ impl Default for StageAA1Plugin {
             protocol: None,
             a0_locks: Vec::new(),
             loaded_locks_folder: None,
+            last_run_had_no_readout: false,
             mod_renewed_ms: 0,
             pd_renewed_ms: 0,
             press_start: PressLatch::default(),
@@ -2522,6 +2527,7 @@ impl StageAA1Plugin {
             // from the bench conditions it was taken under at the first move.
             // It is rewritten column-wise on the way in — see `sensor`.
             self.recording.sensor_readout_path = self.gather_sensor_readout(&dir, &raw);
+            self.last_run_had_no_readout = self.recording.sensor_readout_path.is_none();
         }
         // PDQ receipts report the *label* A1 asked for, which is relative to the
         // photodiode's data directory — resolve it before touching the file, and
@@ -5777,7 +5783,13 @@ struct FilesSidecar {
     photodiode_sidecar: Option<String>,
     /// Compacted per-channel sensor readout for this run — the die
     /// temperature, pixel dead time and illumination the host polled while it
-    /// was recording. Absent when the source had no monitoring block.
+    /// was recording.
+    ///
+    /// Absent whenever the host wrote no telemetry companion. Usually that is
+    /// the host's own **Record sensor monitoring** switch being off, not a
+    /// camera without a monitoring block: the switch governs the whole file
+    /// and A1 cannot ask for it. The single-point readings in `[sensor]` come
+    /// from the context bus and are there either way.
     #[serde(skip_serializing_if = "Option::is_none")]
     sensor_readout: Option<String>,
 }
@@ -7215,6 +7227,21 @@ impl Plugin for StageAA1Plugin {
                     parts.join(", "),
                     sensor.age_s
                 )));
+            }
+            // The point values above ride the context bus and are always
+            // there. The per-run *time series* is a separate host feature the
+            // operator switches on, and it is off by default — so a survey
+            // could record forty runs, keep the bench conditions of none of
+            // them, and say nothing until the analysis. A1 cannot ask the host
+            // whether it is on, but it can report that the last run produced
+            // no readout, which is the same fact one recording later.
+            if self.last_run_had_no_readout {
+                entries.push(StatusEntry::Text(
+                    "Sensor readout: the last run wrote none — tick \"Record sensor monitoring\" \
+                     in the recording panel, or runs keep only the single reading above and not \
+                     the series"
+                        .into(),
+                ));
             }
         }
         if let Some((on, off)) = self.latest_rolling() {
@@ -10502,6 +10529,61 @@ bias_refr_code,status,error\n\
         assert_eq!(parsed["channels"]["temperature_c"]["value"][0], 41.5);
         // The wide original does not stay behind in the capture folder.
         assert!(!capture.join("host-capture.sensor-monitoring.csv").exists());
+        assert!(
+            !plugin.last_run_had_no_readout,
+            "a run that did write a readout must not warn about one"
+        );
+
+        let _ = std::fs::remove_dir_all(&capture);
+        let _ = std::fs::remove_dir_all(&output);
+    }
+
+    /// The host's telemetry companion is governed by its own **Record sensor
+    /// monitoring** switch, which is off by default and which A1 cannot ask
+    /// about. A survey that recorded forty runs and kept the bench conditions
+    /// of none of them used to say nothing at all — the absence surfaced in
+    /// the analysis, months later.
+    #[test]
+    fn a_run_with_no_host_telemetry_says_so_in_the_panel() {
+        let capture = temp_folder("sensor-off-capture");
+        std::fs::create_dir_all(&capture).expect("capture dir");
+        let raw = capture.join("host-capture.raw");
+        std::fs::write(&raw, b"raw").expect("raw");
+        // No `.sensor-monitoring.csv` beside it: the host switch was off.
+
+        let output = temp_folder("sensor-off-output");
+        let mut plugin = plugin_with_markers();
+        plugin.sensor = Some(SensorMonitoringV1 {
+            temperature_c: Some(21.5),
+            pixel_dead_time_us: Some(18.1),
+            illumination_lux: Some(0.07),
+            ..SensorMonitoringV1::default()
+        });
+        plugin.output_folder = output.display().to_string();
+        plugin.recording.folder = output.display().to_string();
+        plugin.recording.id = "A1-sensor-off".into();
+        plugin.recording.stem = "A1-sensor-off_20260803-120000".into();
+        plugin.recording.cam_finalized_path = Some(raw.display().to_string());
+
+        plugin.gather_into_measurement_folder();
+
+        assert!(
+            plugin.recording.sensor_readout_path.is_none(),
+            "there was no telemetry to compact"
+        );
+        let panel = plugin
+            .status_entries()
+            .into_iter()
+            .filter_map(|entry| match entry {
+                StatusEntry::Text(text) => Some(text),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            panel.contains("Record sensor monitoring"),
+            "the panel does not name the switch that governs the readout:\n{panel}"
+        );
 
         let _ = std::fs::remove_dir_all(&capture);
         let _ = std::fs::remove_dir_all(&output);
