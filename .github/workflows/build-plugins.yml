@@ -15,7 +15,7 @@ on:
       augur_rs_ref:
         description: "augur-rs ref to build against (branch, tag or SHA)"
         required: false
-        default: main
+        default: fix/gui-layout-and-alignment
 
 concurrency:
   group: build-plugins-${{ github.ref }}
@@ -26,7 +26,12 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  AUGUR_RS_REF: ${{ inputs.augur_rs_ref || 'main' }}
+  # The host branch this repository actually compiles against. augur-rs `main`
+  # does not carry the TableSchema, host-view and dataset-descriptor API these
+  # plugins use, so defaulting to `main` would be a guaranteed red build and
+  # would never hand the bench a bundle. Move this back to `main` in the same
+  # commit that the host API lands there.
+  AUGUR_RS_REF: ${{ inputs.augur_rs_ref || 'fix/gui-layout-and-alignment' }}
 
 jobs:
   build:

@@ -48,7 +48,9 @@ GitHub login and expire; a release asset can be fetched from the bench with
 `curl` and no account.
 
 `workflow_dispatch` takes an `augur_rs_ref` input for building a bundle against a
-host branch or tag other than `main`.
+different host branch or tag — but note that GitHub only offers `workflow_dispatch`
+for workflows present on the default branch, so until this lands on `main` the
+`AUGUR_RS_REF` default below is the only way to retarget the host revision.
 
 ## Why it is shaped this way
 
@@ -125,21 +127,26 @@ library was built against.
 See [Installing Runtime Plugins](../installing-plugins.md) for the full
 installed layout and troubleshooting.
 
-## Prerequisite: the host API this repo targets must be on `augur-rs` `main`
+## Which host revision the bundles are built against
 
-The workflow defaults to building against `augur-rs` `main`, and that only works
-once `main` actually carries the host API these plugins use. At the time this
-workflow was added it did not: the eveSMLM plugins reference `TableSchema`
-fields (`layer_id`, `semantic_label`, `provenance`, `column_display`,
-`row_id_column`, `time_column`, `coordinate_space_3d`),
+`AUGUR_RS_REF` currently defaults to the `augur-rs` branch
+`fix/gui-layout-and-alignment` (open host PR #36), **not** to `main`.
+
+That is not a preference, it is the state of the two repositories. These plugins
+reference `TableSchema` fields (`layer_id`, `semantic_label`, `provenance`,
+`column_display`, `row_id_column`, `time_column`, `coordinate_space_3d`),
 `HostViewKind::Scatter3dFromTable`, `HostDatasetDescriptor.relations` /
-`.display` and `HostViewRegistry.actions`, none of which exist on `augur-rs`
-`main` — they live on an unmerged host branch.
+`.display` and `HostViewRegistry.actions` — none of which exist on `augur-rs`
+`main`, which still has a two-field `TableSchema`. Defaulting to `main` would be
+a guaranteed red build that never hands the bench a bundle.
 
-This is a real finding rather than a CI defect: it means the repository as
-checked in cannot be built by anyone who does not already have that unmerged
-host branch on disk. Until it lands, point `workflow_dispatch` at a pushed
-`augur_rs_ref` that carries the API.
+The first CI run is what surfaced this: the repository as checked in cannot be
+built by anyone who does not already have an unmerged host branch on disk.
+
+**Move the default back to `main` in the same commit that the host API lands
+there.** Until then, `BUILD-INFO.txt` is the thing that keeps this honest — it
+records the exact host ref and SHA behind every library, so an installed plugin
+can always be traced to the host revision it matches.
 
 ## Limitations
 

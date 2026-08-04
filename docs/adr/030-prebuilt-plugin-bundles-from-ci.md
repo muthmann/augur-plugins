@@ -69,11 +69,14 @@ Every bundle carries a `BUILD-INFO.txt` recording the `augur-plugins` commit, th
 **Publish only workflow artifacts.** Simplest, and rejected: it puts a GitHub
 login between the bench and a fix, and the artifact disappears after 90 days.
 
-**Build against the newest `augur-rs` release tag instead of `main`.** Matches a
-bench running a released host, but lags every unpublished API change — and the
-Stage-A work in this repository routinely depends on unreleased host changes.
-`main` is the default; `workflow_dispatch` takes an `augur_rs_ref` for the cases
-where a specific host revision is wanted.
+**Build against the newest `augur-rs` release tag, or against `main`.** Both were
+rejected by fact rather than by preference: `augur-rs` `main` does not carry the
+`TableSchema`, host-view or dataset-descriptor API these plugins already use, so
+either choice is a guaranteed red build. The default host ref is therefore the
+open host branch that does carry it, and `BUILD-INFO.txt` records the exact ref
+and SHA behind every library so the coupling stays visible. This is temporary by
+construction: the default moves to `main` in the same commit that the host API
+lands there.
 
 **Reimplement the install layout in the workflow.** Would have avoided calling
 shell scripts from YAML, at the cost of a second, silently divergent definition
