@@ -1,4 +1,4 @@
-use augur_plugin_evesmlm_fitting::{EveLocalization, EveLocalizationResults};
+use evesmlm_types::{EveLocalization, EveLocalizationResults};
 
 pub fn filter_results(
     results: &EveLocalizationResults,

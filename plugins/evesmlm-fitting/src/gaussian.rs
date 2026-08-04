@@ -1,4 +1,4 @@
-use augur_plugin_evesmlm_candidates::EveCluster;
+use evesmlm_types::EveCluster;
 
 use crate::{mean_xy, FitEstimate};
 
