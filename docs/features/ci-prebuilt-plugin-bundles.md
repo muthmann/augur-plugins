@@ -71,11 +71,18 @@ as `augur-gui`. [`rust-toolchain.toml`](../../rust-toolchain.toml) pins the same
 `1.95.0` as `augur-rs`, and the workflow parses the channel out of that file
 rather than repeating the version — CI cannot drift from the pin.
 
-**Linux system dependencies come from the host's own script.** The job runs
-`augur-rs/.github/scripts/install-linux-deps.sh` from the checkout it already
-has, instead of keeping a second list that can go stale. `serialport` (used by
-`stage-a-modulation` and `stage-a-photodiode`) needs `libudev`, and that script
-is guaranteed to be a superset of what the plugins need.
+**Linux system dependencies are the plugins' own, not the host's.** The job
+installs `pkg-config` and `libudev-dev`, which is what `serialport` (used by
+`stage-a-modulation` and `stage-a-photodiode`) needs. Reusing
+`augur-rs/.github/scripts/install-linux-deps.sh` was tried first and reverted: it
+pulls the whole GUI stack that no plugin links, and it does not exist on every
+`augur-rs` revision this job can be pointed at, so the Linux build failed on the
+value of `augur_rs_ref` rather than on anything in this repository.
+
+**Warnings are not errors here.** `actions-rust-lang/setup-rust-toolchain`
+injects `RUSTFLAGS="-D warnings"` by default. This job ships artifacts, so it
+sets `rustflags: ""` — a dead-code warning in one plugin must not deny the bench
+a bundle for all of them. Lint gating belongs in its own job.
 
 **The build goes through the repo's own two scripts.** `build-runtime-plugins.sh`
 and `install-built-plugins.sh` already know which crates are runtime plugins,
@@ -117,6 +124,22 @@ library was built against.
 
 See [Installing Runtime Plugins](../installing-plugins.md) for the full
 installed layout and troubleshooting.
+
+## Prerequisite: the host API this repo targets must be on `augur-rs` `main`
+
+The workflow defaults to building against `augur-rs` `main`, and that only works
+once `main` actually carries the host API these plugins use. At the time this
+workflow was added it did not: the eveSMLM plugins reference `TableSchema`
+fields (`layer_id`, `semantic_label`, `provenance`, `column_display`,
+`row_id_column`, `time_column`, `coordinate_space_3d`),
+`HostViewKind::Scatter3dFromTable`, `HostDatasetDescriptor.relations` /
+`.display` and `HostViewRegistry.actions`, none of which exist on `augur-rs`
+`main` — they live on an unmerged host branch.
+
+This is a real finding rather than a CI defect: it means the repository as
+checked in cannot be built by anyone who does not already have that unmerged
+host branch on disk. Until it lands, point `workflow_dispatch` at a pushed
+`augur_rs_ref` that carries the API.
 
 ## Limitations
 
