@@ -66,6 +66,31 @@ The plugin crates under `plugins/` are under active development and not yet read
 
 ## Quick Start
 
+### Download Prebuilt Plugins (no toolchain needed)
+
+Every push to `main` publishes freshly built plugins for macOS (arm64 and x86_64),
+Linux and Windows to the rolling
+[`plugins-latest`](https://github.com/muthmann/augur-plugins/releases/tag/plugins-latest)
+release. This is the recommended route for a measurement machine.
+
+```bash
+curl -LO https://github.com/muthmann/augur-plugins/releases/download/plugins-latest/augur-plugins-macos-arm64.zip
+unzip augur-plugins-macos-arm64.zip -d augur-plugins-bundle
+mkdir -p ~/.augur/plugins
+cp -R augur-plugins-bundle/*/ ~/.augur/plugins/
+```
+
+Pick the archive matching the machine: `macos-arm64`, `macos-x86_64`,
+`linux-x86_64`, or `windows-x86_64`. Then open `augur-gui`, go to **Plugins**, and
+click **Scan for New Plugins**.
+
+Each archive contains a `BUILD-INFO.txt` recording the `augur-rs` revision and the
+`rustc` version the libraries were built against — quote it in any ABI-mismatch
+report. Verify downloads against `SHA256SUMS.txt` from the same release.
+
+Pull requests build the same bundles as workflow artifacts. See
+[CI Prebuilt Plugin Bundles](./docs/features/ci-prebuilt-plugin-bundles.md).
+
 ### Build One Plugin
 
 ```bash
@@ -145,6 +170,7 @@ augur-plugins/
 
 - [Plugin API Notes](./docs/plugin-api.md) — repo-local summary of the current runtime contract
 - [Installing Plugins](./docs/installing-plugins.md) — build, copy, reload, and troubleshoot installed plugins
+- [CI Prebuilt Plugin Bundles](./docs/features/ci-prebuilt-plugin-bundles.md) — how the downloadable per-platform bundles are built and published
 - [Architecture Notes](./docs/architecture.md) — repository role, execution model, host views, and shared settings
 - [augur-rs Plugin Authoring Guide](https://github.com/muthmann/augur-rs/blob/main/docs/features/plugin-authoring-guide.md) — canonical host/runtime authoring guide
 - [augur-rs Global Settings Guide](https://github.com/muthmann/augur-rs/blob/main/docs/features/global-settings-menu.md) — host-owned settings published to plugins
