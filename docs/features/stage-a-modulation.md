@@ -60,6 +60,17 @@ Every accepted setting change is transferred to the Teensy **immediately** as on
 no Apply button, no experiment state machine. The panel shows the modulation and live DAC code the
 board *reports* (`MOD` reply + 2 Hz `STATUS` poll), not merely the commanded values.
 
+## Port discovery
+
+`auto` opens every candidate port and keeps the one that answers `HELLO` — the probe, not the port
+name, tells the command port from the photodiode stream port of the same dual-serial device. Which
+ports are candidates is platform-specific and shared with the photodiode plugin through
+`stage-a-io::transport::candidate_ports()`: `cu.usbmodem*` on macOS (the callout node only, since
+every device is listed twice), `ttyACM*` on Linux, and every USB-classified `COMn` on Windows,
+where the name carries no device information at all (ADR 032). The settings picker lists exactly
+the same set with each port's USB label. When nothing qualifies, the error names the ports the OS
+did enumerate.
+
 ## Contract
 
 - Owns the Teensy **command port** exclusively (one owner per port, ADR 006). The photodiode
