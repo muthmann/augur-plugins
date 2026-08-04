@@ -6,7 +6,7 @@
 
 pub mod dbscan;
 pub mod eigenfeature;
-pub mod types;
+mod tracking;
 
 use std::collections::{HashMap, HashSet};
 
@@ -23,11 +23,11 @@ use augur_plugin_api::{
 };
 use serde_json::{json, Value};
 
-use types::TrackedCluster;
-pub use types::{
+pub use evesmlm_types::{
     CandidateFindingMethod, ClusterBoundary, EveCandidates, EveCluster, EveEvent,
     CTX_EVE_CANDIDATES,
 };
+use tracking::TrackedCluster;
 
 const KERNEL_G1: [f64; 5] = [1.0 / 16.0, 0.25, 3.0 / 8.0, 0.25, 1.0 / 16.0];
 const KERNEL_G2: [f64; 9] = [
@@ -130,24 +130,6 @@ impl PolarityMode {
             Self::Positive => event.polarity,
             Self::Negative => !event.polarity,
             Self::Both => true,
-        }
-    }
-}
-
-impl CandidateFindingMethod {
-    fn from_index(index: usize) -> Self {
-        match index {
-            1 => Self::Eigenfeature,
-            2 => Self::FrameBased,
-            _ => Self::Dbscan,
-        }
-    }
-
-    fn index(self) -> usize {
-        match self {
-            Self::Dbscan => 0,
-            Self::Eigenfeature => 1,
-            Self::FrameBased => 2,
         }
     }
 }

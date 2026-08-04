@@ -1,6 +1,6 @@
 use std::f64::consts::TAU;
 
-use augur_plugin_evesmlm_candidates::EveCluster;
+use evesmlm_types::EveCluster;
 use num_complex::Complex64;
 
 use crate::{mean_xy, FitEstimate};

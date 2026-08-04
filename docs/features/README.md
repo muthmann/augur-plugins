@@ -23,4 +23,4 @@ Repository-level feature notes for larger plugin suites, interface migrations, a
 - [Clickable 2D Overlays via Marker `source_row`](./clickable-overlays-source-row.md) — plugin-api ABI 4 `source_dataset_id`/`source_row_id` plumbing and failed-fit click-to-select loop.
 - [Action Requests And Single-Cluster Refit](./action-requests-and-refit.md) — plugin-declared host actions, eveSMLM refit/commit/discard flow on the `augur.evesmlm.refit_preview` dataset.
 - [Reconstruction Workflow](./reconstruction.md) — accumulated localization tables rendered and exported by the host.
-- [eveSMLM Pipeline](./evesmlm.md) — candidate finding, fitting, and post-processing as three chainable plugins.
+- [eveSMLM Pipeline](./evesmlm.md) — candidate finding, fitting, and post-processing as three chainable plugins, chained through the shared `evesmlm-types` contract crate rather than through each other: every plugin exports `augur_plugin_vtable`, so a plugin-to-plugin rlib dependency duplicated that symbol and failed to link on Linux and Windows while macOS accepted it (ADR 031).

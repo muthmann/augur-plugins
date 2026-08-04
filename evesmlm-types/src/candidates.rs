@@ -2,6 +2,7 @@ use augur_plugin_api::FfiCdEvent;
 use serde::{Deserialize, Serialize};
 
 pub const CTX_EVE_CANDIDATES: &str = "augur.evesmlm.candidates";
+pub const ACCEPTED_CANDIDATE_EVENTS_DATASET_ID: &str = "augur.evesmlm.candidates.accepted_events";
 
 fn default_cluster_complete() -> bool {
     true
@@ -17,6 +18,22 @@ pub enum CandidateFindingMethod {
 }
 
 impl CandidateFindingMethod {
+    pub fn from_index(index: usize) -> Self {
+        match index {
+            1 => Self::Eigenfeature,
+            2 => Self::FrameBased,
+            _ => Self::Dbscan,
+        }
+    }
+
+    pub fn index(self) -> usize {
+        match self {
+            Self::Dbscan => 0,
+            Self::Eigenfeature => 1,
+            Self::FrameBased => 2,
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Dbscan => "DBSCAN",
@@ -123,18 +140,4 @@ pub struct EveCandidates {
     pub frame_window_end_us: u64,
     pub n_events_processed: usize,
     pub finding_method: CandidateFindingMethod,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct TrackedCluster {
-    pub id: u64,
-    pub centroid_x: f64,
-    pub centroid_y: f64,
-    pub event_count: usize,
-    pub last_seen_frame: u64,
-    pub last_grown_frame: u64,
-    pub frames_since_growth: usize,
-    pub complete: bool,
-    pub emitted: bool,
-    pub cluster: EveCluster,
 }

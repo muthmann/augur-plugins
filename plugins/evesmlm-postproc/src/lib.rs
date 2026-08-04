@@ -15,13 +15,13 @@ use augur_plugin_api::{
     PluginInput, SettingItem, SettingKind, SettingsSchema, SettingsSection, StatusEntry,
     CTX_GLOBAL_SETTINGS,
 };
-pub use augur_plugin_evesmlm_fitting::{
+use augur_plugin_types::CTX_LOCALIZATION_RESULTS;
+use evaluation::EvaluationState;
+pub use evesmlm_types::{
     current_localizations_dataset, current_localizations_registry_for_results, localization_row_id,
     to_localization_results, EveLocalization, EveLocalizationResults, FitMethod,
     CTX_EVE_LOCALIZATION_RESULTS, CURRENT_LOCALIZATIONS_DATASET_ID, CURRENT_LOCALIZATIONS_LAYER_ID,
 };
-use augur_plugin_types::CTX_LOCALIZATION_RESULTS;
-use evaluation::EvaluationState;
 use serde_json::{json, Value};
 
 const OVERLAY_COLOR: [u8; 4] = [90, 170, 255, 220];
@@ -690,7 +690,7 @@ mod tests {
 
     #[test]
     fn current_localizations_descriptor_matches_fitting() {
-        use augur_plugin_evesmlm_fitting::current_localizations_registry_for_results as fitting_registry;
+        use evesmlm_types::current_localizations_registry_for_results as fitting_registry;
         let results = EveLocalizationResults::default();
         let fitting = fitting_registry(&results, None);
         let postproc = current_localizations_registry_for_results(&results, None);
