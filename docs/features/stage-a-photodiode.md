@@ -137,11 +137,22 @@ but a chart setting.
   always-false state to the worker, so it could never stay recording. The
   `record` boolean setting remains as a non-schema compatibility alias.
 
+## Port discovery
+
+`auto` listens briefly on every candidate port and keeps the one streaming CRC-clean PDA1 sample
+frames — the probe, not the port name, is what identifies the stream port. Which ports are
+candidates is platform-specific and shared with the modulation plugin through
+`stage-a-io::transport::candidate_ports()`: `cu.usbmodem*` on macOS (the callout node only, since
+every device is listed twice), `ttyACM*` on Linux, and every USB-classified `COMn` on Windows,
+where the name carries no device information at all (ADR 032). The settings picker lists exactly
+the same set, so a port offered in the dropdown is one `auto` would also have probed. When nothing
+qualifies, the error names the ports the OS did enumerate.
+
 ## Contract
 
 - Owns the Teensy **stream port** exclusively (ADR 006); the port carries no commands, so the
-  plugin is read-only by construction. It reuses `stage-a-io` (`default-features = false`) only
-  for the PDA1 wire parser — no client, worker, or transport.
+  plugin is read-only by construction. It uses `stage-a-io` for the PDA1 wire parser and for port
+  discovery — no client, worker, or transport.
 - **Frame-independent**: connecting is a checkbox setting; the reader thread and all views
   work with no camera attached (the host only calls `process_frame()` while frames flow).
 - Garbage on the port resynchronises at the next CRC-clean frame; skipped bytes and CRC failures

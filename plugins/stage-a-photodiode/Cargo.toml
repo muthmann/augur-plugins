@@ -13,5 +13,7 @@ crate-type = ["cdylib", "rlib"]
 augur-plugin-api.workspace = true
 serde_json.workspace = true
 serialport.workspace = true
-stage-a-io = { path = "../../stage-a-io", default-features = false }
+# `hardware` brings in the shared platform-aware port discovery; serialport is
+# already a direct dependency here, so it adds nothing new to the build.
+stage-a-io = { path = "../../stage-a-io" }
 stage-a-plugin-contract = { path = "../../stage-a-plugin-contract" }

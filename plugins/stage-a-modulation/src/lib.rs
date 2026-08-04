@@ -2680,7 +2680,7 @@ fn open_serial(port_hint: &str) -> Result<StageAClient<stage_a_io::SerialTranspo
         // port answers HELLO — probe until one does.
         let candidates = serial_ports();
         if candidates.is_empty() {
-            return Err("no USB serial device found (looked for usbmodem/ttyACM)".to_owned());
+            return Err(stage_a_io::transport::no_candidate_ports_message());
         }
         let mut failures = Vec::new();
         for path in &candidates {
@@ -2816,10 +2816,9 @@ fn probe_command_port(path: &str) -> Result<StageAClient<stage_a_io::SerialTrans
 }
 
 fn serial_ports() -> Vec<String> {
-    stage_a_io::transport::available_port_names()
+    stage_a_io::transport::candidate_ports()
         .into_iter()
-        // macOS lists each device twice; use the callout (cu.*) node only.
-        .filter(|name| name.contains("cu.usbmodem") || name.contains("ttyACM"))
+        .map(|port| port.name)
         .collect()
 }
 
@@ -2829,15 +2828,11 @@ fn serial_ports() -> Vec<String> {
 /// only the leading path is the value.
 fn port_variants() -> Vec<String> {
     let mut variants = vec!["auto".to_owned(), "mock".to_owned()];
-    for (name, label) in stage_a_io::transport::available_ports_with_labels() {
-        if !(name.contains("cu.usbmodem") || name.contains("ttyACM")) {
-            continue;
-        }
-        variants.push(match label {
-            Some(label) => format!("{name} ({label})"),
-            None => name,
-        });
-    }
+    variants.extend(
+        stage_a_io::transport::candidate_ports()
+            .iter()
+            .map(stage_a_io::transport::PortInfo::variant),
+    );
     variants
 }
 
@@ -3090,7 +3085,7 @@ impl Plugin for StageAModulationPlugin {
                 key: "port".into(),
                 label: "Port".into(),
                 tooltip: Some(
-                    "auto (recommended) probes the attached usbmodem ports and picks \
+                    "auto (recommended) probes the attached USB serial ports and picks \
                      the one that answers HELLO — the Teensy command port; \
                      mock = in-process simulated controller"
                         .into(),
