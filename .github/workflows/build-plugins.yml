@@ -94,12 +94,22 @@ jobs:
         with:
           toolchain: ${{ env.RUST_CHANNEL }}
           cache-workspaces: augur-plugins
+          # The action injects RUSTFLAGS="-D warnings" by default. That is right
+          # for a lint job and wrong here: this job ships artifacts, and a dead-
+          # code warning in one plugin must not deny the bench a bundle for all
+          # of them. Lint gating belongs in its own job, not in the build.
+          rustflags: ""
 
       - name: Install Linux system dependencies
         if: runner.os == 'Linux'
-        # Reuse the host's own dependency list rather than a second copy that can
-        # drift; it is a superset of what the plugins need (serialport/libudev).
-        run: bash augur-rs/.github/scripts/install-linux-deps.sh
+        # Only what the plugin crates actually link. augur-gui's own dependency
+        # script is deliberately not reused: it is a superset (X11/Wayland/GL for
+        # the GUI, which no plugin links) and it does not exist on every augur-rs
+        # revision this job can be pointed at, so borrowing it made the Linux
+        # build fail on the value of augur_rs_ref. serialport needs libudev.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libudev-dev
 
       - name: Build runtime plugins
         working-directory: augur-plugins
