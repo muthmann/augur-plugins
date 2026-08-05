@@ -277,6 +277,22 @@ its three.
   wording. Because the per-point message is overwritten within the same tick,
   the reasons are kept on the run and shown in the status pane and the closing
   summary.
+- **Every row names itself, in the file names and in both sidecars**
+  ([ADR 033](../adr/033-a-protocol-row-names-itself.md)). A protocol is the one
+  path where nothing in the panel is armed at anything that separates its
+  recordings, so the files carry the row's own identity:
+
+  | where | what |
+  |---|---|
+  | file stem | `_p<NN>_u<ū>m_f<f>Hz_a<a>m` after the timestamp — e.g. `A1-survey_20260805-141233_p03_u500m_f10Hz_a800m` |
+  | A1 `_config.toml` | a `[protocol]` section: `name`, `block`, `point_index`/`point_total`, `point_tag`, `requested_mean_u`, `requested_frequency_hz`, `requested_depth_a`, `settle_s`, `duration_s` |
+  | `_pd.json` / camera metadata | `protocol_name`, `protocol_block`, `protocol_point_index`, `protocol_point_total`, `protocol_point_tag`, `protocol_mean_u`, `protocol_frequency_hz`, `protocol_depth_a`, `protocol_settle_s` |
+
+  The index is 1-based over the whole expanded protocol and comes first, so the
+  files sort in protocol order rather than by `ū`. What the row *asked* for is
+  written here; what the drive reported back is in `[modulation]`, and what the
+  photodiode measured is in `[optical]`, so a row that missed its point can
+  still be told apart from one that hit it.
 
 One lease covers the whole file. `plugins/stage-a-a1/protocols/example.toml` is
 a commented file to copy.
@@ -339,13 +355,23 @@ quantitative A1 sidecar without a fresh photodiode optical summary`, and a
 `Camera: … no trigger signal` line that looked exactly like an unplugged
 `EXT_TRIGGER` cable but was the drive being off.
 
-**Naming.** Files share an `<id>_<timestamp>[_role]` stem under an `<id>/` subfolder
-(`_pilot` / `_background` tag the reference runs, `_ec_f<f>Hz` an event-count point):
+**Naming.** Files share an `<id>_<timestamp>[_role][_point]` stem under an `<id>/`
+subfolder:
 
 - `<id>/<id>_<ts>.raw` — camera RAW, with the host's own `<stem>.toml` sidecar
   (camera biases, ROI) next to it.
 - `<id>/<id>_<ts>_pd.pdq` + `_pd.json` — photodiode PDQ + sidecar.
 - `<id>/<id>_<ts>_config.toml` — the A1 sidecar.
+
+The optional tags say which run within the measurement this is — without one, a
+timestamp is the only thing separating two files:
+
+| tag | written by |
+|---|---|
+| `_pilot` / `_background` | the reference runs |
+| `_p<NN>` | an amplitude-sweep point (prefixed `_f<f>Hz` when nested in the frequency ladder) |
+| `_ec_f<f>Hz` | an event-count point |
+| `_p<NN>_u<ū>m_f<f>Hz_a<a>m` | a protocol row (ADR 033) |
 
 **Everything lands under `<A1 output folder>/<id>/`** (ADR 015). That folder is
 the only setting deciding where a measurement ends up — the host output root and
@@ -443,6 +469,23 @@ press can start the next recording automatically.
 **File locations.** One place: `<A1 output folder>/<id>/` holds `<stem>.raw`
 (+ the host's `<stem>.toml`), `<stem>_pd.pdq` + `<stem>_pd.json`, and
 `<stem>_config.toml`.
+
+**The PDQ says how the drive was shaped, not only how fast it ran** (ADR 033).
+The photodiode's file is the photodiode owner's own, and travels on its own — a
+trace whose sidecar names a frequency and two DAC codes cannot say which lobe,
+or which operating point `ū`, produced it. Alongside `modulation_frequency_hz`,
+`center_dac`, `amplitude_dac`, `depth_a`/`depth_a_source` and `measured_a`, the
+recorder metadata therefore also carries `modulation_waveform`,
+`pockels_calibration_id`, `optical_target`, `requested_mean_u`,
+`resolved_mean_u`, `commanded_a`, `v_null_dac` and `v_peak_dac` — all of it
+already published by the modulation owner, and all of it also in the A1
+sidecar's `[modulation]`.
+
+> The A1 `_config.toml` is the quantitative record and is **refused outright**
+> without a fresh photodiode optical summary, which is what an expired lease or
+> a drive that was switched off looks like after the fact (ADR 029). The run
+> then reports `Recording <id> finished, metadata save failed: …` and only the
+> `_pd.json` remains — which is the other reason it has to be self-describing.
 
 ## The two live plots
 

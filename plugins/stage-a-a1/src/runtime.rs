@@ -56,12 +56,12 @@ use augur_plugin_api::{
 use serde::Serialize;
 use serde_json::{json, Value};
 use stage_a_plugin_contract::{
-    ClientId, ConnectionStateV1, LeaseId, LeaseSnapshotV1, ModulationCommandV1, ModulationRequestV1,
-    ModulationStateV1, OpticalTargetV1, PdqReceiptV1, PdqStartSpecV1, PhotodiodeCommandV1,
-    PhotodiodeOpticalSummaryV1, PhotodiodeRequestV1, PhotodiodeResponseV1, PhotodiodeSummaryV1,
-    RequestId, RunId, SemanticRevision, WaveformV1, CTX_STAGE_A_MODULATION_STATE_V1,
-    CTX_STAGE_A_PHOTODIODE_SUMMARY_V1, SERVICE_STAGE_A_MODULATION_CONTROL_V1,
-    SERVICE_STAGE_A_PHOTODIODE_CONTROL_V1,
+    ClientId, ConnectionStateV1, LeaseId, LeaseSnapshotV1, ModulationCommandV1,
+    ModulationRequestV1, ModulationStateV1, OpticalTargetV1, PdqReceiptV1, PdqStartSpecV1,
+    PhotodiodeCommandV1, PhotodiodeOpticalSummaryV1, PhotodiodeRequestV1, PhotodiodeResponseV1,
+    PhotodiodeSummaryV1, RequestId, RunId, SemanticRevision, WaveformV1,
+    CTX_STAGE_A_MODULATION_STATE_V1, CTX_STAGE_A_PHOTODIODE_SUMMARY_V1,
+    SERVICE_STAGE_A_MODULATION_CONTROL_V1, SERVICE_STAGE_A_PHOTODIODE_CONTROL_V1,
 };
 
 use crate::phase::{fold_events, fold_events_free_running, MarkerValidationConfig, PhaseFold};
@@ -2109,6 +2109,80 @@ impl StageAA1Plugin {
             meta.insert("center_dac".into(), config.center_dac.to_string());
             meta.insert("amplitude_dac".into(), config.amplitude_dac.to_string());
         }
+        // How the drive was actually shaped, not just how fast it ran. The PDQ
+        // is the photodiode's own record and travels on its own — a trace whose
+        // sidecar names a frequency and two DAC codes cannot say which lobe, or
+        // which operating point `ū`, produced it. All of this is already
+        // published by the modulation owner; it was simply never written down
+        // here, so it lived only in the A1 `_config.toml` next door.
+        if let Some(waveform) = self
+            .modulation
+            .as_ref()
+            .and_then(|state| state.acknowledged.as_ref())
+            .and_then(|target| target.waveform.as_ref())
+        {
+            meta.insert("modulation_waveform".into(), waveform_label(waveform));
+        }
+        if let Some(state) = self.modulation.as_ref() {
+            if let Some(calibration) = state.calibration_id.as_ref() {
+                meta.insert("pockels_calibration_id".into(), calibration.clone());
+            }
+            if let Some(drive) = state.optical_drive.as_ref() {
+                meta.insert(
+                    "optical_target".into(),
+                    match drive.target {
+                        OpticalTargetV1::LogSine => "log_sine".into(),
+                        OpticalTargetV1::LinearSine => "linear_sine".into(),
+                    },
+                );
+                // `ū` is a whole axis of the survey, and the one no other key
+                // here implies: two rows can share `f` and `a` and differ only
+                // in the operating point they were driven around.
+                meta.insert(
+                    "requested_mean_u".into(),
+                    format!("{:.6}", f64::from(drive.requested_mean_u_milli) / 1_000.0),
+                );
+                meta.insert(
+                    "resolved_mean_u".into(),
+                    format!("{:.6}", f64::from(drive.resolved_mean_u_milli) / 1_000.0),
+                );
+                meta.insert(
+                    "commanded_a".into(),
+                    format!("{:.6}", f64::from(drive.depth_a_milli) / 1_000.0),
+                );
+                meta.insert("v_null_dac".into(), drive.v_null_dac.to_string());
+                meta.insert("v_peak_dac".into(), drive.v_peak_dac.to_string());
+            }
+        }
+        // Which row of which protocol this run is. Written on both legs so the
+        // PDQ and the RAW can each be traced back to the line of the file that
+        // asked for them, without joining through the A1 sidecar.
+        if let Some(run) = self
+            .protocol
+            .as_ref()
+            .filter(|run| run.phase == ProtocolPhase::Recording)
+        {
+            if let Some(point) = run.point() {
+                // Both are free text out of the operator's file. The photodiode
+                // owner rejects the whole recording over an oversized metadata
+                // value, so a chatty block name must not be able to cost a run.
+                meta.insert("protocol_name".into(), clamp_metadata(&run.plan.name));
+                meta.insert("protocol_block".into(), clamp_metadata(&point.block));
+                meta.insert("protocol_point_tag".into(), point.tag());
+                meta.insert("protocol_point_index".into(), (run.index + 1).to_string());
+                meta.insert(
+                    "protocol_point_total".into(),
+                    run.plan.points.len().to_string(),
+                );
+                meta.insert("protocol_mean_u".into(), format!("{:.6}", point.mean_u));
+                meta.insert(
+                    "protocol_frequency_hz".into(),
+                    format!("{:.6}", point.frequency_hz),
+                );
+                meta.insert("protocol_depth_a".into(), format!("{:.6}", point.depth_a));
+                meta.insert("protocol_settle_s".into(), format!("{:.3}", point.settle_s));
+            }
+        }
         if let Some(n) = self.valid_pixel_count() {
             meta.insert("n_valid".into(), n.to_string());
         }
@@ -2249,8 +2323,30 @@ impl StageAA1Plugin {
                 }
             })
             .unwrap_or_default();
+        // A protocol row is not a sweep point, so `sweep_tag` is empty for one:
+        // nothing armed in the panel says which of the survey's points this is.
+        // Without a tag of its own, every row of a protocol lands under the same
+        // stem but for the second it started, and the operating point a file was
+        // recorded at can only be recovered by opening its sidecar. The row
+        // names all three axes, so its files can too — the 1-based point index
+        // first, so they sort in protocol order rather than by `ū`.
+        let protocol_tag = self
+            .protocol
+            .as_ref()
+            .filter(|run| run.phase == ProtocolPhase::Recording)
+            .and_then(|run| {
+                let point = run.point()?;
+                let width = run.plan.points.len().to_string().len().max(2);
+                Some(format!(
+                    "_p{:0width$}_{}",
+                    run.index + 1,
+                    point.tag(),
+                    width = width
+                ))
+            })
+            .unwrap_or_default();
         let stem = format!(
-            "{id}_{}{}{sweep_tag}",
+            "{id}_{}{}{sweep_tag}{protocol_tag}",
             format_compact_utc(now_ms / 1_000),
             role.suffix()
         );
@@ -5430,6 +5526,25 @@ impl StageAA1Plugin {
                     requested_frequency_hz: point.frequency_hz,
                 })
             }),
+            protocol: self
+                .protocol
+                .as_ref()
+                .filter(|run| run.phase == ProtocolPhase::Recording)
+                .and_then(|run| {
+                    let point = run.point()?;
+                    Some(ProtocolSidecar {
+                        name: run.plan.name.clone(),
+                        block: point.block.clone(),
+                        point_index: run.index + 1,
+                        point_total: run.plan.points.len(),
+                        point_tag: point.tag(),
+                        requested_mean_u: point.mean_u,
+                        requested_frequency_hz: point.frequency_hz,
+                        requested_depth_a: point.depth_a,
+                        settle_s: point.settle_s,
+                        duration_s: point.duration_s,
+                    })
+                }),
             pilot: (self.recording.role == RecRole::Pilot)
                 .then_some(self.pilot_windows)
                 .flatten()
@@ -5557,6 +5672,10 @@ struct SidecarDoc {
     /// Present on points recorded by the automatic frequency ladder.
     #[serde(skip_serializing_if = "Option::is_none")]
     frequency_sweep: Option<FreqSweepSidecar>,
+    /// Present on points recorded by a declarative protocol run: the line of
+    /// the file that asked for this recording, verbatim.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    protocol: Option<ProtocolSidecar>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pilot: Option<PilotSidecar>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -5628,6 +5747,35 @@ struct FreqSweepSidecar {
     /// The ladder asked for this frequency; `[trigger] measured_frequency_hz`
     /// is what the phase-0 markers reported when the point was recorded.
     requested_frequency_hz: f64,
+}
+
+/// The protocol row this recording is, as the file asked for it.
+///
+/// A protocol names every axis explicitly, which is exactly what makes its rows
+/// indistinguishable once they are on disk: the panel is not armed at anything
+/// that would separate them, so without this section the only difference
+/// between two rows' sidecars is the second they started. What is written here
+/// is the *request* — what the drive reported back is in `[modulation]`, and
+/// what the photodiode measured is in `[optical]`, so a row that failed to
+/// reach its point can still be told apart from one that hit it.
+#[derive(Serialize)]
+struct ProtocolSidecar {
+    /// `name` from the protocol file.
+    name: String,
+    /// The `[[block]]` name, or a CSV `label`, this row came from.
+    block: String,
+    /// 1-based position within the whole expanded protocol.
+    point_index: usize,
+    point_total: usize,
+    /// The same fragment that appears in this recording's file names.
+    point_tag: String,
+    /// Normalized cycle-mean lobe point `ū` — the `I_k` axis.
+    requested_mean_u: f64,
+    requested_frequency_hz: f64,
+    requested_depth_a: f64,
+    settle_s: f64,
+    /// The row's own duration, which overrides the panel's for the run.
+    duration_s: i64,
 }
 
 /// Frozen ON/OFF windows written into a **pilot** recording's sidecar and read
@@ -5817,6 +5965,20 @@ fn points_for(points: &[RollingResponsePoint], first: u64) -> Vec<Series1dPoint>
             y: point.run_per_pixel,
         })
         .collect()
+}
+
+/// Trims free text down to what a recording-metadata value may carry.
+///
+/// The photodiode owner bounds every value at 1 KiB and refuses the whole
+/// `BeginRecording` if one is over — a limit worth staying well clear of, since
+/// these strings come from a protocol file nobody validated for length.
+fn clamp_metadata(text: &str) -> String {
+    const MAX_CHARS: usize = 120;
+    let trimmed = text.trim();
+    if trimmed.chars().count() <= MAX_CHARS {
+        return trimmed.to_owned();
+    }
+    trimmed.chars().take(MAX_CHARS).collect()
 }
 
 fn waveform_label(waveform: &WaveformV1) -> String {
@@ -10031,6 +10193,220 @@ mod tests {
         assert!(plugin.pending_duration_s.is_none());
 
         let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// Drives a pending protocol up to the tick that starts its first row's
+    /// recording: take the lease, apply the three retargets, let the dwell pass.
+    fn run_protocol_to_first_recording(plugin: &mut StageAA1Plugin, sink: &mut ControlSink) {
+        control_tick(plugin, PluginControlInbox::default(), sink);
+        let lease_req = sink
+            .services
+            .iter()
+            .find_map(|request| match modulation_command(request) {
+                Some(ModulationCommandV1::AcquireLease { .. }) => Some(request.request_id),
+                _ => None,
+            })
+            .expect("the protocol takes a modulation lease");
+        sink.services.clear();
+        control_tick(plugin, inbox_with(vec![accepted(lease_req)]), sink);
+        let retargets: Vec<u64> = sink
+            .services
+            .iter()
+            .filter(|request| {
+                matches!(
+                    modulation_command(request),
+                    Some(
+                        ModulationCommandV1::SetOperatingPoint { .. }
+                            | ModulationCommandV1::SetDriveFrequency { .. }
+                            | ModulationCommandV1::SetOpticalDepth { .. }
+                    )
+                )
+            })
+            .map(|request| request.request_id)
+            .collect();
+        sink.services.clear();
+        control_tick(
+            plugin,
+            inbox_with(retargets.into_iter().map(accepted).collect()),
+            sink,
+        );
+        // Settle (`settle_s = 0`) then hand off to the recording coordinator.
+        control_tick(plugin, PluginControlInbox::default(), sink);
+    }
+
+    /// Every row of a protocol is recorded with the same panel state, so a row
+    /// that does not name itself is indistinguishable on disk from the row
+    /// before it but for the second it started. The operating point a `.pdq`
+    /// was taken at then cannot be recovered from its name at all — which is
+    /// exactly what a survey's files are for.
+    #[test]
+    fn a_protocol_row_names_its_own_point_in_the_file_stem() {
+        let folder = temp_folder("protocol-file-stem");
+        let (mut plugin, _) = protocol_plugin(&folder, TWO_POINT_PROTOCOL);
+        let mut sink = ControlSink::default();
+
+        run_protocol_to_first_recording(&mut plugin, &mut sink);
+
+        let stem = plugin.recording.stem.clone();
+        assert!(
+            stem.ends_with("_p01_u400m_f25Hz_a700m"),
+            "the stem does not name the protocol point: {stem}"
+        );
+        // Two rows of the same protocol differ by more than their timestamp.
+        let second = TWO_POINT_PROTOCOL.replace("mean_u = [0.4, 0.6]", "mean_u = [0.6]");
+        let other_folder = temp_folder("protocol-file-stem-2");
+        let (mut other, _) = protocol_plugin(&other_folder, &second);
+        let mut other_sink = ControlSink::default();
+        run_protocol_to_first_recording(&mut other, &mut other_sink);
+        assert!(
+            other.recording.stem.ends_with("_p01_u600m_f25Hz_a700m"),
+            "the second row reuses the first row's tag: {}",
+            other.recording.stem
+        );
+
+        let _ = std::fs::remove_dir_all(&folder);
+        let _ = std::fs::remove_dir_all(&other_folder);
+    }
+
+    /// The PDQ travels on its own — it is the photodiode owner's file, and an
+    /// analysis that opens it must be able to say which row of which protocol
+    /// it is without joining through the A1 sidecar next door.
+    #[test]
+    fn a_protocol_row_names_itself_in_the_recording_metadata() {
+        let folder = temp_folder("protocol-metadata");
+        let (mut plugin, _) = protocol_plugin(&folder, TWO_POINT_PROTOCOL);
+        let mut sink = ControlSink::default();
+
+        run_protocol_to_first_recording(&mut plugin, &mut sink);
+        let meta = plugin.recording_metadata();
+
+        assert_eq!(
+            meta.get("protocol_name").map(String::as_str),
+            Some("two-point")
+        );
+        assert_eq!(meta.get("protocol_block").map(String::as_str), Some("pair"));
+        assert_eq!(
+            meta.get("protocol_point_index").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            meta.get("protocol_point_total").map(String::as_str),
+            Some("2")
+        );
+        assert_eq!(
+            meta.get("protocol_point_tag").map(String::as_str),
+            Some("u400m_f25Hz_a700m")
+        );
+        assert_eq!(
+            meta.get("protocol_mean_u").map(String::as_str),
+            Some("0.400000")
+        );
+        assert_eq!(
+            meta.get("protocol_frequency_hz").map(String::as_str),
+            Some("25.000000")
+        );
+        assert_eq!(
+            meta.get("protocol_depth_a").map(String::as_str),
+            Some("0.700000")
+        );
+
+        // The metadata map has to stay inside the photodiode owner's bounds, or
+        // BeginRecording is refused and the row records nothing at all.
+        assert!(meta.len() <= 64, "{} metadata keys", meta.len());
+        assert!(meta
+            .iter()
+            .all(|(key, value)| key.len() <= 128 && value.len() <= 1_024));
+
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// The A1 sidecar had a section for every automatic path *except* the one
+    /// that names all three axes: a protocol row's `[sweep]` carries only the
+    /// panel's `min_a`/`max_a`, so nothing on disk said which line of the file
+    /// had asked for the recording.
+    #[test]
+    fn the_a1_sidecar_names_the_protocol_row() {
+        let folder = temp_folder("protocol-sidecar");
+        let (mut plugin, _) = protocol_plugin(&folder, TWO_POINT_PROTOCOL);
+        let mut sink = ControlSink::default();
+
+        run_protocol_to_first_recording(&mut plugin, &mut sink);
+        // The quantitative sidecar needs a measured optical summary; the plan
+        // itself is admitted against the photodiode the fixture starts with.
+        plugin.photodiode = Some(fresh_photodiode_summary());
+        let path = plugin.write_sidecar().expect("sidecar path");
+        let text = std::fs::read_to_string(&path).expect("read sidecar");
+
+        assert!(text.contains("[protocol]"), "{text}");
+        assert!(text.contains("name = \"two-point\""), "{text}");
+        assert!(text.contains("block = \"pair\""), "{text}");
+        assert!(text.contains("point_index = 1"), "{text}");
+        assert!(text.contains("point_total = 2"), "{text}");
+        assert!(text.contains("point_tag = \"u400m_f25Hz_a700m\""), "{text}");
+        assert!(text.contains("requested_mean_u = 0.4"), "{text}");
+        assert!(text.contains("requested_frequency_hz = 25.0"), "{text}");
+        assert!(text.contains("requested_depth_a = 0.7"), "{text}");
+
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// A run that is not driving anything must not claim a protocol row.
+    #[test]
+    fn a_hand_driven_recording_carries_no_protocol_keys() {
+        let mut plugin = plugin_with_markers();
+        plugin.modulation = Some(connected_modulation());
+        let meta = plugin.recording_metadata();
+        assert!(!meta.contains_key("protocol_name"));
+        assert!(!meta.contains_key("protocol_point_index"));
+    }
+
+    /// What the drive was actually doing, in the photodiode's own sidecar. A
+    /// frequency and two DAC codes do not say which lobe, or which operating
+    /// point `ū`, produced a trace — and `ū` is a whole axis of the survey.
+    #[test]
+    fn the_recording_metadata_describes_how_the_drive_was_shaped() {
+        let mut plugin = plugin_with_markers();
+        let mut state = commanded_modulation(1, 0.7);
+        state.acknowledged = Some(stage_a_plugin_contract::ModulationTargetV1 {
+            revision: SemanticRevision(1),
+            waveform: Some(WaveformV1::Periodic {
+                waveform: stage_a_plugin_contract::PeriodicWaveformV1::Sine,
+                min_dac: 100,
+                max_dac: 800,
+                frequency_millihz: 25_000,
+            }),
+            a1_configuration: None,
+            acquisition_running: true,
+            board_dac_code: None,
+            firmware_configuration_revision: None,
+        });
+        plugin.modulation = Some(state);
+        let meta = plugin.recording_metadata();
+
+        for key in [
+            "modulation_waveform",
+            "pockels_calibration_id",
+            "optical_target",
+            "requested_mean_u",
+            "resolved_mean_u",
+            "commanded_a",
+            "v_null_dac",
+            "v_peak_dac",
+        ] {
+            assert!(meta.contains_key(key), "{key} missing from {meta:?}");
+        }
+        assert_eq!(
+            meta.get("optical_target").map(String::as_str),
+            Some("log_sine")
+        );
+        assert_eq!(
+            meta.get("requested_mean_u").map(String::as_str),
+            Some("0.500000")
+        );
+        assert_eq!(
+            meta.get("commanded_a").map(String::as_str),
+            Some("0.700000")
+        );
     }
 
     /// A protocol file on disk, and a plugin ready to run it.
