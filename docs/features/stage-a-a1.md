@@ -207,7 +207,11 @@ swept at all, and what a block recorded lived in the panel rather than in
 anything that travels with the results.
 
 A **protocol** is a file naming every axis for every recording. The reader is
-chosen by extension, and both produce the same flat list of points.
+chosen by extension, and both produce the same flat list of points. Both
+tolerate what a spreadsheet writes: CRLF line endings, and the UTF-8
+byte-order mark Excel's "CSV UTF-8" prepends — unstripped, the BOM becomes
+part of the first header cell and the file is refused for missing a column it
+visibly has.
 
 **CSV — one row per recording**, and the one to reach for: it opens in a
 spreadsheet, comes straight out of a script, and each row carries its own

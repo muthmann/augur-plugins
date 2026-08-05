@@ -298,10 +298,21 @@ impl Axis {
     }
 }
 
+/// Drops a leading UTF-8 byte-order mark.
+///
+/// Saving a protocol as "CSV UTF-8" in Excel — the obvious choice on a Windows
+/// bench — writes a BOM. Left in place it becomes part of the first header
+/// cell, so `mean_u` stops matching `mean_u` and the file is refused for
+/// missing a column that is plainly there; in the TOML form it fails the parse
+/// outright. Neither message would point at an invisible character.
+fn strip_bom(text: &str) -> &str {
+    text.strip_prefix('\u{feff}').unwrap_or(text)
+}
+
 /// Parses a protocol and expands it into the points to record.
 pub fn parse(text: &str) -> Result<Protocol, ProtocolError> {
-    let doc: ProtocolDoc =
-        toml::from_str(text).map_err(|error| ProtocolError::Toml(error.to_string()))?;
+    let doc: ProtocolDoc = toml::from_str(strip_bom(text))
+        .map_err(|error| ProtocolError::Toml(error.to_string()))?;
 
     let default_duration = doc.defaults.duration_s.unwrap_or(10);
     let default_settle = doc.defaults.settle_s.unwrap_or(2.0);
@@ -444,7 +455,8 @@ pub fn parse_csv(text: &str) -> Result<Protocol, ProtocolError> {
     let mut header: Option<Vec<String>> = None;
     let mut points = Vec::new();
 
-    for (offset, raw) in text.lines().enumerate() {
+    // `lines()` already absorbs CRLF; the BOM is the part it leaves behind.
+    for (offset, raw) in strip_bom(text).lines().enumerate() {
         let line_no = offset + 1;
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -598,6 +610,31 @@ frequency_hz = { min = 1.0, max = 100.0, points = 3, spacing = "log" }
 depth_a = 0.8
 duration_s = 30
 "#;
+
+    #[test]
+    fn a_spreadsheet_bom_does_not_hide_the_first_column() {
+        // Excel's "CSV UTF-8" writes a BOM. Without stripping it, `mean_u`
+        // reads as `\u{feff}mean_u` and the file is refused for missing the
+        // column it visibly has.
+        let csv = "\u{feff}mean_u,frequency_hz,depth_a\n0.5,10,1.0\n";
+        let protocol = parse_file("survey.csv", csv).expect("BOM-prefixed CSV");
+        assert_eq!(protocol.points.len(), 1);
+        assert_eq!(protocol.points[0].mean_u, 0.5);
+    }
+
+    #[test]
+    fn a_bom_does_not_break_the_toml_form_either() {
+        let protocol = parse(&format!("\u{feff}{SAMPLE}")).expect("BOM-prefixed TOML");
+        assert_eq!(protocol.name, "sample");
+    }
+
+    #[test]
+    fn a_spreadsheet_crlf_file_parses() {
+        let csv = "mean_u,frequency_hz,depth_a\r\n0.5,10,1.0\r\n";
+        let protocol = parse_file("survey.csv", csv).expect("CRLF CSV");
+        assert_eq!(protocol.points.len(), 1);
+        assert_eq!(protocol.points[0].frequency_hz, 10.0);
+    }
 
     #[test]
     fn a_protocol_expands_to_the_product_of_its_axes() {
