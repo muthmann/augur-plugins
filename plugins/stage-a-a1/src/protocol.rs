@@ -311,8 +311,8 @@ fn strip_bom(text: &str) -> &str {
 
 /// Parses a protocol and expands it into the points to record.
 pub fn parse(text: &str) -> Result<Protocol, ProtocolError> {
-    let doc: ProtocolDoc = toml::from_str(strip_bom(text))
-        .map_err(|error| ProtocolError::Toml(error.to_string()))?;
+    let doc: ProtocolDoc =
+        toml::from_str(strip_bom(text)).map_err(|error| ProtocolError::Toml(error.to_string()))?;
 
     let default_duration = doc.defaults.duration_s.unwrap_or(10);
     let default_settle = doc.defaults.settle_s.unwrap_or(2.0);
