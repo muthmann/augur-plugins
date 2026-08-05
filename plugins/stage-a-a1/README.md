@@ -171,6 +171,9 @@ Columns are found **by name**, so their order does not matter and one can be lef
 Blank lines and `#` comments are skipped, and a blank cell falls back to the default. Errors carry
 the **file line number**, which is what your editor and spreadsheet both show.
 
+Files saved by a spreadsheet load as-is: Windows line endings and the byte-order mark that Excel's
+"CSV UTF-8" writes are both absorbed, so the first column is not silently reported missing.
+
 Two things the row form gives you that blocks cannot without one block per value: **a different
 duration per row** (1 Hz needs 40 s of cycles, 200 Hz does not), and **a `role` column**, so a file
 can open with its own background floor and pilot and then record the points scored against them —
