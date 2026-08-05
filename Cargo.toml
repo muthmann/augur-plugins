@@ -1,5 +1,11 @@
 [workspace]
 members = [
+  "evesmlm-types",
+  "stage-a-io",
+  "stage-a-plugin-contract",
+  "plugins/stage-a-a1",
+  "plugins/stage-a-modulation",
+  "plugins/stage-a-photodiode",
   "plugins/localization",
   "plugins/reconstruction",
   "plugins/focus-metrics",
@@ -22,6 +28,9 @@ augur-core = { path = "../augur-rs/augur-core" }
 augur-plugin-api = { path = "../augur-rs/augur-plugin-api" }
 augur-plugin-types = { path = "../augur-rs/augur-plugin-types" }
 egui = "0.27"
+evesmlm-types = { path = "evesmlm-types" }
 rustfft = "6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serialport = "4"
+stage-a-plugin-contract = { path = "stage-a-plugin-contract" }

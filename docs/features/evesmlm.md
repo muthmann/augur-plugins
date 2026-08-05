@@ -4,23 +4,53 @@ The eveSMLM pipeline is implemented as three focused plugins so each stage can b
 
 ## Stages
 
-1. **EVE Candidate Finding** (`RawEvents`) clusters raw `CdEvent` samples into emitter candidates and publishes `EveCandidates`.
-2. **EVE Candidate Fitting** (`DerivedData`) converts each candidate into one or more sub-pixel localization estimates, republishes `EveLocalizationResults` and `LocalizationResults`, and exposes the compact host-view dataset `augur.evesmlm.current_localizations`.
-3. **EVE Post-Processing** (`DerivedData`) filters, drift-corrects, and evaluates the fitted localizations, then republishes the same host-view dataset id and view id with the same schema.
+1. **EVE Candidate Finding** (`RawEvents`) clusters raw `CdEvent` samples into emitter candidates, can aggregate over retained event history, publishes only stable completed `EveCandidates`, and exposes accepted/rejected raw-event investigation layers plus boundary overlays.
+2. **EVE Candidate Fitting** (`DerivedData`) converts each completed candidate into one or more sub-pixel localization estimates, republishes `EveLocalizationResults` and `LocalizationResults`, and exposes both the shared host-view dataset `augur.evesmlm.current_localizations` and the rejected-fit dataset `augur.evesmlm.rejected_fits`.
+3. **EVE Post-Processing** (`DerivedData`) filters, drift-corrects, and evaluates the fitted localizations, then republishes the same host-view dataset id and view ids with the same schema and metadata.
+
+## Shared Contract Crate
+
+The three plugins do **not** depend on each other. Everything that crosses a
+stage boundary — `EveEvent`, `EveCluster`, `EveCandidates`, `EveLocalization`,
+`EveLocalizationResults`, `FitMethod`, the `CTX_*` channel names, and the
+`augur.evesmlm.current_localizations` dataset/registry builders that both
+fitting and post-processing publish — lives in the `evesmlm-types` crate.
+
+That is not a stylistic choice. Each plugin `cdylib` exports
+`augur_plugin_vtable`, so a plugin that linked another plugin's rlib pulled the
+symbol in twice. macOS linked it anyway; `rust-lld` and MSVC's `link.exe`
+refused, which meant the chain silently only worked on macOS until CI first
+built the repository on Linux and Windows (ADR 031). Each plugin still
+re-exports the names it used to own, so existing `use` paths keep working.
 
 ## Why Three Plugins
 
 - Keeps raw-event grouping separate from numerical fitting, so candidate quality can be inspected directly.
+- Lets researchers compare accepted and rejected candidate-stage raw events while tuning clustering thresholds.
 - Lets researchers compare fitting methods on a fixed candidate set.
 - Allows post-processing to be toggled or replaced without touching candidate generation.
 - Preserves compatibility with existing downstream plugins through `LocalizationResults`.
 
 ## Host View Resolution
 
+- `EVE Candidate Finding` publishes two investigation datasets for the current analysis window:
+  - accepted candidate events
+  - rejected candidate events
+- the accepted candidate-events dataset now keys rows by `cluster_id` so centroid overlays can select every event in a cluster at once.
+- both candidate datasets now register host tables as well as 3D views, so the investigation workflow has visible table targets for selection and inspection.
+- both candidate datasets include timestamps, 2D coordinates, and 3D scatter metadata so the host can color them separately in linked 2D/3D inspection.
+- candidate host-view titles stay short (`Accepted Events`, `Rejected Events`) because the host renders
+  table/window chips in narrow plugin cards; the full dataset ids remain stable.
+- candidate table display metadata marks concise `X`, `Y`, `Time`, `Polarity`, and `Cluster`
+  labels, with accepted events using `Cluster` as the compact-card headline.
+- fitting also publishes a rejected-fit investigation dataset and 3D view so fit failures and threshold rejections can be inspected alongside accepted localizations.
+- cross-dataset linking is still host-limited: matching `cluster_id` values do not automatically link candidate events to rejected fits because AugurRS selections are scoped by dataset id.
 - The compact EVE localization panel is declared by both fitting and post-processing.
+- the 3D current-localizations view is also declared by both fitting and post-processing
 - The host resolves duplicate ids in plugin execution order.
 - When **EVE Post-Processing** is enabled, it becomes the active provider for the panel view.
 - When post-processing is disabled, the panel falls back automatically to **EVE Candidate Fitting**.
+- fitting and post-processing must therefore keep the shared current-localization dataset/view descriptors identical
 
 ## Calibration Note
 
@@ -30,7 +60,7 @@ The fitting and post-processing stages now use that host `nm_per_pixel` value au
 
 ## Data Flow
 
-`CdEvent` stream -> `EveCandidates` -> `EveLocalizationResults` -> filtered / corrected `EveLocalizationResults`
+`CdEvent` stream -> tracked / completed `EveCandidates` -> `EveLocalizationResults` (+ rejected-fit dataset) -> filtered / corrected `EveLocalizationResults`
 
 ## Installation
 

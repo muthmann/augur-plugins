@@ -656,6 +656,7 @@ mod tests {
             height: 16,
             pixels: FfiSlice::from_slice(&pixels),
             events: FfiSlice::default(),
+            external_triggers: FfiSlice::default(),
             window_start_us: 0,
             window_end_us: 1_000,
         };

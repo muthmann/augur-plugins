@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use augur_plugin_evesmlm_fitting::{EveLocalization, EveLocalizationResults};
+use evesmlm_types::{EveLocalization, EveLocalizationResults};
 
 const DEFAULT_PSF_SIZE: usize = 9;
 const TRACK_LINK_RADIUS_PX: f64 = 1.5;

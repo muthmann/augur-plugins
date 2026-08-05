@@ -23,6 +23,7 @@ Sub-pixel localization for eveSMLM candidate clusters. The plugin consumes `EveC
 | Sigma max | `200.0` nm | Upper accepted sigma bound for sigma-producing methods |
 | Max fit residual | `0.5` | Reject fits above this residual |
 | Show overlay | `true` | Highlight accepted localization positions |
+| Show rejected | `false` | Draw rejected fits as linked diamond markers |
 
 AugurRS now publishes host-owned calibration on `CTX_GLOBAL_SETTINGS` as `GlobalSettings`. This plugin uses the host `nm_per_pixel` value automatically for sigma filtering when it is available, while retaining a hidden fallback for older hosts.
 
@@ -34,11 +35,24 @@ AugurRS now publishes host-owned calibration on `CTX_GLOBAL_SETTINGS` as `Global
 
 - `EveLocalizationResults` on `augur.evesmlm.localization_results`
 - `LocalizationResults` on `augur.localization.results` for compatibility with plugins such as Focus Metrics
-- the compact host-view dataset `augur.evesmlm.current_localizations`
+- the shared host-view dataset `augur.evesmlm.current_localizations`
+- the rejected-fit investigation dataset `augur.evesmlm.rejected_fits`
 
 ## Host View
 
-The plugin declares the compact analysis-panel view `augur.evesmlm.current_localizations.compact`. If `EVE Post-Processing` is also enabled, the host resolves that same view id to the later post-processing stage instead.
+The plugin declares the shared current-localizations dataset plus:
+
+- the compact analysis-panel view `augur.evesmlm.current_localizations.compact`
+- a linked 3D scatter view over the same dataset
+- compact, windowed, and 3D views for rejected fits
+
+That dataset now carries stable row ids, timestamps, 2D/3D coordinate metadata, and layer/display metadata so the host can keep selection stable across tables, overlays, and 3D inspection.
+
+Rejected fits are exposed as structured rows with `cluster_id`, timestamps, fit metrics, and a categorical rejection reason so fit failures and threshold rejections can be inspected directly instead of inferred from a counter alone.
+
+Rejected-fit selection is currently local to the rejected-fits dataset. Matching `cluster_id` values do not create cross-dataset linking back to candidate-event rows because AugurRS stable row keys are scoped by dataset id.
+
+If `EVE Post-Processing` is also enabled, the host resolves those same dataset/view ids to the later post-processing stage instead.
 
 ## Dependencies
 
