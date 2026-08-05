@@ -102,10 +102,14 @@ inversion they used. Full detail: [feature brief](../../docs/features/stage-a-po
 
 ## Ports
 
-**Use `auto` (default recommendation):** it probes every attached usbmodem/ttyACM device and
-connects to the one that answers `HELLO` — that is always the Teensy command port, never the
-photodiode stream port. Explicit ports remain selectable; `mock` runs an in-process simulated
-controller for hardware-free testing.
+**Use `auto` (default recommendation):** it probes every attached USB serial port and connects to
+the one that answers `HELLO` — that is always the Teensy command port, never the photodiode
+stream port. Explicit ports remain selectable; `mock` runs an in-process simulated controller for
+hardware-free testing.
+
+Which ports get probed is platform-specific: `cu.usbmodem*` on macOS, `ttyACM*` on Linux, and
+every USB-classified `COMn` on Windows (ADR 032). The picker lists the same set with each port's
+USB label, so the Teensy is recognisable by name.
 
 Replaying a recording disconnects the plugin defensively; live control itself needs no
 capture session.

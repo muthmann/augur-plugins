@@ -24,9 +24,12 @@ read-only by construction; the command port belongs to `stage-a-modulation`.
 
 ## Ports
 
-**Use `auto` (default recommendation):** it listens briefly on every attached usbmodem/ttyACM
-device and connects to the one actually streaming CRC-clean PDA1 sample frames — that is always
-the Teensy stream port. `mock` generates a synthetic sine for hardware-free testing.
+**Use `auto` (default recommendation):** it listens briefly on every attached USB serial port and
+connects to the one actually streaming CRC-clean PDA1 sample frames — that is always the Teensy
+stream port. `mock` generates a synthetic sine for hardware-free testing.
+
+Which ports get listened to is platform-specific: `cu.usbmodem*` on macOS, `ttyACM*` on Linux,
+and every USB-classified `COMn` on Windows (ADR 032).
 
 ## Owner control service
 

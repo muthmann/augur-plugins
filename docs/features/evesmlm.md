@@ -8,6 +8,21 @@ The eveSMLM pipeline is implemented as three focused plugins so each stage can b
 2. **EVE Candidate Fitting** (`DerivedData`) converts each completed candidate into one or more sub-pixel localization estimates, republishes `EveLocalizationResults` and `LocalizationResults`, and exposes both the shared host-view dataset `augur.evesmlm.current_localizations` and the rejected-fit dataset `augur.evesmlm.rejected_fits`.
 3. **EVE Post-Processing** (`DerivedData`) filters, drift-corrects, and evaluates the fitted localizations, then republishes the same host-view dataset id and view ids with the same schema and metadata.
 
+## Shared Contract Crate
+
+The three plugins do **not** depend on each other. Everything that crosses a
+stage boundary — `EveEvent`, `EveCluster`, `EveCandidates`, `EveLocalization`,
+`EveLocalizationResults`, `FitMethod`, the `CTX_*` channel names, and the
+`augur.evesmlm.current_localizations` dataset/registry builders that both
+fitting and post-processing publish — lives in the `evesmlm-types` crate.
+
+That is not a stylistic choice. Each plugin `cdylib` exports
+`augur_plugin_vtable`, so a plugin that linked another plugin's rlib pulled the
+symbol in twice. macOS linked it anyway; `rust-lld` and MSVC's `link.exe`
+refused, which meant the chain silently only worked on macOS until CI first
+built the repository on Linux and Windows (ADR 031). Each plugin still
+re-exports the names it used to own, so existing `use` paths keep working.
+
 ## Why Three Plugins
 
 - Keeps raw-event grouping separate from numerical fitting, so candidate quality can be inspected directly.

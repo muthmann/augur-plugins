@@ -1,0 +1,199 @@
+name: Build Plugins
+
+# Produces drop-in plugin folders for a machine that has no Rust toolchain: the
+# bench downloads a bundle, copies its folders into ~/.augur/plugins/, and hits
+# "Scan for New Plugins". Pull requests get workflow artifacts; main also
+# publishes a rolling release so the download needs no GitHub login.
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      augur_rs_ref:
+        description: "augur-rs ref to build against (branch, tag or SHA)"
+        required: false
+        default: fix/gui-layout-and-alignment
+
+concurrency:
+  group: build-plugins-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # The host branch this repository actually compiles against. augur-rs `main`
+  # does not carry the TableSchema, host-view and dataset-descriptor API these
+  # plugins use, so defaulting to `main` would be a guaranteed red build and
+  # would never hand the bench a bundle. Move this back to `main` in the same
+  # commit that the host API lands there.
+  AUGUR_RS_REF: ${{ inputs.augur_rs_ref || 'fix/gui-layout-and-alignment' }}
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            name: macOS (arm64)
+            bundle: macos-arm64
+          - os: macos-13
+            name: macOS (x86_64)
+            bundle: macos-x86_64
+          - os: ubuntu-latest
+            name: Linux (x86_64)
+            bundle: linux-x86_64
+          - os: windows-latest
+            name: Windows (x86_64)
+            bundle: windows-x86_64
+
+    defaults:
+      run:
+        # The repo drives its builds through two bash scripts; use the same
+        # shell on Windows so there is exactly one code path to reason about.
+        shell: bash
+
+    steps:
+      # This workspace depends on the host by path (../augur-rs/augur-core), so
+      # CI has to reproduce the two-sibling-checkout layout, not clone one repo.
+      - name: Check out augur-plugins
+        uses: actions/checkout@v5
+        with:
+          path: augur-plugins
+
+      - name: Check out augur-rs
+        uses: actions/checkout@v5
+        with:
+          repository: muthmann/augur-rs
+          ref: ${{ env.AUGUR_RS_REF }}
+          path: augur-rs
+
+      - name: Pin the host revision and disarm the source patch
+        run: |
+          echo "AUGUR_RS_SHA=$(git -C augur-rs rev-parse HEAD)" >> "$GITHUB_ENV"
+          # build-runtime-plugins.sh patches [patch."…/augur-rs.git"] whenever a
+          # sibling augur-rs *git checkout* exists. This workspace already
+          # depends on it by path, so that patch matches nothing in the crate
+          # graph — it only costs cargo a fetch of the checkout. Removing .git
+          # makes the script's detection fail and the path deps win outright.
+          rm -rf augur-rs/.git
+
+      - name: Resolve the pinned Rust toolchain
+        run: |
+          channel="$(sed -n 's/^channel *= *"\(.*\)"$/\1/p' augur-plugins/rust-toolchain.toml | head -n 1)"
+          if [[ -z "${channel}" ]]; then
+            echo "No channel found in augur-plugins/rust-toolchain.toml" >&2
+            exit 1
+          fi
+          echo "RUST_CHANNEL=${channel}" >> "$GITHUB_ENV"
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_CHANNEL }}
+          cache-workspaces: augur-plugins
+          # The action injects RUSTFLAGS="-D warnings" by default. That is right
+          # for a lint job and wrong here: this job ships artifacts, and a dead-
+          # code warning in one plugin must not deny the bench a bundle for all
+          # of them. Lint gating belongs in its own job, not in the build.
+          rustflags: ""
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        # Only what the plugin crates actually link. augur-gui's own dependency
+        # script is deliberately not reused: it is a superset (X11/Wayland/GL for
+        # the GUI, which no plugin links) and it does not exist on every augur-rs
+        # revision this job can be pointed at, so borrowing it made the Linux
+        # build fail on the value of augur_rs_ref. serialport needs libudev.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libudev-dev
+
+      - name: Build runtime plugins
+        working-directory: augur-plugins
+        run: bash scripts/build-runtime-plugins.sh --profile release
+
+      - name: Stage installable plugin folders
+        working-directory: augur-plugins
+        run: bash scripts/install-built-plugins.sh --profile release --dest "dist/${{ matrix.bundle }}"
+
+      - name: Write build provenance
+        working-directory: augur-plugins
+        run: |
+          {
+            echo "bundle:        ${{ matrix.bundle }}"
+            echo "built_at:      $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "augur_plugins: $(git rev-parse HEAD)"
+            echo "augur_rs_ref:  ${AUGUR_RS_REF}"
+            echo "augur_rs_sha:  ${AUGUR_RS_SHA}"
+            echo "rustc:         $(rustc --version)"
+            echo
+            echo "Copy the plugin folders next to this file into ~/.augur/plugins/,"
+            echo "then use Plugins -> Scan for New Plugins in augur-gui."
+          } > "dist/${{ matrix.bundle }}/BUILD-INFO.txt"
+
+      - name: Upload plugin bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: augur-plugins-${{ matrix.bundle }}
+          path: augur-plugins/dist/${{ matrix.bundle }}
+          if-no-files-found: error
+
+  release:
+    name: Publish rolling release
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download every plugin bundle
+        uses: actions/download-artifact@v4
+        with:
+          path: bundles
+          pattern: augur-plugins-*
+
+      - name: Package one archive per platform
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for bundle_dir in bundles/augur-plugins-*/; do
+            bundle="$(basename "${bundle_dir%/}")"
+            (cd "${bundle_dir}" && zip -qr "${GITHUB_WORKSPACE}/dist/${bundle}.zip" .)
+            echo "Packaged ${bundle}.zip"
+          done
+          (cd dist && sha256sum ./*.zip > SHA256SUMS.txt)
+          ls -l dist
+
+      - name: Publish rolling release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="plugins-latest"
+          # Delete and recreate rather than upload --clobber: it retags at the
+          # new commit and guarantees no asset from an older build survives.
+          gh release delete "${tag}" --yes --cleanup-tag || true
+          gh release create "${tag}" dist/* \
+            --title "Prebuilt plugins (latest main)" \
+            --notes "$(printf '%s\n' \
+              "Prebuilt AugurRS plugins, rebuilt on every push to \`main\`." \
+              "" \
+              "- augur-plugins: \`${GITHUB_SHA}\`" \
+              "- built against augur-rs \`${AUGUR_RS_REF}\`" \
+              "" \
+              "Download the archive for your platform, unpack it, and copy the" \
+              "plugin folders inside into \`~/.augur/plugins/\`. Then open augur-gui," \
+              "go to **Plugins**, and click **Scan for New Plugins**." \
+              "" \
+              "\`BUILD-INFO.txt\` in each archive records the exact revisions and" \
+              "compiler the libraries were built with. Verify downloads against" \
+              "\`SHA256SUMS.txt\`.")"

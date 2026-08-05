@@ -556,6 +556,8 @@ impl Reader {
     ) -> Result<Self, String> {
         let port = serialport::new(&path, 115_200)
             .timeout(Duration::from_millis(50))
+            // Windows opens with DTR deasserted; see ADR 032.
+            .dtr_on_open(true)
             .open()
             .map_err(|err| format!("open {path}: {err}"))?;
         let stop = Arc::new(AtomicBool::new(false));
@@ -2527,16 +2529,10 @@ fn rejected_service_reply(
 }
 
 fn serial_ports() -> Vec<String> {
-    serialport::available_ports()
-        .map(|ports| {
-            ports
-                .into_iter()
-                .map(|p| p.port_name)
-                // macOS lists each device twice; use the callout (cu.*) node only.
-                .filter(|name| name.contains("cu.usbmodem") || name.contains("ttyACM"))
-                .collect()
-        })
-        .unwrap_or_default()
+    stage_a_io::transport::candidate_ports()
+        .into_iter()
+        .map(|port| port.name)
+        .collect()
 }
 
 /// Finds the Teensy stream port: the dual-serial firmware free-runs PDA1
@@ -2545,7 +2541,7 @@ fn serial_ports() -> Vec<String> {
 fn resolve_auto_port() -> Result<String, String> {
     let candidates = serial_ports();
     if candidates.is_empty() {
-        return Err("no USB serial device found (looked for usbmodem/ttyACM)".to_owned());
+        return Err(stage_a_io::transport::no_candidate_ports_message());
     }
     let mut saw_legacy_ascii = false;
     for path in &candidates {
@@ -2589,6 +2585,8 @@ enum ProbeResult {
 fn probe_pd_stream(path: &str) -> ProbeResult {
     let Ok(mut port) = serialport::new(path, 115_200)
         .timeout(Duration::from_millis(100))
+        // Windows opens with DTR deasserted; see ADR 032.
+        .dtr_on_open(true)
         .open()
     else {
         return ProbeResult::Nothing;
@@ -2632,26 +2630,11 @@ fn probe_pd_stream(path: &str) -> ProbeResult {
 /// host exchanges enum settings as indices into this list.
 fn port_variants() -> Vec<String> {
     let mut variants = vec!["mock".to_owned(), "auto".to_owned()];
-    for port in serialport::available_ports().unwrap_or_default() {
-        if !(port.port_name.contains("cu.usbmodem") || port.port_name.contains("ttyACM")) {
-            continue;
-        }
-        let label = match port.port_type {
-            serialport::SerialPortType::UsbPort(info) => match (info.manufacturer, info.product) {
-                (Some(manufacturer), Some(product)) if !product.starts_with(&manufacturer) => {
-                    Some(format!("{manufacturer} {product}"))
-                }
-                (_, Some(product)) => Some(product),
-                (Some(manufacturer), None) => Some(manufacturer),
-                (None, None) => None,
-            },
-            _ => None,
-        };
-        variants.push(match label {
-            Some(label) => format!("{} ({label})", port.port_name),
-            None => port.port_name,
-        });
-    }
+    variants.extend(
+        stage_a_io::transport::candidate_ports()
+            .iter()
+            .map(stage_a_io::transport::PortInfo::variant),
+    );
     variants
 }
 
