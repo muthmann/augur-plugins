@@ -215,6 +215,25 @@ time are reported first. Use **Stop** in the Record section to end a run early.
 `~/.augur/plugins/stage-a-a1/protocols/`. See
 [ADR 027](../../docs/adr/027-stage-a-a1-declarative-protocols.md).
 
+## How long will this take?
+
+Every run long enough to walk away from — **Sweep a**, **Sweep f**, **Sweep a × f**, an `a₀` point
+or a protocol — reports its remaining time on the button press and keeps reporting it on the status
+pane:
+
+```
+Estimated time: ≈ 41 min left of ≈ 1 h 5 min — done by 03:41 UTC
+```
+
+The first number is the plan's own time (`Duration` + `Settle time` per point, or each protocol
+row's own) plus a fixed allowance for the camera/photodiode handshake, and it says so:
+*(from the plan until the first point finishes)*. After that, every finished point re-scales what
+is left by the pace the bench is actually keeping — settling, handshakes, `a₀` trials and the
+marker periods a new frequency has to be confirmed over. Only the outermost run states an estimate:
+a ladder's already covers the depth sweep inside it. It is advisory — nothing is skipped or
+shortened because of it. See
+[ADR 034](../../docs/adr/034-a1-time-estimates-are-the-plan-corrected-by-the-measured-pace.md).
+
 ## Live quicklooks
 
 - **Rolling half-period response** `S_p(t) = N_p(t−T/2, t] / N_valid` — events per valid pixel in the

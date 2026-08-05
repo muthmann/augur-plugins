@@ -64,6 +64,7 @@ use stage_a_plugin_contract::{
     SERVICE_STAGE_A_MODULATION_CONTROL_V1, SERVICE_STAGE_A_PHOTODIODE_CONTROL_V1,
 };
 
+use crate::eta::{format_duration, Eta};
 use crate::phase::{fold_events, fold_events_free_running, MarkerValidationConfig, PhaseFold};
 use crate::protocol;
 use crate::rates::{rolling_half_period_response, RollingResponsePoint};
@@ -122,6 +123,17 @@ const A0_LOCK_SAMPLE_SPACING: f64 = 0.5;
 /// operating point is called unstable instead of locked. A drifting `a` that
 /// happens to cross the target on one reading is not a lock.
 const A0_LOCK_MAX_SPREAD_TOLERANCES: f64 = 2.0;
+/// Trials one `a₀` lock is *expected* to spend, for the time estimate only.
+/// The cap above is [`A0_LOCK_MAX_TRIALS`], but a calibrated drive lands inside
+/// the tolerance in two or three, and estimating every rung of a ladder at the
+/// cap would put a night on a run that takes an hour.
+const A0_LOCK_NOMINAL_TRIALS: f64 = 3.0;
+/// Nominal measuring time of one lock trial on top of the operator's settle
+/// dwell: the independent photodiode readings it takes a window apart.
+const A0_LOCK_NOMINAL_TRIAL_S: f64 = 4.0;
+/// Nominal firmware/table cost of retargeting the drive to a new frequency, on
+/// top of the marker periods the confirmation then waits for.
+const FREQ_RETARGET_NOMINAL_S: f64 = 2.0;
 /// Clipping fraction above which a lock's measured `a` is called out as
 /// unreliable in the operator message.
 ///
@@ -462,6 +474,8 @@ struct Sweep {
     completed_ok: bool,
     last_activity_ms: u64,
     stop_requested: bool,
+    /// How much longer this run has to go — see [`crate::eta`].
+    eta: Eta,
 }
 
 impl Sweep {
@@ -790,6 +804,9 @@ struct FreqSweep {
     seed: u64,
     last_activity_ms: u64,
     stop_requested: bool,
+    /// How much longer the *ladder* has to go — see [`crate::eta`]. The inner
+    /// run keeps one of its own; only the outermost is ever shown.
+    eta: Eta,
 }
 
 impl FreqSweep {
@@ -851,6 +868,8 @@ struct ProtocolRun {
     /// Why the current point is being given up, when that was decided in a
     /// service reply rather than in the tick.
     skip_reason: Option<String>,
+    /// How much longer the survey has to go — see [`crate::eta`].
+    eta: Eta,
 }
 
 impl ProtocolRun {
@@ -2758,6 +2777,123 @@ impl StageAA1Plugin {
             .collect()
     }
 
+    // ---- how long a run is planned to take -----------------------------
+    //
+    // These are deliberately *not* the lease TTLs below. A TTL is a worst case
+    // — it has to cover the settle timeout of every point, or the owner takes
+    // the drive back mid-run — while an estimate the operator plans an evening
+    // around has to be the likely case. Quoting the TTL would tell someone
+    // their five-minute sweep needs half an hour. The measured pace in
+    // [`crate::eta`] closes whatever gap is left.
+
+    /// What one recorded point costs: the recording itself, the operator's
+    /// settle dwell, and the start/finalize handshake around it.
+    fn planned_point_s(&self) -> f64 {
+        self.duration_s.max(1) as f64 + self.settle_s.max(0.0) + crate::eta::POINT_OVERHEAD_S
+    }
+
+    /// What one closed-loop `a₀` lock costs, or zero where the depth is
+    /// commanded and no lock runs at all (ADR 021).
+    fn planned_a0_lock_s(&self) -> f64 {
+        if !self.depth_source.needs_a0_lock() {
+            return 0.0;
+        }
+        A0_LOCK_NOMINAL_TRIALS * (self.settle_s.max(0.0) + A0_LOCK_NOMINAL_TRIAL_S)
+    }
+
+    /// What one rung of the frequency ladder costs at `frequency_hz`:
+    /// retargeting the drive, waiting for the trigger to confirm the new period
+    /// — which is a few cycles, so it is the low frequencies that dominate a
+    /// ladder — and then whatever that rung records.
+    fn planned_rung_s(&self, mode: FreqSweepMode, frequency_hz: f64) -> f64 {
+        let confirm_s = if frequency_hz > 0.0 {
+            (FREQ_CONFIRM_CYCLES / frequency_hz).min(FREQ_CONFIRM_BASE_MS as f64 / 1_000.0)
+        } else {
+            0.0
+        };
+        let inner_s = match mode {
+            FreqSweepMode::A0Point => self.planned_a0_lock_s() + self.planned_point_s(),
+            FreqSweepMode::DepthSweep => {
+                self.sweep_count.clamp(2, 64) as f64 * self.planned_point_s()
+            }
+        };
+        FREQ_RETARGET_NOMINAL_S + confirm_s + inner_s
+    }
+
+    /// Planned seconds a run still has left, counting the point in flight.
+    /// `None` when nothing is running.
+    fn planned_remaining_s(&self) -> Option<f64> {
+        // Outermost first: a ladder's estimate already contains the inner
+        // sweep it handed the current rung to, and a protocol contains both.
+        if let Some(run) = self.protocol.as_ref() {
+            let remaining_points = run.plan.points.len().saturating_sub(run.index);
+            return Some(
+                run.plan.remaining_seconds(run.index)
+                    + remaining_points as f64 * crate::eta::POINT_OVERHEAD_S,
+            );
+        }
+        if let Some(sweep) = self.freq_sweep.as_ref() {
+            let from = sweep.index.min(sweep.points.len());
+            return Some(
+                sweep.points[from..]
+                    .iter()
+                    .map(|point| self.planned_rung_s(sweep.mode, point.frequency_hz))
+                    .sum(),
+            );
+        }
+        if let Some(sweep) = self.sweep.as_ref() {
+            let remaining = sweep.total().saturating_sub(sweep.index);
+            return Some(remaining as f64 * self.planned_point_s());
+        }
+        None
+    }
+
+    /// The estimate itself: the [`Eta`] of the outermost run in flight, paired
+    /// with what its plan still asks for.
+    fn run_eta(&self) -> Option<(Eta, f64)> {
+        let planned_remaining_s = self.planned_remaining_s()?;
+        let eta = if let Some(run) = self.protocol.as_ref() {
+            run.eta
+        } else if let Some(sweep) = self.freq_sweep.as_ref() {
+            sweep.eta
+        } else {
+            self.sweep.as_ref()?.eta
+        };
+        Some((eta, planned_remaining_s))
+    }
+
+    /// One line of "how much longer", for whichever run the operator started.
+    ///
+    /// The total is elapsed + remaining rather than a stored plan number, so it
+    /// is wall clock throughout and grows honestly when a run runs long.
+    fn estimated_time_line(&self, now_ms: u64) -> Option<String> {
+        let (eta, planned_remaining_s) = self.run_eta()?;
+        let remaining_s = eta.remaining_s(now_ms, planned_remaining_s);
+        let total_s = eta.elapsed_s(now_ms) + remaining_s;
+        let mut line = format!(
+            "Estimated time: ≈ {} left of ≈ {}",
+            format_duration(remaining_s),
+            format_duration(total_s)
+        );
+        // Long enough that the operator will leave the bench: say when to come
+        // back, in the same UTC every file of the run is stamped with. Minutes
+        // are noise below that — a five-minute sweep is watched, not planned
+        // around.
+        if remaining_s >= 600.0 {
+            line.push_str(&format!(
+                " — done by {}",
+                format_clock_utc(now_ms / 1_000 + remaining_s as u64)
+            ));
+        }
+        // Nothing has finished yet, so this is the plan's own time with a fixed
+        // allowance for the bench. Say so, rather than let a number that is
+        // about to grow look like a measurement.
+        if eta.pace().is_none() {
+            line.push_str(" (from the plan until the first point finishes)");
+        }
+        Some(line)
+    }
+
     /// Worst-case sweep duration, used as the modulation lease TTL.
     fn sweep_lease_ttl_ms(&self, remaining_points: usize) -> u64 {
         let per_point_ms = (self.duration_s.max(1) as u64)
@@ -2824,8 +2960,9 @@ impl StageAA1Plugin {
         }
         let points = self.sweep_points();
         let message = format!(
-            "Sweep: acquiring modulation lease for {} points…",
-            points.len()
+            "Sweep: acquiring modulation lease for {} points, ≈ {} of bench time…",
+            points.len(),
+            format_duration(points.len() as f64 * self.planned_point_s())
         );
         self.begin_leased_sweep(context, SweepKind::Amplitude, points, None, None, message);
     }
@@ -2896,6 +3033,7 @@ impl StageAA1Plugin {
             completed_ok: false,
             last_activity_ms: now_ms,
             stop_requested: false,
+            eta: Eta::new(now_ms),
         });
         self.message = message;
     }
@@ -3168,7 +3306,9 @@ impl StageAA1Plugin {
                     }
                     self.finish_sweep(context, message);
                 } else {
+                    let planned_s = self.planned_point_s();
                     if let Some(sweep) = self.sweep.as_mut() {
+                        sweep.eta.point_done(now_ms, planned_s);
                         sweep.index += 1;
                     }
                     self.send_sweep_depth(context);
@@ -4220,6 +4360,10 @@ impl StageAA1Plugin {
         let lease_req = request.request_id;
         context.request_service(&request);
         let total = points.len();
+        let planned_s: f64 = points
+            .iter()
+            .map(|point| self.planned_rung_s(mode, point.frequency_hz))
+            .sum();
         self.freq_sweep = Some(FreqSweep {
             phase: FreqSweepPhase::AcquiringLease,
             mode,
@@ -4238,15 +4382,18 @@ impl StageAA1Plugin {
             seed: self.freq_seed,
             last_activity_ms: now_ms,
             stop_requested: false,
+            eta: Eta::new(now_ms),
         });
+        let estimate = format_duration(planned_s);
         self.message = match mode {
             FreqSweepMode::A0Point => format!(
-                "Frequency sweep: acquiring the modulation lease for {total} points ({} order)…",
+                "Frequency sweep: acquiring the modulation lease for {total} points ({} order), \
+                 ≈ {estimate} of bench time…",
                 self.freq_order.label()
             ),
             FreqSweepMode::DepthSweep => format!(
                 "Depth sweep at every frequency: acquiring the modulation lease for {total} × {} \
-                 recordings ({} order)…",
+                 recordings ({} order), ≈ {estimate} of bench time…",
                 self.sweep_count.clamp(2, 64),
                 self.freq_order.label()
             ),
@@ -4417,8 +4564,18 @@ impl StageAA1Plugin {
 
     /// Move to the next ladder point, or finish with a summary.
     fn advance_freq_sweep(&mut self, context: &mut impl RecordingControl) {
+        // The rung that just ended is what the estimate learns from, so its
+        // planned cost has to be read before the index moves past it.
+        let planned_s = self
+            .freq_sweep
+            .as_ref()
+            .and_then(|sweep| sweep.point().map(|point| (sweep.mode, point.frequency_hz)))
+            .map(|(mode, frequency_hz)| self.planned_rung_s(mode, frequency_hz))
+            .unwrap_or(0.0);
+        let now_ms = now_unix_ms();
         let done = match self.freq_sweep.as_mut() {
             Some(sweep) => {
+                sweep.eta.point_done(now_ms, planned_s);
                 sweep.index += 1;
                 sweep.index >= sweep.points.len()
             }
@@ -4485,10 +4642,7 @@ impl StageAA1Plugin {
     /// A1 *asks* for, not what it gets — the owner caps the TTL it grants, and
     /// [`Self::drive_lease_heartbeat`] is what actually keeps the lease alive.
     fn protocol_lease_ttl_ms(plan: &protocol::Protocol, from: usize) -> u64 {
-        let remaining: f64 = plan.points[from.min(plan.points.len())..]
-            .iter()
-            .map(|point| point.duration_s as f64 + point.settle_s)
-            .sum();
+        let remaining = plan.remaining_seconds(from);
         // Doubled: every point also spends time on the start/finalize
         // handshake, which is not in the protocol's own numbers.
         ((remaining * 2_000.0) as u64).saturating_add(60_000)
@@ -4572,10 +4726,14 @@ impl StageAA1Plugin {
 
         let (means, frequencies, depths) = plan.axis_counts();
         let total = plan.points.len();
-        let minutes = plan.total_seconds() / 60.0;
+        // The plan's own seconds plus what the bench charges per point — the
+        // same number the panel then counts down, so the estimate on the button
+        // press and the estimate a minute later are not two different figures.
+        let estimate =
+            format_duration(plan.total_seconds() + total as f64 * crate::eta::POINT_OVERHEAD_S);
         self.message = format!(
             "Protocol '{}': {total} recordings ({means} × ū, {frequencies} × f, {depths} × a), \
-             about {minutes:.0} min of bench time — acquiring the modulation lease…",
+             ≈ {estimate} of bench time — acquiring the modulation lease…",
             plan.name
         );
         self.protocol = Some(ProtocolRun {
@@ -4592,6 +4750,7 @@ impl StageAA1Plugin {
             last_activity_ms: now_ms,
             stop_requested: false,
             skip_reason: None,
+            eta: Eta::new(now_ms),
         });
     }
 
@@ -4696,8 +4855,16 @@ impl StageAA1Plugin {
         let Some(run) = self.protocol.as_mut() else {
             return;
         };
+        let now_ms = now_unix_ms();
+        // What the row that just ended was planned to cost, before the index
+        // moves past it — that difference is the whole estimate.
+        let planned_s = run
+            .point()
+            .map(|point| point.duration_s as f64 + point.settle_s + crate::eta::POINT_OVERHEAD_S)
+            .unwrap_or(0.0);
+        run.eta.point_done(now_ms, planned_s);
         run.index += 1;
-        run.last_activity_ms = now_unix_ms();
+        run.last_activity_ms = now_ms;
         if run.index < run.plan.points.len() && !run.stop_requested {
             self.send_protocol_point(context);
             return;
@@ -6142,6 +6309,14 @@ fn format_compact_utc(unix_secs: u64) -> String {
     format!("{y:04}{m:02}{d:02}-{hh:02}{mm:02}{ss:02}")
 }
 
+/// Wall-clock time of day, for "come back at". UTC like every other timestamp
+/// this plugin writes — a local time here and UTC in the filenames would be two
+/// clocks in one panel.
+fn format_clock_utc(unix_secs: u64) -> String {
+    let (_, _, _, hh, mm, _) = ymd_hms(unix_secs);
+    format!("{hh:02}:{mm:02} UTC")
+}
+
 fn format_iso_utc(unix_secs: u64) -> String {
     let (y, m, d, hh, mm, ss) = ymd_hms(unix_secs);
     format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
@@ -7307,6 +7482,12 @@ impl Plugin for StageAA1Plugin {
                 lock.samples.len()
             )));
         }
+        // One estimate, for the run the operator started: a ladder's own line
+        // already covers the inner sweep it is currently running, and a
+        // protocol covers both, so three of these would be one fact three times.
+        if let Some(line) = self.estimated_time_line(now_unix_ms()) {
+            entries.push(StatusEntry::Text(line));
+        }
         if !self.message.is_empty() {
             entries.push(StatusEntry::Text(self.message.clone()));
         }
@@ -8330,6 +8511,7 @@ mod tests {
             seed: 1,
             last_activity_ms: 0,
             stop_requested: false,
+            eta: Eta::new(0),
         });
         plugin.sweep = Some(Sweep {
             phase: SweepPhase::Recording,
@@ -8355,6 +8537,7 @@ mod tests {
             completed_ok: false,
             last_activity_ms: 0,
             stop_requested: false,
+            eta: Eta::new(0),
         });
 
         let mut sink = ControlSink::default();
@@ -9094,6 +9277,7 @@ mod tests {
             completed_ok: false,
             last_activity_ms: 0,
             stop_requested: false,
+            eta: Eta::new(0),
         });
         plugin.recording.id = "A1-sweeprow".into();
         plugin.recording.stem = "A1-sweeprow_20260723-000000_p02".into();
@@ -9579,6 +9763,7 @@ mod tests {
             seed: 1,
             last_activity_ms: now_unix_ms(),
             stop_requested: false,
+            eta: Eta::new(0),
         });
         let mut sink = ControlSink::default();
         plugin.send_freq_sweep_frequency(&mut sink);
@@ -9904,6 +10089,7 @@ mod tests {
             completed_ok: false,
             last_activity_ms: 0,
             stop_requested: false,
+            eta: Eta::new(0),
         });
 
         // The stem carries the frequency instead of a sweep-point index.
@@ -10850,6 +11036,201 @@ depth_a = 99.0
         );
 
         let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// Every text line of the status pane, joined.
+    fn status_text(plugin: &StageAA1Plugin) -> String {
+        plugin
+            .status_entries()
+            .iter()
+            .filter_map(|entry| match entry {
+                StatusEntry::Text(text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" | ")
+    }
+
+    /// A survey started at 23:00 has to say whether it is a coffee-length or a
+    /// night-length one — on the button press, before it is left alone.
+    #[test]
+    fn a_protocol_says_how_long_it_will_take_before_it_starts() {
+        let folder = temp_folder("protocol-estimate");
+        let (mut plugin, _) = protocol_plugin(&folder, TWO_POINT_PROTOCOL);
+        let mut sink = ControlSink::default();
+
+        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+
+        // Two rows of 3 s with no settle, plus the handshake around each.
+        let expected = format_duration(2.0 * (3.0 + crate::eta::POINT_OVERHEAD_S));
+        assert!(
+            plugin.message.contains(&format!("≈ {expected}")),
+            "the button press does not say how long the survey takes: {}",
+            plugin.message
+        );
+        // And the panel keeps saying it while the run walks the file.
+        let status = status_text(&plugin);
+        assert!(
+            status.contains("Estimated time:"),
+            "no estimate on the status pane: {status}"
+        );
+        assert!(
+            status.contains("from the plan"),
+            "an estimate with nothing measured yet claims to be a measurement: {status}"
+        );
+
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// The plan is what the operator asked for; the bench charges more for it
+    /// (handshakes, settling, a photodiode window). Once a point has actually
+    /// finished, the estimate has to follow the bench rather than the file —
+    /// otherwise a run that is running at half speed keeps promising the
+    /// original finish time right up to the end.
+    #[test]
+    fn the_estimate_follows_the_measured_pace_not_the_plan() {
+        let mut plugin = StageAA1Plugin {
+            duration_s: 10,
+            settle_s: 0.0,
+            sweep_count: 5,
+            ..StageAA1Plugin::default()
+        };
+        let planned_point_s = plugin.planned_point_s();
+        let start_ms = 1_000_000;
+        plugin.sweep = Some(Sweep {
+            phase: SweepPhase::Recording,
+            kind: SweepKind::Amplitude,
+            points: plugin.sweep_points(),
+            lock: None,
+            index: 0,
+            lease_id: LeaseId::new("test"),
+            lease_granted: true,
+            lease_req: 0,
+            owns_lease: true,
+            depth_req: 0,
+            depth_applied: true,
+            settled_since_ms: None,
+            settle_deadline_ms: 0,
+            point_started: true,
+            completed_ok: false,
+            last_activity_ms: start_ms,
+            stop_requested: false,
+            eta: Eta::new(start_ms),
+        });
+
+        // Nothing measured yet: five points at their planned cost.
+        let planned_total = 5.0 * planned_point_s;
+        assert!(
+            plugin
+                .estimated_time_line(start_ms)
+                .expect("a running sweep has an estimate")
+                .contains(&format_duration(planned_total)),
+            "the first estimate is not the plan's own time"
+        );
+
+        // The first point took twice as long as planned. Four points are left,
+        // so the estimate has to double them too.
+        let after_ms = start_ms + (2.0 * planned_point_s * 1_000.0) as u64;
+        if let Some(sweep) = plugin.sweep.as_mut() {
+            sweep.eta.point_done(after_ms, planned_point_s);
+            sweep.index = 1;
+        }
+        let line = plugin
+            .estimated_time_line(after_ms)
+            .expect("a running sweep has an estimate");
+        assert!(
+            line.contains(&format_duration(8.0 * planned_point_s)),
+            "the estimate ignored how long the first point actually took: {line}"
+        );
+        assert!(
+            !line.contains("from the plan"),
+            "a measured estimate still calls itself a plan: {line}"
+        );
+    }
+
+    /// The ladder, its inner depth sweep and a protocol are three nested runs,
+    /// and each knows its own remaining time. Printing all three would state
+    /// one fact three times, with the two inner ones — which end long before
+    /// the run does — reading as contradictions of the one that matters.
+    #[test]
+    fn only_the_outermost_run_states_an_estimate() {
+        let mut plugin = StageAA1Plugin {
+            duration_s: 5,
+            sweep_count: 3,
+            ..StageAA1Plugin::default()
+        };
+        // The status pane reads the wall clock, so this run has to start on it.
+        let now_ms = now_unix_ms();
+        plugin.sweep = Some(Sweep {
+            phase: SweepPhase::Recording,
+            kind: SweepKind::Amplitude,
+            points: plugin.sweep_points(),
+            lock: None,
+            index: 0,
+            lease_id: LeaseId::new("test"),
+            lease_granted: true,
+            lease_req: 0,
+            owns_lease: false,
+            depth_req: 0,
+            depth_applied: true,
+            settled_since_ms: None,
+            settle_deadline_ms: 0,
+            point_started: true,
+            completed_ok: false,
+            last_activity_ms: now_ms,
+            stop_requested: false,
+            eta: Eta::new(now_ms),
+        });
+        plugin.freq_sweep = Some(FreqSweep {
+            phase: FreqSweepPhase::Recording,
+            mode: FreqSweepMode::DepthSweep,
+            points: vec![
+                FreqSweepPoint {
+                    frequency_hz: 10.0,
+                    is_reference: false,
+                },
+                FreqSweepPoint {
+                    frequency_hz: 20.0,
+                    is_reference: false,
+                },
+            ],
+            index: 0,
+            lease_id: LeaseId::new("test-ladder"),
+            lease_granted: true,
+            lease_req: 0,
+            freq_req: 0,
+            freq_applied: true,
+            confirm_deadline_ms: 0,
+            skip_reason: None,
+            failed: Vec::new(),
+            recorded: 0,
+            order: FreqOrder::default(),
+            seed: 1,
+            last_activity_ms: now_ms,
+            stop_requested: false,
+            eta: Eta::new(now_ms),
+        });
+
+        let lines: Vec<String> = plugin
+            .status_entries()
+            .iter()
+            .filter_map(|entry| match entry {
+                StatusEntry::Text(text) if text.starts_with("Estimated time:") => {
+                    Some(text.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(lines.len(), 1, "more than one estimate: {lines:?}");
+        // And it is the ladder's: both rungs, not just the three depths of the
+        // rung currently running.
+        let both_rungs = plugin.planned_rung_s(FreqSweepMode::DepthSweep, 10.0)
+            + plugin.planned_rung_s(FreqSweepMode::DepthSweep, 20.0);
+        assert!(
+            lines[0].contains(&format_duration(both_rungs)),
+            "the inner sweep's estimate won over the ladder's: {}",
+            lines[0]
+        );
     }
 
     /// The host writes its sensor telemetry beside the RAW and A1 moves the

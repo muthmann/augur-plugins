@@ -5,6 +5,7 @@
 //! photodiode plugins; this code only validates and analyses immutable inputs.
 
 mod csv;
+pub mod eta;
 pub mod phase;
 pub mod protocol;
 pub mod rates;

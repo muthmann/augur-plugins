@@ -141,7 +141,14 @@ impl Protocol {
 
     /// Total bench time the protocol asks for, settling included.
     pub fn total_seconds(&self) -> f64 {
-        self.points
+        self.remaining_seconds(0)
+    }
+
+    /// Bench time the points from `from` onwards still ask for, settling
+    /// included — what a run in progress has left of its *plan*, before the
+    /// bench's own overheads are added to it.
+    pub fn remaining_seconds(&self, from: usize) -> f64 {
+        self.points[from.min(self.points.len())..]
             .iter()
             .map(|point| point.duration_s as f64 + point.settle_s)
             .sum()

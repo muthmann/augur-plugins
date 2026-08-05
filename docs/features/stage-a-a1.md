@@ -31,7 +31,10 @@
   (the sensor readout travels with the measurement, column-wise),
   [ADR 029](../adr/029-stage-a-leases-are-renewed-against-the-granted-deadline.md)
   (a leased run heartbeats against the deadline the owner granted, so a point
-  longer than the owner's TTL cap no longer loses the drive mid-recording)
+  longer than the owner's TTL cap no longer loses the drive mid-recording),
+  [ADR 034](../adr/034-a1-time-estimates-are-the-plan-corrected-by-the-measured-pace.md)
+  (every long run says how much longer it has: the plan's own seconds, re-scaled
+  by the pace the bench is actually keeping)
 - **Automation roadmap:** [Stage-A A1 Automation](./stage-a-a1-automation.md)
 - **Second workflow:** [Stage-A A1 Exact Event Count](./stage-a-a1-event-count.md)
   — hold one *measured* depth `a₀` across the frequency sweep
@@ -296,6 +299,38 @@ its three.
 
 One lease covers the whole file. `plugins/stage-a-a1/protocols/example.toml` is
 a commented file to copy.
+
+### How long will this take? (ADR 034)
+
+Every run long enough to walk away from — the depth sweep, either mode of the
+frequency ladder, an `a₀` point, a protocol — states its remaining time on the
+button press and then keeps stating it, in one status line:
+
+```
+Estimated time: ≈ 41 min left of ≈ 1 h 5 min — done by 03:41 UTC
+```
+
+- **The plan is the starting point, the bench is the correction.** The first
+  number is what the run asks for (`duration_s + settle_s` per point, per row
+  for a protocol) plus a fixed allowance for the start/finalize handshake, and
+  it says of itself *(from the plan until the first point finishes)*. From the
+  first finished point on, the estimate is re-scaled by the pace the run is
+  actually keeping — settling, handshakes, `a₀` trials and all — so a survey
+  running at half speed says so within one point instead of in the morning.
+- **A ladder rung** is costed as the frequency retarget, the trigger
+  confirmation (four marker periods, so the low frequencies dominate), the `a₀`
+  lock where one runs at all, and then whatever the rung records.
+- **One line, for the run the operator started.** A ladder's estimate already
+  covers the inner depth sweep it is currently running, and a protocol covers
+  both.
+- **Skipped points count**, the estimate counts down inside the point in
+  flight, and the finish clock (shown above ten minutes) is UTC like every
+  filename this plugin writes.
+
+It is advisory only: nothing is skipped, shortened or refused because of an
+estimate. It is deliberately *not* the lease TTL, which is a worst case that
+must cover every remaining settle timeout and would quote half an hour for a
+five-minute sweep.
 
 ### Bench conditions on every run (ADR 022)
 
@@ -621,3 +656,11 @@ Two cover the nested sweep (ADR 023): the whole 2 × 3 block records every depth
 at every frequency in depth order, on exactly **one** lease acquisition, never
 entering the search phase and finishing with `2/2 frequencies × 3 depths`; and a
 nested point's file stem carries both axes (`…_f50Hz_p03`).
+
+Eight cover the time estimate (ADR 034): duration wording from seconds to hours;
+an unmeasured run reporting the plan and still counting down inside the point in
+flight; a finished point re-scaling what is left; the bounded pace correction;
+elapsed measured from the run start; a protocol stating its bench time on the
+button press *and* on the status pane, labelled as the plan; a sweep whose first
+point ran at half speed doubling the four points left; and exactly one estimate —
+the ladder's, not its inner sweep's — when both runs are live.
