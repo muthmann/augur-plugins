@@ -88,12 +88,36 @@ client's — to decide how much of it to grant.
 - A lease A1 loses anyway (owner restart, an operator disconnect) is not
   papered over. The heartbeat goes quiet because the owner's snapshot no longer
   names A1 as the holder, and the runner's own retarget reports the real
-  failure in its own words.
+  failure in its own words. See *Amendment* below for what "reports" turned out
+  to have to mean for a protocol.
 - Renewal replies are not routed to any runner. An unmatched `request_id`
   already falls through `on_service_reply` untouched, so a heartbeat cannot
   be mistaken for a point's retarget outcome.
 - The owners were left alone. Raising `MAX_LEASE_TTL_MS` to survey length would
   have fixed the symptom by deleting the safety property that motivated it.
+
+## Amendment (2026-08-10) — a protocol re-takes a lease it lost
+
+"Report the real failure in its own words" was the right instinct and the wrong
+end state for an unattended run. A rejected retarget is a *per-point* failure:
+the point is skipped, the run steps to the next one, and that one is rejected
+identically, because nothing about advancing the index gives the lease back. One
+expiry mid-survey therefore cost every row after it — a forty-point protocol
+reporting `3/40 recorded — 37 skipped (… the modulation owner requires an active
+automation lease)` after an hour on the bench.
+
+A protocol that is rejected with `LeaseRequired` / `LeaseExpired` /
+`LeaseMismatch` now re-acquires **the same lease id** — so it is that lease
+continuing rather than a second one — announces it on the status line, and
+repeats the point from the top, restating all three axes. Bounded to one retry
+per point: a lease the owner will not give back still ends as a named skip
+rather than a spin, and a lease held by *somebody else* (`LeaseBusy`) is never
+taken from them.
+
+This does not weaken the dead-man switch, and it does not hide the fault: the
+loss is stated when it happens, and the survey's own report still names it if
+the retry fails. What changed is that a recoverable interruption no longer
+costs the bench time of every point that follows it.
 
 ## Also fixed here
 

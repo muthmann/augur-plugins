@@ -105,7 +105,16 @@ Everything that records an `a` records which source produced it:
 
 `measured_a` keeps its historical meaning — a number the photodiode actually
 measured — so an open-loop run simply carries no `measured_a`, rather than
-carrying a commanded value under that name. A `q_p(a, f)` fit that pools the two
+carrying a commanded value under that name. The whole `[optical]` block follows
+it: an open-loop run measured none of those quantities, so the section is empty
+rather than absent-with-excuses, and **the sidecar is still written**. This is
+the point at which the implementation had drifted from the decision — the
+sidecar refused any run without a fresh optical summary "from a confirmed
+`I_tot` anchor", regardless of source, which made the commanded source unable to
+save a single recording on the very bench it exists for. A forty-point protocol
+drove every one of its points and threw them all away at metadata-save time.
+Whether a run *can* be described is now asked before the camera starts, not
+after it stops. A `q_p(a, f)` fit that pools the two
 sources without looking at `depth_a_source` would be pooling two different error
 budgets; the field is there so that cannot happen silently.
 

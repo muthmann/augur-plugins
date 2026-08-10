@@ -59,7 +59,7 @@ use stage_a_plugin_contract::{
     ClientId, ConnectionStateV1, LeaseId, LeaseSnapshotV1, ModulationCommandV1,
     ModulationRequestV1, ModulationStateV1, OpticalTargetV1, PdqReceiptV1, PdqStartSpecV1,
     PhotodiodeCommandV1, PhotodiodeOpticalSummaryV1, PhotodiodeRequestV1, PhotodiodeResponseV1,
-    PhotodiodeSummaryV1, RequestId, RunId, SemanticRevision, WaveformV1,
+    PhotodiodeSummaryV1, RequestId, RunId, SemanticRevision, ServiceErrorCodeV1, WaveformV1,
     CTX_STAGE_A_MODULATION_STATE_V1, CTX_STAGE_A_PHOTODIODE_SUMMARY_V1,
     SERVICE_STAGE_A_MODULATION_CONTROL_V1, SERVICE_STAGE_A_PHOTODIODE_CONTROL_V1,
 };
@@ -211,6 +211,25 @@ fn same_frequency(left: f64, right: f64) -> bool {
 
 fn frequency_label(hz: f64) -> String {
     format!("{hz:.3} Hz")
+}
+
+/// Whether a rejection means the owner no longer holds the lease the request
+/// was made under — as opposed to refusing the request on its merits.
+///
+/// The owners encode the code as the lower-cased variant name (see
+/// `stage-a-modulation`'s `rejected_service_reply`), so the comparison is built
+/// from the enum rather than from string literals: a renamed variant then fails
+/// to compile here instead of silently never matching again.
+fn lease_was_lost(code: &str) -> bool {
+    // `LeaseBusy` is deliberately absent: that one means somebody *else* holds
+    // the drive, and asking again would only take it from them.
+    [
+        ServiceErrorCodeV1::LeaseRequired,
+        ServiceErrorCodeV1::LeaseExpired,
+        ServiceErrorCodeV1::LeaseMismatch,
+    ]
+    .iter()
+    .any(|known| format!("{known:?}").to_ascii_lowercase() == code)
 }
 
 /// Upper-cases the first character, so a blocker written as a sentence fragment
@@ -868,6 +887,13 @@ struct ProtocolRun {
     /// Why the current point is being given up, when that was decided in a
     /// service reply rather than in the tick.
     skip_reason: Option<String>,
+    /// Set when the owner rejected a retarget because it no longer holds this
+    /// run's lease. The next tick asks for the lease again and repeats the
+    /// point; see [`StageAA1Plugin::reacquire_protocol_lease`].
+    reacquire_pending: bool,
+    /// The point a lease re-acquisition has already been spent on, so a lease
+    /// the owner will not give back costs one retry rather than looping.
+    lease_retry_index: Option<usize>,
     /// How much longer the survey has to go — see [`crate::eta`].
     eta: Eta,
 }
@@ -2286,6 +2312,32 @@ impl StageAA1Plugin {
         None
     }
 
+    /// Why this run could not write its config sidecar, phrased as the operator
+    /// action that fixes it. `None` means [`Self::write_sidecar`] will find
+    /// everything it needs.
+    ///
+    /// Only the **photodiode** source needs a measured optical summary. Under
+    /// [`DepthSource::Commanded`] the depth is the modulation owner's commanded
+    /// number, `[optical]` is legitimately absent, and ADR 020 is explicit that
+    /// such a run "simply carries no `measured_a`" rather than carrying a
+    /// commanded value under that name. Demanding one there made the open-loop
+    /// source — which exists precisely for a bench whose photodiode cannot
+    /// publish `a`, so no `I_tot` anchor can be confirmed — unable to save a
+    /// single recording: every row of a protocol ran to completion and was then
+    /// thrown away at metadata-save time.
+    fn sidecar_blocker(&self) -> Option<String> {
+        if self.depth_source != DepthSource::Photodiode {
+            return None;
+        }
+        // `photodiode_a_blocker` is `None` exactly when the fresh summary is
+        // present, and it already names both the gate and the way past it.
+        let reason = self.photodiode_a_blocker()?;
+        Some(format!(
+            "a quantitative A1 sidecar needs a fresh photodiode optical summary from a confirmed \
+             I_tot anchor — {reason}"
+        ))
+    }
+
     /// Kick off a coordinated recording by starting the camera first. Called
     /// on the control tick after a record button is pressed.
     fn begin_recording(&mut self, context: &mut impl RecordingControl, role: RecRole) {
@@ -2301,6 +2353,15 @@ impl StageAA1Plugin {
         // a stub RAW behind and no photodiode data.
         if let Some(blocker) = self.photodiode_blocker() {
             self.note(blocker);
+            return;
+        }
+        // The same rule, one step earlier. `write_sidecar` refuses a run it
+        // cannot describe, but it only runs once the recording is over — so a
+        // bench that could never satisfy it spent the whole duration, and every
+        // row of a protocol, before saying so. Refuse before the camera starts,
+        // where the reason still costs nothing.
+        if let Some(blocker) = self.sidecar_blocker() {
+            self.note(capitalize_first(&blocker));
             return;
         }
         let now_ms = now_unix_ms();
@@ -4681,6 +4742,13 @@ impl StageAA1Plugin {
             self.message = blocker;
             return;
         }
+        // Refuse the survey, not its 40th point: a bench that cannot describe a
+        // recording cannot describe any of them, and an unattended run has no
+        // one to read the first row's refusal.
+        if let Some(blocker) = self.sidecar_blocker() {
+            self.message = format!("Protocol refused — {blocker}");
+            return;
+        }
         let text = match std::fs::read_to_string(&path) {
             Ok(text) => text,
             Err(error) => {
@@ -4750,6 +4818,8 @@ impl StageAA1Plugin {
             last_activity_ms: now_ms,
             stop_requested: false,
             skip_reason: None,
+            reacquire_pending: false,
+            lease_retry_index: None,
             eta: Eta::new(now_ms),
         });
     }
@@ -4769,6 +4839,46 @@ impl StageAA1Plugin {
             }
         }
         self.message = message;
+    }
+
+    /// Ask the modulation owner for this run's lease again, after it rejected a
+    /// retarget because it no longer holds one.
+    ///
+    /// The owner drops a lease it considers expired and switches the output off
+    /// (ADR 029) — [`Self::drive_lease_heartbeat`] exists to prevent that, but
+    /// it can only renew a lease the owner still advertises, so anything that
+    /// ends the lease behind its back (an expiry the owner decided during a
+    /// long point, an owner that restarted) used to be terminal for the survey:
+    /// every remaining point was skipped with the owner's `LeaseRequired`. The
+    /// run keeps its lease *id*, so the re-acquisition is the same lease
+    /// continuing rather than a second one, and the granted phase re-sends this
+    /// point's three retargets unchanged.
+    fn reacquire_protocol_lease(&mut self, context: &mut impl RecordingControl) {
+        let Some(run) = self.protocol.as_ref() else {
+            return;
+        };
+        let lease_id = run.lease_id.clone();
+        let ttl_ms = Self::protocol_lease_ttl_ms(&run.plan, run.index);
+        let (index, total) = (run.index, run.plan.points.len());
+
+        let request =
+            self.modulation_request(ModulationCommandV1::AcquireLease { ttl_ms }, &lease_id);
+        let lease_req = request.request_id;
+        context.request_service(&request);
+
+        if let Some(run) = self.protocol.as_mut() {
+            run.reacquire_pending = false;
+            run.phase = ProtocolPhase::AcquiringLease;
+            run.lease_granted = false;
+            run.lease_req = lease_req;
+            run.pending_reqs.clear();
+            run.last_activity_ms = now_unix_ms();
+        }
+        self.message = format!(
+            "Protocol {}/{total}: the modulation lease was lost — re-acquiring it and repeating \
+             the point…",
+            index + 1
+        );
     }
 
     /// Renew the lease and retarget all three axes at the current point.
@@ -4916,7 +5026,15 @@ impl StageAA1Plugin {
             self.message = "A protocol is already running — press Stop to end it".into();
         }
         let now_ms = now_unix_ms();
-        let (phase, stop_requested, lease_granted, retargets_left, settle_until_ms, last_activity) = {
+        let (
+            phase,
+            stop_requested,
+            lease_granted,
+            retargets_left,
+            settle_until_ms,
+            last_activity,
+            reacquire_pending,
+        ) = {
             let run = self.protocol.as_ref().expect("run checked above");
             (
                 run.phase,
@@ -4925,6 +5043,7 @@ impl StageAA1Plugin {
                 run.pending_reqs.len(),
                 run.settle_until_ms,
                 run.last_activity_ms,
+                run.reacquire_pending,
             )
         };
 
@@ -4937,6 +5056,13 @@ impl StageAA1Plugin {
                 return;
             }
             self.advance_protocol(context);
+            return;
+        }
+
+        // Ahead of the phases: the point that was rejected has to be repeated
+        // from the top, whichever phase it was in when the lease went away.
+        if reacquire_pending {
+            self.reacquire_protocol_lease(context);
             return;
         }
 
@@ -5079,15 +5205,28 @@ impl StageAA1Plugin {
                     run.last_activity_ms = now_ms;
                 }
             }
-            PluginServiceOutcome::Rejected { message, .. } => {
-                // Carry the owner's own wording through to the skip message:
-                // "ū=0.90 rejected: peak exceeds the lobe ceiling" tells the
-                // operator which line of the file to fix, "retarget failed"
-                // does not.
+            PluginServiceOutcome::Rejected { code, message } => {
+                // A lease the owner no longer holds is not this point's fault,
+                // and it does not heal by moving to the next one: every
+                // remaining retarget is rejected identically, so a run that
+                // only skipped lost the whole rest of the survey to one expiry.
+                // Ask for the lease again and repeat the point — once, so a
+                // lease that is genuinely gone still ends the run rather than
+                // spinning on it.
+                let lease_lost = lease_was_lost(code);
                 if let Some(run) = self.protocol.as_mut() {
                     run.pending_reqs.clear();
-                    run.skip_reason = Some(message.clone());
                     run.last_activity_ms = now_ms;
+                    if lease_lost && run.lease_retry_index != Some(run.index) {
+                        run.lease_retry_index = Some(run.index);
+                        run.reacquire_pending = true;
+                    } else {
+                        // Carry the owner's own wording through to the skip
+                        // message: "ū=0.90 rejected: peak exceeds the lobe
+                        // ceiling" tells the operator which line of the file to
+                        // fix, "retarget failed" does not.
+                        run.skip_reason = Some(message.clone());
+                    }
                 }
             }
         }
@@ -5621,12 +5760,8 @@ impl StageAA1Plugin {
             .as_ref()
             .and_then(|state| state.optical_drive.as_ref());
         let optical = self.fresh_optical_summary();
-        if optical.is_none() {
-            return Err(
-                "cannot write a quantitative A1 sidecar without a fresh photodiode optical \
-                 summary from a confirmed I_tot anchor"
-                    .into(),
-            );
+        if let Some(blocker) = self.sidecar_blocker() {
+            return Err(blocker);
         }
         let roi = self.host_roi.unwrap_or_default();
 
@@ -7866,13 +8001,19 @@ mod tests {
     }
 
     fn rejected(request_id: u64, message: &str) -> PluginServiceReply {
+        rejected_with_code(request_id, "invalid_command", message)
+    }
+
+    /// A rejection carrying the owner's own code, encoded the way the owners
+    /// encode it on the wire — the lower-cased variant name.
+    fn rejected_with_code(request_id: u64, code: &str, message: &str) -> PluginServiceReply {
         PluginServiceReply {
             request_id,
             source_plugin_id: A1_PLUGIN_ID.into(),
             target_plugin_id: MODULATION_PLUGIN_ID.into(),
             service: SERVICE_STAGE_A_MODULATION_CONTROL_V1.into(),
             outcome: PluginServiceOutcome::Rejected {
-                code: "invalid_command".into(),
+                code: code.into(),
                 message: message.into(),
             },
         }
@@ -8688,43 +8829,27 @@ mod tests {
     }
 
     /// A photodiode summary that passes the pre-flight: connected, unleased,
-    /// and with somewhere to put the PDQ.
+    /// with somewhere to put the PDQ, and publishing the optical summary the
+    /// default (photodiode) depth source is recorded against — without it no
+    /// run can be described, so a fixture missing it is not a bench that could
+    /// record at all.
     fn ready_photodiode() -> PhotodiodeSummaryV1 {
-        PhotodiodeSummaryV1 {
-            contract_version: CONTRACT_VERSION_V1,
-            owner_instance: OwnerInstanceId::new("pd-test"),
-            service_revision: 1,
+        let mut summary = PhotodiodeSummaryV1 {
             connection: ConnectionStateV1::Connected {
                 port_label: "mock".into(),
                 firmware_version: None,
             },
-            lease: None,
-            active_run_id: None,
-            requested_revision: None,
-            acknowledged_revision: None,
-            stream: PhotodiodeStreamV1 {
-                stream_epoch: 1,
-                sample_range: None,
-                sample_rate_hz: Some(20_000),
-                latest_adc_code: Some(1_000),
-                integrity: StreamIntegrityV1::default(),
-                level: None,
-            },
             data_dir: Some("/pd".into()),
-            active_recording: None,
-            last_finalized_recording: None,
-            optical_summary: None,
-            optical_unavailable: None,
-            synchronization: SynchronizationV1::Unsynced {
-                reason: stage_a_plugin_contract::UnsyncedReasonV1::NoLease,
-                detail: None,
-            },
-            last_response: None,
-            freshness: FreshnessV1 {
-                observed_at_unix_ms: now_unix_ms(),
-                valid_for_ms: 60_000,
-            },
+            ..fresh_photodiode_summary()
+        };
+        // A protocol admits its plan against the estimator window at its lowest
+        // frequency, so this fixture needs a bench-sized window rather than the
+        // 8 ms one the 1 kHz fold tests are written around.
+        if let Some(optical) = summary.optical_summary.as_mut() {
+            optical.window_seconds = Some(2.0);
+            optical.covered_cycles = Some(50.0);
         }
+        summary
     }
 
     fn on(timestamp_us: u64) -> CameraEvent {
@@ -10811,6 +10936,155 @@ depth_a = 0.7
         let _ = std::fs::remove_dir_all(&folder);
     }
 
+    /// A lease the owner no longer holds is not the point's fault, and moving
+    /// to the next point does not heal it: every remaining retarget comes back
+    /// with the same `LeaseRequired`, so one expiry mid-survey used to cost
+    /// every row after it. The run asks for the lease back and repeats the
+    /// point instead.
+    #[test]
+    fn a_lost_modulation_lease_is_taken_again_and_the_point_repeated() {
+        let folder = temp_folder("protocol-lease-lost");
+        let (mut plugin, _) = protocol_plugin(&folder, TWO_POINT_PROTOCOL);
+        let mut sink = ControlSink::default();
+
+        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+        let lease_req = sink.services[0].request_id;
+        sink.services.clear();
+        control_tick(
+            &mut plugin,
+            inbox_with(vec![accepted(lease_req)]),
+            &mut sink,
+        );
+        let retarget = sink
+            .services
+            .iter()
+            .find(|request| {
+                matches!(
+                    modulation_command(request),
+                    Some(ModulationCommandV1::SetOperatingPoint { .. })
+                )
+            })
+            .expect("operating point retarget")
+            .request_id;
+
+        sink.services.clear();
+        control_tick(
+            &mut plugin,
+            inbox_with(vec![rejected_with_code(
+                retarget,
+                "leaserequired",
+                "the modulation owner requires an active automation lease",
+            )]),
+            &mut sink,
+        );
+
+        let retaken = sink
+            .services
+            .iter()
+            .find_map(|request| match modulation_command(request) {
+                Some(ModulationCommandV1::AcquireLease { .. }) => Some(request.request_id),
+                _ => None,
+            })
+            .expect("the run did not ask for the lease back");
+        let run = plugin.protocol.as_ref().expect("the run gave up");
+        assert_eq!(run.index, 0, "the point was skipped instead of repeated");
+        assert!(
+            run.failed.is_empty(),
+            "a lease loss was blamed on the point"
+        );
+        assert_eq!(run.phase, ProtocolPhase::AcquiringLease);
+
+        // Granted again, the point's three axes are commanded from the top.
+        sink.services.clear();
+        control_tick(&mut plugin, inbox_with(vec![accepted(retaken)]), &mut sink);
+        let commanded = sink
+            .services
+            .iter()
+            .filter(|request| {
+                matches!(
+                    modulation_command(request),
+                    Some(
+                        ModulationCommandV1::SetOperatingPoint { .. }
+                            | ModulationCommandV1::SetDriveFrequency { .. }
+                            | ModulationCommandV1::SetOpticalDepth { .. }
+                    )
+                )
+            })
+            .count();
+        assert_eq!(
+            commanded, 3,
+            "the repeated point did not restate all three axes"
+        );
+
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// One retry per point, not a loop: a lease that is genuinely gone must
+    /// still end up as a named skip rather than spinning the survey forever.
+    #[test]
+    fn a_lease_the_owner_will_not_give_back_costs_one_retry_then_skips() {
+        let folder = temp_folder("protocol-lease-gone");
+        let (mut plugin, _) = protocol_plugin(&folder, TWO_POINT_PROTOCOL);
+        let mut sink = ControlSink::default();
+
+        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+        let lease_req = sink.services[0].request_id;
+        sink.services.clear();
+        control_tick(
+            &mut plugin,
+            inbox_with(vec![accepted(lease_req)]),
+            &mut sink,
+        );
+
+        let mut retaken = 0;
+        for _ in 0..2 {
+            let retarget = sink
+                .services
+                .iter()
+                .find(|request| {
+                    matches!(
+                        modulation_command(request),
+                        Some(ModulationCommandV1::SetOperatingPoint { .. })
+                    )
+                })
+                .expect("operating point retarget")
+                .request_id;
+            sink.services.clear();
+            control_tick(
+                &mut plugin,
+                inbox_with(vec![rejected_with_code(
+                    retarget,
+                    "leaserequired",
+                    "the modulation owner requires an active automation lease",
+                )]),
+                &mut sink,
+            );
+            if let Some(id) =
+                sink.services
+                    .iter()
+                    .find_map(|request| match modulation_command(request) {
+                        Some(ModulationCommandV1::AcquireLease { .. }) => Some(request.request_id),
+                        _ => None,
+                    })
+            {
+                retaken += 1;
+                sink.services.clear();
+                control_tick(&mut plugin, inbox_with(vec![accepted(id)]), &mut sink);
+            }
+        }
+
+        assert_eq!(retaken, 1, "the run kept asking for the same lease");
+        let run = plugin.protocol.as_ref().expect("the run aborted");
+        assert_eq!(run.index, 1, "the run did not move on to the second point");
+        let (_, reason) = run.failed.last().expect("the skip was recorded");
+        assert!(
+            reason.contains("automation lease"),
+            "the owner's reason was replaced: {reason}"
+        );
+
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
     /// A protocol whose file is wrong must say so on the button press, before
     /// the drive has moved — the whole point is that it runs unattended.
     #[test]
@@ -11369,6 +11643,119 @@ bias_refr_code,status,error\n\
         assert!(text.contains("[files]"));
         assert!(text.contains("camera_config_sidecar = \"/data/A1-test/A1-test.toml\""));
         let _ = std::fs::remove_file(&doc);
+    }
+
+    /// ADR 020's open-loop source exists for a bench whose photodiode cannot
+    /// publish `a` at all — no phase-0 markers, so no `I_tot` anchor can be
+    /// confirmed. The sidecar demanded one anyway, which made that source
+    /// unable to save a single recording: a survey drove all forty of its
+    /// points and threw every one of them away at metadata-save time.
+    #[test]
+    fn an_open_loop_run_saves_its_sidecar_without_a_photodiode_anchor() {
+        let mut plugin = plugin_with_markers();
+        plugin.depth_source = DepthSource::Commanded;
+        plugin.modulation = Some(commanded_modulation(1, 0.7));
+        // The bench that forces the open-loop source in the first place: the
+        // detector is connected and streaming, and publishes no `a`.
+        if let Some(state) = plugin.photodiode.as_mut() {
+            state.optical_summary = None;
+            state.optical_unavailable =
+                Some("no stretch of samples covers two whole modulation cycles".into());
+        }
+        plugin.recording.id = "A1-open-loop".into();
+        plugin.recording.stem = "A1-open-loop_20260810-000000".into();
+        plugin.recording.folder = std::env::temp_dir().display().to_string();
+
+        assert!(
+            plugin.sidecar_blocker().is_none(),
+            "an open-loop run was refused: {:?}",
+            plugin.sidecar_blocker()
+        );
+        let doc = plugin
+            .write_sidecar()
+            .expect("an open-loop run must be describable");
+        let text = std::fs::read_to_string(&doc).expect("read sidecar");
+        assert!(
+            text.contains("depth_a_source = \"modulation_commanded\""),
+            "{text}"
+        );
+        assert!(text.contains("depth_a = 0.7"), "{text}");
+        // …and it claims nothing the photodiode did not measure: `measured_a`
+        // keeps its historical meaning, so an open-loop run simply carries none.
+        assert!(!text.contains("measured_a"), "{text}");
+        assert!(!text.contains("total_power_anchor_id"), "{text}");
+
+        let _ = std::fs::remove_file(&doc);
+    }
+
+    /// The photodiode source still needs its anchor — but the refusal belongs
+    /// *before* the camera rolls. It used to arrive from `write_sidecar`, after
+    /// the recording had already run its full duration.
+    #[test]
+    fn a_run_that_could_not_be_described_is_refused_before_the_camera_starts() {
+        let folder = temp_folder("no-anchor");
+        let mut plugin = plugin_with_markers();
+        plugin.output_folder = folder.display().to_string();
+        plugin.modulation = Some(connected_modulation());
+        if let Some(state) = plugin.photodiode.as_mut() {
+            state.optical_summary = None;
+            state.optical_unavailable = Some("0 trigger(s) in the last 3446784 samples".into());
+        }
+        let mut sink = ControlSink::default();
+
+        plugin.begin_recording(&mut sink, RecRole::Normal);
+
+        assert_eq!(
+            plugin.recording.phase,
+            RecPhase::Idle,
+            "the camera was started for a run that could never be saved"
+        );
+        assert!(
+            sink.hosts.is_empty(),
+            "the camera was commanded: {:?}",
+            sink.hosts
+        );
+        assert!(
+            plugin.message.contains("I_tot anchor"),
+            "the refusal does not name what is missing: {}",
+            plugin.message
+        );
+        assert!(
+            plugin.message.contains("Depth a source"),
+            "the refusal does not name the way past it: {}",
+            plugin.message
+        );
+
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// And a whole survey is refused at the press, not one row at a time: an
+    /// unattended run has nobody to read the first row's refusal.
+    #[test]
+    fn a_protocol_is_refused_when_no_row_of_it_could_be_described() {
+        let folder = temp_folder("protocol-no-anchor");
+        let (mut plugin, _) = protocol_plugin(&folder, TWO_POINT_PROTOCOL);
+        if let Some(state) = plugin.photodiode.as_mut() {
+            state.optical_summary = None;
+            state.optical_unavailable = Some("0 trigger(s) in the last 3446784 samples".into());
+        }
+        let mut sink = ControlSink::default();
+
+        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+
+        assert!(plugin.protocol.is_none(), "the survey started anyway");
+        assert!(
+            sink.services.is_empty(),
+            "the drive was taken for a survey that cannot be saved: {:?}",
+            sink.services
+        );
+        assert!(
+            plugin.message.contains("Protocol refused") && plugin.message.contains("I_tot anchor"),
+            "{}",
+            plugin.message
+        );
+
+        let _ = std::fs::remove_dir_all(&folder);
     }
 
     #[test]

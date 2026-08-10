@@ -390,6 +390,16 @@ quantitative A1 sidecar without a fresh photodiode optical summary`, and a
 `Camera: … no trigger signal` line that looked exactly like an unplugged
 `EXT_TRIGGER` cable but was the drive being off.
 
+**A lease lost anyway is taken again, once per point** (ADR 029). The heartbeat
+can only renew what the owner still advertises, so a lease that ends behind its
+back — an expiry the owner decided during a long point, an owner that restarted
+— left every remaining retarget rejected with `the modulation owner requires an
+active automation lease`. Reporting that per point meant one expiry cost the
+whole rest of the survey. A protocol now re-acquires its lease (same lease id,
+so it is the same lease continuing), says so on the status line, and repeats the
+point from the top. One retry per point: a lease the owner will not give back
+still ends as a named skip rather than a spin.
+
 **Naming.** Files share an `<id>_<timestamp>[_role][_point]` stem under an `<id>/`
 subfolder:
 
@@ -453,7 +463,10 @@ internal `u_g`/`u_c`, requested `a`, `V_null` and `V_peak`); the depth this run
 was driven and judged by with its provenance (`depth_a`, `depth_a_source`); the
 photodiode-measured `a`, extrema, geometric pedestal,
 headroom, clip fractions, ADC id, and the learned `I_tot` anchor with its
-provenance (ADR 024); ROI +
+provenance (ADR 024) — the whole `[optical]` block being present only for a
+**photodiode-sourced** run, since an open-loop one measured none of it and
+records no `measured_a` rather than a commanded value under that name (ADR 020);
+ROI +
 masked-pixel count + `N_valid`; the `[sensor]` bench conditions (die temperature,
 pixel dead time, illumination — ADR 022);
 trigger info (marker-anchored, marker count,
@@ -462,6 +475,16 @@ sidecar), the PDQ (+ its sidecar) and the `sensor_readout`. The **pilot** run
 additionally records the frozen ON/OFF windows and the **background** run the
 floor `q0`, so returning to a measurement (folder + id) auto-reloads them for
 the `q_p` plot.
+
+**What the sidecar needs is checked before the camera rolls, not after.** A
+photodiode-sourced run cannot be described without a fresh optical summary from
+a confirmed `I_tot` anchor, and that used to be discovered by `write_sidecar` —
+i.e. once the recording had already run its full duration, and, in a protocol,
+once every row of the survey had. The same question is now asked in
+`begin_recording` (the row is refused before the camera and the PDQ start) and
+in `begin_protocol` (the whole survey is refused at the press), phrased as the
+photodiode owner's own reason plus the way past it — switch **Depth `a` source**
+to the commanded drive and work open loop.
 
 **Mechanism.** A small control-plane state machine in `process_control` starts
 the host camera recorder first and waits for its receipt. Only after the host
