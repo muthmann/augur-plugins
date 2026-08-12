@@ -9,7 +9,6 @@ min_augur_version = "1.0.0"
 host_commands = [
   "start_recording",
   "stop_recording",
-  "apply_biases",
   "apply_camera_configuration",
   "restore_camera_configuration",
 ]

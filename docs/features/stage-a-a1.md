@@ -59,7 +59,8 @@ A1 has two jobs on the Stage-A bench, both deliberately thin:
 
 A1 owns no hardware and never opens the Teensy or camera directly. The optical
 drive remains owned by the modulation plugin and camera settings remain owned
-by the host; A1 can retarget them only through their allowlisted control paths.
+by the host; A1 retargets them only through declared, generic control
+capabilities.
 
 ## The recording workflow
 
@@ -387,6 +388,13 @@ resolved versioned snapshot and profile provenance, the point's requested
 `status = "confirmed"`. The same profile name/revision/hash and point values are
 sent in recorder metadata, so the RAW, PDQ, and A1 sidecar identify one immutable
 configuration even if the saved profile later changes.
+
+A1 applies the initial configuration and each point through the same generic
+complete-snapshot host command. For a bias point it clones the last confirmed
+snapshot and changes only `diff_on`/`diff_off`; no A1- or bias-specific command
+exists in the recorder. A1 checks its own scientific requirements (sensor
+telemetry on, STC and Trail off) and starts recording automatically after the
+host returns a fresh matching sensor readback.
 
 For manual recordings A1 never drives the Teensy: set the drive (high `a` for
 the pilot, `a≈0` for the background) in the modulation plugin, then press the

@@ -210,7 +210,15 @@ one named profile or one complete versioned inline snapshot.
 Plugin camera changes are applied immediately by the host and shown as applied
 settings; no extra user Apply click is required. A1 records only after a fresh
 sensor readback confirms the codes and restores the pre-run settings on success,
-Stop, or abort. Missing/disabled Sensor reading fails closed.
+Stop, or abort. A rejected or timed-out restore is retried up to three times and
+is never reported as successful without confirmation. Missing/disabled Sensor
+reading fails closed.
+
+The host command always carries a complete camera snapshot. For a point, A1
+clones the last confirmed snapshot and changes only `diff_on`/`diff_off`, so the
+remaining biases, ROI, mask, filters, trigger, and global settings stay explicit
+and unchanged. A1 itself rejects confirmed configurations with sensor telemetry
+off or STC/Trail on; these experiment rules are not built into the recorder.
 
 The current firmware-qualified drive range is 0.01 Hz to 2 kHz. A1 also
 requires at least 16 photodiode samples per cycle: 1.25 kHz at 20 kSa/s and
