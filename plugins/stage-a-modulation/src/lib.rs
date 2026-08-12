@@ -47,7 +47,8 @@ use stage_a_plugin_contract::{
     PhotodiodeLevelV1, PhotodiodeSummaryV1, RequestOutcomeV1, ResponseCommonV1, RunId,
     SemanticRevision, ServiceErrorCodeV1, ServiceErrorV1, SynchronizationV1, UnsyncedReasonV1,
     WaveformV1, CONTRACT_VERSION_V1, CTX_STAGE_A_MODULATION_STATE_V1,
-    CTX_STAGE_A_PHOTODIODE_SUMMARY_V1, PLUGIN_ID_STAGE_A_MODULATION, PLUGIN_ID_STAGE_A_PHOTODIODE,
+    CTX_STAGE_A_PHOTODIODE_SUMMARY_V1, DRIVE_FREQUENCY_MAX_MILLIHZ, DRIVE_FREQUENCY_MIN_MILLIHZ,
+    PLUGIN_ID_STAGE_A_MODULATION, PLUGIN_ID_STAGE_A_PHOTODIODE,
     SERVICE_STAGE_A_MODULATION_CONTROL_V1,
 };
 
@@ -1256,7 +1257,11 @@ impl StageAModulationPlugin {
     /// (`send_modulation`) and the leased `SetOpticalDepth` service command.
     fn drive_command(&self) -> Result<Command, String> {
         let (lo, hi, hold) = self.dac_band()?;
-        let freq_mhz = (self.frequency_hz.clamp(0.01, 2_000.0) * 1_000.0).round() as i64;
+        let freq_mhz = (self.frequency_hz.clamp(
+            DRIVE_FREQUENCY_MIN_MILLIHZ as f64 / 1_000.0,
+            DRIVE_FREQUENCY_MAX_MILLIHZ as f64 / 1_000.0,
+        ) * 1_000.0)
+            .round() as i64;
         Ok(match self.mode {
             Mode::Const => Command::new("MOD")
                 .field("wave", "CONST")
@@ -2087,12 +2092,13 @@ impl StageAModulationPlugin {
                 let frequency_hz = *frequency_millihz as f64 / 1_000.0;
                 // The same band `drive_command` clamps to; refuse rather than
                 // silently record a different frequency than the one asked for.
-                if !(0.01..=2_000.0).contains(&frequency_hz) {
+                if !stage_a_plugin_contract::drive_frequency_supported(*frequency_millihz) {
                     return Err(service_error(
                         ServiceErrorCodeV1::InvalidCommand,
                         format!(
-                            "frequency {frequency_hz:.3} Hz outside the supported \
-                             0.01..=2000 Hz"
+                            "frequency {frequency_hz:.3} Hz outside the supported {:.2}..={} Hz",
+                            DRIVE_FREQUENCY_MIN_MILLIHZ as f64 / 1_000.0,
+                            DRIVE_FREQUENCY_MAX_MILLIHZ / 1_000
                         ),
                         false,
                     ));
@@ -3150,10 +3156,14 @@ impl Plugin for StageAModulationPlugin {
             SettingItem {
                 key: "frequency_hz".into(),
                 label: "Frequency".into(),
-                tooltip: Some("Periodic-waveform frequency, 0.01–2000 Hz".into()),
+                tooltip: Some(format!(
+                    "Periodic-waveform frequency, {:.2}–{} Hz",
+                    DRIVE_FREQUENCY_MIN_MILLIHZ as f64 / 1_000.0,
+                    DRIVE_FREQUENCY_MAX_MILLIHZ / 1_000
+                )),
                 kind: SettingKind::F64Drag {
-                    min: 0.01,
-                    max: 2_000.0,
+                    min: DRIVE_FREQUENCY_MIN_MILLIHZ as f64 / 1_000.0,
+                    max: DRIVE_FREQUENCY_MAX_MILLIHZ as f64 / 1_000.0,
                     speed: 1.0,
                     default: self.frequency_hz,
                 },
@@ -3522,7 +3532,10 @@ impl Plugin for StageAModulationPlugin {
             }
             "frequency_hz" => {
                 let hz = value.as_f64().ok_or("frequency_hz must be a number")?;
-                self.frequency_hz = hz.clamp(0.01, 2_000.0);
+                self.frequency_hz = hz.clamp(
+                    DRIVE_FREQUENCY_MIN_MILLIHZ as f64 / 1_000.0,
+                    DRIVE_FREQUENCY_MAX_MILLIHZ as f64 / 1_000.0,
+                );
                 if self.mode.is_periodic() {
                     self.send_modulation();
                 }

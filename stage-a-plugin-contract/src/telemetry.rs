@@ -5,10 +5,10 @@
 //! `<raw-stem>.sensor-monitoring.csv` next to the RAW. Two things are wrong
 //! with keeping that file as it is:
 //!
-//! 1. **It stays behind.** A1 gathers the camera RAW, its bias sidecar, the
-//!    photodiode PDQ and the description file into one measurement folder
-//!    under one name; the telemetry did not travel with them, so the bench
-//!    conditions of a run were separated from the run at the first `mv`.
+//! 1. **It stays behind.** A workflow gathers the camera RAW, its bias sidecar
+//!    and the description file into one measurement folder under one name; the
+//!    telemetry did not travel with them, so the bench conditions of a run were
+//!    separated from the run at the first `mv`.
 //!
 //! 2. **It is a wide table of mostly-empty cells.** The channels are polled on
 //!    different schedules — the die temperature drifts over minutes, the pixel
@@ -25,8 +25,13 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-/// Schema tag written into every readout file.
-pub const SCHEMA: &str = "stage-a.a1.sensor.v1";
+/// Schema tag for A1's readout files.
+pub const SCHEMA_A1: &str = "stage-a.a1.sensor.v1";
+
+/// Schema tag for A4's readout files. The layout is identical; the tag names
+/// the workflow that produced the file so a folder of mixed measurements is
+/// still self-describing.
+pub const SCHEMA_A4: &str = "stage-a.a4.sensor.v1";
 
 /// One channel's samples, in acquisition order.
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -83,10 +88,10 @@ impl SensorReadout {
     /// each: these files are read by eye as often as by script, and a pretty
     /// printer puts one number per line — thousands of lines for what is
     /// conceptually one row.
-    pub fn to_json(&self, measurement_id: &str, recording_stem: &str) -> String {
+    pub fn to_json(&self, schema: &str, measurement_id: &str, recording_stem: &str) -> String {
         let mut out = String::with_capacity(1_024 + self.polls * 24);
         out.push_str("{\n");
-        let _ = writeln!(out, "  \"schema\": \"{SCHEMA}\",");
+        let _ = writeln!(out, "  \"schema\": {},", json_string(schema));
         let _ = writeln!(
             out,
             "  \"measurement_id\": {},",
@@ -315,7 +320,7 @@ bias_refr_code,status,error";
             assert!(!name.starts_with("bias"), "bias channel survived: {name}");
         }
         let parsed: serde_json::Value =
-            serde_json::from_str(&readout.to_json("m", "s")).expect("valid JSON");
+            serde_json::from_str(&readout.to_json(SCHEMA_A1, "m", "s")).expect("valid JSON");
         let channels = parsed["channels"].as_object().expect("channels object");
         assert!(
             channels.keys().all(|name| !name.starts_with("bias")),
@@ -386,10 +391,10 @@ bias_refr_code,status,error";
             "1,1,full,1000,1200,0,0,140.0,41.5,12.7,,,,,,ok,",
             "1,2,fast,2000,2200,0,0,,,12.8,,,,,,ok,",
         ]);
-        let json = parse_csv(&text).to_json("meas-1", "meas-1_20260731T120000Z");
+        let json = parse_csv(&text).to_json(SCHEMA_A1, "meas-1", "meas-1_20260731T120000Z");
 
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
-        assert_eq!(parsed["schema"], SCHEMA);
+        assert_eq!(parsed["schema"], SCHEMA_A1);
         assert_eq!(parsed["measurement_id"], "meas-1");
         assert_eq!(parsed["polls"], 2);
         assert_eq!(parsed["channels"]["pixel_dead_time_us"]["value"][1], 12.8);
@@ -411,7 +416,7 @@ bias_refr_code,status,error";
         let readout = parse_csv(&text);
         assert_eq!(readout.faults[0].message, "a, b, \"c\"");
         let parsed: serde_json::Value =
-            serde_json::from_str(&readout.to_json("m", "s")).expect("valid JSON");
+            serde_json::from_str(&readout.to_json(SCHEMA_A1, "m", "s")).expect("valid JSON");
         assert_eq!(parsed["faults"][0]["message"], "a, b, \"c\"");
     }
 }
