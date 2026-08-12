@@ -60,7 +60,10 @@ pub const MAX_POINTS: usize = 4_096;
 /// still see which line was wrong.
 const DEPTH_A_RANGE: (f64, f64) = (0.01, 6.0);
 const MEAN_U_RANGE: (f64, f64) = (0.01, 1.0);
-const FREQUENCY_RANGE: (f64, f64) = (0.01, 2_000.0);
+const FREQUENCY_RANGE: (f64, f64) = (
+    stage_a_plugin_contract::DRIVE_FREQUENCY_MIN_MILLIHZ as f64 / 1_000.0,
+    stage_a_plugin_contract::DRIVE_FREQUENCY_MAX_MILLIHZ as f64 / 1_000.0,
+);
 const DURATION_RANGE: (i64, i64) = (1, 3_600);
 const SETTLE_RANGE: (f64, f64) = (0.0, 60.0);
 
@@ -102,6 +105,10 @@ pub struct ProtocolPoint {
     pub duration_s: i64,
     pub settle_s: f64,
     pub role: PointRole,
+    /// Optional per-point contrast-threshold offsets. These are the host's
+    /// canonical `diff_on`/`diff_off` values, not absolute sensor codes.
+    pub diff_on: Option<i32>,
+    pub diff_off: Option<i32>,
 }
 
 impl ProtocolPoint {
@@ -121,6 +128,13 @@ impl ProtocolPoint {
 pub struct Protocol {
     pub name: String,
     pub points: Vec<ProtocolPoint>,
+    pub camera: Option<CameraSelection>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum CameraSelection {
+    NamedProfile(String),
+    Snapshot(augur_plugin_api::CameraConfigurationSnapshotV1),
 }
 
 impl Protocol {
@@ -190,6 +204,16 @@ struct ProtocolDoc {
     defaults: Defaults,
     #[serde(default, rename = "block")]
     blocks: Vec<BlockDoc>,
+    #[serde(default)]
+    camera: Option<CameraDoc>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CameraDoc {
+    #[serde(default)]
+    profile: Option<String>,
+    #[serde(default)]
+    snapshot: Option<augur_plugin_api::CameraConfigurationSnapshotV1>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -198,6 +222,10 @@ struct Defaults {
     duration_s: Option<i64>,
     #[serde(default)]
     settle_s: Option<f64>,
+    #[serde(default)]
+    diff_on: Option<i32>,
+    #[serde(default)]
+    diff_off: Option<i32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -211,6 +239,10 @@ struct BlockDoc {
     duration_s: Option<i64>,
     #[serde(default)]
     settle_s: Option<f64>,
+    #[serde(default)]
+    diff_on: Option<i32>,
+    #[serde(default)]
+    diff_off: Option<i32>,
 }
 
 /// One axis: an explicit list, a single value, or a generated range.
@@ -311,11 +343,28 @@ fn strip_bom(text: &str) -> &str {
 
 /// Parses a protocol and expands it into the points to record.
 pub fn parse(text: &str) -> Result<Protocol, ProtocolError> {
-    let doc: ProtocolDoc = toml::from_str(strip_bom(text))
-        .map_err(|error| ProtocolError::Toml(error.to_string()))?;
+    let doc: ProtocolDoc =
+        toml::from_str(strip_bom(text)).map_err(|error| ProtocolError::Toml(error.to_string()))?;
 
     let default_duration = doc.defaults.duration_s.unwrap_or(10);
     let default_settle = doc.defaults.settle_s.unwrap_or(2.0);
+    let camera = match doc.camera {
+        None => None,
+        Some(CameraDoc {
+            profile: Some(profile),
+            snapshot: None,
+        }) if !profile.trim().is_empty() => Some(CameraSelection::NamedProfile(profile)),
+        Some(CameraDoc {
+            profile: None,
+            snapshot: Some(snapshot),
+        }) => Some(CameraSelection::Snapshot(snapshot)),
+        Some(_) => {
+            return Err(ProtocolError::Invalid {
+                what: "camera".into(),
+                detail: "provide exactly one non-empty profile or snapshot".into(),
+            });
+        }
+    };
 
     let mut points = Vec::new();
     // Blocks may be named or not; unnamed ones get a stable positional name so
@@ -357,6 +406,10 @@ pub fn parse(text: &str) -> Result<Protocol, ProtocolError> {
                 ),
             });
         }
+        let diff_on = block.diff_on.or(doc.defaults.diff_on);
+        let diff_off = block.diff_off.or(doc.defaults.diff_off);
+        validate_bias("diff_on", diff_on)?;
+        validate_bias("diff_off", diff_off)?;
 
         let mean_u = block
             .mean_u
@@ -380,6 +433,8 @@ pub fn parse(text: &str) -> Result<Protocol, ProtocolError> {
                         duration_s,
                         settle_s,
                         role: PointRole::Normal,
+                        diff_on,
+                        diff_off,
                     });
                     if points.len() > MAX_POINTS {
                         return Err(ProtocolError::TooManyPoints(points.len()));
@@ -398,6 +453,7 @@ pub fn parse(text: &str) -> Result<Protocol, ProtocolError> {
             .filter(|name| !name.trim().is_empty())
             .unwrap_or_else(|| "protocol".to_owned()),
         points,
+        camera,
     })
 }
 
@@ -439,7 +495,15 @@ pub fn parse_file(path: &str, text: &str) -> Result<Protocol, ProtocolError> {
 /// Columns a protocol CSV may carry. `mean_u`, `frequency_hz` and `depth_a` are
 /// required; the rest fall back to their defaults.
 const CSV_REQUIRED: [&str; 3] = ["mean_u", "frequency_hz", "depth_a"];
-const CSV_OPTIONAL: [&str; 4] = ["duration_s", "settle_s", "label", "role"];
+const CSV_OPTIONAL: [&str; 7] = [
+    "duration_s",
+    "settle_s",
+    "label",
+    "role",
+    "camera_profile",
+    "diff_on",
+    "diff_off",
+];
 
 /// Parses the row-per-recording CSV form.
 ///
@@ -454,6 +518,7 @@ const CSV_OPTIONAL: [&str; 4] = ["duration_s", "settle_s", "label", "role"];
 pub fn parse_csv(text: &str) -> Result<Protocol, ProtocolError> {
     let mut header: Option<Vec<String>> = None;
     let mut points = Vec::new();
+    let mut camera_profile: Option<String> = None;
 
     // `lines()` already absorbs CRLF; the BOM is the part it leaves behind.
     for (offset, raw) in strip_bom(text).lines().enumerate() {
@@ -548,6 +613,35 @@ pub fn parse_csv(text: &str) -> Result<Protocol, ProtocolError> {
                 ),
             })?;
         let label = cell("label").unwrap_or("").trim().to_owned();
+        let row_profile = cell("camera_profile").unwrap_or("").trim();
+        if !row_profile.is_empty() {
+            match &camera_profile {
+                Some(existing) if existing != row_profile => {
+                    return Err(ProtocolError::Invalid {
+                        what: format!("line {line_no}: camera_profile"),
+                        detail: format!(
+                            "'{row_profile}' differs from the series profile '{existing}'"
+                        ),
+                    });
+                }
+                None => camera_profile = Some(row_profile.to_owned()),
+                _ => {}
+            }
+        }
+        let parse_bias = |name: &str| -> Result<Option<i32>, ProtocolError> {
+            let raw = cell(name).unwrap_or("");
+            if raw.is_empty() {
+                return Ok(None);
+            }
+            let value = raw.parse::<i32>().map_err(|_| ProtocolError::Invalid {
+                what: format!("line {line_no}: {name}"),
+                detail: format!("'{raw}' is not a signed integer offset"),
+            })?;
+            validate_bias(&format!("line {line_no}: {name}"), Some(value))?;
+            Ok(Some(value))
+        };
+        let diff_on = parse_bias("diff_on")?;
+        let diff_off = parse_bias("diff_off")?;
 
         points.push(ProtocolPoint {
             block: if label.is_empty() {
@@ -561,6 +655,8 @@ pub fn parse_csv(text: &str) -> Result<Protocol, ProtocolError> {
             duration_s,
             settle_s,
             role,
+            diff_on,
+            diff_off,
         });
         if points.len() > MAX_POINTS {
             return Err(ProtocolError::TooManyPoints(points.len()));
@@ -583,7 +679,18 @@ pub fn parse_csv(text: &str) -> Result<Protocol, ProtocolError> {
     Ok(Protocol {
         name: "protocol".to_owned(),
         points,
+        camera: camera_profile.map(CameraSelection::NamedProfile),
     })
+}
+
+fn validate_bias(what: &str, value: Option<i32>) -> Result<(), ProtocolError> {
+    if let Some(value) = value.filter(|value| !(-85..=140).contains(value)) {
+        return Err(ProtocolError::Invalid {
+            what: what.to_owned(),
+            detail: format!("{value} is outside the supported -85..=140 offset range"),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -689,6 +796,122 @@ duration_s = 30
         assert_eq!(ladder.duration_s, 30);
         // settle_s was not overridden, so the default still applies.
         assert!((ladder.settle_s - 1.5).abs() < f64::EPSILON);
+        assert_eq!(protocol.camera, None);
+        assert!(protocol
+            .points
+            .iter()
+            .all(|point| point.diff_on.is_none() && point.diff_off.is_none()));
+    }
+
+    #[test]
+    fn a_named_camera_profile_and_canonical_bias_offsets_are_parsed() {
+        let protocol = parse(
+            r#"
+name = "camera-series"
+
+[camera]
+profile = "A1 low noise"
+
+[defaults]
+diff_on = 12
+diff_off = -7
+
+[[block]]
+name = "first"
+mean_u = 0.5
+frequency_hz = 10.0
+depth_a = 0.5
+
+[[block]]
+name = "override"
+mean_u = 0.5
+frequency_hz = 20.0
+depth_a = 0.5
+diff_on = 20
+"#,
+        )
+        .expect("camera protocol");
+        assert_eq!(
+            protocol.camera,
+            Some(CameraSelection::NamedProfile("A1 low noise".into()))
+        );
+        assert_eq!(protocol.points[0].diff_on, Some(12));
+        assert_eq!(protocol.points[0].diff_off, Some(-7));
+        assert_eq!(protocol.points[1].diff_on, Some(20));
+        assert_eq!(protocol.points[1].diff_off, Some(-7));
+    }
+
+    #[test]
+    fn out_of_range_bias_offsets_are_refused_before_the_run() {
+        let error = parse(
+            r#"
+[[block]]
+mean_u = 0.5
+frequency_hz = 10.0
+depth_a = 0.5
+diff_on = 141
+"#,
+        )
+        .expect_err("invalid bias");
+        assert!(error.to_string().contains("diff_on"), "{error}");
+        assert!(error.to_string().contains("-85..=140"), "{error}");
+    }
+
+    #[test]
+    fn an_inline_camera_snapshot_roundtrips_through_toml() {
+        let protocol = parse(
+            r#"
+[camera.snapshot]
+schema_version = 1
+masked_pixels = [[3, 4]]
+
+[camera.snapshot.biases]
+diff_on = 12
+diff_off = -7
+fo = 0
+hpf = 0
+refr = 0
+
+[camera.snapshot.roi]
+x = 0
+y = 0
+width = 1280
+height = 720
+
+[camera.snapshot.digital_filter]
+stc_enabled = false
+stc_threshold_us = 0
+trail_enabled = false
+
+[camera.snapshot.external_trigger]
+enabled = false
+channel = 0
+
+[camera.snapshot.global]
+nm_per_pixel = 1000.0
+pixel_scale_calibrated = true
+sensor_width = 1280
+sensor_height = 720
+acq_time_ms = 1
+event_store_budget_mib = 512
+preview_interval_ms = 16
+point_cloud_interval_ms = 50
+disk_writer_buffer_mib = 64
+record_sensor_telemetry = true
+
+[[block]]
+mean_u = 0.5
+frequency_hz = 10.0
+depth_a = 0.5
+"#,
+        )
+        .expect("inline snapshot protocol");
+        let Some(CameraSelection::Snapshot(snapshot)) = protocol.camera else {
+            panic!("inline snapshot was not selected");
+        };
+        assert_eq!(snapshot.biases.diff_on, 12);
+        assert!(snapshot.global.record_sensor_telemetry);
+        assert_eq!(snapshot.masked_pixels, vec![(3, 4)]);
     }
 
     #[test]
@@ -810,6 +1033,8 @@ depth_a = 1.0
             duration_s: 5,
             settle_s: 1.0,
             role: PointRole::Normal,
+            diff_on: None,
+            diff_off: None,
         };
         assert_eq!(point.tag(), "u500m_f12p5Hz_a750m");
         assert!(!point.tag().contains('.'));
@@ -850,6 +1075,30 @@ slow,0.4,1,0.8,40,4,
         // Blank cells fall back rather than failing the row.
         assert_eq!(protocol.points[1].duration_s, 10);
         assert!((protocol.points[1].settle_s - 2.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn csv_carries_one_series_profile_and_per_point_diff_offsets() {
+        let csv = "camera_profile,mean_u,frequency_hz,depth_a,diff_on,diff_off\n\
+A1 low noise,0.5,10,0.5,12,-7\n\
+A1 low noise,0.5,20,0.5,20,-8\n";
+        let protocol = parse_csv(csv).expect("camera CSV");
+        assert_eq!(
+            protocol.camera,
+            Some(CameraSelection::NamedProfile("A1 low noise".into()))
+        );
+        assert_eq!(protocol.points[0].diff_on, Some(12));
+        assert_eq!(protocol.points[1].diff_off, Some(-8));
+    }
+
+    #[test]
+    fn csv_refuses_profile_changes_within_one_measurement_series() {
+        let csv = "camera_profile,mean_u,frequency_hz,depth_a\n\
+profile-a,0.5,10,0.5\n\
+profile-b,0.5,20,0.5\n";
+        let error = parse_csv(csv).expect_err("two series profiles");
+        assert!(error.to_string().contains("profile-b"), "{error}");
+        assert!(error.to_string().contains("profile-a"), "{error}");
     }
 
     #[test]

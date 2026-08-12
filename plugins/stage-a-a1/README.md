@@ -150,11 +150,9 @@ is chosen by extension.
 ### CSV — one row per recording (the one to reach for)
 
 ```csv
-label,mean_u,frequency_hz,depth_a,duration_s,settle_s,role
-floor,0.50,10,0.02,20,3,background
-windows,0.50,10,2.00,20,3,pilot
-ladder,0.40,1,0.80,40,4,
-ladder,0.40,200,0.80,10,2,
+camera_profile,label,mean_u,frequency_hz,depth_a,duration_s,settle_s,role,diff_on,diff_off
+A1_low_noise,floor,0.50,10,0.02,20,3,background,12,-7
+A1_low_noise,ladder,0.40,200,0.80,10,2,,20,-8
 ```
 
 | column | | |
@@ -166,6 +164,8 @@ ladder,0.40,200,0.80,10,2,
 | `settle_s` | optional, default 2 | dwell after retargeting, 0–60 |
 | `role` | optional, default `normal` | `normal`, `pilot` or `background` |
 | `label` | optional | free text for the status line and sidecar; quote it if it contains a comma |
+| `camera_profile` | optional | one host-owned named camera/global profile for the full series |
+| `diff_on`, `diff_off` | optional | per-point factory-relative threshold offsets; A1 applies and confirms them through the host |
 
 Columns are found **by name**, so their order does not matter and one can be left out entirely.
 Blank lines and `#` comments are skipped, and a blank cell falls back to the default. Errors carry
@@ -184,9 +184,14 @@ a complete measurement, not one that needs two button presses first.
 Kept for a dense regular sweep, which a 96-row CSV states badly:
 
 ```toml
+[camera]
+profile = "A1_low_noise"
+
 [defaults]
 duration_s = 10
 settle_s   = 2.0
+diff_on    = 12
+diff_off   = -7
 
 [[block]]
 name         = "frequency-ladder"
@@ -199,6 +204,18 @@ duration_s   = 20
 Each axis takes a single value, a list, or a `{ min, max, points }` range (`linear` default, `log`
 for per-decade ladders); a block records the product of its three, `ū` outermost then `f` then `a`,
 which settles the slow axis least often. `duration_s`/`settle_s` are per block.
+`diff_on`/`diff_off` may be defaults or block overrides. `[camera]` may select
+one named profile or one complete versioned inline snapshot.
+
+Plugin camera changes are applied immediately by the host and shown as applied
+settings; no extra user Apply click is required. A1 records only after a fresh
+sensor readback confirms the codes and restores the pre-run settings on success,
+Stop, or abort. Missing/disabled Sensor reading fails closed.
+
+The current firmware-qualified drive range is 0.01 Hz to 2 kHz. A1 also
+requires at least 16 photodiode samples per cycle: 1.25 kHz at 20 kSa/s and
+31.25 kHz at 500 kSa/s. The lower of this measurement bound and the 2 kHz drive
+bound applies.
 
 ### Either way
 
@@ -210,6 +227,23 @@ lease covers the whole run; a point whose drive the modulation owner refuses is 
 its wording, and the reasons are kept on the status pane and in the closing summary. The whole file
 is validated on the button press, before the drive moves, and the point count and expected bench
 time are reported first. Use **Stop** in the Record section to end a run early.
+
+### Qualified A1 bench files
+
+The installed protocol directory also contains the four validated laboratory schedules:
+
+- `a1_stufe1_bode_dc.csv` (73 recordings)
+- `a1_stufe2_bode_u010.csv` (47 recordings)
+- `a1_stufe2_bode_u045.csv` (47 recordings)
+- `a1_stufe2_flussleiter.csv` (231 recordings)
+
+Tests run these exact files through A1's CSV parser, the modulation owner's calibrated
+optical-log-sine/lobe/DAC calculations, the real mean → frequency → depth retarget order, and the
+photodiode's production ring-capacity calculation. The photodiode ring sizes itself to the marker
+period, so the 0.075 Hz rungs need no cache length set by hand (ADR 033). Before pressing Start, arm
+a valid calibrated optical-log-sine drive with **`a <= 1.70`** and complete the connection, fresh
+anchor, lease, storage, laser and HV checks in the selected file's header. Static validation cannot
+prove those live bench conditions.
 
 `protocols/example.csv` and `example.toml` are commented files to copy, installed to
 `~/.augur/plugins/stage-a-a1/protocols/`. See

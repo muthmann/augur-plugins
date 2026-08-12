@@ -43,25 +43,26 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use augur_plugin_api::{
-    export_plugin, EventStoreHandle, FfiCdEvent, GlobalSettings, HostCommand, HostCommandOutcome,
+    export_plugin, CameraConfigurationProvenanceV1, CameraConfigurationSnapshotV1,
+    EventStoreHandle, FfiCdEvent, GlobalSettings, HostCommand, HostCommandOutcome,
     HostCommandReply, HostCommandRequest, HostContext, HostDatasetDescriptor, HostDatasetKind,
     HostOutput, HostViewDescriptor, HostViewKind, HostViewPlacement, HostViewRegistry,
     PathDialogKind, Plugin, PluginCapabilities, PluginControlContext, PluginControlInbox,
     PluginDiscontinuity, PluginFrame, PluginInput, PluginRuntimeRole, PluginServiceOutcome,
-    PluginServiceReply, PluginServiceRequest, RoiV1, SensorMonitoringV1, Series1dLine,
-    Series1dPoint, Series1dV1, SettingItem, SettingKind, SettingsSchema, SettingsSection,
-    StatusEntry, TableColumn, TableColumnData, TableColumnValues, TableDatasetV1, TableSchema,
-    TableValueType, CTX_GLOBAL_SETTINGS, CTX_SENSOR_MONITORING,
+    PluginServiceReply, PluginServiceRequest, RoiV1, SensorBiasOffsetsV1, SensorBiasReadbackV1,
+    SensorMonitoringV1, Series1dLine, Series1dPoint, Series1dV1, SettingItem, SettingKind,
+    SettingsSchema, SettingsSection, StatusEntry, TableColumn, TableColumnData, TableColumnValues,
+    TableDatasetV1, TableSchema, TableValueType, CTX_GLOBAL_SETTINGS, CTX_SENSOR_MONITORING,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
 use stage_a_plugin_contract::{
-    ClientId, ConnectionStateV1, LeaseId, LeaseSnapshotV1, ModulationCommandV1, ModulationRequestV1,
-    ModulationStateV1, OpticalTargetV1, PdqReceiptV1, PdqStartSpecV1, PhotodiodeCommandV1,
-    PhotodiodeOpticalSummaryV1, PhotodiodeRequestV1, PhotodiodeResponseV1, PhotodiodeSummaryV1,
-    RequestId, RunId, SemanticRevision, WaveformV1, CTX_STAGE_A_MODULATION_STATE_V1,
-    CTX_STAGE_A_PHOTODIODE_SUMMARY_V1, SERVICE_STAGE_A_MODULATION_CONTROL_V1,
-    SERVICE_STAGE_A_PHOTODIODE_CONTROL_V1,
+    ClientId, ConnectionStateV1, LeaseId, LeaseSnapshotV1, ModulationCommandV1,
+    ModulationRequestV1, ModulationStateV1, OpticalTargetV1, PdqReceiptV1, PdqStartSpecV1,
+    PhotodiodeCommandV1, PhotodiodeOpticalSummaryV1, PhotodiodeRequestV1, PhotodiodeResponseV1,
+    PhotodiodeSummaryV1, RequestId, RunId, SemanticRevision, WaveformV1,
+    CTX_STAGE_A_MODULATION_STATE_V1, CTX_STAGE_A_PHOTODIODE_SUMMARY_V1,
+    SERVICE_STAGE_A_MODULATION_CONTROL_V1, SERVICE_STAGE_A_PHOTODIODE_CONTROL_V1,
 };
 
 use crate::phase::{fold_events, fold_events_free_running, MarkerValidationConfig, PhaseFold};
@@ -379,6 +380,18 @@ struct Recording {
     /// First thing that went wrong, kept verbatim so the closing message names
     /// the cause instead of only reporting that the run was incomplete.
     failure: Option<String>,
+    /// The newest optical summary seen while this recording was running.
+    ///
+    /// The sidecar's optical section describes the light *during the recording*,
+    /// so it is latched here rather than re-read live when the metadata is
+    /// written. Between the last sample and that write sit the photodiode
+    /// finalize, the camera finalize and a gather that may copy a multi-gigabyte
+    /// RAW across volumes — all of it blocking this plugin's own control tick,
+    /// so no snapshot arrives while it runs. Read live, the owner's 2 s
+    /// freshness budget then expires against wall-clock time that the recording
+    /// spent finalizing, and a finished recording lost its sidecar for having
+    /// been *large* (ADR 034).
+    optical: Option<PhotodiodeOpticalSummaryV1>,
 }
 
 /// Where the amplitude sweep is within its per-point cycle.
@@ -805,6 +818,8 @@ impl FreqSweep {
 /// Where a protocol run is within its per-point cycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProtocolPhase {
+    /// The host is resolving/applying the named profile or inline snapshot.
+    ApplyingCamera,
     /// AcquireLease sent to the modulation owner; waiting for the grant.
     AcquiringLease,
     /// The three retargets for this point are in flight; waiting for all of
@@ -814,6 +829,9 @@ enum ProtocolPhase {
     Settling,
     /// The recording coordinator owns this phase.
     Recording,
+    /// All recording work is complete; the host is restoring the pre-run
+    /// configuration (or A1 is restoring the original point biases).
+    RestoringCamera,
 }
 
 /// One protocol run: walk the parsed points, retargeting all three axes at
@@ -831,6 +849,17 @@ struct ProtocolRun {
     lease_id: LeaseId,
     lease_granted: bool,
     lease_req: u64,
+    camera_apply_req: Option<u64>,
+    camera_session_active: bool,
+    camera_snapshot: Option<CameraConfigurationSnapshotV1>,
+    camera_provenance: Option<CameraConfigurationProvenanceV1>,
+    camera_confirmation: Option<(SensorBiasReadbackV1, f64)>,
+    bias_req: Option<u64>,
+    bias_confirmation: Option<(SensorBiasOffsetsV1, SensorBiasReadbackV1, f64)>,
+    original_biases: Option<SensorBiasOffsetsV1>,
+    biases_changed: bool,
+    restore_req: Option<u64>,
+    finish_message: Option<String>,
     /// Request ids of the retargets in flight for the current point. A point
     /// only proceeds once this is empty: the three axes are applied
     /// independently, and recording after two of them would file the run under
@@ -838,6 +867,7 @@ struct ProtocolRun {
     pending_reqs: Vec<u64>,
     /// Wall-clock instant the dwell ends.
     settle_until_ms: u64,
+    settle_started_ms: u64,
     /// Points whose retarget or recording failed, with the owner's own reason.
     ///
     /// Kept rather than aborting — the rest of the survey is still worth
@@ -889,6 +919,9 @@ pub struct StageAA1Plugin {
     // -- host camera ROI/mask, mirrored from CTX_GLOBAL_SETTINGS --
     host_roi: Option<RoiV1>,
     masked_pixels: HashSet<(u16, u16)>,
+    /// Host-owned recording switch mirrored from `CTX_GLOBAL_SETTINGS`.
+    /// Bias-only protocols require it so every point keeps its sensor history.
+    record_sensor_telemetry: bool,
     /// Latest sensor-measured die temperature, pixel dead time and scene
     /// illumination, mirrored from `CTX_SENSOR_MONITORING` every frame.
     ///
@@ -1040,6 +1073,7 @@ impl Default for StageAA1Plugin {
             frame_height: 0,
             host_roi: None,
             masked_pixels: HashSet::new(),
+            record_sensor_telemetry: false,
             sensor: None,
             sensor_at_start: None,
             window_floor: DEFAULT_WINDOW_FLOOR,
@@ -1139,6 +1173,7 @@ impl Recording {
             pd_valid: false,
             pd_rejected: false,
             failure: None,
+            optical: None,
         }
     }
 
@@ -1637,40 +1672,51 @@ impl StageAA1Plugin {
     }
 
     fn photodiode_a_blocker(&self) -> Option<String> {
-        if self.photodiode_a().is_some() {
-            return None;
-        }
         // Every branch names the photodiode gate to fix *and* the way past it,
         // because a bench that cannot produce a measured `a` at all — no
         // trigger markers, say — otherwise leaves the operator with a correct
         // diagnosis and no next step.
-        let fallback = " (or switch \"Depth a source\" to the commanded drive to work open loop)";
+        let reason = self.optical_summary_blocker()?;
+        Some(format!(
+            "{reason} (or switch \"Depth a source\" to the commanded drive to work open loop)"
+        ))
+    }
+
+    /// Why the photodiode is publishing no optical summary, in the owner's own
+    /// words where it has any. `None` means it is publishing one.
+    ///
+    /// Separate from [`Self::photodiode_a_blocker`] because not every caller can
+    /// offer the open-loop way out: the sidecar needs this summary whichever
+    /// depth source is selected, so telling the operator to switch sources there
+    /// would name an escape that does not exist.
+    fn optical_summary_blocker(&self) -> Option<String> {
+        if self.fresh_optical_summary().is_some() {
+            return None;
+        }
         let Some(state) = self.photodiode.as_ref() else {
-            return Some(format!(
+            return Some(
                 "the photodiode plugin is not reporting status — enable it and connect the \
-                 detector{fallback}"
-            ));
+                 detector"
+                    .into(),
+            );
         };
         if !matches!(state.connection, ConnectionStateV1::Connected { .. }) {
             return Some(format!(
-                "the photodiode is {} — connect it{fallback}",
+                "the photodiode is {} — connect it",
                 connection_label(&state.connection)
             ));
         }
         if state.freshness.is_stale_at(now_unix_ms()) {
-            return Some(format!(
-                "the photodiode status snapshot is stale — check that the stream is \
-                 running{fallback}"
-            ));
+            return Some(
+                "the photodiode status snapshot is stale — check that the stream is running".into(),
+            );
         }
         // The owner's own words: it is the only side that knows which estimator
         // gate rejected the window.
         if let Some(reason) = state.optical_unavailable.as_deref() {
-            return Some(format!("{reason}{fallback}"));
+            return Some(reason.to_owned());
         }
-        Some(format!(
-            "the photodiode is streaming no samples yet — start the stream{fallback}"
-        ))
+        Some("the photodiode is streaming no samples yet — start the stream".into())
     }
 
     fn commanded_a_blocker(&self) -> Option<String> {
@@ -2112,6 +2158,47 @@ impl StageAA1Plugin {
         if let Some(n) = self.valid_pixel_count() {
             meta.insert("n_valid".into(), n.to_string());
         }
+        if let Some(run) = self.protocol.as_ref() {
+            meta.insert("a1_protocol_name".into(), run.plan.name.clone());
+            meta.insert("a1_protocol_point".into(), (run.index + 1).to_string());
+            if let Some(provenance) = run.camera_provenance.as_ref() {
+                meta.insert(
+                    "camera_configuration_sha256".into(),
+                    provenance.sha256.clone(),
+                );
+                meta.insert(
+                    "camera_configuration_schema_version".into(),
+                    provenance.schema_version.to_string(),
+                );
+                if let Some(name) = provenance.profile_name.as_ref() {
+                    meta.insert("camera_profile_name".into(), name.clone());
+                }
+                if let Some(revision) = provenance.profile_revision {
+                    meta.insert("camera_profile_revision".into(), revision.to_string());
+                }
+            }
+            if let Some(point) = run.point() {
+                if let Some(diff_on) = point.diff_on {
+                    meta.insert("requested_diff_on".into(), diff_on.to_string());
+                }
+                if let Some(diff_off) = point.diff_off {
+                    meta.insert("requested_diff_off".into(), diff_off.to_string());
+                }
+            }
+            if let Some((applied, readback, age_s)) = run.bias_confirmation {
+                meta.insert("confirmed_diff_on".into(), applied.diff_on.to_string());
+                meta.insert("confirmed_diff_off".into(), applied.diff_off.to_string());
+                meta.insert(
+                    "confirmed_diff_on_code".into(),
+                    readback.current.diff_on.to_string(),
+                );
+                meta.insert(
+                    "confirmed_diff_off_code".into(),
+                    readback.current.diff_off.to_string(),
+                );
+                meta.insert("bias_readback_age_s".into(), format!("{age_s:.3}"));
+            }
+        }
         // Bench conditions, on every run and every role. Each key appears only
         // when the sensor actually reported that quantity — an absent reading
         // must not arrive downstream as 0 °C or 0 lux.
@@ -2193,6 +2280,36 @@ impl StageAA1Plugin {
         None
     }
 
+    /// Separates "the controller can output this frequency" from "the current
+    /// photodiode stream can resolve it as an A1 waveform". The latter needs a
+    /// fresh, explicit sample rate and at least 16 samples per cycle; a Nyquist
+    /// pass with two samples would not support peak/trough or waveform fitting.
+    fn photodiode_measurement_blocker(&self, frequency_hz: f64) -> Option<String> {
+        let photodiode = self.photodiode.as_ref()?;
+        if photodiode.freshness.is_stale_at(now_unix_ms()) {
+            return Some(
+                "The photodiode sample-rate reading is stale — restart or check the stream".into(),
+            );
+        }
+        let Some(sample_rate_hz) = photodiode.stream.sample_rate_hz else {
+            return Some(
+                "The photodiode reports no sample rate, so A1 cannot prove this frequency is measurable"
+                    .into(),
+            );
+        };
+        let limit = stage_a_plugin_contract::a1_measurement_frequency_limit_hz(sample_rate_hz);
+        if frequency_hz > limit {
+            return Some(format!(
+                "The drive can output {}, but the photodiode is sampling at {} Sa/s: A1 requires at least {} samples/cycle, so the measurable limit is {}",
+                frequency_label(frequency_hz),
+                sample_rate_hz,
+                stage_a_plugin_contract::A1_MIN_SAMPLES_PER_CYCLE,
+                frequency_label(limit),
+            ));
+        }
+        None
+    }
+
     /// Kick off a coordinated recording by starting the camera first. Called
     /// on the control tick after a record button is pressed.
     fn begin_recording(&mut self, context: &mut impl RecordingControl, role: RecRole) {
@@ -2209,6 +2326,12 @@ impl StageAA1Plugin {
         if let Some(blocker) = self.photodiode_blocker() {
             self.note(blocker);
             return;
+        }
+        if let Some(hz) = self.frequency_hz() {
+            if let Some(blocker) = self.photodiode_measurement_blocker(hz) {
+                self.note(blocker);
+                return;
+            }
         }
         let now_ms = now_unix_ms();
         // Freeze the bench conditions this run begins under, before any of the
@@ -2567,7 +2690,7 @@ impl StageAA1Plugin {
             return None;
         }
         let destination = dir.join(format!("{}.sensor.json", self.recording.stem));
-        let json = readout.to_json(&self.recording.id, &self.recording.stem);
+        let json = readout.to_json(sensor::SCHEMA_A1, &self.recording.id, &self.recording.stem);
         if std::fs::write(&destination, json).is_err() {
             return None;
         }
@@ -4462,45 +4585,190 @@ impl StageAA1Plugin {
                 return;
             }
         }
+        let highest = plan
+            .points
+            .iter()
+            .map(|point| point.frequency_hz)
+            .fold(0.0_f64, f64::max);
+        if let Some(blocker) = self.photodiode_measurement_blocker(highest) {
+            self.message = format!(
+                "Protocol refused at its highest frequency ({}): {blocker}",
+                frequency_label(highest)
+            );
+            return;
+        }
+
+        let controls_camera = plan.camera.is_some()
+            || plan
+                .points
+                .iter()
+                .any(|point| point.diff_on.is_some() || point.diff_off.is_some());
+        if controls_camera && plan.camera.is_none() && !self.record_sensor_telemetry {
+            self.message =
+                "Protocol refused: enable Record sensor monitoring before a bias-controlled run"
+                    .into();
+            return;
+        }
+        let original_biases = if controls_camera {
+            let Some(sensor) = self.sensor.filter(|sensor| sensor.age_s <= 2.0) else {
+                self.message =
+                    "Protocol refused: camera bias control requires a fresh Sensor reading".into();
+                return;
+            };
+            let Some(readback) = sensor.bias_codes else {
+                self.message =
+                    "Protocol refused: the Sensor reading contains no bias readback".into();
+                return;
+            };
+            Some(SensorBiasOffsetsV1 {
+                diff_on: i32::from(readback.current.diff_on)
+                    - i32::from(readback.factory_default.diff_on),
+                diff_off: i32::from(readback.current.diff_off)
+                    - i32::from(readback.factory_default.diff_off),
+            })
+        } else {
+            None
+        };
 
         let now_ms = now_unix_ms();
         let lease_id = LeaseId::new(format!(
             "a1-protocol-{}",
             format_compact_utc(now_ms / 1_000)
         ));
-        let ttl_ms = Self::protocol_lease_ttl_ms(&plan, 0);
-        let request =
-            self.modulation_request(ModulationCommandV1::AcquireLease { ttl_ms }, &lease_id);
-        let lease_req = request.request_id;
-        context.request_service(&request);
+        let camera_selection = plan.camera.clone();
+        let phase = if camera_selection.is_some() {
+            ProtocolPhase::ApplyingCamera
+        } else {
+            ProtocolPhase::AcquiringLease
+        };
 
         let (means, frequencies, depths) = plan.axis_counts();
         let total = plan.points.len();
         let minutes = plan.total_seconds() / 60.0;
         self.message = format!(
             "Protocol '{}': {total} recordings ({means} × ū, {frequencies} × f, {depths} × a), \
-             about {minutes:.0} min of bench time — acquiring the modulation lease…",
+             about {minutes:.0} min of bench time — preparing the camera and modulation lease…",
             plan.name
         );
         self.protocol = Some(ProtocolRun {
             plan,
-            phase: ProtocolPhase::AcquiringLease,
+            phase,
             index: 0,
             lease_id,
             lease_granted: false,
-            lease_req,
+            lease_req: 0,
+            camera_apply_req: None,
+            camera_session_active: false,
+            camera_snapshot: None,
+            camera_provenance: None,
+            camera_confirmation: None,
+            bias_req: None,
+            bias_confirmation: None,
+            original_biases,
+            biases_changed: false,
+            restore_req: None,
+            finish_message: None,
             pending_reqs: Vec::new(),
             settle_until_ms: 0,
+            settle_started_ms: 0,
             failed: Vec::new(),
             recorded: 0,
             last_activity_ms: now_ms,
             stop_requested: false,
             skip_reason: None,
         });
+        if let Some(selection) = camera_selection {
+            let request_id = self.next_request_id();
+            let command = match selection {
+                protocol::CameraSelection::NamedProfile(profile_name) => {
+                    HostCommand::ApplyCameraConfiguration {
+                        profile_name: Some(profile_name),
+                        snapshot: None,
+                    }
+                }
+                protocol::CameraSelection::Snapshot(snapshot) => {
+                    HostCommand::ApplyCameraConfiguration {
+                        profile_name: None,
+                        snapshot: Some(snapshot),
+                    }
+                }
+            };
+            context.request_host(&HostCommandRequest {
+                request_id,
+                command,
+            });
+            if let Some(run) = self.protocol.as_mut() {
+                run.camera_apply_req = Some(request_id);
+                // A missing reply is ambiguous: the host may have applied the
+                // configuration before its reply was lost. Treat the session
+                // as active until a restore is confirmed, so timeout and abort
+                // paths also fail safe.
+                run.camera_session_active = true;
+            }
+        } else {
+            self.acquire_protocol_lease(context);
+        }
     }
 
-    /// Release the protocol's lease (if this run holds it) and clear it.
+    fn acquire_protocol_lease(&mut self, context: &mut impl RecordingControl) {
+        let Some(run) = self.protocol.as_ref() else {
+            return;
+        };
+        let ttl_ms = Self::protocol_lease_ttl_ms(&run.plan, run.index);
+        let lease_id = run.lease_id.clone();
+        let request =
+            self.modulation_request(ModulationCommandV1::AcquireLease { ttl_ms }, &lease_id);
+        context.request_service(&request);
+        if let Some(run) = self.protocol.as_mut() {
+            run.phase = ProtocolPhase::AcquiringLease;
+            run.lease_req = request.request_id;
+            run.last_activity_ms = now_unix_ms();
+        }
+    }
+
+    /// Restore camera state before releasing the protocol lease and clearing
+    /// the run. No success, stop, or abort path bypasses this function.
     fn finish_protocol(&mut self, context: &mut impl RecordingControl, message: String) {
+        let Some(run) = self.protocol.as_ref() else {
+            self.message = message;
+            return;
+        };
+        if run.phase == ProtocolPhase::RestoringCamera {
+            return;
+        }
+
+        let restore_command = if run.camera_session_active {
+            Some(HostCommand::RestoreCameraConfiguration)
+        } else if run.biases_changed {
+            run.original_biases.map(|biases| HostCommand::ApplyBiases {
+                diff_on: Some(biases.diff_on),
+                diff_off: Some(biases.diff_off),
+            })
+        } else {
+            None
+        };
+        if let Some(command) = restore_command {
+            let request_id = self.next_request_id();
+            context.request_host(&HostCommandRequest {
+                request_id,
+                command,
+            });
+            if let Some(run) = self.protocol.as_mut() {
+                run.phase = ProtocolPhase::RestoringCamera;
+                run.restore_req = Some(request_id);
+                run.finish_message = Some(message);
+                run.last_activity_ms = now_unix_ms();
+            }
+            self.message =
+                "Protocol stopped recording; restoring the pre-run camera settings…".into();
+            return;
+        }
+
+        self.complete_protocol(context, message);
+    }
+
+    /// Release the modulation lease after camera restoration has resolved.
+    fn complete_protocol(&mut self, context: &mut impl RecordingControl, message: String) {
         if let Some(run) = self.protocol.take() {
             if run.lease_granted {
                 let request = self.modulation_request(
@@ -4551,6 +4819,20 @@ impl StageAA1Plugin {
             context.request_service(&request);
         }
 
+        let bias_request = if point.diff_on.is_some() || point.diff_off.is_some() {
+            let request_id = self.next_request_id();
+            context.request_host(&HostCommandRequest {
+                request_id,
+                command: HostCommand::ApplyBiases {
+                    diff_on: point.diff_on,
+                    diff_off: point.diff_off,
+                },
+            });
+            Some(request_id)
+        } else {
+            None
+        };
+
         // The retained markers and events belong to the previous point's
         // frequency; the measured period is their mean spacing, so leaving
         // them would confirm this point against a mixture of the two. Pilot
@@ -4564,6 +4846,9 @@ impl StageAA1Plugin {
         if let Some(run) = self.protocol.as_mut() {
             run.phase = ProtocolPhase::Retargeting;
             run.pending_reqs = pending;
+            run.bias_req = bias_request;
+            run.bias_confirmation = None;
+            run.biases_changed |= bias_request.is_some();
             run.skip_reason = None;
             run.last_activity_ms = now_ms;
         }
@@ -4653,13 +4938,26 @@ impl StageAA1Plugin {
             self.message = "A protocol is already running — press Stop to end it".into();
         }
         let now_ms = now_unix_ms();
-        let (phase, stop_requested, lease_granted, retargets_left, settle_until_ms, last_activity) = {
+        let (
+            phase,
+            stop_requested,
+            lease_granted,
+            lease_req,
+            retargets_left,
+            bias_pending,
+            restore_pending,
+            settle_until_ms,
+            last_activity,
+        ) = {
             let run = self.protocol.as_ref().expect("run checked above");
             (
                 run.phase,
                 run.stop_requested,
                 run.lease_granted,
+                run.lease_req,
                 run.pending_reqs.len(),
+                run.bias_req.is_some(),
+                run.restore_req.is_some(),
                 run.settle_until_ms,
                 run.last_activity_ms,
             )
@@ -4668,9 +4966,17 @@ impl StageAA1Plugin {
         // A stop waits for the recording in flight to wind down, then ends the
         // run — a protocol that abandoned a half-written file would leave a
         // truncated RAW behind.
-        if stop_requested {
+        if stop_requested && phase != ProtocolPhase::RestoringCamera {
             if self.recording.is_active() {
                 self.recording.stop_requested = true;
+                return;
+            }
+            if let Some(message) = self
+                .protocol
+                .as_mut()
+                .and_then(|run| run.finish_message.take())
+            {
+                self.finish_protocol(context, message);
                 return;
             }
             self.advance_protocol(context);
@@ -4678,7 +4984,20 @@ impl StageAA1Plugin {
         }
 
         match phase {
+            ProtocolPhase::ApplyingCamera => {
+                if now_ms.saturating_sub(last_activity) > REPLY_TIMEOUT_MS {
+                    self.finish_protocol(
+                        context,
+                        "Protocol aborted: the host did not confirm the camera configuration"
+                            .into(),
+                    );
+                }
+            }
             ProtocolPhase::AcquiringLease => {
+                if lease_req == 0 {
+                    self.acquire_protocol_lease(context);
+                    return;
+                }
                 if !lease_granted {
                     if now_ms.saturating_sub(last_activity) > REPLY_TIMEOUT_MS {
                         self.finish_protocol(
@@ -4700,11 +5019,11 @@ impl StageAA1Plugin {
                     self.fail_protocol_point(context, reason);
                     return;
                 }
-                if retargets_left > 0 {
+                if retargets_left > 0 || bias_pending {
                     if now_ms.saturating_sub(last_activity) > REPLY_TIMEOUT_MS {
                         self.fail_protocol_point(
                             context,
-                            "the modulation plugin did not apply the requested drive".into(),
+                            "the requested drive or camera biases were not confirmed".into(),
                         );
                     }
                     return;
@@ -4718,6 +5037,7 @@ impl StageAA1Plugin {
                 if let Some(run) = self.protocol.as_mut() {
                     run.phase = ProtocolPhase::Settling;
                     run.settle_until_ms = now_ms.saturating_add(settle_ms);
+                    run.settle_started_ms = now_ms;
                     run.last_activity_ms = now_ms;
                 }
             }
@@ -4776,6 +5096,33 @@ impl StageAA1Plugin {
                     let reason = self.message.clone();
                     self.fail_protocol_point(context, reason);
                 }
+            }
+            ProtocolPhase::RestoringCamera => {
+                if restore_pending {
+                    if now_ms.saturating_sub(last_activity) > REPLY_TIMEOUT_MS {
+                        let message = self
+                            .protocol
+                            .as_ref()
+                            .and_then(|run| run.finish_message.clone())
+                            .unwrap_or_else(|| "Protocol ended".into());
+                        self.complete_protocol(
+                            context,
+                            format!(
+                                "{message} — ERROR: pre-run camera settings were not confirmed restored"
+                            ),
+                        );
+                    }
+                    return;
+                }
+                let message = self
+                    .protocol
+                    .as_mut()
+                    .and_then(|run| run.finish_message.take())
+                    .unwrap_or_else(|| "Protocol ended; pre-run camera settings restored".into());
+                self.complete_protocol(
+                    context,
+                    format!("{message} — pre-run camera settings restored"),
+                );
             }
         }
     }
@@ -5130,6 +5477,119 @@ impl StageAA1Plugin {
     }
 
     fn on_host_reply(&mut self, reply: &HostCommandReply) {
+        let protocol_requests = self
+            .protocol
+            .as_ref()
+            .map(|run| (run.camera_apply_req, run.bias_req, run.restore_req));
+        if let Some((camera_apply_req, bias_req, restore_req)) = protocol_requests {
+            if camera_apply_req == Some(reply.request_id) {
+                let now_ms = now_unix_ms();
+                match &reply.outcome {
+                    HostCommandOutcome::CameraConfigurationApplied {
+                        snapshot,
+                        provenance,
+                        readback,
+                        readback_age_s,
+                    } => {
+                        if let Some(run) = self.protocol.as_mut() {
+                            run.camera_apply_req = None;
+                            run.camera_session_active = true;
+                            run.camera_snapshot = Some(snapshot.clone());
+                            run.camera_provenance = Some(provenance.clone());
+                            run.camera_confirmation = Some((*readback, *readback_age_s));
+                            run.phase = ProtocolPhase::AcquiringLease;
+                            run.lease_req = 0;
+                            run.last_activity_ms = now_ms;
+                        }
+                    }
+                    HostCommandOutcome::Rejected { code, message } => {
+                        if let Some(run) = self.protocol.as_mut() {
+                            run.camera_apply_req = None;
+                            run.stop_requested = true;
+                            run.finish_message = Some(format!(
+                                "Protocol aborted: camera configuration rejected ({code}): {message}"
+                            ));
+                            run.last_activity_ms = now_ms;
+                        }
+                    }
+                    _ => {
+                        if let Some(run) = self.protocol.as_mut() {
+                            run.camera_apply_req = None;
+                            run.stop_requested = true;
+                            run.finish_message = Some(
+                                "Protocol aborted: host returned an invalid camera-configuration reply"
+                                    .into(),
+                            );
+                            run.last_activity_ms = now_ms;
+                        }
+                    }
+                }
+                return;
+            }
+            if bias_req == Some(reply.request_id) {
+                let now_ms = now_unix_ms();
+                match &reply.outcome {
+                    HostCommandOutcome::BiasesApplied {
+                        applied,
+                        readback,
+                        readback_age_s,
+                    } => {
+                        if let Some(run) = self.protocol.as_mut() {
+                            run.bias_req = None;
+                            run.bias_confirmation = Some((*applied, *readback, *readback_age_s));
+                            run.last_activity_ms = now_ms;
+                        }
+                    }
+                    HostCommandOutcome::Rejected { code, message } => {
+                        if let Some(run) = self.protocol.as_mut() {
+                            run.bias_req = None;
+                            run.skip_reason = Some(format!(
+                                "camera biases were not confirmed ({code}): {message}"
+                            ));
+                            run.last_activity_ms = now_ms;
+                        }
+                    }
+                    _ => {
+                        if let Some(run) = self.protocol.as_mut() {
+                            run.bias_req = None;
+                            run.skip_reason =
+                                Some("host returned an invalid camera-bias confirmation".into());
+                            run.last_activity_ms = now_ms;
+                        }
+                    }
+                }
+                return;
+            }
+            if restore_req == Some(reply.request_id) {
+                let now_ms = now_unix_ms();
+                let restored = matches!(
+                    reply.outcome,
+                    HostCommandOutcome::CameraConfigurationRestored { .. }
+                        | HostCommandOutcome::BiasesApplied { .. }
+                );
+                if let Some(run) = self.protocol.as_mut() {
+                    run.restore_req = None;
+                    run.camera_session_active = false;
+                    run.biases_changed = false;
+                    run.last_activity_ms = now_ms;
+                    if !restored {
+                        let detail = match &reply.outcome {
+                            HostCommandOutcome::Rejected { code, message } => {
+                                format!("restore rejected ({code}): {message}")
+                            }
+                            _ => "host returned an invalid restore confirmation".into(),
+                        };
+                        let message = run
+                            .finish_message
+                            .take()
+                            .unwrap_or_else(|| "Protocol ended".into());
+                        run.finish_message = Some(format!("{message} — ERROR: {detail}"));
+                    }
+                }
+                return;
+            }
+        }
+
         if reply.request_id == self.recording.cam_start_req {
             match &reply.outcome {
                 HostCommandOutcome::RecordingStarted {
@@ -5233,6 +5693,15 @@ impl StageAA1Plugin {
     /// Advance the recording state machine one control tick.
     fn drive_recording(&mut self, context: &mut impl RecordingControl) {
         let now_ms = now_unix_ms();
+        // Latch the light while the recording can still see it. Everything after
+        // the last sample — both finalizes, the gather — blocks this tick, so a
+        // summary read afterwards is judged stale for time the recording itself
+        // spent being written out.
+        if self.recording.is_active() {
+            if let Some(optical) = self.fresh_optical_summary() {
+                self.recording.optical = Some(optical.clone());
+            }
+        }
         match self.recording.phase {
             RecPhase::Idle => {
                 if let Some(role) = self.pending_role.take() {
@@ -5357,13 +5826,26 @@ impl StageAA1Plugin {
             .modulation
             .as_ref()
             .and_then(|state| state.optical_drive.as_ref());
-        let optical = self.fresh_optical_summary();
+        // The recording's own conditions first, and only then a live read for a
+        // sidecar written outside one.
+        let optical = self
+            .recording
+            .optical
+            .as_ref()
+            .or_else(|| self.fresh_optical_summary());
         if optical.is_none() {
-            return Err(
+            // The refusal used to stop at "no fresh summary", which reads as a
+            // missing anchor and sends the operator to re-confirm one that was
+            // already fine. The owner knows which estimator gate rejected the
+            // window — a railed detector, too few whole cycles, a stopped
+            // stream — so hand its sentence on. This is the whole report an
+            // unattended protocol run leaves behind for the point it lost.
+            return Err(format!(
                 "cannot write a quantitative A1 sidecar without a fresh photodiode optical \
-                 summary from a confirmed I_tot anchor"
-                    .into(),
-            );
+                 summary from a confirmed I_tot anchor: {}",
+                self.optical_summary_blocker()
+                    .unwrap_or_else(|| "the photodiode gave no reason".into())
+            ));
         }
         let roi = self.host_roi.unwrap_or_default();
 
@@ -5388,7 +5870,12 @@ impl StageAA1Plugin {
             finalized_at_utc: format_iso_utc(now_ms / 1_000),
             duration_s: self.recording.duration_s,
             depth_a_source: self.depth_source.label().into(),
-            depth_a: self.depth_a(),
+            // Measured `a` comes from the same latched window as the rest of the
+            // optical section, so the two can never disagree.
+            depth_a: match self.depth_source {
+                DepthSource::Photodiode => optical.map(|o| o.measured_log_contrast),
+                DepthSource::Commanded => self.commanded_a(),
+            },
             sweep: {
                 let point = self
                     .sweep
@@ -5492,8 +5979,44 @@ impl StageAA1Plugin {
                 masked_pixels: self.masked_pixels.len(),
                 n_valid: self.valid_pixel_count(),
             },
+            camera_control: self.protocol.as_ref().and_then(|run| {
+                let point = run.point();
+                let point_requested =
+                    point.is_some_and(|point| point.diff_on.is_some() || point.diff_off.is_some());
+                if run.camera_snapshot.is_none() && !point_requested {
+                    return None;
+                }
+                let (confirmed_offsets, confirmed_readback, readback_age_s) = run
+                    .bias_confirmation
+                    .map(|(offsets, readback, age_s)| (Some(offsets), Some(readback), Some(age_s)))
+                    .or_else(|| {
+                        run.camera_confirmation.map(|(readback, age_s)| {
+                            let offsets =
+                                run.camera_snapshot
+                                    .as_ref()
+                                    .map(|snapshot| SensorBiasOffsetsV1 {
+                                        diff_on: snapshot.biases.diff_on,
+                                        diff_off: snapshot.biases.diff_off,
+                                    });
+                            (offsets, Some(readback), Some(age_s))
+                        })
+                    })
+                    .unwrap_or((None, None, None));
+                Some(CameraControlSidecar {
+                    snapshot: run.camera_snapshot.clone(),
+                    provenance: run.camera_provenance.clone(),
+                    requested_diff_on: point.and_then(|point| point.diff_on),
+                    requested_diff_off: point.and_then(|point| point.diff_off),
+                    confirmed_offsets,
+                    confirmed_readback,
+                    readback_age_s,
+                    status: "confirmed".into(),
+                })
+            }),
             sensor: self.recorded_sensor().map(|sensor| {
-                let codes = sensor.bias_codes.map(|readback| readback.current);
+                let readback = sensor.bias_codes;
+                let codes = readback.map(|readback| readback.current);
+                let factory = readback.map(|readback| readback.factory_default);
                 SensorSidecar {
                     temperature_c: sensor.temperature_c,
                     pixel_dead_time_us: sensor.pixel_dead_time_us,
@@ -5504,6 +6027,11 @@ impl StageAA1Plugin {
                     bias_fo: codes.map(|c| c.fo),
                     bias_hpf: codes.map(|c| c.hpf),
                     bias_refr: codes.map(|c| c.refr),
+                    factory_diff_on: factory.map(|c| c.diff_on),
+                    factory_diff_off: factory.map(|c| c.diff_off),
+                    factory_fo: factory.map(|c| c.fo),
+                    factory_hpf: factory.map(|c| c.hpf),
+                    factory_refr: factory.map(|c| c.refr),
                 }
             }),
             trigger: TriggerSidecar {
@@ -5564,6 +6092,9 @@ struct SidecarDoc {
     modulation: ModulationSidecar,
     optical: OpticalSidecar,
     camera: CameraSidecar,
+    /// Host-routed camera settings and fresh readback for this protocol point.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    camera_control: Option<CameraControlSidecar>,
     /// Absent when the host had no camera able to measure these (replay,
     /// imports, a sensor without a monitoring block).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -5727,6 +6258,25 @@ struct CameraSidecar {
     n_valid: Option<usize>,
 }
 
+#[derive(Serialize)]
+struct CameraControlSidecar {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    snapshot: Option<CameraConfigurationSnapshotV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provenance: Option<CameraConfigurationProvenanceV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    requested_diff_on: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    requested_diff_off: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    confirmed_offsets: Option<SensorBiasOffsetsV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    confirmed_readback: Option<SensorBiasReadbackV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    readback_age_s: Option<f64>,
+    status: String,
+}
+
 /// Bench conditions the sensor measured for itself at the start of the run.
 ///
 /// Provenance, never an input: the `q_p(a, f)` response depends on the pixel
@@ -5761,6 +6311,16 @@ struct SensorSidecar {
     bias_hpf: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
     bias_refr: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    factory_diff_on: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    factory_diff_off: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    factory_fo: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    factory_hpf: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    factory_refr: Option<u8>,
 }
 
 #[derive(Serialize)]
@@ -6083,6 +6643,7 @@ impl Plugin for StageAA1Plugin {
         {
             self.host_roi = Some(settings.roi);
             self.masked_pixels = settings.masked_pixels.into_iter().collect();
+            self.record_sensor_telemetry = settings.record_sensor_telemetry;
         }
         // Mirrored above the `live` gate on purpose: these are recorded with
         // every run, and recordings are made with Live analysis off just as
@@ -6490,7 +7051,8 @@ impl Plugin for StageAA1Plugin {
                             ),
                             kind: SettingKind::F64Drag {
                                 min: 0.01,
-                                max: 2_000.0,
+                                max: stage_a_plugin_contract::DRIVE_FREQUENCY_MAX_MILLIHZ as f64
+                                    / 1_000.0,
                                 speed: 0.1,
                                 default: self.min_f,
                             },
@@ -6505,7 +7067,8 @@ impl Plugin for StageAA1Plugin {
                             ),
                             kind: SettingKind::F64Drag {
                                 min: 0.01,
-                                max: 2_000.0,
+                                max: stage_a_plugin_contract::DRIVE_FREQUENCY_MAX_MILLIHZ as f64
+                                    / 1_000.0,
                                 speed: 1.0,
                                 default: self.max_f,
                             },
@@ -9499,6 +10062,96 @@ mod tests {
         let _ = std::fs::remove_dir_all(&folder);
     }
 
+    /// A finished recording must not lose its sidecar for having been *large*.
+    ///
+    /// Between the last sample and the sidecar write sit both finalizes and a
+    /// gather that may copy a multi-gigabyte RAW across volumes, all of it
+    /// blocking this plugin's own tick — so no photodiode snapshot arrives while
+    /// it runs. Read live at that moment, the owner's 2 s freshness budget has
+    /// expired against the recording's own write-out time, and the metadata that
+    /// makes the RAW and PDQ quantitative is refused.
+    #[test]
+    fn the_sidecar_records_the_light_during_the_recording_not_at_write_time() {
+        let folder = temp_folder("stale-at-write");
+        let mut plugin = plugin_locking(1.0, &folder);
+        plugin.recording.id = "A1-stale".into();
+        plugin.recording.stem = "A1-stale_20260807-120000".into();
+        plugin.recording.folder = folder.display().to_string();
+        plugin.recording.phase = RecPhase::Running;
+        plugin.recording.duration_s = 100;
+        plugin.recording.start_unix_ms = now_unix_ms();
+
+        // While it runs, the owner is publishing.
+        let mut sink = ControlSink::default();
+        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+        let latched = plugin
+            .recording
+            .optical
+            .as_ref()
+            .expect("a running recording latches the light it is recording under")
+            .measured_log_contrast;
+
+        // Finalizing took longer than the freshness budget: the last snapshot is
+        // now old, and nothing newer can arrive because this tick was blocked.
+        if let Some(summary) = plugin.photodiode.as_mut() {
+            summary.freshness.observed_at_unix_ms = now_unix_ms()
+                .saturating_sub(summary.freshness.valid_for_ms)
+                .saturating_sub(30_000);
+        }
+        assert!(
+            plugin.fresh_optical_summary().is_none(),
+            "the live read must be stale for this test to mean anything"
+        );
+
+        let path = plugin
+            .write_sidecar()
+            .expect("the latched summary carries the sidecar");
+        let written = std::fs::read_to_string(&path).expect("sidecar readable");
+        assert!(
+            written.contains(&format!("measured_a = {latched}")),
+            "the sidecar must carry the measured a from the recording: {written}"
+        );
+        assert!(
+            written.contains(&format!("depth_a = {latched}")),
+            "the recorded depth must come from the same window: {written}"
+        );
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// The sidecar refusal is the whole report an unattended protocol run leaves
+    /// behind for a point it lost — and it arrives after the recording has
+    /// already run. Naming only the anchor sent the operator to re-confirm one
+    /// that was fine while the real gate (too few whole cycles at a sub-hertz
+    /// rung) went unnamed for a whole survey.
+    #[test]
+    fn a_refused_sidecar_quotes_the_owners_reason_not_just_the_anchor() {
+        let folder = temp_folder("sidecar-blocker");
+        let mut plugin = plugin_locking(1.0, &folder);
+        if let Some(summary) = plugin.photodiode.as_mut() {
+            summary.optical_summary = None;
+            summary.optical_unavailable = Some(
+                "no stretch of samples covers two whole modulation cycles between triggers \
+                 (2 trigger(s) in the last 10000000 samples)"
+                    .into(),
+            );
+        }
+
+        let error = plugin
+            .write_sidecar()
+            .expect_err("no optical summary must refuse the sidecar");
+        assert!(
+            error.contains("two whole modulation cycles"),
+            "the refusal must quote the owner: {error}"
+        );
+        // And it must not offer the open-loop escape here: the sidecar needs
+        // this summary whichever depth source is selected.
+        assert!(
+            !error.contains("Depth a source"),
+            "the sidecar refusal must not name an escape that does not exist: {error}"
+        );
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
     #[test]
     fn the_status_panel_names_live_analysis_when_it_is_off() {
         // "0 events, free-running" describes the toggle, not the bench, and the
@@ -10045,6 +10698,7 @@ mod tests {
         plugin.measurement_id = "A1-proto".into();
         plugin.protocol_path = path.display().to_string();
         plugin.protocol_pending = true;
+        plugin.record_sensor_telemetry = true;
         (plugin, path)
     }
 
@@ -10061,6 +10715,376 @@ mean_u = [0.4, 0.6]
 frequency_hz = 25.0
 depth_a = 0.7
 "#;
+
+    const BIAS_PROTOCOL: &str = r#"
+name = "bias-point"
+
+[defaults]
+duration_s = 3
+settle_s = 0.0
+
+[[block]]
+mean_u = 0.5
+frequency_hz = 25.0
+depth_a = 0.7
+diff_on = 12
+diff_off = -7
+"#;
+
+    const PROFILE_PROTOCOL: &str = r#"
+name = "profile-point"
+
+[camera]
+profile = "A1 low noise"
+
+[[block]]
+mean_u = 0.5
+frequency_hz = 25.0
+depth_a = 0.7
+"#;
+
+    fn fresh_bias_sensor(diff_on: u8, diff_off: u8) -> SensorMonitoringV1 {
+        SensorMonitoringV1 {
+            bias_codes: Some(SensorBiasReadbackV1 {
+                current: augur_plugin_api::SensorBiasCodesV1 {
+                    diff_on,
+                    diff_off,
+                    fo: 30,
+                    hpf: 40,
+                    refr: 50,
+                },
+                factory_default: augur_plugin_api::SensorBiasCodesV1 {
+                    diff_on: 100,
+                    diff_off: 100,
+                    fo: 30,
+                    hpf: 40,
+                    refr: 50,
+                },
+            }),
+            age_s: 0.1,
+            ..SensorMonitoringV1::default()
+        }
+    }
+
+    fn bias_reply(request_id: u64, diff_on: i32, diff_off: i32) -> HostCommandReply {
+        HostCommandReply {
+            request_id,
+            outcome: HostCommandOutcome::BiasesApplied {
+                applied: SensorBiasOffsetsV1 { diff_on, diff_off },
+                readback: SensorBiasReadbackV1 {
+                    current: augur_plugin_api::SensorBiasCodesV1 {
+                        diff_on: (100 + diff_on) as u8,
+                        diff_off: (100 + diff_off) as u8,
+                        fo: 30,
+                        hpf: 40,
+                        refr: 50,
+                    },
+                    factory_default: augur_plugin_api::SensorBiasCodesV1 {
+                        diff_on: 100,
+                        diff_off: 100,
+                        fo: 30,
+                        hpf: 40,
+                        refr: 50,
+                    },
+                },
+                readback_age_s: 0.05,
+            },
+        }
+    }
+
+    fn camera_snapshot() -> CameraConfigurationSnapshotV1 {
+        CameraConfigurationSnapshotV1 {
+            schema_version: 1,
+            biases: augur_plugin_api::CameraBiasOffsetsV1 {
+                diff_on: 5,
+                diff_off: -2,
+                fo: 0,
+                hpf: 0,
+                refr: 0,
+            },
+            roi: RoiV1 {
+                x: 0,
+                y: 0,
+                width: 1280,
+                height: 720,
+            },
+            masked_pixels: Vec::new(),
+            digital_filter: augur_plugin_api::CameraDigitalFilterV1 {
+                stc_enabled: false,
+                stc_threshold_us: 0,
+                trail_enabled: false,
+            },
+            external_trigger: augur_plugin_api::CameraExternalTriggerV1::default(),
+            global: augur_plugin_api::CameraGlobalSettingsV1 {
+                nm_per_pixel: 1_000.0,
+                pixel_scale_calibrated: true,
+                sensor_width: 1280,
+                sensor_height: 720,
+                acq_time_ms: 1,
+                event_store_budget_mib: 512,
+                preview_interval_ms: 16,
+                point_cloud_interval_ms: 50,
+                disk_writer_buffer_mib: 64,
+                record_sensor_telemetry: true,
+            },
+        }
+    }
+
+    #[test]
+    fn a_protocol_bias_point_waits_for_host_readback_and_restores_after_success() {
+        let folder = temp_folder("protocol-bias");
+        let (mut plugin, _) = protocol_plugin(&folder, BIAS_PROTOCOL);
+        plugin.sensor = Some(fresh_bias_sensor(105, 98));
+        let mut sink = ControlSink::default();
+
+        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+        let lease_req = sink.services[0].request_id;
+        sink.services.clear();
+        control_tick(
+            &mut plugin,
+            inbox_with(vec![accepted(lease_req)]),
+            &mut sink,
+        );
+        let retargets: Vec<u64> = sink
+            .services
+            .iter()
+            .filter(|request| {
+                matches!(
+                    modulation_command(request),
+                    Some(
+                        ModulationCommandV1::SetOperatingPoint { .. }
+                            | ModulationCommandV1::SetDriveFrequency { .. }
+                            | ModulationCommandV1::SetOpticalDepth { .. }
+                    )
+                )
+            })
+            .map(|request| request.request_id)
+            .collect();
+        let bias_req = sink
+            .hosts
+            .iter()
+            .find(|request| {
+                matches!(
+                    request.command,
+                    HostCommand::ApplyBiases {
+                        diff_on: Some(12),
+                        diff_off: Some(-7)
+                    }
+                )
+            })
+            .expect("A1 must ask the host to set the point biases")
+            .request_id;
+
+        control_tick(
+            &mut plugin,
+            inbox_with(retargets.into_iter().map(accepted).collect()),
+            &mut sink,
+        );
+        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+        assert!(
+            !plugin.recording.is_active(),
+            "recording started before the host confirmed its sensor readback"
+        );
+
+        control_tick(
+            &mut plugin,
+            PluginControlInbox {
+                host_replies: vec![bias_reply(bias_req, 12, -7)],
+                ..PluginControlInbox::default()
+            },
+            &mut sink,
+        );
+        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+        assert!(
+            plugin.recording.is_active(),
+            "confirmed point did not start"
+        );
+        let metadata = plugin.recording_metadata();
+        assert_eq!(
+            metadata.get("requested_diff_on").map(String::as_str),
+            Some("12")
+        );
+        assert_eq!(
+            metadata.get("confirmed_diff_on_code").map(String::as_str),
+            Some("112")
+        );
+
+        plugin.recording = Recording::idle();
+        plugin.recording_completed_ok = true;
+        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+        assert!(matches!(
+            sink.hosts.last().map(|request| &request.command),
+            Some(HostCommand::ApplyBiases {
+                diff_on: Some(5),
+                diff_off: Some(-2)
+            })
+        ));
+
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn camera_bias_control_fails_closed_without_a_sensor_reading() {
+        let folder = temp_folder("protocol-bias-no-sensor");
+        let (mut plugin, _) = protocol_plugin(&folder, BIAS_PROTOCOL);
+        plugin.sensor = None;
+        let mut sink = ControlSink::default();
+
+        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+
+        assert!(plugin.protocol.is_none());
+        assert!(sink.services.is_empty() && sink.hosts.is_empty());
+        assert!(
+            plugin.message.contains("Sensor reading"),
+            "{}",
+            plugin.message
+        );
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn bias_only_protocol_fails_closed_when_sensor_recording_is_disabled() {
+        let folder = temp_folder("protocol-bias-sensor-recording-off");
+        let (mut plugin, _) = protocol_plugin(&folder, BIAS_PROTOCOL);
+        plugin.sensor = Some(fresh_bias_sensor(105, 98));
+        plugin.record_sensor_telemetry = false;
+        let mut sink = ControlSink::default();
+
+        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+
+        assert!(plugin.protocol.is_none());
+        assert!(sink.services.is_empty() && sink.hosts.is_empty());
+        assert!(
+            plugin.message.contains("Record sensor monitoring"),
+            "{}",
+            plugin.message
+        );
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn a_rejected_bias_point_aborts_without_recording_and_still_restores() {
+        let folder = temp_folder("protocol-bias-abort-restore");
+        let (mut plugin, _) = protocol_plugin(&folder, BIAS_PROTOCOL);
+        plugin.sensor = Some(fresh_bias_sensor(105, 98));
+        let mut sink = ControlSink::default();
+
+        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+        let lease_req = sink.services[0].request_id;
+        control_tick(
+            &mut plugin,
+            inbox_with(vec![accepted(lease_req)]),
+            &mut sink,
+        );
+        let bias_req = sink
+            .hosts
+            .iter()
+            .find(|request| matches!(&request.command, HostCommand::ApplyBiases { .. }))
+            .expect("bias request")
+            .request_id;
+        control_tick(
+            &mut plugin,
+            PluginControlInbox {
+                host_replies: vec![HostCommandReply {
+                    request_id: bias_req,
+                    outcome: HostCommandOutcome::Rejected {
+                        code: "bias_readback_mismatch".into(),
+                        message: "sensor codes do not match".into(),
+                    },
+                }],
+                ..PluginControlInbox::default()
+            },
+            &mut sink,
+        );
+
+        assert!(!plugin.recording.is_active());
+        assert!(matches!(
+            sink.hosts.last().map(|request| &request.command),
+            Some(HostCommand::ApplyBiases {
+                diff_on: Some(5),
+                diff_off: Some(-2)
+            })
+        ));
+        assert!(plugin.protocol.as_ref().is_some_and(|run| {
+            run.phase == ProtocolPhase::RestoringCamera && run.recorded == 0
+        }));
+
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn a_named_profile_is_applied_before_the_lease_and_restored_on_stop() {
+        let folder = temp_folder("protocol-profile-restore");
+        let (mut plugin, _) = protocol_plugin(&folder, PROFILE_PROTOCOL);
+        plugin.sensor = Some(fresh_bias_sensor(105, 98));
+        let mut sink = ControlSink::default();
+
+        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+        assert!(sink.services.is_empty(), "drive moved before camera apply");
+        let apply_req = sink.hosts.last().expect("profile apply request");
+        assert!(matches!(
+            &apply_req.command,
+            HostCommand::ApplyCameraConfiguration {
+                profile_name: Some(name),
+                snapshot: None
+            } if name == "A1 low noise"
+        ));
+        let apply_request_id = apply_req.request_id;
+        let snapshot = camera_snapshot();
+        control_tick(
+            &mut plugin,
+            PluginControlInbox {
+                host_replies: vec![HostCommandReply {
+                    request_id: apply_request_id,
+                    outcome: HostCommandOutcome::CameraConfigurationApplied {
+                        snapshot: snapshot.clone(),
+                        provenance: CameraConfigurationProvenanceV1 {
+                            source: "named_profile".into(),
+                            profile_name: Some("A1 low noise".into()),
+                            schema_version: 1,
+                            profile_revision: Some(3),
+                            sha256: "ab".repeat(32),
+                        },
+                        readback: fresh_bias_sensor(105, 98).bias_codes.expect("biases"),
+                        readback_age_s: 0.05,
+                    },
+                }],
+                ..PluginControlInbox::default()
+            },
+            &mut sink,
+        );
+        assert!(sink.services.iter().any(|request| matches!(
+            modulation_command(request),
+            Some(ModulationCommandV1::AcquireLease { .. })
+        )));
+
+        plugin.protocol.as_mut().expect("run").stop_requested = true;
+        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+        let restore_req = sink.hosts.last().expect("restore request");
+        assert!(matches!(
+            restore_req.command,
+            HostCommand::RestoreCameraConfiguration
+        ));
+        let restore_request_id = restore_req.request_id;
+        control_tick(
+            &mut plugin,
+            PluginControlInbox {
+                host_replies: vec![HostCommandReply {
+                    request_id: restore_request_id,
+                    outcome: HostCommandOutcome::CameraConfigurationRestored {
+                        readback: fresh_bias_sensor(105, 98).bias_codes.expect("biases"),
+                        readback_age_s: 0.05,
+                    },
+                }],
+                ..PluginControlInbox::default()
+            },
+            &mut sink,
+        );
+        assert!(plugin.protocol.is_none());
+        assert!(plugin.message.contains("restored"), "{}", plugin.message);
+
+        let _ = std::fs::remove_dir_all(&folder);
+    }
 
     /// The reason a protocol exists rather than three nested button presses:
     /// every point states its whole operating condition, so all three axes are
@@ -10695,6 +11719,28 @@ bias_refr_code,status,error\n\
             "message={}",
             plugin.message
         );
+    }
+
+    #[test]
+    fn a1_measurement_limit_uses_the_reported_sample_rate_not_the_drive_limit() {
+        let mut photodiode = ready_photodiode();
+        photodiode.stream.sample_rate_hz = Some(20_000);
+        let mut plugin = StageAA1Plugin {
+            photodiode: Some(photodiode),
+            ..StageAA1Plugin::default()
+        };
+        let blocker = plugin
+            .photodiode_measurement_blocker(2_000.0)
+            .expect("20 kSa/s cannot resolve 2 kHz at 16 samples/cycle");
+        assert!(blocker.contains("1250"), "{blocker}");
+
+        plugin
+            .photodiode
+            .as_mut()
+            .expect("photodiode")
+            .stream
+            .sample_rate_hz = Some(500_000);
+        assert!(plugin.photodiode_measurement_blocker(2_000.0).is_none());
     }
 
     /// A connected modulation plugin with no drive applied yet must never be

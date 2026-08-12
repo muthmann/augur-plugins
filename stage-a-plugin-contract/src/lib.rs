@@ -1,17 +1,44 @@
 //! Versioned, serde-only messages shared by Stage-A experiment workflows and
-//! the two persistent Teensy device-owner plugins.
+//! the two persistent Teensy device-owner plugins, plus the small pure helpers
+//! more than one Stage-A workflow needs ([`telemetry`], [`csv`]).
 //!
-//! This crate contains semantic control-plane types only. It intentionally
-//! contains no Augur ABI types, serial transports, filesystem access, raw ADC
-//! arrays, or experiment state machines.
+//! This crate intentionally contains no Augur ABI types, serial transports,
+//! filesystem access, raw ADC arrays, or experiment state machines. Every
+//! experiment plugin exports `augur_plugin_vtable`, so shared code cannot live
+//! in one of them and be linked by another — it lives here, in a plain library
+//! that exports no vtable at all (ADR 031).
 
 #![forbid(unsafe_code)]
+
+pub mod csv;
+pub mod telemetry;
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
 
 pub const CONTRACT_VERSION_V1: u16 = 1;
+
+/// Firmware-qualified periodic-drive range. These values mirror
+/// `stage-a-controller/include/board_config.h`; all Rust-side UI, service and
+/// protocol validation uses this one definition rather than duplicating the
+/// literals. The connected firmware remains authoritative and rejects outside
+/// this range as well.
+pub const DRIVE_FREQUENCY_MIN_MILLIHZ: u64 = 10;
+pub const DRIVE_FREQUENCY_MAX_MILLIHZ: u64 = 2_000_000;
+pub const DRIVE_DAC_UPDATE_RATE_HZ: u32 = 40_000;
+/// Minimum sample density for an A1 photodiode waveform measurement. Nyquist
+/// alone only proves non-aliasing; 16 samples/cycle is the project's minimum
+/// shape-resolution acceptance threshold.
+pub const A1_MIN_SAMPLES_PER_CYCLE: u32 = 16;
+
+pub fn drive_frequency_supported(frequency_millihz: u64) -> bool {
+    (DRIVE_FREQUENCY_MIN_MILLIHZ..=DRIVE_FREQUENCY_MAX_MILLIHZ).contains(&frequency_millihz)
+}
+
+pub fn a1_measurement_frequency_limit_hz(sample_rate_hz: u32) -> f64 {
+    f64::from(sample_rate_hz) / f64::from(A1_MIN_SAMPLES_PER_CYCLE)
+}
 
 pub const PLUGIN_ID_STAGE_A_MODULATION: &str = "stage-a.modulation";
 pub const PLUGIN_ID_STAGE_A_PHOTODIODE: &str = "stage-a.photodiode";
@@ -762,6 +789,16 @@ mod tests {
             CTX_STAGE_A_PHOTODIODE_SUMMARY_V1,
             "stage_a.photodiode_summary.v1"
         );
+    }
+
+    #[test]
+    fn firmware_drive_bounds_and_a1_measurement_bounds_are_distinct() {
+        assert!(drive_frequency_supported(DRIVE_FREQUENCY_MIN_MILLIHZ));
+        assert!(drive_frequency_supported(DRIVE_FREQUENCY_MAX_MILLIHZ));
+        assert!(!drive_frequency_supported(DRIVE_FREQUENCY_MIN_MILLIHZ - 1));
+        assert!(!drive_frequency_supported(DRIVE_FREQUENCY_MAX_MILLIHZ + 1));
+        assert_eq!(a1_measurement_frequency_limit_hz(20_000), 1_250.0);
+        assert_eq!(a1_measurement_frequency_limit_hz(500_000), 31_250.0);
     }
 
     #[test]

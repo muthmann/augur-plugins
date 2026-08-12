@@ -272,8 +272,44 @@ impl Default for SharedState {
 }
 
 impl SharedState {
+    /// Samples the ring retains: the operator's cache length, or the whole
+    /// modulation cycles the optical estimator needs at the period the drive is
+    /// running — whichever is longer, capped by [`RING_MAX_SAMPLES`].
+    ///
+    /// `a` is only measurable between phase-0 markers, so at low `f` the
+    /// retained window *is* the gate on whether it can be published at all: two
+    /// cycles at 0.075 Hz are 26.7 s, which the 20 s default never covers. Left
+    /// to a setting, that turns into a precondition an operator has to work out
+    /// per file and set by hand before pressing Start — and an A1 survey whose
+    /// lowest rung is sub-hertz otherwise records its full duration and only
+    /// then discovers it has no `a` to write. The markers give the period on the
+    /// same sample clock the ring is indexed by, so size the ring from them and
+    /// the precondition disappears.
+    ///
+    /// Sizing follows the drive both ways: the ring shrinks back on the next
+    /// ingest when the frequency goes up, because eviction re-reads the capacity
+    /// every frame.
     fn ring_capacity(&self, rate_hz: u32) -> usize {
-        ((f64::from(rate_hz.max(1)) * self.cache_seconds) as usize).clamp(2, RING_MAX_SAMPLES)
+        let requested = f64::from(rate_hz.max(1)) * self.cache_seconds;
+        // One cycle beyond the estimator's window, so a whole window still fits
+        // once the oldest marker ages out of it.
+        let needed = self
+            .contrast_period_samples()
+            .map_or(0.0, |period| period * (CONTRAST_WINDOW_CYCLES + 1.0));
+        (requested.max(needed) as usize).clamp(2, RING_MAX_SAMPLES)
+    }
+
+    /// The modulation period in samples the ring sizes itself against.
+    ///
+    /// The newest marker interval first: it moves to the new period on the first
+    /// marker after a retarget, where the mean over the retained markers still
+    /// carries the previous rung and would grow the ring a cycle at a time. It
+    /// also survives eviction, so a period longer than the ring itself — the
+    /// case this exists for — is still known.
+    fn contrast_period_samples(&self) -> Option<f64> {
+        self.marker_period_estimate
+            .filter(|period| *period > 0.0)
+            .or_else(|| self.marker_period_samples())
     }
 
     /// Ingests one `SamplesU16` frame. Any discontinuity — rate change,
@@ -3517,16 +3553,44 @@ mod tests {
         state
     }
 
+    /// The bug an A1 survey paid for a recording at a time: a cache length left
+    /// at its default is shorter than one cycle of a sub-hertz rung, so the
+    /// estimator saw no whole cycle, `a` was withheld, and the sidecar was
+    /// refused *after* the recording had already run its full duration. The ring
+    /// grows to the drive now, so the same stream publishes an `a`.
+    #[test]
+    fn a_cache_shorter_than_the_drive_no_longer_starves_the_estimator() {
+        let plugin = live_plugin();
+        // 0.5 Hz at 20 kSa/s = 40 000 samples per cycle, against a cache set to
+        // hold 0.6 of one.
+        let mut state = slow_sine_state(40_000, 24_000, 200_000);
+        anchor_at(&mut state, 3.0);
+        let summary = plugin
+            .optical_summary_result(&state)
+            .expect("the ring sizes itself to the marker period");
+        assert!(
+            summary.covered_cycles.expect("cycles") >= 2.0,
+            "window covers {:?} cycles",
+            summary.covered_cycles
+        );
+    }
+
     #[test]
     fn a_window_shorter_than_one_cycle_withholds_a_instead_of_under_reporting_it() {
         // `a` is peak-to-peak. Below one full cycle the robust extrema see an
         // arc of the sine, so `a` comes out low — and A1's a₀ lock divides by
         // it, inflating its drive against a bias it cannot see. Fail closed.
+        //
+        // A cache too short for the drive is no longer the way to get here —
+        // the ring follows the period. What is left is a drive whose cycles have
+        // not gone by yet: the first phase-0 stamp after a retarget or a segment
+        // restart bounds no whole cycle at all.
         let plugin = live_plugin();
 
-        // 0.5 Hz at 20 kSa/s = 40 000 samples per cycle; retain 0.6 of one.
+        // 0.5 Hz at 20 kSa/s = 40 000 samples per cycle, one marker seen.
         let mut partial = slow_sine_state(40_000, 24_000, 200_000);
         anchor_at(&mut partial, 3.0);
+        partial.markers.drain(1..);
         let error = plugin
             .optical_summary_result(&partial)
             .expect_err("a partial cycle must not publish an a");
@@ -3551,8 +3615,15 @@ mod tests {
             summary.measured_log_contrast
         );
         assert!((summary.measured_frequency_hz.expect("markers") - 0.5).abs() < 0.01);
-        assert!((summary.window_seconds.expect("window") - 4.0).abs() < 0.01);
-        assert!(summary.covered_cycles.expect("cycles") >= 1.0);
+        // The window is whole cycles, and says how many, so a consumer can wait
+        // it out before trusting a re-read.
+        let cycles = summary.covered_cycles.expect("cycles");
+        assert!(cycles >= 2.0, "covered only {cycles} cycles");
+        assert!(
+            (summary.window_seconds.expect("window") - cycles * 2.0).abs() < 0.01,
+            "window {:?} is not {cycles} cycles at 0.5 Hz",
+            summary.window_seconds
+        );
     }
 
     #[test]
@@ -3966,6 +4037,43 @@ mod tests {
         state.ring_first_index = 60;
         state.push_marker(40); // now below the ring start
         assert_eq!(state.markers.len(), 3);
+    }
+
+    /// The A1 protocols' 0.075 Hz floor at the bench's 500 kSa/s: two whole
+    /// cycles are 26.7 s, and the 20 s default cache cannot hold them. The ring
+    /// has to follow the drive down on its own — a survey that only learns at
+    /// the end of a 267 s recording that no `a` was retained has already spent
+    /// the bench time.
+    #[test]
+    fn ring_follows_the_drive_down_to_sub_hertz() {
+        let rate = 500_000_u32;
+        let mut state = SharedState {
+            rate_hz: rate,
+            ..SharedState::default()
+        };
+        assert_eq!(
+            state.ring_capacity(rate),
+            10_000_000,
+            "with no markers the operator's 20 s default stands"
+        );
+
+        // Two markers 0.075 Hz apart are all it takes to know the period.
+        let period = (f64::from(rate) / 0.075) as u64;
+        state.push_marker(0);
+        state.push_marker(period);
+
+        let capacity = state.ring_capacity(rate);
+        assert_eq!(capacity, RING_MAX_SAMPLES, "sized up to the absolute cap");
+        assert!(
+            capacity as u64 >= 2 * period,
+            "two cycles at 0.075 Hz need {} samples, ring holds {capacity}",
+            2 * period
+        );
+
+        // Back up at 8.7 Hz the ring returns to the operator's cache length.
+        let fast = (f64::from(rate) / 8.7) as u64;
+        state.push_marker(period + fast);
+        assert_eq!(state.ring_capacity(rate), 10_000_000);
     }
 
     #[test]

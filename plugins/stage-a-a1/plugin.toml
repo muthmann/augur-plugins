@@ -6,4 +6,10 @@ domain = "stage-a"
 library = "augur_plugin_stage_a_a1"
 phase = "raw_events"
 min_augur_version = "1.0.0"
-host_commands = ["start_recording", "stop_recording"]
+host_commands = [
+  "start_recording",
+  "stop_recording",
+  "apply_biases",
+  "apply_camera_configuration",
+  "restore_camera_configuration",
+]

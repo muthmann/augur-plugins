@@ -68,6 +68,9 @@ Key properties:
 - `sensor_height`
 - `acq_time_ms`
 - `event_store_budget_bytes`
+- `record_sensor_telemetry`
+- active ROI and masked pixels
+- event-filter state
 
 New plugins should prefer this shared host contract over duplicating pixel scale or sensor geometry in plugin-local defaults.
 
