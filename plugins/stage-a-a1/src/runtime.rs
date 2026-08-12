@@ -43,16 +43,17 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use augur_plugin_api::{
-    export_plugin, CameraConfigurationProvenanceV1, CameraConfigurationSnapshotV1,
-    EventStoreHandle, FfiCdEvent, GlobalSettings, HostCommand, HostCommandOutcome,
-    HostCommandReply, HostCommandRequest, HostContext, HostDatasetDescriptor, HostDatasetKind,
-    HostOutput, HostViewDescriptor, HostViewKind, HostViewPlacement, HostViewRegistry,
-    PathDialogKind, Plugin, PluginCapabilities, PluginControlContext, PluginControlInbox,
-    PluginDiscontinuity, PluginFrame, PluginInput, PluginRuntimeRole, PluginServiceOutcome,
-    PluginServiceReply, PluginServiceRequest, RoiV1, SensorBiasOffsetsV1, SensorBiasReadbackV1,
-    SensorMonitoringV1, Series1dLine, Series1dPoint, Series1dV1, SettingItem, SettingKind,
-    SettingsSchema, SettingsSection, StatusEntry, TableColumn, TableColumnData, TableColumnValues,
-    TableDatasetV1, TableSchema, TableValueType, CTX_GLOBAL_SETTINGS, CTX_SENSOR_MONITORING,
+    export_plugin, CameraBiasOffsetsV1, CameraConfigurationProvenanceV1,
+    CameraConfigurationSnapshotV1, CameraConfigurationSourceV1, EventStoreHandle, FfiCdEvent,
+    GlobalSettings, HostCommand, HostCommandOutcome, HostCommandReply, HostCommandRequest,
+    HostContext, HostDatasetDescriptor, HostDatasetKind, HostOutput, HostViewDescriptor,
+    HostViewKind, HostViewPlacement, HostViewRegistry, PathDialogKind, Plugin, PluginCapabilities,
+    PluginControlContext, PluginControlInbox, PluginDiscontinuity, PluginFrame, PluginInput,
+    PluginRuntimeRole, PluginServiceOutcome, PluginServiceReply, PluginServiceRequest, RoiV1,
+    SensorBiasReadbackV1, SensorMonitoringV1, Series1dLine, Series1dPoint, Series1dV1, SettingItem,
+    SettingKind, SettingsSchema, SettingsSection, StatusEntry, TableColumn, TableColumnData,
+    TableColumnValues, TableDatasetV1, TableSchema, TableValueType, CTX_GLOBAL_SETTINGS,
+    CTX_SENSOR_MONITORING,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -97,6 +98,7 @@ const DEFAULT_WINDOW_FLOOR: f64 = 0.10;
 const DEFAULT_ANALYSIS_WINDOW_MS: i64 = 2_000;
 /// Give up waiting for a control-plane reply after this many milliseconds.
 const REPLY_TIMEOUT_MS: u64 = 15_000;
+const CAMERA_RESTORE_MAX_ATTEMPTS: u8 = 3;
 /// Upper bound on retained phase-0 markers in the no-EventStore fallback path.
 const MAX_MARKERS: usize = 65_536;
 /// Give up waiting for the photodiode-measured `a` to reach a sweep target
@@ -818,7 +820,7 @@ impl FreqSweep {
 /// Where a protocol run is within its per-point cycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProtocolPhase {
-    /// The host is resolving/applying the named profile or inline snapshot.
+    /// The host is resolving/applying and confirming a complete configuration.
     ApplyingCamera,
     /// AcquireLease sent to the modulation owner; waiting for the grant.
     AcquiringLease,
@@ -830,7 +832,7 @@ enum ProtocolPhase {
     /// The recording coordinator owns this phase.
     Recording,
     /// All recording work is complete; the host is restoring the pre-run
-    /// configuration (or A1 is restoring the original point biases).
+    /// configuration.
     RestoringCamera,
 }
 
@@ -852,13 +854,15 @@ struct ProtocolRun {
     camera_apply_req: Option<u64>,
     camera_session_active: bool,
     camera_snapshot: Option<CameraConfigurationSnapshotV1>,
+    camera_profile_provenance: Option<CameraConfigurationProvenanceV1>,
     camera_provenance: Option<CameraConfigurationProvenanceV1>,
     camera_confirmation: Option<(SensorBiasReadbackV1, f64)>,
     bias_req: Option<u64>,
-    bias_confirmation: Option<(SensorBiasOffsetsV1, SensorBiasReadbackV1, f64)>,
-    original_biases: Option<SensorBiasOffsetsV1>,
-    biases_changed: bool,
+    bias_confirmation: Option<(CameraBiasOffsetsV1, SensorBiasReadbackV1, f64)>,
     restore_req: Option<u64>,
+    restore_attempts: u8,
+    restore_confirmed: bool,
+    restore_error: Option<String>,
     finish_message: Option<String>,
     /// Request ids of the retargets in flight for the current point. A point
     /// only proceeds once this is empty: the three axes are applied
@@ -887,6 +891,18 @@ impl ProtocolRun {
     fn point(&self) -> Option<&protocol::ProtocolPoint> {
         self.plan.points.get(self.index)
     }
+}
+
+fn a1_camera_configuration_refusal(
+    snapshot: &CameraConfigurationSnapshotV1,
+) -> Option<&'static str> {
+    if !snapshot.global.record_sensor_telemetry {
+        return Some("Record sensor monitoring is disabled");
+    }
+    if snapshot.digital_filter.stc_enabled || snapshot.digital_filter.trail_enabled {
+        return Some("STC and Trail must be disabled for an event-count protocol");
+    }
+    None
 }
 
 /// On-disk form of the per-frequency lock table.
@@ -2170,6 +2186,9 @@ impl StageAA1Plugin {
                     "camera_configuration_schema_version".into(),
                     provenance.schema_version.to_string(),
                 );
+            }
+            if let Some(provenance) = run.camera_profile_provenance.as_ref() {
+                meta.insert("camera_profile_sha256".into(), provenance.sha256.clone());
                 if let Some(name) = provenance.profile_name.as_ref() {
                     meta.insert("camera_profile_name".into(), name.clone());
                 }
@@ -4609,26 +4628,18 @@ impl StageAA1Plugin {
                     .into();
             return;
         }
-        let original_biases = if controls_camera {
+        if controls_camera {
             let Some(sensor) = self.sensor.filter(|sensor| sensor.age_s <= 2.0) else {
                 self.message =
                     "Protocol refused: camera bias control requires a fresh Sensor reading".into();
                 return;
             };
-            let Some(readback) = sensor.bias_codes else {
+            if sensor.bias_codes.is_none() {
                 self.message =
                     "Protocol refused: the Sensor reading contains no bias readback".into();
                 return;
-            };
-            Some(SensorBiasOffsetsV1 {
-                diff_on: i32::from(readback.current.diff_on)
-                    - i32::from(readback.factory_default.diff_on),
-                diff_off: i32::from(readback.current.diff_off)
-                    - i32::from(readback.factory_default.diff_off),
-            })
-        } else {
-            None
-        };
+            }
+        }
 
         let now_ms = now_unix_ms();
         let lease_id = LeaseId::new(format!(
@@ -4636,7 +4647,7 @@ impl StageAA1Plugin {
             format_compact_utc(now_ms / 1_000)
         ));
         let camera_selection = plan.camera.clone();
-        let phase = if camera_selection.is_some() {
+        let phase = if controls_camera {
             ProtocolPhase::ApplyingCamera
         } else {
             ProtocolPhase::AcquiringLease
@@ -4660,13 +4671,15 @@ impl StageAA1Plugin {
             camera_apply_req: None,
             camera_session_active: false,
             camera_snapshot: None,
+            camera_profile_provenance: None,
             camera_provenance: None,
             camera_confirmation: None,
             bias_req: None,
             bias_confirmation: None,
-            original_biases,
-            biases_changed: false,
             restore_req: None,
+            restore_attempts: 0,
+            restore_confirmed: false,
+            restore_error: None,
             finish_message: None,
             pending_reqs: Vec::new(),
             settle_until_ms: 0,
@@ -4677,25 +4690,20 @@ impl StageAA1Plugin {
             stop_requested: false,
             skip_reason: None,
         });
-        if let Some(selection) = camera_selection {
+        if controls_camera {
             let request_id = self.next_request_id();
-            let command = match selection {
-                protocol::CameraSelection::NamedProfile(profile_name) => {
-                    HostCommand::ApplyCameraConfiguration {
-                        profile_name: Some(profile_name),
-                        snapshot: None,
-                    }
+            let configuration = match camera_selection {
+                Some(protocol::CameraSelection::NamedProfile(name)) => {
+                    CameraConfigurationSourceV1::NamedProfile { name }
                 }
-                protocol::CameraSelection::Snapshot(snapshot) => {
-                    HostCommand::ApplyCameraConfiguration {
-                        profile_name: None,
-                        snapshot: Some(snapshot),
-                    }
+                Some(protocol::CameraSelection::Snapshot(snapshot)) => {
+                    CameraConfigurationSourceV1::Snapshot { snapshot }
                 }
+                None => CameraConfigurationSourceV1::Current,
             };
             context.request_host(&HostCommandRequest {
                 request_id,
-                command,
+                command: HostCommand::ApplyCameraConfiguration { configuration },
             });
             if let Some(run) = self.protocol.as_mut() {
                 run.camera_apply_req = Some(request_id);
@@ -4737,34 +4745,31 @@ impl StageAA1Plugin {
             return;
         }
 
-        let restore_command = if run.camera_session_active {
-            Some(HostCommand::RestoreCameraConfiguration)
-        } else if run.biases_changed {
-            run.original_biases.map(|biases| HostCommand::ApplyBiases {
-                diff_on: Some(biases.diff_on),
-                diff_off: Some(biases.diff_off),
-            })
-        } else {
-            None
-        };
-        if let Some(command) = restore_command {
-            let request_id = self.next_request_id();
-            context.request_host(&HostCommandRequest {
-                request_id,
-                command,
-            });
+        if run.camera_session_active {
             if let Some(run) = self.protocol.as_mut() {
                 run.phase = ProtocolPhase::RestoringCamera;
-                run.restore_req = Some(request_id);
                 run.finish_message = Some(message);
-                run.last_activity_ms = now_unix_ms();
             }
+            self.request_protocol_camera_restore(context);
             self.message =
                 "Protocol stopped recording; restoring the pre-run camera settings…".into();
             return;
         }
 
         self.complete_protocol(context, message);
+    }
+
+    fn request_protocol_camera_restore(&mut self, context: &mut impl RecordingControl) {
+        let request_id = self.next_request_id();
+        context.request_host(&HostCommandRequest {
+            request_id,
+            command: HostCommand::RestoreCameraConfiguration,
+        });
+        if let Some(run) = self.protocol.as_mut() {
+            run.restore_req = Some(request_id);
+            run.restore_attempts = run.restore_attempts.saturating_add(1);
+            run.last_activity_ms = now_unix_ms();
+        }
     }
 
     /// Release the modulation lease after camera restoration has resolved.
@@ -4793,8 +4798,10 @@ impl StageAA1Plugin {
             return;
         };
         let lease_id = run.lease_id.clone();
-        let (index, total) = (run.index, run.plan.points.len());
-        let ttl_ms = Self::protocol_lease_ttl_ms(&run.plan, index);
+        let index = run.index;
+        let total = run.plan.points.len();
+        let ttl_ms = Self::protocol_lease_ttl_ms(&run.plan, run.index);
+        let camera_snapshot = run.camera_snapshot.clone();
 
         let renew = self.modulation_request(ModulationCommandV1::RenewLease { ttl_ms }, &lease_id);
         context.request_service(&renew);
@@ -4819,13 +4826,26 @@ impl StageAA1Plugin {
             context.request_service(&request);
         }
 
-        let bias_request = if point.diff_on.is_some() || point.diff_off.is_some() {
+        let point_changes_biases = point.diff_on.is_some() || point.diff_off.is_some();
+        let point_snapshot = point_changes_biases
+            .then_some(camera_snapshot)
+            .flatten()
+            .map(|mut snapshot| {
+                if let Some(diff_on) = point.diff_on {
+                    snapshot.biases.diff_on = diff_on;
+                }
+                if let Some(diff_off) = point.diff_off {
+                    snapshot.biases.diff_off = diff_off;
+                }
+                snapshot
+            });
+        let missing_camera_snapshot = point_changes_biases && point_snapshot.is_none();
+        let bias_request = if let Some(snapshot) = point_snapshot {
             let request_id = self.next_request_id();
             context.request_host(&HostCommandRequest {
                 request_id,
-                command: HostCommand::ApplyBiases {
-                    diff_on: point.diff_on,
-                    diff_off: point.diff_off,
+                command: HostCommand::ApplyCameraConfiguration {
+                    configuration: CameraConfigurationSourceV1::Snapshot { snapshot },
                 },
             });
             Some(request_id)
@@ -4848,8 +4868,8 @@ impl StageAA1Plugin {
             run.pending_reqs = pending;
             run.bias_req = bias_request;
             run.bias_confirmation = None;
-            run.biases_changed |= bias_request.is_some();
-            run.skip_reason = None;
+            run.skip_reason = missing_camera_snapshot
+                .then(|| "the host did not return a complete camera snapshot".into());
             run.last_activity_ms = now_ms;
         }
         self.message = format!(
@@ -5100,29 +5120,51 @@ impl StageAA1Plugin {
             ProtocolPhase::RestoringCamera => {
                 if restore_pending {
                     if now_ms.saturating_sub(last_activity) > REPLY_TIMEOUT_MS {
-                        let message = self
-                            .protocol
-                            .as_ref()
-                            .and_then(|run| run.finish_message.clone())
-                            .unwrap_or_else(|| "Protocol ended".into());
-                        self.complete_protocol(
-                            context,
-                            format!(
-                                "{message} — ERROR: pre-run camera settings were not confirmed restored"
-                            ),
-                        );
+                        if let Some(run) = self.protocol.as_mut() {
+                            run.restore_req = None;
+                            run.restore_error = Some("host reply timed out".into());
+                            run.last_activity_ms = now_ms;
+                        }
                     }
                     return;
                 }
-                let message = self
+                let (restore_confirmed, restore_attempts, restore_error) = self
                     .protocol
-                    .as_mut()
-                    .and_then(|run| run.finish_message.take())
-                    .unwrap_or_else(|| "Protocol ended; pre-run camera settings restored".into());
-                self.complete_protocol(
-                    context,
-                    format!("{message} — pre-run camera settings restored"),
-                );
+                    .as_ref()
+                    .map(|run| {
+                        (
+                            run.restore_confirmed,
+                            run.restore_attempts,
+                            run.restore_error.clone(),
+                        )
+                    })
+                    .unwrap_or_default();
+                if restore_confirmed {
+                    let message = self
+                        .protocol
+                        .as_mut()
+                        .and_then(|run| run.finish_message.take())
+                        .unwrap_or_else(|| "Protocol ended".into());
+                    self.complete_protocol(
+                        context,
+                        format!("{message} — pre-run camera settings restored"),
+                    );
+                } else if restore_attempts < CAMERA_RESTORE_MAX_ATTEMPTS {
+                    self.request_protocol_camera_restore(context);
+                } else {
+                    let message = self
+                        .protocol
+                        .as_mut()
+                        .and_then(|run| run.finish_message.take())
+                        .unwrap_or_else(|| "Protocol ended".into());
+                    self.complete_protocol(
+                        context,
+                        format!(
+                            "{message} — ERROR: pre-run camera settings were not confirmed restored after {restore_attempts} attempts ({})",
+                            restore_error.unwrap_or_else(|| "unknown restore failure".into())
+                        ),
+                    );
+                }
             }
         }
     }
@@ -5495,16 +5537,31 @@ impl StageAA1Plugin {
                             run.camera_apply_req = None;
                             run.camera_session_active = true;
                             run.camera_snapshot = Some(snapshot.clone());
+                            run.camera_profile_provenance = provenance
+                                .profile_name
+                                .is_some()
+                                .then(|| provenance.clone());
                             run.camera_provenance = Some(provenance.clone());
                             run.camera_confirmation = Some((*readback, *readback_age_s));
-                            run.phase = ProtocolPhase::AcquiringLease;
-                            run.lease_req = 0;
+                            if let Some(reason) = a1_camera_configuration_refusal(snapshot) {
+                                run.stop_requested = true;
+                                run.finish_message = Some(format!(
+                                    "Protocol aborted: applied camera configuration is incompatible: {reason}"
+                                ));
+                            } else {
+                                run.phase = ProtocolPhase::AcquiringLease;
+                                run.lease_req = 0;
+                            }
                             run.last_activity_ms = now_ms;
                         }
                     }
                     HostCommandOutcome::Rejected { code, message } => {
                         if let Some(run) = self.protocol.as_mut() {
                             run.camera_apply_req = None;
+                            // A host rejection is terminal only after any
+                            // required rollback has completed. A missing reply
+                            // remains the ambiguous case handled by timeout.
+                            run.camera_session_active = false;
                             run.stop_requested = true;
                             run.finish_message = Some(format!(
                                 "Protocol aborted: camera configuration rejected ({code}): {message}"
@@ -5529,14 +5586,23 @@ impl StageAA1Plugin {
             if bias_req == Some(reply.request_id) {
                 let now_ms = now_unix_ms();
                 match &reply.outcome {
-                    HostCommandOutcome::BiasesApplied {
-                        applied,
+                    HostCommandOutcome::CameraConfigurationApplied {
+                        snapshot,
+                        provenance,
                         readback,
                         readback_age_s,
                     } => {
                         if let Some(run) = self.protocol.as_mut() {
                             run.bias_req = None;
-                            run.bias_confirmation = Some((*applied, *readback, *readback_age_s));
+                            run.camera_snapshot = Some(snapshot.clone());
+                            run.camera_provenance = Some(provenance.clone());
+                            run.bias_confirmation =
+                                Some((snapshot.biases, *readback, *readback_age_s));
+                            if let Some(reason) = a1_camera_configuration_refusal(snapshot) {
+                                run.skip_reason = Some(format!(
+                                    "applied camera configuration is incompatible: {reason}"
+                                ));
+                            }
                             run.last_activity_ms = now_ms;
                         }
                     }
@@ -5565,25 +5631,22 @@ impl StageAA1Plugin {
                 let restored = matches!(
                     reply.outcome,
                     HostCommandOutcome::CameraConfigurationRestored { .. }
-                        | HostCommandOutcome::BiasesApplied { .. }
                 );
                 if let Some(run) = self.protocol.as_mut() {
                     run.restore_req = None;
-                    run.camera_session_active = false;
-                    run.biases_changed = false;
                     run.last_activity_ms = now_ms;
-                    if !restored {
+                    if restored {
+                        run.camera_session_active = false;
+                        run.restore_confirmed = true;
+                        run.restore_error = None;
+                    } else {
                         let detail = match &reply.outcome {
                             HostCommandOutcome::Rejected { code, message } => {
                                 format!("restore rejected ({code}): {message}")
                             }
                             _ => "host returned an invalid restore confirmation".into(),
                         };
-                        let message = run
-                            .finish_message
-                            .take()
-                            .unwrap_or_else(|| "Protocol ended".into());
-                        run.finish_message = Some(format!("{message} — ERROR: {detail}"));
+                        run.restore_error = Some(detail);
                     }
                 }
                 return;
@@ -5992,12 +6055,7 @@ impl StageAA1Plugin {
                     .or_else(|| {
                         run.camera_confirmation.map(|(readback, age_s)| {
                             let offsets =
-                                run.camera_snapshot
-                                    .as_ref()
-                                    .map(|snapshot| SensorBiasOffsetsV1 {
-                                        diff_on: snapshot.biases.diff_on,
-                                        diff_off: snapshot.biases.diff_off,
-                                    });
+                                run.camera_snapshot.as_ref().map(|snapshot| snapshot.biases);
                             (offsets, Some(readback), Some(age_s))
                         })
                     })
@@ -6005,6 +6063,7 @@ impl StageAA1Plugin {
                 Some(CameraControlSidecar {
                     snapshot: run.camera_snapshot.clone(),
                     provenance: run.camera_provenance.clone(),
+                    profile_provenance: run.camera_profile_provenance.clone(),
                     requested_diff_on: point.and_then(|point| point.diff_on),
                     requested_diff_off: point.and_then(|point| point.diff_off),
                     confirmed_offsets,
@@ -6265,11 +6324,13 @@ struct CameraControlSidecar {
     #[serde(skip_serializing_if = "Option::is_none")]
     provenance: Option<CameraConfigurationProvenanceV1>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    profile_provenance: Option<CameraConfigurationProvenanceV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     requested_diff_on: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     requested_diff_off: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    confirmed_offsets: Option<SensorBiasOffsetsV1>,
+    confirmed_offsets: Option<CameraBiasOffsetsV1>,
     #[serde(skip_serializing_if = "Option::is_none")]
     confirmed_readback: Option<SensorBiasReadbackV1>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -10766,11 +10827,18 @@ depth_a = 0.7
         }
     }
 
-    fn bias_reply(request_id: u64, diff_on: i32, diff_off: i32) -> HostCommandReply {
+    fn configuration_reply(
+        request_id: u64,
+        snapshot: CameraConfigurationSnapshotV1,
+        provenance: CameraConfigurationProvenanceV1,
+    ) -> HostCommandReply {
+        let diff_on = snapshot.biases.diff_on;
+        let diff_off = snapshot.biases.diff_off;
         HostCommandReply {
             request_id,
-            outcome: HostCommandOutcome::BiasesApplied {
-                applied: SensorBiasOffsetsV1 { diff_on, diff_off },
+            outcome: HostCommandOutcome::CameraConfigurationApplied {
+                snapshot,
+                provenance,
                 readback: SensorBiasReadbackV1 {
                     current: augur_plugin_api::SensorBiasCodesV1 {
                         diff_on: (100 + diff_on) as u8,
@@ -10790,6 +10858,23 @@ depth_a = 0.7
                 readback_age_s: 0.05,
             },
         }
+    }
+
+    fn current_configuration_reply(
+        request_id: u64,
+        snapshot: CameraConfigurationSnapshotV1,
+    ) -> HostCommandReply {
+        configuration_reply(
+            request_id,
+            snapshot,
+            CameraConfigurationProvenanceV1 {
+                source: "current_configuration".into(),
+                profile_name: None,
+                schema_version: 1,
+                profile_revision: None,
+                sha256: "cd".repeat(32),
+            },
+        )
     }
 
     fn camera_snapshot() -> CameraConfigurationSnapshotV1 {
@@ -10838,8 +10923,27 @@ depth_a = 0.7
         let mut sink = ControlSink::default();
 
         control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
-        let lease_req = sink.services[0].request_id;
-        sink.services.clear();
+        let session_req = sink.hosts.last().expect("current configuration request");
+        assert!(matches!(
+            &session_req.command,
+            HostCommand::ApplyCameraConfiguration {
+                configuration: CameraConfigurationSourceV1::Current
+            }
+        ));
+        let session_request_id = session_req.request_id;
+        let initial_snapshot = camera_snapshot();
+        control_tick(
+            &mut plugin,
+            PluginControlInbox {
+                host_replies: vec![current_configuration_reply(
+                    session_request_id,
+                    initial_snapshot.clone(),
+                )],
+                ..PluginControlInbox::default()
+            },
+            &mut sink,
+        );
+        let lease_req = sink.services.last().expect("lease request").request_id;
         control_tick(
             &mut plugin,
             inbox_with(vec![accepted(lease_req)]),
@@ -10860,20 +10964,29 @@ depth_a = 0.7
             })
             .map(|request| request.request_id)
             .collect();
-        let bias_req = sink
+        let point_request = sink
             .hosts
             .iter()
-            .find(|request| {
-                matches!(
-                    request.command,
-                    HostCommand::ApplyBiases {
-                        diff_on: Some(12),
-                        diff_off: Some(-7)
-                    }
-                )
+            .rev()
+            .find(|request| match &request.command {
+                HostCommand::ApplyCameraConfiguration {
+                    configuration: CameraConfigurationSourceV1::Snapshot { snapshot },
+                } => snapshot.biases.diff_on == 12 && snapshot.biases.diff_off == -7,
+                _ => false,
             })
-            .expect("A1 must ask the host to set the point biases")
-            .request_id;
+            .expect("A1 must apply a complete snapshot for the point biases");
+        let HostCommand::ApplyCameraConfiguration {
+            configuration: CameraConfigurationSourceV1::Snapshot { snapshot },
+        } = &point_request.command
+        else {
+            unreachable!("matched above")
+        };
+        assert_eq!(snapshot.biases.fo, initial_snapshot.biases.fo);
+        assert_eq!(snapshot.biases.hpf, initial_snapshot.biases.hpf);
+        assert_eq!(snapshot.biases.refr, initial_snapshot.biases.refr);
+        assert_eq!(snapshot.roi, initial_snapshot.roi);
+        assert_eq!(snapshot.digital_filter, initial_snapshot.digital_filter);
+        let bias_req = point_request.request_id;
 
         control_tick(
             &mut plugin,
@@ -10886,10 +10999,23 @@ depth_a = 0.7
             "recording started before the host confirmed its sensor readback"
         );
 
+        let mut point_snapshot = initial_snapshot;
+        point_snapshot.biases.diff_on = 12;
+        point_snapshot.biases.diff_off = -7;
         control_tick(
             &mut plugin,
             PluginControlInbox {
-                host_replies: vec![bias_reply(bias_req, 12, -7)],
+                host_replies: vec![configuration_reply(
+                    bias_req,
+                    point_snapshot,
+                    CameraConfigurationProvenanceV1 {
+                        source: "inline_snapshot".into(),
+                        profile_name: None,
+                        schema_version: 1,
+                        profile_revision: None,
+                        sha256: "ef".repeat(32),
+                    },
+                )],
                 ..PluginControlInbox::default()
             },
             &mut sink,
@@ -10914,10 +11040,7 @@ depth_a = 0.7
         control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
         assert!(matches!(
             sink.hosts.last().map(|request| &request.command),
-            Some(HostCommand::ApplyBiases {
-                diff_on: Some(5),
-                diff_off: Some(-2)
-            })
+            Some(HostCommand::RestoreCameraConfiguration)
         ));
 
         let _ = std::fs::remove_dir_all(&folder);
@@ -10970,7 +11093,16 @@ depth_a = 0.7
         let mut sink = ControlSink::default();
 
         control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
-        let lease_req = sink.services[0].request_id;
+        let session_req = sink.hosts.last().expect("session request").request_id;
+        control_tick(
+            &mut plugin,
+            PluginControlInbox {
+                host_replies: vec![current_configuration_reply(session_req, camera_snapshot())],
+                ..PluginControlInbox::default()
+            },
+            &mut sink,
+        );
+        let lease_req = sink.services.last().expect("lease request").request_id;
         control_tick(
             &mut plugin,
             inbox_with(vec![accepted(lease_req)]),
@@ -10979,8 +11111,16 @@ depth_a = 0.7
         let bias_req = sink
             .hosts
             .iter()
-            .find(|request| matches!(&request.command, HostCommand::ApplyBiases { .. }))
-            .expect("bias request")
+            .rev()
+            .find(|request| {
+                matches!(
+                    &request.command,
+                    HostCommand::ApplyCameraConfiguration {
+                        configuration: CameraConfigurationSourceV1::Snapshot { .. }
+                    }
+                )
+            })
+            .expect("point configuration request")
             .request_id;
         control_tick(
             &mut plugin,
@@ -11000,10 +11140,7 @@ depth_a = 0.7
         assert!(!plugin.recording.is_active());
         assert!(matches!(
             sink.hosts.last().map(|request| &request.command),
-            Some(HostCommand::ApplyBiases {
-                diff_on: Some(5),
-                diff_off: Some(-2)
-            })
+            Some(HostCommand::RestoreCameraConfiguration)
         ));
         assert!(plugin.protocol.as_ref().is_some_and(|run| {
             run.phase == ProtocolPhase::RestoringCamera && run.recorded == 0
@@ -11025,8 +11162,7 @@ depth_a = 0.7
         assert!(matches!(
             &apply_req.command,
             HostCommand::ApplyCameraConfiguration {
-                profile_name: Some(name),
-                snapshot: None
+                configuration: CameraConfigurationSourceV1::NamedProfile { name }
             } if name == "A1 low noise"
         ));
         let apply_request_id = apply_req.request_id;
@@ -11082,6 +11218,75 @@ depth_a = 0.7
         );
         assert!(plugin.protocol.is_none());
         assert!(plugin.message.contains("restored"), "{}", plugin.message);
+
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn rejected_camera_restore_retries_and_never_reports_success() {
+        let folder = temp_folder("protocol-profile-restore-rejected");
+        let (mut plugin, _) = protocol_plugin(&folder, PROFILE_PROTOCOL);
+        plugin.sensor = Some(fresh_bias_sensor(105, 98));
+        let mut sink = ControlSink::default();
+
+        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+        let apply_request_id = sink.hosts.last().expect("profile apply request").request_id;
+        let snapshot = camera_snapshot();
+        control_tick(
+            &mut plugin,
+            PluginControlInbox {
+                host_replies: vec![configuration_reply(
+                    apply_request_id,
+                    snapshot,
+                    CameraConfigurationProvenanceV1 {
+                        source: "named_profile".into(),
+                        profile_name: Some("A1 low noise".into()),
+                        schema_version: 1,
+                        profile_revision: Some(3),
+                        sha256: "ab".repeat(32),
+                    },
+                )],
+                ..PluginControlInbox::default()
+            },
+            &mut sink,
+        );
+
+        plugin.protocol.as_mut().expect("run").stop_requested = true;
+        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+
+        for attempt in 1..=CAMERA_RESTORE_MAX_ATTEMPTS {
+            let restore_request_id = sink.hosts.last().expect("restore request").request_id;
+            control_tick(
+                &mut plugin,
+                PluginControlInbox {
+                    host_replies: vec![HostCommandReply {
+                        request_id: restore_request_id,
+                        outcome: HostCommandOutcome::Rejected {
+                            code: "camera_configuration_restore_failed".into(),
+                            message: "device refused restore".into(),
+                        },
+                    }],
+                    ..PluginControlInbox::default()
+                },
+                &mut sink,
+            );
+            control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+            if attempt < CAMERA_RESTORE_MAX_ATTEMPTS {
+                assert!(plugin.protocol.is_some(), "restore stopped before retry");
+                assert_ne!(
+                    sink.hosts.last().expect("retry request").request_id,
+                    restore_request_id
+                );
+            }
+        }
+
+        assert!(plugin.protocol.is_none());
+        assert!(plugin.message.contains("ERROR"), "{}", plugin.message);
+        assert!(
+            !plugin.message.ends_with("pre-run camera settings restored"),
+            "{}",
+            plugin.message
+        );
 
         let _ = std::fs::remove_dir_all(&folder);
     }
