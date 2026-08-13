@@ -57,6 +57,7 @@ use augur_plugin_api::{
 };
 use serde::Serialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use stage_a_plugin_contract::{
     ClientId, ConnectionStateV1, LeaseId, LeaseSnapshotV1, ModulationCommandV1,
     ModulationRequestV1, ModulationStateV1, OpticalTargetV1, PdqReceiptV1, PdqStartSpecV1,
@@ -846,6 +847,9 @@ enum ProtocolPhase {
 /// implicitly at whatever the operator last armed.
 struct ProtocolRun {
     plan: protocol::Protocol,
+    source_path: String,
+    source_sha256: String,
+    source_text: String,
     phase: ProtocolPhase,
     index: usize,
     lease_id: LeaseId,
@@ -901,6 +905,9 @@ fn a1_camera_configuration_refusal(
     }
     if snapshot.digital_filter.stc_enabled || snapshot.digital_filter.trail_enabled {
         return Some("STC and Trail must be disabled for an event-count protocol");
+    }
+    if snapshot.digital_filter.erc_enabled != Some(false) {
+        return Some("ERC must be explicitly reported disabled for an event-count protocol");
     }
     None
 }
@@ -2152,12 +2159,18 @@ impl StageAA1Plugin {
         // it came from. `measured_a` keeps its historical meaning — a number the
         // photodiode actually measured — so an open-loop run simply does not
         // carry one, rather than carrying a commanded value under that name.
-        meta.insert("depth_a_source".into(), self.depth_source.label().into());
+        meta.insert(
+            "depth_a_analysis_source".into(),
+            self.depth_source.label().into(),
+        );
         if let Some(a) = self.depth_a() {
-            meta.insert("depth_a".into(), format!("{a:.6}"));
+            meta.insert("depth_a_analysis".into(), format!("{a:.6}"));
+        }
+        if let Some(a) = self.commanded_a() {
+            meta.insert("depth_a_commanded".into(), format!("{a:.6}"));
         }
         if let Some(a) = self.photodiode_a() {
-            meta.insert("measured_a".into(), format!("{a:.6}"));
+            meta.insert("depth_a_measured".into(), format!("{a:.6}"));
         }
         if let Some(hz) = self.period_us().map(|t| 1_000_000.0 / t) {
             meta.insert("modulation_frequency_hz".into(), format!("{hz:.6}"));
@@ -2176,25 +2189,26 @@ impl StageAA1Plugin {
         }
         if let Some(run) = self.protocol.as_ref() {
             meta.insert("a1_protocol_name".into(), run.plan.name.clone());
-            meta.insert("a1_protocol_point".into(), (run.index + 1).to_string());
-            if let Some(provenance) = run.camera_provenance.as_ref() {
+            if let Some(version) = run.plan.version.as_ref() {
+                meta.insert("a1_protocol_version".into(), version.clone());
+            }
+            meta.insert(
+                "a1_protocol_source_sha256".into(),
+                run.source_sha256.clone(),
+            );
+            if let Some(file) = Path::new(&run.source_path).file_name() {
                 meta.insert(
-                    "camera_configuration_sha256".into(),
-                    provenance.sha256.clone(),
-                );
-                meta.insert(
-                    "camera_configuration_schema_version".into(),
-                    provenance.schema_version.to_string(),
+                    "a1_protocol_source_file".into(),
+                    file.to_string_lossy().into_owned(),
                 );
             }
-            if let Some(provenance) = run.camera_profile_provenance.as_ref() {
-                meta.insert("camera_profile_sha256".into(), provenance.sha256.clone());
-                if let Some(name) = provenance.profile_name.as_ref() {
-                    meta.insert("camera_profile_name".into(), name.clone());
-                }
-                if let Some(revision) = provenance.profile_revision {
-                    meta.insert("camera_profile_revision".into(), revision.to_string());
-                }
+            meta.insert("a1_protocol_point".into(), (run.index + 1).to_string());
+            meta.insert(
+                "a1_protocol_points".into(),
+                run.plan.points.len().to_string(),
+            );
+            if let Some(point) = run.point() {
+                meta.insert("a1_protocol_point_label".into(), point.block.clone());
             }
             if let Some(point) = run.point() {
                 if let Some(diff_on) = point.diff_on {
@@ -2203,19 +2217,6 @@ impl StageAA1Plugin {
                 if let Some(diff_off) = point.diff_off {
                     meta.insert("requested_diff_off".into(), diff_off.to_string());
                 }
-            }
-            if let Some((applied, readback, age_s)) = run.bias_confirmation {
-                meta.insert("confirmed_diff_on".into(), applied.diff_on.to_string());
-                meta.insert("confirmed_diff_off".into(), applied.diff_off.to_string());
-                meta.insert(
-                    "confirmed_diff_on_code".into(),
-                    readback.current.diff_on.to_string(),
-                );
-                meta.insert(
-                    "confirmed_diff_off_code".into(),
-                    readback.current.diff_off.to_string(),
-                );
-                meta.insert("bias_readback_age_s".into(), format!("{age_s:.3}"));
             }
         }
         // Bench conditions, on every run and every role. Each key appears only
@@ -3794,7 +3795,8 @@ impl StageAA1Plugin {
         let mut readings = lock.samples.clone();
         if readings.is_empty() {
             // The owner withholds `a` for a stated reason (clipping, no
-            // headroom, a bad `I_tot` anchor, a sub-cycle window). Ask the
+            // headroom, an invalid placement-specific reference, a sub-cycle
+            // window). Ask the
             // blocker for it rather than leaving the operator with "nothing
             // happened" — and it answers for whichever source is selected.
             let reason = self
@@ -3813,8 +3815,8 @@ impl StageAA1Plugin {
             self.finish_a0_lock(
                 context,
                 format!(
-                    "a₀ lock aborted: the {} a = {measured:.3} — check the I_tot anchor and that \
-                     the drive is modulating",
+                    "a₀ lock aborted: the {} a = {measured:.3} — check the photodiode placement, \
+                     its dark/anchor gate, and that the drive is modulating",
                     self.depth_source.verb()
                 ),
             );
@@ -3828,7 +3830,8 @@ impl StageAA1Plugin {
                 format!(
                     "a₀ lock aborted at {}: the observed a is not settled — {} readings spread \
                      {spread:.3} across {}× the ±{tolerance:.3} tolerance (median {measured:.3}). \
-                     Increase Sweep settle (s) or check the drive and the I_tot anchor",
+                     Increase Sweep settle (s), or check the drive and the placement-specific \
+                     photodiode reference",
                     frequency_label(hz),
                     readings.len(),
                     A0_LOCK_MAX_SPREAD_TOLERANCES,
@@ -4587,6 +4590,7 @@ impl StageAA1Plugin {
                 return;
             }
         };
+        let source_sha256 = format!("{:x}", Sha256::digest(text.as_bytes()));
         // The photodiode measures `a` over one window for every frequency, so
         // the lowest frequency in the file decides whether the survey is
         // measurable at all. Refuse the plan, not its 40th point.
@@ -4645,6 +4649,9 @@ impl StageAA1Plugin {
         );
         self.protocol = Some(ProtocolRun {
             plan,
+            source_path: path,
+            source_sha256,
+            source_text: text,
             phase,
             index: 0,
             lease_id,
@@ -5862,6 +5869,8 @@ impl StageAA1Plugin {
     /// Build and write the A1 config sidecar linking the RAW + PDQ files.
     fn write_sidecar(&self) -> Result<String, String> {
         let now_ms = now_unix_ms();
+        let dir = PathBuf::from(&self.recording.folder).join(&self.recording.id);
+        std::fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
         let modulation = self
             .modulation
             .as_ref()
@@ -5878,7 +5887,7 @@ impl StageAA1Plugin {
             .optical
             .as_ref()
             .or_else(|| self.fresh_optical_summary());
-        if optical.is_none() {
+        if optical.is_none() && self.depth_source == DepthSource::Photodiode {
             // The refusal used to stop at "no fresh summary", which reads as a
             // missing anchor and sends the operator to re-confirm one that was
             // already fine. The owner knows which estimator gate rejected the
@@ -5887,13 +5896,11 @@ impl StageAA1Plugin {
             // unattended protocol run leaves behind for the point it lost.
             return Err(format!(
                 "cannot write a quantitative A1 sidecar without a fresh photodiode optical \
-                 summary from a confirmed I_tot anchor: {}",
+                 summary that passed the selected placement's optical gates: {}",
                 self.optical_summary_blocker()
                     .unwrap_or_else(|| "the photodiode gave no reason".into())
             ));
         }
-        let roi = self.host_roi.unwrap_or_default();
-
         let raw_path = self
             .recording
             .cam_finalized_path
@@ -5901,7 +5908,60 @@ impl StageAA1Plugin {
             .or_else(|| self.recording.cam_raw_path.clone());
         let camera_bias_sidecar = raw_path.as_deref().and_then(sibling_toml);
 
+        let protocol = self
+            .protocol
+            .as_ref()
+            .map(|run| {
+                let extension = Path::new(&run.source_path)
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .unwrap_or("txt");
+                let short_hash = &run.source_sha256[..12.min(run.source_sha256.len())];
+                let archive_name = format!("a1_protocol_{short_hash}.{extension}");
+                let archive_path = dir.join(&archive_name);
+                if !archive_path.exists() {
+                    std::fs::write(&archive_path, &run.source_text)
+                        .map_err(|error| format!("archiving protocol source failed: {error}"))?;
+                }
+                let point = run.point();
+                Ok::<_, String>(ProtocolSidecar {
+                    name: run.plan.name.clone(),
+                    version: run.plan.version.clone(),
+                    source_file: Path::new(&run.source_path)
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| run.source_path.clone()),
+                    source_sha256: run.source_sha256.clone(),
+                    archived_file: archive_name,
+                    point_index: run.index + 1,
+                    point_total: run.plan.points.len(),
+                    point_label: point.map(|point| point.block.clone()),
+                    point_role: point.map(|point| {
+                        match point.role {
+                            protocol::PointRole::Normal => "normal",
+                            protocol::PointRole::Pilot => "pilot",
+                            protocol::PointRole::Background => "background",
+                        }
+                        .to_owned()
+                    }),
+                    requested_mean_u: point.map(|point| point.mean_u),
+                    requested_frequency_hz: point.map(|point| point.frequency_hz),
+                    requested_depth_a: point.map(|point| point.depth_a),
+                    requested_diff_on: point.and_then(|point| point.diff_on),
+                    requested_diff_off: point.and_then(|point| point.diff_off),
+                })
+            })
+            .transpose()?;
+        let direct_dark = optical
+            .and_then(|summary| summary.calibration.dark_reference.as_ref())
+            .or_else(|| {
+                self.photodiode
+                    .as_ref()
+                    .and_then(|summary| summary.dark_reference.as_ref())
+            });
+
         let doc = SidecarDoc {
+            schema: "stage-a.a1.sidecar.v2".into(),
             measurement_id: self.recording.id.clone(),
             file_stem: self.recording.stem.clone(),
             role: self.recording.role.label().into(),
@@ -5914,12 +5974,15 @@ impl StageAA1Plugin {
             ),
             finalized_at_utc: format_iso_utc(now_ms / 1_000),
             duration_s: self.recording.duration_s,
-            depth_a_source: self.depth_source.label().into(),
-            // Measured `a` comes from the same latched window as the rest of the
-            // optical section, so the two can never disagree.
-            depth_a: match self.depth_source {
-                DepthSource::Photodiode => optical.map(|o| o.measured_log_contrast),
-                DepthSource::Commanded => self.commanded_a(),
+            protocol,
+            depth: DepthSidecar {
+                analysis_source: self.depth_source.label().into(),
+                analysis_a: match self.depth_source {
+                    DepthSource::Photodiode => optical.map(|o| o.measured_log_contrast),
+                    DepthSource::Commanded => self.commanded_a(),
+                },
+                commanded_a: self.commanded_a(),
+                measured_a: optical.map(|o| o.measured_log_contrast),
             },
             sweep: {
                 let point = self
@@ -5991,7 +6054,6 @@ impl StageAA1Plugin {
                 resolved_mean_u: mod_optical
                     .map(|drive| f64::from(drive.resolved_mean_u_milli) / 1_000.0),
                 internal_u: mod_optical.map(|drive| f64::from(drive.internal_u_milli) / 1_000.0),
-                requested_a: mod_optical.map(|drive| f64::from(drive.depth_a_milli) / 1_000.0),
                 v_null_dac: mod_optical.map(|drive| drive.v_null_dac),
                 v_peak_dac: mod_optical.map(|drive| drive.v_peak_dac),
                 center_dac: a1_config.map(|c| c.center_dac),
@@ -6000,80 +6062,41 @@ impl StageAA1Plugin {
                     .and_then(|t| t.waveform.as_ref())
                     .map(waveform_label),
             },
-            optical: OpticalSidecar {
+            photodiode: PhotodiodeSidecar {
+                placement: optical
+                    .map(|o| o.placement)
+                    .or_else(|| self.photodiode.as_ref().map(|summary| summary.placement)),
+                splitter_fraction: optical.and_then(|o| o.splitter_fraction).or_else(|| {
+                    self.photodiode
+                        .as_ref()
+                        .and_then(|summary| summary.splitter_fraction)
+                }),
                 measured_a: optical.map(|o| o.measured_log_contrast),
-                geometric_mean_excitation_volts: optical
+                geometric_mean_detector_volts: optical
                     .map(|o| (o.excitation_min_volts * o.excitation_max_volts).sqrt()),
-                excitation_min_volts: optical.map(|o| o.excitation_min_volts),
-                excitation_max_volts: optical.map(|o| o.excitation_max_volts),
-                excitation_headroom_volts: optical.map(|o| o.excitation_headroom_volts),
+                detector_min_volts: optical.map(|o| o.excitation_min_volts),
+                detector_max_volts: optical.map(|o| o.excitation_max_volts),
+                detector_headroom_volts: optical.map(|o| o.excitation_headroom_volts),
                 low_clip_fraction: optical.map(|o| o.low_clip_fraction),
                 high_clip_fraction: optical.map(|o| o.high_clip_fraction),
                 measured_frequency_hz: optical.and_then(|o| o.measured_frequency_hz),
                 adc_calibration_id: optical.map(|o| o.calibration.adc_calibration_id.clone()),
-                dark_id: optical.map(|o| o.calibration.dark_id.clone()),
-                total_power_anchor_id: optical.map(|o| o.calibration.anchor_id.clone()),
-                dark_volts: optical.map(|o| o.calibration.dark_volts),
-                total_power_volts: optical.map(|o| o.calibration.total_power_volts),
+                dark_id: optical
+                    .map(|o| o.calibration.dark_id.clone())
+                    .or_else(|| direct_dark.map(|dark| dark.dark_id.clone())),
+                dark_source: direct_dark.map(|dark| dark.source),
+                dark_volts: optical
+                    .map(|o| o.calibration.dark_volts)
+                    .or_else(|| direct_dark.map(|dark| dark.dark_volts)),
+                dark_captured_at_unix_ms: direct_dark.map(|dark| dark.captured_at_unix_ms),
+                dark_age_s: direct_dark
+                    .map(|dark| now_ms.saturating_sub(dark.captured_at_unix_ms) as f64 / 1_000.0),
             },
-            camera: CameraSidecar {
-                roi_x: roi.x,
-                roi_y: roi.y,
-                roi_width: roi.width,
-                roi_height: roi.height,
-                masked_pixels: self.masked_pixels.len(),
-                n_valid: self.valid_pixel_count(),
-            },
-            camera_control: self.protocol.as_ref().and_then(|run| {
-                let point = run.point();
-                let point_requested =
-                    point.is_some_and(|point| point.diff_on.is_some() || point.diff_off.is_some());
-                if run.camera_snapshot.is_none() && !point_requested {
-                    return None;
-                }
-                let (confirmed_offsets, confirmed_readback, readback_age_s) = run
-                    .bias_confirmation
-                    .map(|(offsets, readback, age_s)| (Some(offsets), Some(readback), Some(age_s)))
-                    .or_else(|| {
-                        run.camera_confirmation.map(|(readback, age_s)| {
-                            let offsets =
-                                run.camera_snapshot.as_ref().map(|snapshot| snapshot.biases);
-                            (offsets, Some(readback), Some(age_s))
-                        })
-                    })
-                    .unwrap_or((None, None, None));
-                Some(CameraControlSidecar {
-                    snapshot: run.camera_snapshot.clone(),
-                    provenance: run.camera_provenance.clone(),
-                    profile_provenance: run.camera_profile_provenance.clone(),
-                    requested_diff_on: point.and_then(|point| point.diff_on),
-                    requested_diff_off: point.and_then(|point| point.diff_off),
-                    confirmed_offsets,
-                    confirmed_readback,
-                    readback_age_s,
-                    status: "confirmed".into(),
-                })
-            }),
-            sensor: self.recorded_sensor().map(|sensor| {
-                let readback = sensor.bias_codes;
-                let codes = readback.map(|readback| readback.current);
-                let factory = readback.map(|readback| readback.factory_default);
-                SensorSidecar {
-                    temperature_c: sensor.temperature_c,
-                    pixel_dead_time_us: sensor.pixel_dead_time_us,
-                    illumination_lux: sensor.illumination_lux,
-                    reading_age_s: sensor.age_s,
-                    bias_diff_on: codes.map(|c| c.diff_on),
-                    bias_diff_off: codes.map(|c| c.diff_off),
-                    bias_fo: codes.map(|c| c.fo),
-                    bias_hpf: codes.map(|c| c.hpf),
-                    bias_refr: codes.map(|c| c.refr),
-                    factory_diff_on: factory.map(|c| c.diff_on),
-                    factory_diff_off: factory.map(|c| c.diff_off),
-                    factory_fo: factory.map(|c| c.fo),
-                    factory_hpf: factory.map(|c| c.hpf),
-                    factory_refr: factory.map(|c| c.refr),
-                }
+            sensor: self.recorded_sensor().map(|sensor| SensorSidecar {
+                temperature_c: sensor.temperature_c,
+                pixel_dead_time_us: sensor.pixel_dead_time_us,
+                illumination_lux: sensor.illumination_lux,
+                reading_age_s: sensor.age_s,
             }),
             trigger: TriggerSidecar {
                 marker_anchored: self.is_marker_anchored(),
@@ -6090,8 +6113,6 @@ impl StageAA1Plugin {
         };
 
         let toml = toml::to_string_pretty(&doc).map_err(|err| err.to_string())?;
-        let dir = PathBuf::from(&self.recording.folder).join(&self.recording.id);
-        std::fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
         let path = dir.join(format!("{}_config.toml", self.recording.stem));
         std::fs::write(&path, toml).map_err(|err| err.to_string())?;
         Ok(path.display().to_string())
@@ -6102,23 +6123,16 @@ impl StageAA1Plugin {
 
 #[derive(Serialize)]
 struct SidecarDoc {
+    schema: String,
     measurement_id: String,
     file_stem: String,
     role: String,
     recorded_at_utc: String,
     finalized_at_utc: String,
     duration_s: u64,
-    /// The modulation depth this run was driven and judged by, and which source
-    /// produced it (`photodiode_measured` / `modulation_commanded`).
-    ///
-    /// Written on every run, so offline analysis never has to infer the depth's
-    /// provenance from which of `optical.measured_a` and `modulation.requested_a`
-    /// happens to be present. A commanded depth is an open-loop number carrying
-    /// the Pockels calibration's error; a fit that mixes the two sources without
-    /// looking here would silently mix two error budgets.
-    depth_a_source: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    depth_a: Option<f64>,
+    protocol: Option<ProtocolSidecar>,
+    depth: DepthSidecar,
     sweep: SweepSidecar,
     /// Present on **event-count** points: the `a₀` lock this point replayed.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -6131,17 +6145,53 @@ struct SidecarDoc {
     #[serde(skip_serializing_if = "Option::is_none")]
     background: Option<BackgroundSidecar>,
     modulation: ModulationSidecar,
-    optical: OpticalSidecar,
-    camera: CameraSidecar,
-    /// Host-routed camera settings and fresh readback for this protocol point.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    camera_control: Option<CameraControlSidecar>,
+    photodiode: PhotodiodeSidecar,
     /// Absent when the host had no camera able to measure these (replay,
     /// imports, a sensor without a monitoring block).
     #[serde(skip_serializing_if = "Option::is_none")]
     sensor: Option<SensorSidecar>,
     trigger: TriggerSidecar,
     files: FilesSidecar,
+}
+
+#[derive(Serialize)]
+struct ProtocolSidecar {
+    name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version: Option<String>,
+    source_file: String,
+    source_sha256: String,
+    archived_file: String,
+    point_index: usize,
+    point_total: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    point_label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    point_role: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    requested_mean_u: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    requested_frequency_hz: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    requested_depth_a: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    requested_diff_on: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    requested_diff_off: Option<i32>,
+}
+
+#[derive(Serialize)]
+struct DepthSidecar {
+    /// Value selected for online gates and offline analysis.
+    analysis_source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    analysis_a: Option<f64>,
+    /// Optical drive command, never described as measured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    commanded_a: Option<f64>,
+    /// Independent photodiode estimate, never filled from a drive command.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    measured_a: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -6245,8 +6295,6 @@ struct ModulationSidecar {
     #[serde(skip_serializing_if = "Option::is_none")]
     internal_u: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    requested_a: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     v_null_dac: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     v_peak_dac: Option<u16>,
@@ -6259,17 +6307,21 @@ struct ModulationSidecar {
 }
 
 #[derive(Serialize)]
-struct OpticalSidecar {
+struct PhotodiodeSidecar {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    placement: Option<stage_a_plugin_contract::PhotodiodePlacementV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    splitter_fraction: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     measured_a: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    geometric_mean_excitation_volts: Option<f64>,
+    geometric_mean_detector_volts: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    excitation_min_volts: Option<f64>,
+    detector_min_volts: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    excitation_max_volts: Option<f64>,
+    detector_max_volts: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    excitation_headroom_volts: Option<f64>,
+    detector_headroom_volts: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     low_clip_fraction: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -6281,43 +6333,13 @@ struct OpticalSidecar {
     #[serde(skip_serializing_if = "Option::is_none")]
     dark_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    total_power_anchor_id: Option<String>,
+    dark_source: Option<stage_a_plugin_contract::PhotodiodeDarkSourceV1>,
     #[serde(skip_serializing_if = "Option::is_none")]
     dark_volts: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    total_power_volts: Option<f64>,
-}
-
-#[derive(Serialize)]
-struct CameraSidecar {
-    roi_x: u16,
-    roi_y: u16,
-    roi_width: u16,
-    roi_height: u16,
-    masked_pixels: usize,
+    dark_captured_at_unix_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    n_valid: Option<usize>,
-}
-
-#[derive(Serialize)]
-struct CameraControlSidecar {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    snapshot: Option<CameraConfigurationSnapshotV1>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    provenance: Option<CameraConfigurationProvenanceV1>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    profile_provenance: Option<CameraConfigurationProvenanceV1>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    requested_diff_on: Option<i32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    requested_diff_off: Option<i32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    confirmed_offsets: Option<CameraBiasOffsetsV1>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    confirmed_readback: Option<SensorBiasReadbackV1>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    readback_age_s: Option<f64>,
-    status: String,
+    dark_age_s: Option<f64>,
 }
 
 /// Bench conditions the sensor measured for itself at the start of the run.
@@ -6342,28 +6364,6 @@ struct SensorSidecar {
     /// Seconds between the host's last read of these values and the moment the
     /// recording started — the host polls at a few hertz, so this is never 0.
     reading_age_s: f64,
-    /// Absolute programmed bias codes, and the per-unit factory trim the
-    /// host's relative offsets are expressed against.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    bias_diff_on: Option<u8>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    bias_diff_off: Option<u8>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    bias_fo: Option<u8>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    bias_hpf: Option<u8>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    bias_refr: Option<u8>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    factory_diff_on: Option<u8>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    factory_diff_off: Option<u8>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    factory_fo: Option<u8>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    factory_hpf: Option<u8>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    factory_refr: Option<u8>,
 }
 
 #[derive(Serialize)]
@@ -8218,10 +8218,13 @@ mod tests {
                 calibration: stage_a_plugin_contract::PhotodiodeCalibrationV1 {
                     adc_calibration_id: "adc".into(),
                     dark_id: "dark".into(),
-                    anchor_id: "anchor".into(),
+                    anchor_id: Some("anchor".into()),
                     dark_volts: 0.0,
-                    total_power_volts: 1.0,
+                    dark_reference: None,
+                    total_power_volts: Some(1.0),
                 },
+                placement: stage_a_plugin_contract::PhotodiodePlacementV1::RejectedPort,
+                splitter_fraction: None,
                 measured_log_contrast: measured_a,
                 log_contrast_stddev: None,
                 excitation_min_volts: 0.1,
@@ -8238,6 +8241,9 @@ mod tests {
                 covered_cycles: Some(8.0),
             }),
             optical_unavailable: None,
+            placement: stage_a_plugin_contract::PhotodiodePlacementV1::RejectedPort,
+            splitter_fraction: None,
+            dark_reference: None,
             synchronization: stage_a_plugin_contract::SynchronizationV1::Unsynced {
                 reason: stage_a_plugin_contract::UnsyncedReasonV1::NoLease,
                 detail: None,
@@ -8413,6 +8419,7 @@ mod tests {
                 frequency_millihz: (hz * 1_000.0).round() as u64,
             }),
             a1_configuration: None,
+            a2_configuration: None,
             acquisition_running: true,
             board_dac_code: None,
             firmware_configuration_revision: None,
@@ -8864,7 +8871,10 @@ mod tests {
         assert!(text.contains("temperature_c = 41.25"), "{text}");
         assert!(text.contains("pixel_dead_time_us = 102.5"), "{text}");
         assert!(text.contains("illumination_lux = 742.0"), "{text}");
-        assert!(text.contains("bias_refr = 20"), "{text}");
+        assert!(
+            !text.contains("bias_refr") && !text.contains("factory_diff_on"),
+            "camera configuration must stay in the host sidecar: {text}"
+        );
         let _ = std::fs::remove_file(&doc);
     }
 
@@ -8903,23 +8913,33 @@ mod tests {
 
         let meta = plugin.recording_metadata();
         assert_eq!(
-            meta.get("depth_a_source").map(String::as_str),
+            meta.get("depth_a_analysis_source").map(String::as_str),
             Some("modulation_commanded")
         );
-        assert_eq!(meta.get("depth_a").map(String::as_str), Some("0.750000"));
+        assert_eq!(
+            meta.get("depth_a_analysis").map(String::as_str),
+            Some("0.750000")
+        );
+        assert_eq!(
+            meta.get("depth_a_commanded").map(String::as_str),
+            Some("0.750000")
+        );
         assert!(
-            !meta.contains_key("measured_a"),
-            "`measured_a` names a measurement, and there was none"
+            !meta.contains_key("depth_a_measured"),
+            "`depth_a_measured` names a measurement, and there was none"
         );
 
         plugin.depth_source = DepthSource::Photodiode;
         plugin.photodiode = Some(photodiode_measuring(1, 0.42));
         let meta = plugin.recording_metadata();
         assert_eq!(
-            meta.get("depth_a_source").map(String::as_str),
+            meta.get("depth_a_analysis_source").map(String::as_str),
             Some("photodiode_measured")
         );
-        assert_eq!(meta.get("measured_a").map(String::as_str), Some("0.420000"));
+        assert_eq!(
+            meta.get("depth_a_measured").map(String::as_str),
+            Some("0.420000")
+        );
     }
 
     fn pd_reply(request_id: u64, receipt: Option<PdqReceiptV1>) -> PluginServiceReply {
@@ -8976,6 +8996,9 @@ mod tests {
             last_finalized_recording: None,
             optical_summary: None,
             optical_unavailable: None,
+            placement: stage_a_plugin_contract::PhotodiodePlacementV1::RejectedPort,
+            splitter_fraction: None,
+            dark_reference: None,
             synchronization: SynchronizationV1::Unsynced {
                 reason: stage_a_plugin_contract::UnsyncedReasonV1::NoLease,
                 detail: None,
@@ -9026,10 +9049,13 @@ mod tests {
                 calibration: PhotodiodeCalibrationV1 {
                     adc_calibration_id: "adc-test".into(),
                     dark_id: "dark-test".into(),
-                    anchor_id: "itot-test".into(),
+                    anchor_id: Some("itot-test".into()),
                     dark_volts: 0.05,
-                    total_power_volts: 3.0,
+                    dark_reference: None,
+                    total_power_volts: Some(3.0),
                 },
+                placement: stage_a_plugin_contract::PhotodiodePlacementV1::RejectedPort,
+                splitter_fraction: None,
                 measured_log_contrast: 1.0,
                 log_contrast_stddev: None,
                 excitation_min_volts: 0.8,
@@ -9044,6 +9070,9 @@ mod tests {
                 covered_cycles: Some(8.0),
             }),
             optical_unavailable: None,
+            placement: stage_a_plugin_contract::PhotodiodePlacementV1::RejectedPort,
+            splitter_fraction: None,
+            dark_reference: None,
             synchronization: SynchronizationV1::Unsynced {
                 reason: UnsyncedReasonV1::NoLease,
                 detail: None,
@@ -10155,7 +10184,7 @@ mod tests {
             "the sidecar must carry the measured a from the recording: {written}"
         );
         assert!(
-            written.contains(&format!("depth_a = {latched}")),
+            written.contains(&format!("analysis_a = {latched}")),
             "the recorded depth must come from the same window: {written}"
         );
         let _ = std::fs::remove_dir_all(&folder);
@@ -10747,6 +10776,7 @@ mod tests {
 
     const TWO_POINT_PROTOCOL: &str = r#"
 name = "two-point"
+version = "test-v2"
 
 [defaults]
 duration_s = 3
@@ -10758,6 +10788,53 @@ mean_u = [0.4, 0.6]
 frequency_hz = 25.0
 depth_a = 0.7
 "#;
+
+    #[test]
+    fn protocol_identity_and_exact_source_are_archived_with_each_point() {
+        let folder = temp_folder("protocol-provenance");
+        let (mut plugin, source) = protocol_plugin(&folder, TWO_POINT_PROTOCOL);
+        plugin.photodiode = Some(fresh_photodiode_summary());
+        if let Some(optical) = plugin
+            .photodiode
+            .as_mut()
+            .and_then(|summary| summary.optical_summary.as_mut())
+        {
+            optical.window_seconds = Some(1.0);
+            optical.covered_cycles = Some(25.0);
+        }
+        let mut sink = ControlSink::default();
+        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+
+        plugin.recording.id = "A1-proto".into();
+        plugin.recording.stem = "A1-proto_20260813-120000".into();
+        plugin.recording.folder = folder.display().to_string();
+        plugin.recording.duration_s = 3;
+        plugin.recording.start_unix_ms = now_unix_ms();
+        let sidecar = plugin.write_sidecar().expect("v2 sidecar");
+        let text = std::fs::read_to_string(&sidecar).expect("sidecar text");
+
+        assert!(text.contains("[protocol]"));
+        assert!(text.contains("name = \"two-point\""));
+        assert!(text.contains("version = \"test-v2\""));
+        assert!(text.contains("source_file = \"protocol.toml\""));
+        assert!(text.contains("source_sha256 = \""));
+        assert!(text.contains("point_label = \"pair\""));
+        let archived = std::fs::read_dir(folder.join("A1-proto"))
+            .expect("measurement folder")
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with("a1_protocol_"))
+            })
+            .expect("archived protocol");
+        assert_eq!(
+            std::fs::read_to_string(archived).expect("archived source"),
+            std::fs::read_to_string(source).expect("original source")
+        );
+
+        let _ = std::fs::remove_dir_all(&folder);
+    }
 
     const BIAS_PROTOCOL: &str = r#"
 name = "bias-point"
@@ -10880,6 +10957,7 @@ depth_a = 0.7
                 stc_enabled: false,
                 stc_threshold_us: 0,
                 trail_enabled: false,
+                erc_enabled: Some(false),
             },
             external_trigger: augur_plugin_api::CameraExternalTriggerV1::default(),
             global: augur_plugin_api::CameraGlobalSettingsV1 {
@@ -11012,9 +11090,10 @@ depth_a = 0.7
             metadata.get("requested_diff_on").map(String::as_str),
             Some("12")
         );
-        assert_eq!(
-            metadata.get("confirmed_diff_on_code").map(String::as_str),
-            Some("112")
+        assert!(
+            !metadata.contains_key("confirmed_diff_on_code")
+                && !metadata.contains_key("camera_configuration_sha256"),
+            "host camera configuration must not be copied into A1 metadata: {metadata:?}"
         );
 
         plugin.recording = Recording::idle();
@@ -11105,6 +11184,34 @@ depth_a = 0.7
             .and_then(|run| run.finish_message.as_deref())
             .is_some_and(|message| message.contains("Record sensor monitoring")));
         let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn an_older_snapshot_without_erc_state_is_refused() {
+        let mut value = serde_json::to_value(camera_snapshot()).expect("serialize snapshot");
+        value["digital_filter"]
+            .as_object_mut()
+            .expect("digital filter object")
+            .remove("erc_enabled");
+        let snapshot: CameraConfigurationSnapshotV1 =
+            serde_json::from_value(value).expect("older snapshot remains decodable");
+
+        assert_eq!(snapshot.digital_filter.erc_enabled, None);
+        assert_eq!(
+            a1_camera_configuration_refusal(&snapshot),
+            Some("ERC must be explicitly reported disabled for an event-count protocol")
+        );
+    }
+
+    #[test]
+    fn a_confirmed_configuration_with_erc_enabled_is_refused() {
+        let mut snapshot = camera_snapshot();
+        snapshot.digital_filter.erc_enabled = Some(true);
+
+        assert_eq!(
+            a1_camera_configuration_refusal(&snapshot),
+            Some("ERC must be explicitly reported disabled for an event-count protocol")
+        );
     }
 
     #[test]
@@ -11858,12 +11965,57 @@ bias_refr_code,status,error\n\
         assert!(text.contains("measurement_id = \"A1-test\""));
         // Provenance of `a` is unconditional: offline analysis must never have
         // to guess whether a run's depth was measured or merely commanded.
-        assert!(text.contains("depth_a_source = \"photodiode_measured\""));
+        assert!(text.contains("schema = \"stage-a.a1.sidecar.v2\""));
+        assert!(text.contains("analysis_source = \"photodiode_measured\""));
+        assert!(text.contains("[depth]"));
         assert!(text.contains("[modulation]"));
-        assert!(text.contains("[camera]"));
+        assert!(text.contains("[photodiode]"));
+        assert!(!text.contains("[camera_control]"));
+        assert!(!text.contains("total_power_volts"));
         assert!(text.contains("[files]"));
         assert!(text.contains("camera_config_sidecar = \"/data/A1-test/A1-test.toml\""));
         let _ = std::fs::remove_file(&doc);
+    }
+
+    #[test]
+    fn commanded_depth_sidecar_does_not_require_a_measured_optical_summary() {
+        let folder = temp_folder("commanded-sidecar");
+        let mut photodiode = ready_photodiode();
+        photodiode.placement = stage_a_plugin_contract::PhotodiodePlacementV1::EmissionPath;
+        photodiode.splitter_fraction = Some(0.5);
+        photodiode.dark_reference = Some(stage_a_plugin_contract::PhotodiodeDarkReferenceV1 {
+            dark_id: "lamp-off@sample-42@1774223990000".into(),
+            source: stage_a_plugin_contract::PhotodiodeDarkSourceV1::MeasuredLampOff,
+            dark_volts: 0.012,
+            captured_at_unix_ms: 1_774_223_990_000,
+            age_s: 10.0,
+        });
+        let mut plugin = StageAA1Plugin {
+            depth_source: DepthSource::Commanded,
+            modulation: Some(commanded_modulation(1, 0.75)),
+            photodiode: Some(photodiode),
+            ..StageAA1Plugin::default()
+        };
+        plugin.recording.id = "A1-commanded".into();
+        plugin.recording.stem = "A1-commanded_20260813-120000".into();
+        plugin.recording.folder = folder.display().to_string();
+        plugin.recording.duration_s = 5;
+
+        let path = plugin.write_sidecar().expect("commanded sidecar");
+        let text = std::fs::read_to_string(path).expect("sidecar text");
+        assert!(text.contains("analysis_source = \"modulation_commanded\""));
+        assert!(text.contains("commanded_a = 0.75"));
+        assert!(!text.contains("measured_a"));
+        assert!(text.contains("placement = \"emission_path\""));
+        assert!(text.contains("splitter_fraction = 0.5"));
+        assert!(text.contains("dark_id = \"lamp-off@sample-42@1774223990000\""));
+        assert!(text.contains("dark_source = \"measured_lamp_off\""));
+        assert!(text.contains("dark_volts = 0.012"));
+        assert!(text.contains("dark_captured_at_unix_ms = 1774223990000"));
+        assert!(text.contains("dark_age_s = "));
+        assert!(!text.contains("total_power"));
+
+        let _ = std::fs::remove_dir_all(folder);
     }
 
     #[test]

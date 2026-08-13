@@ -127,6 +127,10 @@ impl ProtocolPoint {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Protocol {
     pub name: String,
+    /// Optional revision declared by the protocol author. The exact source
+    /// file is archived separately, so this is a human-facing revision, not a
+    /// substitute for content identity.
+    pub version: Option<String>,
     pub points: Vec<ProtocolPoint>,
     pub camera: Option<CameraSelection>,
 }
@@ -200,6 +204,8 @@ impl std::error::Error for ProtocolError {}
 struct ProtocolDoc {
     #[serde(default)]
     name: Option<String>,
+    #[serde(default)]
+    version: Option<String>,
     #[serde(default)]
     defaults: Defaults,
     #[serde(default, rename = "block")]
@@ -450,6 +456,7 @@ pub fn parse(text: &str) -> Result<Protocol, ProtocolError> {
             .name
             .filter(|name| !name.trim().is_empty())
             .unwrap_or_else(|| "protocol".to_owned()),
+        version: doc.version.filter(|version| !version.trim().is_empty()),
         points,
         camera,
     })
@@ -484,7 +491,14 @@ pub fn parse_file(path: &str, text: &str) -> Result<Protocol, ProtocolError> {
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("csv"));
     if is_csv {
-        parse_csv(text)
+        let mut protocol = parse_csv(text)?;
+        protocol.name = std::path::Path::new(path)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .filter(|stem| !stem.is_empty())
+            .unwrap_or("protocol")
+            .to_owned();
+        Ok(protocol)
     } else {
         parse(text)
     }
@@ -676,6 +690,7 @@ pub fn parse_csv(text: &str) -> Result<Protocol, ProtocolError> {
     }
     Ok(Protocol {
         name: "protocol".to_owned(),
+        version: None,
         points,
         camera: camera_profile.map(CameraSelection::NamedProfile),
     })
@@ -687,6 +702,7 @@ mod tests {
 
     const SAMPLE: &str = r#"
 name = "sample"
+version = "2026-08-13"
 
 [defaults]
 duration_s = 5
@@ -721,6 +737,7 @@ duration_s = 30
     fn a_bom_does_not_break_the_toml_form_either() {
         let protocol = parse(&format!("\u{feff}{SAMPLE}")).expect("BOM-prefixed TOML");
         assert_eq!(protocol.name, "sample");
+        assert_eq!(protocol.version.as_deref(), Some("2026-08-13"));
     }
 
     #[test]
@@ -1051,6 +1068,13 @@ slow,0.4,1,0.8,40,4,
             .map(|point| (point.frequency_hz, point.depth_a))
             .collect();
         assert_eq!(order, vec![(10.0, 0.02), (10.0, 0.5), (1.0, 0.8)]);
+    }
+
+    #[test]
+    fn csv_protocol_identity_comes_from_its_source_filename() {
+        let protocol = parse_file("a1_fc_flux_discriminator.csv", SAMPLE).expect("valid CSV");
+        assert_eq!(protocol.name, "a1_fc_flux_discriminator");
+        assert_eq!(protocol.version, None);
     }
 
     /// The reason for the row-per-recording form: a low frequency needs longer

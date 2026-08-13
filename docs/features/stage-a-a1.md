@@ -40,7 +40,10 @@
   (firmware-qualified drive limits remain separate from A1 sample-density),
   [ADR 037](../adr/037-stage-a-a1-camera-configurations-and-bias-points.md)
   (protocols apply host camera profiles and per-point biases with readback and
-  restore).
+  restore),
+  [ADR 039](../adr/039-stage-a-a1-sidecar-owns-experiment-provenance.md)
+  (A1 records protocol and optical provenance but does not duplicate the host
+  camera sidecar).
 - **Automation roadmap:** [Stage-A A1 Automation](./stage-a-a1-automation.md)
 - **Second workflow:** [Stage-A A1 Exact Event Count](./stage-a-a1-event-count.md)
   — hold one *measured* depth `a₀` across the frequency sweep
@@ -61,6 +64,10 @@ A1 owns no hardware and never opens the Teensy or camera directly. The optical
 drive remains owned by the modulation plugin and camera settings remain owned
 by the host; A1 retargets them only through declared, generic control
 capabilities.
+
+Runtime requires Augur 2.0.2 or newer. Older installed hosts do not publish the
+camera-session and sensor-monitoring contracts this workflow needs, even when
+the plugin binary is current.
 
 ## The recording workflow
 
@@ -396,7 +403,7 @@ A1 applies the initial configuration and each point through the same generic
 complete-snapshot host command. For a bias point it clones the last confirmed
 snapshot and changes only `diff_on`/`diff_off`; no A1- or bias-specific command
 exists in the recorder. A1 checks its own scientific requirements (sensor
-telemetry on, STC and Trail off) and starts recording automatically after the
+telemetry on, STC, Trail and ERC explicitly off) and starts recording automatically after the
 host returns a fresh matching sensor readback.
 
 For manual recordings A1 never drives the Teensy: set the drive (high `a` for

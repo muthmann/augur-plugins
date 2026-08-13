@@ -28,7 +28,8 @@ ladder, the response curve — reads as `a`:
 
 Open loop there is **nothing to search for**, so `Find a₀` is not used and the frequency ladder skips
 it (see below), and the photodiode's window-length and clipping checks are skipped because neither
-bounds a commanded depth. Every artefact records the source: `depth_a_source`/`depth_a` in the sidecar,
+bounds a commanded depth. Every artefact records the source: `depth.analysis_source` /
+`depth.analysis_a` in the sidecar,
 `depth_source` in `[a0_lock]` and in `a0_locks.json`, and the *a from* column of the a₀ lock view.
 `measured_a` stays reserved for a number the photodiode actually measured. See
 [ADR 020](../../docs/adr/020-stage-a-a1-depth-source.md).
@@ -141,6 +142,19 @@ Files share an `<id>_<timestamp>` stem: `<id>/<id>_<ts>.raw` (camera, under the 
 experiment directory to co-locate everything. The host also writes its own `<stem>.toml` next to the
 RAW with the camera biases/ROI; the A1 sidecar cross-references it.
 
+The A1 sidecar uses `schema = "stage-a.a1.sidecar.v2"`. It does not copy the
+host-owned camera snapshot, readback, ROI, mask or bias codes. The host TOML
+named by `[files].camera_config_sidecar` is their single source of truth.
+`[protocol]` identifies the experiment schedule by name, optional version,
+source filename, SHA-256 and row identity. A content-addressed copy of the
+protocol is archived in the measurement folder. `[depth]` keeps analysis,
+commanded and measured `a` separate. `[photodiode]` records `rejected_port`,
+`camera_path` or `emission_path` plus the splitter fraction. See
+[ADR 039](../../docs/adr/039-stage-a-a1-sidecar-owns-experiment-provenance.md).
+
+This plugin requires Augur **2.0.2 or newer**. Older hosts do not publish the
+camera-session and sensor-monitoring contracts this workflow depends on.
+
 ## Protocol — run a survey from a file
 
 The four sweep buttons each move one axis and leave the others wherever they are. A **protocol**
@@ -184,6 +198,9 @@ a complete measurement, not one that needs two button presses first.
 Kept for a dense regular sweep, which a 96-row CSV states badly:
 
 ```toml
+name = "a1-example-survey"
+version = "2026-08-13"
+
 [camera]
 profile = "A1_low_noise"
 
@@ -214,14 +231,17 @@ Stop, or abort. A rejected or timed-out restore is retried up to three times and
 is never reported as successful without confirmation. A named profile may
 enable Sensor reading in that same apply; A1 uses the confirmed host reply, not
 the previous UI state. Missing readback or a confirmed snapshot with Sensor
-reading disabled fails closed. Sensor-specific bias ranges stay in the camera
-backend.
+reading disabled fails closed. Before running the qualified CSV files, save the
+named profile `A1-bias-v1-monitoring` with `bias-v1`, the frozen ROI and pixel
+mask, STC, Trail, and ERC explicitly OFF, and **Record sensor monitoring** ON.
+Sensor-specific bias ranges stay in the camera backend.
 
 The host command always carries a complete camera snapshot. For a point, A1
 clones the last confirmed snapshot and changes only `diff_on`/`diff_off`, so the
 remaining biases, ROI, mask, filters, trigger, and global settings stay explicit
 and unchanged. A1 itself rejects confirmed configurations with sensor telemetry
-off or STC/Trail on; these experiment rules are not built into the recorder.
+off, STC or Trail on, ERC on, or an ERC state omitted by an older host. A new
+host must report ERC explicitly OFF; absence is not interpreted as OFF.
 
 The current firmware-qualified drive range is 0.01 Hz to 2 kHz. A1 also
 requires at least 16 photodiode samples per cycle: 1.25 kHz at 20 kSa/s and
