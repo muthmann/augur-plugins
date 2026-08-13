@@ -32,12 +32,16 @@ applies the complete snapshot immediately. A1 waits for the reply containing a
 sensor read taken after the change. It never waits for an extra user Apply
 action and never records an unconfirmed point.
 
-Bias control requires a fresh sensor-monitoring context before the drive moves.
-A1, not the host, verifies that the confirmed snapshot enables sensor telemetry
-and disables STC and Trail. Missing or disabled sensor reading, an out-of-range
-offset, a rejected apply, or a mismatched/missing readback fails closed. Drive
-retarget replies and the configuration confirmation must both arrive before
-settle and recording.
+Bias control requires the host's successful apply reply, including a fresh
+generation-bound sensor readback, before recording may start. It does not depend
+on the previous UI context: a selected profile may enable sensor monitoring as
+part of the same atomic apply. The initial series configuration is confirmed
+before A1 acquires the drive lease. A1, not the host, verifies afterwards that
+the confirmed snapshot enables sensor telemetry and disables STC and Trail.
+Sensor-specific bias ranges remain owned by the active camera backend. A
+rejected apply or a mismatched/missing readback fails closed. At each point,
+drive-retarget replies and the configuration confirmation must both arrive
+before settle and recording.
 
 The host-start metadata and A1 sidecar store requested offsets, confirmed
 offsets, absolute current and factory codes, readback age, the immutable camera

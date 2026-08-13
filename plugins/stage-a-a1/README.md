@@ -211,8 +211,11 @@ Plugin camera changes are applied immediately by the host and shown as applied
 settings; no extra user Apply click is required. A1 records only after a fresh
 sensor readback confirms the codes and restores the pre-run settings on success,
 Stop, or abort. A rejected or timed-out restore is retried up to three times and
-is never reported as successful without confirmation. Missing/disabled Sensor
-reading fails closed.
+is never reported as successful without confirmation. A named profile may
+enable Sensor reading in that same apply; A1 uses the confirmed host reply, not
+the previous UI state. Missing readback or a confirmed snapshot with Sensor
+reading disabled fails closed. Sensor-specific bias ranges stay in the camera
+backend.
 
 The host command always carries a complete camera snapshot. For a point, A1
 clones the last confirmed snapshot and changes only `diff_on`/`diff_off`, so the

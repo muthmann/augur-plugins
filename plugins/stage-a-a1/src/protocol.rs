@@ -408,8 +408,6 @@ pub fn parse(text: &str) -> Result<Protocol, ProtocolError> {
         }
         let diff_on = block.diff_on.or(doc.defaults.diff_on);
         let diff_off = block.diff_off.or(doc.defaults.diff_off);
-        validate_bias("diff_on", diff_on)?;
-        validate_bias("diff_off", diff_off)?;
 
         let mean_u = block
             .mean_u
@@ -633,12 +631,12 @@ pub fn parse_csv(text: &str) -> Result<Protocol, ProtocolError> {
             if raw.is_empty() {
                 return Ok(None);
             }
-            let value = raw.parse::<i32>().map_err(|_| ProtocolError::Invalid {
-                what: format!("line {line_no}: {name}"),
-                detail: format!("'{raw}' is not a signed integer offset"),
-            })?;
-            validate_bias(&format!("line {line_no}: {name}"), Some(value))?;
-            Ok(Some(value))
+            raw.parse::<i32>()
+                .map(Some)
+                .map_err(|_| ProtocolError::Invalid {
+                    what: format!("line {line_no}: {name}"),
+                    detail: format!("'{raw}' is not a signed integer offset"),
+                })
         };
         let diff_on = parse_bias("diff_on")?;
         let diff_off = parse_bias("diff_off")?;
@@ -681,16 +679,6 @@ pub fn parse_csv(text: &str) -> Result<Protocol, ProtocolError> {
         points,
         camera: camera_profile.map(CameraSelection::NamedProfile),
     })
-}
-
-fn validate_bias(what: &str, value: Option<i32>) -> Result<(), ProtocolError> {
-    if let Some(value) = value.filter(|value| !(-85..=140).contains(value)) {
-        return Err(ProtocolError::Invalid {
-            what: what.to_owned(),
-            detail: format!("{value} is outside the supported -85..=140 offset range"),
-        });
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -842,19 +830,20 @@ diff_on = 20
     }
 
     #[test]
-    fn out_of_range_bias_offsets_are_refused_before_the_run() {
-        let error = parse(
+    fn sensor_specific_bias_ranges_are_left_to_the_host_backend() {
+        let protocol = parse(
             r#"
 [[block]]
 mean_u = 0.5
 frequency_hz = 10.0
 depth_a = 0.5
 diff_on = 141
+diff_off = 191
 "#,
         )
-        .expect_err("invalid bias");
-        assert!(error.to_string().contains("diff_on"), "{error}");
-        assert!(error.to_string().contains("-85..=140"), "{error}");
+        .expect("the active camera backend owns its supported ranges");
+        assert_eq!(protocol.points[0].diff_on, Some(141));
+        assert_eq!(protocol.points[0].diff_off, Some(191));
     }
 
     #[test]
