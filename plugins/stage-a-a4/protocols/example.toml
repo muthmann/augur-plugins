@@ -1,0 +1,47 @@
+# Stage-A A4 — the 2D threshold map, written as blocks and ranges.
+#
+# A block expands to the PRODUCT of its two bias axes: every diff_on against
+# every diff_off, walked diff_on outermost. That is the right shape for mapping
+# the ON/OFF threshold plane.
+#
+# For a symmetric sweep — diff_on and diff_off moving together — use the CSV
+# form instead: those are specific pairs, not a product.
+
+name = "a4-threshold-map"
+
+# Defaults every block inherits unless it says otherwise.
+[defaults]
+duration_s     = 60
+settle_s       = 5
+repeats        = 1
+optical_state  = "LP647+BP700"
+filter_id      = "F-700"
+max_temperature_drift_c        = 2.0
+max_illumination_drift_percent = 5.0
+
+# A coarse map: 5 × 5 = 25 recordings.
+[[block]]
+name     = "coarse-map"
+diff_on  = { min = -20, max = 20, step = 10 }
+diff_off = { min = -20, max = 20, step = 10 }
+
+# A finer look around the symmetric centre, recorded twice each.
+[[block]]
+name     = "centre-detail"
+diff_on  = [-4, -2, 0, 2, 4]
+diff_off = [0]
+repeats  = 2
+duration_s = 90
+
+# A dark reference at the end. `pause_before` stops once, before the block, so
+# the cap goes on and every point under it runs unattended.
+[[block]]
+name          = "dark-reference"
+diff_on       = [0, 20]
+diff_off      = [0, 20]
+optical_state = "dark cap"
+filter_id     = "none"
+pause_before  = true
+duration_s    = 120
+settle_s      = 10
+max_event_rate = 50000

@@ -1,0 +1,17 @@
+# Stage-A A4 — symmetric threshold sweep at one optical condition.
+#
+# One row per recording. Only diff_on and diff_off are required; everything
+# else falls back (60 s, 5 s settle, recorded once, no QC limits).
+#
+# diff_on/diff_off are OFFSETS around the sensor's per-unit factory trim — the
+# same numbers the host settings panel shows. The absolute codes on the die are
+# read back from the sensor and written into every sidecar.
+#
+# Symmetric pairs belong in a CSV: each row is one exact (on, off) pair. Use
+# the TOML form when you want the product of two axes instead.
+label,optical_state,diff_on,diff_off,duration_s,settle_s,repeats,max_temperature_drift_c,max_illumination_drift_percent
+threshold-01,LP647+BP700,-20,-20,60,5,2,2.0,5.0
+threshold-02,LP647+BP700,-10,-10,60,5,2,2.0,5.0
+threshold-03,LP647+BP700,0,0,60,5,2,2.0,5.0
+threshold-04,LP647+BP700,10,10,60,5,2,2.0,5.0
+threshold-05,LP647+BP700,20,20,60,5,2,2.0,5.0

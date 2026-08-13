@@ -5,6 +5,7 @@ members = [
   "stage-a-plugin-contract",
   "plugins/stage-a-a1",
   "plugins/stage-a-a2",
+  "plugins/stage-a-a4",
   "plugins/stage-a-modulation",
   "plugins/stage-a-photodiode",
   "plugins/localization",
