@@ -21,6 +21,8 @@
 //! modulation off — drag the power slider to 0 to drive 0 V.
 
 mod calibration;
+#[cfg(test)]
+mod protocol_validation_tests;
 mod waveform;
 
 use std::collections::{BTreeMap, VecDeque};
@@ -40,16 +42,17 @@ use augur_plugin_api::{
 };
 use serde_json::{json, Value};
 use stage_a_io::{Command, DeviceEvent, MockController, StageAClient, Transport};
+use stage_a_plugin_contract::drive_frequency_supported;
 use stage_a_plugin_contract::{
-    A1AcquisitionConfigV1, ClientId, ConnectionStateV1, ControllerStateV1, FreshnessV1, LeaseId,
-    LeaseSnapshotV1, ModulationCommandV1, ModulationRequestV1, ModulationResponseV1,
-    ModulationStateV1, ModulationTargetV1, OpticalDriveStateV1, OpticalTargetV1, OwnerInstanceId,
-    PhotodiodeLevelV1, PhotodiodeSummaryV1, RequestOutcomeV1, ResponseCommonV1, RunId,
-    SemanticRevision, ServiceErrorCodeV1, ServiceErrorV1, SynchronizationV1, UnsyncedReasonV1,
-    WaveformV1, CONTRACT_VERSION_V1, CTX_STAGE_A_MODULATION_STATE_V1,
-    CTX_STAGE_A_PHOTODIODE_SUMMARY_V1, DRIVE_FREQUENCY_MAX_MILLIHZ, DRIVE_FREQUENCY_MIN_MILLIHZ,
-    PLUGIN_ID_STAGE_A_MODULATION, PLUGIN_ID_STAGE_A_PHOTODIODE,
-    SERVICE_STAGE_A_MODULATION_CONTROL_V1,
+    A1AcquisitionConfigV1, A2AcquisitionConfigV1, ClientId, ConnectionStateV1, ControllerStateV1,
+    FreshnessV1, LeaseId, LeaseSnapshotV1, ModulationCommandV1, ModulationRequestV1,
+    ModulationResponseV1, ModulationStateV1, ModulationTargetV1, OpticalDriveStateV1,
+    OpticalTargetV1, OwnerInstanceId, PhotodiodeLevelV1, PhotodiodeSummaryV1, RequestOutcomeV1,
+    ResponseCommonV1, RunId, SemanticRevision, ServiceErrorCodeV1, ServiceErrorV1,
+    SynchronizationV1, UnsyncedReasonV1, WaveformV1, CONTRACT_VERSION_V1,
+    CTX_STAGE_A_MODULATION_STATE_V1, CTX_STAGE_A_PHOTODIODE_SUMMARY_V1,
+    DRIVE_FREQUENCY_MAX_MILLIHZ, DRIVE_FREQUENCY_MIN_MILLIHZ, PLUGIN_ID_STAGE_A_MODULATION,
+    PLUGIN_ID_STAGE_A_PHOTODIODE, SERVICE_STAGE_A_MODULATION_CONTROL_V1,
 };
 
 const STATUS_DATASET_ID: &str = "stage-a-modulation.status";
@@ -328,6 +331,7 @@ impl DeviceState {
             revision: SemanticRevision(0),
             waveform: Some(waveform),
             a1_configuration: None,
+            a2_configuration: None,
             acquisition_running: self.controller_state == ControllerStateV1::Running,
             board_dac_code: self.board_code.and_then(|code| u16::try_from(code).ok()),
             firmware_configuration_revision: None,
@@ -538,6 +542,18 @@ fn execute_operation<T: Transport>(
         }
         if let Ok(events) = client.poll_events() {
             apply_device_events(shared, events);
+        }
+    }
+
+    if error.is_none() && operation.purpose == "PREPARE_A2" {
+        let prepared = merged.get("trigger_source").map(String::as_str) == Some("comparator")
+            && merged.get("cmp_armed").map(String::as_str) == Some("1")
+            && merged.get("mod_wave").map(String::as_str) == Some("LOG_SQUARE");
+        if !prepared {
+            error = Some(
+                "firmware did not confirm trigger_source=comparator, cmp_armed=1 and mod_wave=LOG_SQUARE"
+                    .into(),
+            );
         }
     }
 
@@ -1798,6 +1814,7 @@ impl StageAModulationPlugin {
                 revision,
                 waveform: None,
                 a1_configuration: None,
+                a2_configuration: None,
                 acquisition_running: false,
                 board_dac_code: None,
                 firmware_configuration_revision: None,
@@ -2212,6 +2229,27 @@ impl StageAModulationPlugin {
                         a1_config_command(configuration),
                     ],
                     "PREPARE_A1",
+                    false,
+                )
+            }
+            ModulationCommandV1::PrepareA2 { configuration } => {
+                self.require_lease(request)?;
+                validate_a2_configuration(configuration)?;
+                let revision = self.requested_revision(request)?;
+                let mut target = self.base_target(revision);
+                target.a1_configuration = None;
+                target.a2_configuration = Some(configuration.clone());
+                target.acquisition_running = false;
+                self.queue_service_operation(
+                    request,
+                    target,
+                    vec![
+                        Command::new("STOP").field("reason", "prepare_a2"),
+                        a2_config_command(configuration),
+                        a2_comparator_command(configuration),
+                        a2_log_square_command(configuration),
+                    ],
+                    "PREPARE_A2",
                     false,
                 )
             }
@@ -2770,6 +2808,69 @@ fn a1_config_command(configuration: &A1AcquisitionConfigV1) -> Command {
         .field("block_samples", configuration.block_samples)
         .field("raw", u8::from(configuration.emit_raw_samples))
         .field("summary", u8::from(configuration.emit_summary))
+}
+
+fn validate_a2_configuration(configuration: &A2AcquisitionConfigV1) -> Result<(), ServiceErrorV1> {
+    let invalid = |message: &str| service_error(ServiceErrorCodeV1::InvalidCommand, message, false);
+    if !(1..=1_000).contains(&configuration.mean_u_milli) {
+        return Err(invalid("A2 mean_u_milli must be in 1..=1000"));
+    }
+    if configuration.depth_a_milli == 0 {
+        return Err(invalid("A2 depth_a_milli must be positive"));
+    }
+    if !drive_frequency_supported(configuration.frequency_millihz) {
+        return Err(invalid("A2 frequency is outside the firmware drive range"));
+    }
+    let half_us = 500_000_000_u64 / configuration.frequency_millihz;
+    if half_us < u64::from(configuration.min_half_us) {
+        return Err(invalid("A2 half-period is below min_half_us"));
+    }
+    if configuration.v_peak_dac <= configuration.v_null_dac {
+        return Err(invalid("A2 v_peak_dac must be greater than v_null_dac"));
+    }
+    if !(1..=4_095).contains(&configuration.comparator_threshold_dac) {
+        return Err(invalid("A2 comparator threshold must be in 1..=4095"));
+    }
+    if configuration.comparator_hysteresis > 3 {
+        return Err(invalid("A2 comparator hysteresis must be in 0..=3"));
+    }
+    if !(100..=500_000).contains(&configuration.sample_rate_hz) {
+        return Err(invalid("A2 sample_rate_hz must be in 100..=500000"));
+    }
+    if configuration.block_samples == 0 {
+        return Err(invalid("A2 block_samples must be positive"));
+    }
+    if !configuration.emit_raw_samples && !configuration.emit_summary {
+        return Err(invalid("A2 must enable raw samples or summaries"));
+    }
+    Ok(())
+}
+
+fn a2_config_command(configuration: &A2AcquisitionConfigV1) -> Command {
+    Command::new("CONFIG")
+        .field("mode", "A2")
+        .field("rate_hz", configuration.sample_rate_hz)
+        .field("block_samples", configuration.block_samples)
+        .field("raw", u8::from(configuration.emit_raw_samples))
+        .field("summary", u8::from(configuration.emit_summary))
+}
+
+fn a2_comparator_command(configuration: &A2AcquisitionConfigV1) -> Command {
+    Command::new("CMP")
+        .field("thr", configuration.comparator_threshold_dac)
+        .field("hyst", configuration.comparator_hysteresis)
+        .field("invert", u8::from(configuration.comparator_invert))
+}
+
+fn a2_log_square_command(configuration: &A2AcquisitionConfigV1) -> Command {
+    Command::new("MOD")
+        .field("wave", "LOG_SQUARE")
+        .field("a_milli", configuration.depth_a_milli)
+        .field("u_k_milli", configuration.mean_u_milli)
+        .field("v_null", configuration.v_null_dac)
+        .field("v_pi", configuration.v_peak_dac - configuration.v_null_dac)
+        .field("freq_mhz", configuration.frequency_millihz)
+        .field("min_half_us", configuration.min_half_us)
 }
 
 fn accepted_service_reply(
@@ -5456,5 +5557,41 @@ mod tests {
         plugin.apply_execution_context(&ExecutionContext::fail_closed());
         assert!(plugin.link.is_none());
         assert!(plugin.lease.is_none());
+    }
+
+    #[test]
+    fn a2_commands_match_the_firmware_grammar_and_use_lobe_span() {
+        let config = A2AcquisitionConfigV1 {
+            mean_u_milli: 300,
+            depth_a_milli: 450,
+            frequency_millihz: 500,
+            min_half_us: 100_000,
+            v_null_dac: 100,
+            v_peak_dac: 1_000,
+            comparator_threshold_dac: 1_500,
+            comparator_hysteresis: 1,
+            comparator_invert: true,
+            sample_rate_hz: 500_000,
+            block_samples: 256,
+            emit_raw_samples: true,
+            emit_summary: true,
+        };
+        validate_a2_configuration(&config).unwrap();
+        assert_eq!(
+            String::from_utf8(a2_config_command(&config).encode(1).unwrap()).unwrap(),
+            "@1 CONFIG mode=A2 rate_hz=500000 block_samples=256 raw=1 summary=1\n"
+        );
+        assert_eq!(
+            String::from_utf8(a2_comparator_command(&config).encode(2).unwrap()).unwrap(),
+            "@2 CMP thr=1500 hyst=1 invert=1\n"
+        );
+        let drive = String::from_utf8(a2_log_square_command(&config).encode(3).unwrap()).unwrap();
+        assert!(drive.contains("wave=LOG_SQUARE"));
+        assert!(drive.contains("v_null=100 v_pi=900"), "{drive}");
+        assert!(drive.contains("min_half_us=100000"), "{drive}");
+
+        let mut unsafe_threshold = config;
+        unsafe_threshold.comparator_threshold_dac = 0;
+        assert!(validate_a2_configuration(&unsafe_threshold).is_err());
     }
 }
