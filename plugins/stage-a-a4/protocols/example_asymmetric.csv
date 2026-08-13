@@ -1,0 +1,17 @@
+# Stage-A A4 — ON and OFF thresholds moved independently, with a filter change
+# partway through.
+#
+# `pause_before` stops the run and waits for Continue, once per row: the filter
+# is already changed by the time a second repeat starts. Use it for anything
+# the operator has to do by hand — a filter swap, a dark cap, a flux change.
+#
+# `filter_id` and `flux_id` are free text carried into every sidecar, so two
+# points can be shown to have been taken under the same optical condition
+# rather than merely assumed to be.
+label,optical_state,filter_id,flux_id,diff_on,diff_off,duration_s,settle_s,repeats,pause_before,max_event_rate
+on-low,LP647+BP700,F-700,flux-A,-20,0,60,5,1,no,2000000
+on-high,LP647+BP700,F-700,flux-A,20,0,60,5,1,no,2000000
+off-low,LP647+BP700,F-700,flux-A,0,-20,60,5,1,no,2000000
+off-high,LP647+BP700,F-700,flux-A,0,20,60,5,1,no,2000000
+dark-01,dark cap,none,dark,0,0,120,10,1,yes,50000
+dark-02,dark cap,none,dark,20,20,120,10,1,no,50000

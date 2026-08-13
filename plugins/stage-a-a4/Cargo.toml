@@ -1,0 +1,23 @@
+[package]
+name = "augur-plugin-stage-a-a4"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Stage-A A4 contrast-threshold survey: bias points recorded unattended against a sensor readback"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+augur-plugin-api.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# The same digest the host reports for a RAW file, so the protocol copy carries
+# a hash that means the same thing as every other hash in the folder.
+sha2 = "0.10"
+stage-a-plugin-contract = { path = "../../stage-a-plugin-contract" }
+toml = "0.8"
+
+[lints.rust]
+unsafe_code = "forbid"
