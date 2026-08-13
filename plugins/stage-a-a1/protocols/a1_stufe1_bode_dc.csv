@@ -1,0 +1,147 @@
+# A1 Stufe 1 — vollstaendige Bode-Kurve + DC-Aufhebungstest
+# EINE Sitzung, EINE Intensitaetseinstellung, EINE durchgehende Kurve.
+# 
+#   (A) Bode-Kurve, 0.1 bis 68 Hz. Der Sweep vom 31.07. begann bei 1 Hz und lag
+#       dort schon im Abfall (f_c ~ 2-3 Hz) — ohne gemessenes Plateau sind |H|
+#       und C nur Obergrenzen. Der ganze Bereich wird neu gefahren, nicht nur
+#       das fehlende Stueck: |H| = N(f)/N_Plateau braucht Plateau UND Abfall auf
+#       derselben Kurve. Zwei Sitzungen zusammenzukleben ginge nur, wenn die
+#       Intensitaet exakt dieselbe waere — sie ist es nicht (siehe unten).
+#       Die hohen Frequenzen sind billig (20 s), das kostet nur ~15 min extra.
+#       Oberhalb 68 Hz war zuletzt |H| < 0.03, deshalb endet die Leiter dort.
+# 
+#   (B) DC-Aufhebung. Bei festem a muss die Eventzahl pro Zyklus bei tiefem f
+#       unabhaengig von der Helligkeit sein ('I_0 verschiebt das Knie, a setzt
+#       die Hoehe'). Die Methodik nennt das den schaerfsten Test der Stufe A.
+#       Faellt er durch, ist die Log-Frontend-Annahme kaputt. Drei
+#       Arbeitspunkte, gleiches a, gleiches f.
+# 
+# ZWINGEND VOR DEM START — sonst laeuft kein einziges Recording durch.
+# Der Lauf vom 03.08. ist an genau diesen drei Punkten gescheitert (0/73):
+# 
+#   1. I_tot-ANKER. stage-a-a1 verweigert den Sidecar ohne ihn: 'cannot write
+#      a quantitative A1 sidecar without a fresh photodiode optical summary
+#      from a confirmed I_tot anchor'. Das ist eine Software-Vorbedingung, 
+#      nicht eine Anforderung der Auswertung — der Sidecar gilt sonst als
+#      nicht quantitativ. Also: Pockels auf volle Anregungsextinktion fahren,
+#      PD-Maximum als I_tot bestaetigen. Nach der Sitzung wiederholen, die
+#      Differenz ist das Driftbudget.
+# 
+#   2. AUTOMATION LEASE fuer Modulations- UND Photodioden-Owner. Ohne aktive
+#      Lease lehnt jeder Retarget ab ('the modulation owner requires an
+#      active automation lease'). Sie laeuft ab — bei 60 min Sitzung darauf
+#      achten, dass die Gueltigkeit reicht.
+# 
+#   3. LOBE-DECKE. stage-a-modulation rechnet
+#         u_g    = mean_u / I_0(a/2)        (geometrischer Pedestal)
+#         u_peak = u_g * exp(a/2)  und verlangt u_peak <= 1,
+#      weil die Transmission oberhalb der Lobe-Spitze nicht mehr monoton ist.
+#      Dieses Protokoll haelt das fuer jede Zeile ein. ABER: steht in der
+#      Oberflaeche ein groesseres Sweep-Maximum a als in dieser Datei, wird
+#      DAS geprueft. Der 03.08. meldete u_peak = 1.222 bei mean_u = 0.400 —
+#      das entspricht a ~ 3.6 und stammt NICHT aus dieser Datei (max 1.70).
+#      Also Sweep-Maximum in der Oberflaeche auf 1.70 setzen. Zur Kontrolle,
+#      groesstes zulaessiges mean_u = I_0(a/2) * exp(-a/2):
+#         a = 1.70 -> 0.508     a = 3.00 -> 0.367     a = 5.50 -> 0.255
+# 
+# Was trotzdem ins Logbuch gehoert: die eingestellten AOM-/Laserwerte und der
+# Lux-Wert. Lux taugt nicht als Flussachse (ueber 100 Recordings bei festem I_k
+# streut er 6.5 % gegen 1.8 % beim PD-Mittel und korreliert mit dem optischen
+# Pegel nur zu r = +0.10), aber als grober Wiederfindungshinweis und
+# Raumlicht-Waechter kostet er nichts.
+# 
+# Der 31.07.-Datensatz wird durch diese Sitzung ersetzt, nicht ergaenzt.
+#
+# Umfang: 73 Recordings, ~61 min reine Aufnahmezeit (inkl. 11 s Overhead je Recording)
+label,mean_u,frequency_hz,depth_a,duration_s,settle_s,role
+#
+# === Teil A: Bode-Kurve 0.1 - 68 Hz bei mean_u = 0.30 ===================
+# Bei 0.10/0.20 Hz nur 4 Amplituden — dort kostet ein Punkt bis 2 min.
+# Ab 0.40 Hz sechs Amplituden, dicht um den Antwortuebergang a_50 ~ 0.23.
+#
+# --- Flusspunkt mean_u = 0.30 ----------------------------------------
+floor,0.30,2,0.02,20,8,background
+windows,0.30,0.1,1.70,120,3,pilot
+windows,0.30,1,1.70,20,3,pilot
+windows,0.30,68.219,1.70,20,3,pilot
+plateau,0.30,0.1,0.15,120,3,
+plateau,0.30,0.1,0.28,120,3,
+plateau,0.30,0.1,0.80,120,3,
+plateau,0.30,0.1,1.70,120,3,
+plateau,0.30,0.2,1.70,100,3,
+plateau,0.30,0.2,0.80,100,3,
+plateau,0.30,0.2,0.28,100,3,
+plateau,0.30,0.2,0.15,100,3,
+plateau,0.30,0.4,0.15,50,3,
+plateau,0.30,0.4,0.28,50,3,
+plateau,0.30,0.4,0.45,50,3,
+plateau,0.30,0.4,0.80,50,3,
+ref,0.30,0.5,0.80,40,3,
+plateau,0.30,0.4,1.30,50,3,
+plateau,0.30,0.4,1.70,50,3,
+plateau,0.30,0.7,1.70,29,3,
+plateau,0.30,0.7,1.30,29,3,
+plateau,0.30,0.7,0.80,29,3,
+plateau,0.30,0.7,0.45,29,3,
+plateau,0.30,0.7,0.28,29,3,
+plateau,0.30,0.7,0.15,29,3,
+plateau,0.30,1,0.15,20,3,
+plateau,0.30,1,0.28,20,3,
+plateau,0.30,1,0.45,20,3,
+plateau,0.30,1,0.80,20,3,
+ref,0.30,0.5,0.80,40,3,
+plateau,0.30,1,1.30,20,3,
+plateau,0.30,1,1.70,20,3,
+plateau,0.30,2,1.70,20,3,
+plateau,0.30,2,1.30,20,3,
+plateau,0.30,2,0.80,20,3,
+plateau,0.30,2,0.45,20,3,
+plateau,0.30,2,0.28,20,3,
+plateau,0.30,2,0.15,20,3,
+plateau,0.30,5.415,0.15,20,3,
+plateau,0.30,5.415,0.28,20,3,
+plateau,0.30,5.415,0.45,20,3,
+plateau,0.30,5.415,0.80,20,3,
+ref,0.30,0.5,0.80,40,3,
+plateau,0.30,5.415,1.30,20,3,
+plateau,0.30,5.415,1.70,20,3,
+plateau,0.30,12.599,1.70,20,3,
+plateau,0.30,12.599,1.30,20,3,
+plateau,0.30,12.599,0.80,20,3,
+plateau,0.30,12.599,0.45,20,3,
+plateau,0.30,12.599,0.28,20,3,
+plateau,0.30,12.599,0.15,20,3,
+plateau,0.30,29.317,0.15,20,3,
+plateau,0.30,29.317,0.28,20,3,
+plateau,0.30,29.317,0.45,20,3,
+plateau,0.30,29.317,0.80,20,3,
+ref,0.30,0.5,0.80,40,3,
+plateau,0.30,29.317,1.30,20,3,
+plateau,0.30,29.317,1.70,20,3,
+plateau,0.30,68.219,1.70,20,3,
+plateau,0.30,68.219,1.30,20,3,
+plateau,0.30,68.219,0.80,20,3,
+plateau,0.30,68.219,0.45,20,3,
+plateau,0.30,68.219,0.28,20,3,
+plateau,0.30,68.219,0.15,20,3,
+#
+# === Teil B: DC-Aufhebungstest ==========================================
+# f = 0.4 Hz, a = [0.45, 1.3] — beides schon in Teil A gefahren, deshalb ist
+# der Arm mean_u = 0.30 dort bereits enthalten und wird hier nicht wiederholt.
+# Erwartung: gleiche Events/Zyklus/Pixel bei gleichem a, unabhaengig von der
+# Helligkeit. Abweichung > 10 % ist ein Befund, kein Rauschen.
+#
+# --- Flusspunkt mean_u = 0.15 ----------------------------------------
+floor,0.15,0.4,0.02,50,8,background
+windows,0.15,0.4,1.70,50,3,pilot
+dc,0.15,0.4,0.45,50,3,
+dc,0.15,0.4,1.30,50,3,
+#
+# --- Flusspunkt mean_u = 0.45 ----------------------------------------
+floor,0.45,0.4,0.02,50,8,background
+windows,0.45,0.4,1.70,50,3,pilot
+dc,0.45,0.4,0.45,50,3,
+dc,0.45,0.4,1.30,50,3,
+#
+# Abschluss: Referenz zurueck auf den Startpunkt (Drift ueber die Sitzung).
+ref,0.30,0.5,0.80,40,8,

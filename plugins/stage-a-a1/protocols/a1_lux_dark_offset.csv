@@ -1,0 +1,14 @@
+# A1 Lamp-off-Offset und H14-Sham — separat vor dem Hauptlauf fahren
+# VOR START: Strahl physisch blockieren; Raumlicht und Kameraposition unveraendert.
+# Diese Datei nie direkt mit dem Hauptprotokoll verketten: nach dem Recording stoppen,
+# Dateien finalisieren, dann den Strahlengang kontrolliert wieder freigeben.
+# Ausgabe: Median/Streuung illumination_lux, Kamera-Untergrund je Polaritaet und
+# Darkwert der Emissions-PD hinter Filter/50:50. Der Offset gilt nur fuer diese Sitzung.
+# Die kommandierte a=0.02-Modulation ist kein optischer Background; bei blockiertem
+# Licht dient sie ausschliesslich als koharenter H14-Uebersprechtest.
+# A1 Depth a source fuer diesen Lauf auf Commanded stellen. Vor dem beleuchteten
+# Smoke-Test wieder auf Photodiode measured zurueckstellen.
+#
+# Umfang: 1 Recordings, ~1 min reine Aufnahmezeit (inkl. 11 s Overhead je Recording)
+camera_profile,label,mean_u,frequency_hz,depth_a,duration_s,settle_s,role
+A1-bias-v1-monitoring,lux_dark_h14,0.30,100,0.02,30,8,background

@@ -13,6 +13,7 @@ crate-type = ["cdylib", "rlib"]
 augur-plugin-api.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2 = "0.10"
 stage-a-plugin-contract = { path = "../../stage-a-plugin-contract" }
 toml = "0.8"
 

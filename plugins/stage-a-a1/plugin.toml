@@ -5,7 +5,7 @@ description = "Stage-A A1 recording coordinator: one-button synchronized camera 
 domain = "stage-a"
 library = "augur_plugin_stage_a_a1"
 phase = "raw_events"
-min_augur_version = "1.0.0"
+min_augur_version = "2.0.2"
 host_commands = [
   "start_recording",
   "stop_recording",

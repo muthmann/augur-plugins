@@ -36,6 +36,7 @@
 # named in the status line rather than stopping the survey.
 
 name = "a1-example-survey"
+version = "2026-08-13"
 
 # Applied to every block that does not override them.
 [defaults]

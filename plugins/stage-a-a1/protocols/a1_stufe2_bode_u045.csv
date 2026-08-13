@@ -1,0 +1,83 @@
+# A1 Stufe 2 — vollstaendiger Flusspunkt mean_u=0.45
+# Ein unabhaengig fahrbarer Flusspunkt fuer f_c(I), C(I) und ON/OFF.
+# Die heutige 0.30-Kurve ersetzt die tiefen Frequenzen hier NICHT: |H(f)|
+# wird bei demselben I_k durch das lokale Plateau normiert, und f_c verschiebt
+# sich mit I_k. Deshalb bleiben zwei lokale Plateaupunkte erhalten; die dichte
+# Niederfrequenzsuche aus Stufe 1 wird aber nicht wiederholt.
+# 
+# Aktueller Prior: f_c(0.45) ~ 3.262 Hz, skaliert aus
+# f_c(0.40)=2.9 Hz. Nach dem heutigen 0.30-Quicklook neu zentrieren,
+# falls gemessenes f_c oder die realisierten I_k-Verhaeltnisse deutlich abweichen.
+# 
+# Umfang je Punkt: sieben Frequenzen; an den zwei tiefen Frequenzen fuenf
+# a-Werte (0.15, 0.28, 0.45, 0.80, 1.70), sonst alle sechs bis 1.70.
+# Die eigentlichen Messpunkte enthalten 20 Zyklen (maximal 300 s); Pilot,
+# Background und lokale Plateau-Referenzen sind separat enthalten.
+# 
+# Laserleistung, ND, Bias, Probe/ROI und Ausrichtung innerhalb des Blocks fest
+# halten. mean_u ist nur der Setpoint; ausgewertet wird das gemessene lokale I_k.
+# Vor/nach dem Block ADC-Dark und I_tot ankern; RAW, PDQ, beide JSON/TOML-
+# Sidecars und den ausgefuehrten Zeitplan pruefen. Automations-Leases muessen
+# fuer die gesamte Laufzeit gelten; GUI-Sweep-Maximum vor Start auf a=1.70.
+# Photodioden-Cache: nichts einzustellen. Der Ring waechst selbst auf die
+# gemessene Markerperiode, am tiefsten Punkt also auf die zwei vollen Zyklen,
+# die die drei Phasenmarker brauchen. Grenze bleibt der harte 32-s-Ring bei
+# 500 kSa/s (ADR 033).
+#
+# Umfang: 47 Recordings, ~32 min reine Aufnahmezeit (inkl. 11 s Overhead je Recording)
+label,mean_u,frequency_hz,depth_a,duration_s,settle_s,role
+#
+# ==========================================================================
+# mean_u = 0.45   erwartetes f_c ~ 3.26 Hz   Leiter 0.261 .. 39.15 Hz
+# Lokales Plateau: 0.261 und 0.652 Hz; diese Punkte duerfen nicht durch die 0.30-Messung ersetzt werden.
+#
+# --- Flusspunkt mean_u = 0.45 ----------------------------------------
+floor,0.45,3.262,0.02,20,8,background
+windows,0.45,0.261,1.70,77,3,pilot
+windows,0.45,39.15,1.70,20,3,pilot
+ladder,0.45,0.261,0.15,77,3,
+ladder,0.45,0.261,0.28,77,3,
+ladder,0.45,0.261,0.45,77,3,
+ladder,0.45,0.261,0.80,77,3,
+ladder,0.45,0.261,1.70,77,3,
+ladder,0.45,0.652,1.70,31,3,
+ladder,0.45,0.652,0.80,31,3,
+ladder,0.45,0.652,0.45,31,3,
+ladder,0.45,0.652,0.28,31,3,
+ladder,0.45,0.652,0.15,31,3,
+ladder,0.45,1.631,0.15,20,3,
+ladder,0.45,1.631,0.28,20,3,
+ref,0.45,0.652,0.80,31,3,
+ladder,0.45,1.631,0.45,20,3,
+ladder,0.45,1.631,0.80,20,3,
+ladder,0.45,1.631,1.30,20,3,
+ladder,0.45,1.631,1.70,20,3,
+ladder,0.45,3.262,1.70,20,3,
+ladder,0.45,3.262,1.30,20,3,
+ladder,0.45,3.262,0.80,20,3,
+ladder,0.45,3.262,0.45,20,3,
+ladder,0.45,3.262,0.28,20,3,
+ladder,0.45,3.262,0.15,20,3,
+ladder,0.45,7.178,0.15,20,3,
+ladder,0.45,7.178,0.28,20,3,
+ref,0.45,0.652,0.80,31,3,
+ladder,0.45,7.178,0.45,20,3,
+ladder,0.45,7.178,0.80,20,3,
+ladder,0.45,7.178,1.30,20,3,
+ladder,0.45,7.178,1.70,20,3,
+ladder,0.45,16.312,1.70,20,3,
+ladder,0.45,16.312,1.30,20,3,
+ladder,0.45,16.312,0.80,20,3,
+ladder,0.45,16.312,0.45,20,3,
+ladder,0.45,16.312,0.28,20,3,
+ladder,0.45,16.312,0.15,20,3,
+ladder,0.45,39.15,0.15,20,3,
+ladder,0.45,39.15,0.28,20,3,
+ref,0.45,0.652,0.80,31,3,
+ladder,0.45,39.15,0.45,20,3,
+ladder,0.45,39.15,0.80,20,3,
+ladder,0.45,39.15,1.30,20,3,
+ladder,0.45,39.15,1.70,20,3,
+#
+# Abschluss: lokale Plateau-Referenz bei 0.652 Hz, a=0.8.
+ref,0.45,0.652,0.80,31,3,
