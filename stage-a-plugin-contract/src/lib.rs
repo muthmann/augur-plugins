@@ -289,6 +289,28 @@ pub struct A1AcquisitionConfigV1 {
     pub optical_lut_id: Option<String>,
 }
 
+/// Complete, firmware-level configuration for one A2 step-latency point.
+///
+/// The optical coordinates are calibrated lobe coordinates, not physical
+/// photon flux. `min_half_us` is a precomputed safety floor from the qualified
+/// A1/A5 timing bounds; the firmware enforces it and never guesses it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct A2AcquisitionConfigV1 {
+    pub mean_u_milli: u32,
+    pub depth_a_milli: u32,
+    pub frequency_millihz: u64,
+    pub min_half_us: u32,
+    pub v_null_dac: u16,
+    pub v_peak_dac: u16,
+    pub comparator_threshold_dac: u16,
+    pub comparator_hysteresis: u8,
+    pub comparator_invert: bool,
+    pub sample_rate_hz: u32,
+    pub block_samples: u32,
+    pub emit_raw_samples: bool,
+    pub emit_summary: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ModulationCommandV1 {
@@ -357,6 +379,12 @@ pub enum ModulationCommandV1 {
     PrepareA1 {
         configuration: A1AcquisitionConfigV1,
     },
+    /// Stop the current controller acquisition, enter firmware mode A2,
+    /// configure the optical log-square and its 50 % comparator, and require
+    /// the board to echo `trigger_source=comparator` with the comparator armed.
+    PrepareA2 {
+        configuration: A2AcquisitionConfigV1,
+    },
     StartAcquisition,
     StopAcquisition {
         reason: String,
@@ -385,6 +413,8 @@ pub struct ModulationTargetV1 {
     pub revision: SemanticRevision,
     pub waveform: Option<WaveformV1>,
     pub a1_configuration: Option<A1AcquisitionConfigV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub a2_configuration: Option<A2AcquisitionConfigV1>,
     pub acquisition_running: bool,
     pub board_dac_code: Option<u16>,
     pub firmware_configuration_revision: Option<u64>,
@@ -624,10 +654,57 @@ pub struct PhotodiodeResponseV1 {
 pub struct PhotodiodeCalibrationV1 {
     pub adc_calibration_id: String,
     pub dark_id: String,
-    pub anchor_id: String,
+    /// Full-extinction reference used only for rejected-port complement
+    /// geometry. Direct camera/emission-path measurements have no such anchor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_id: Option<String>,
     pub dark_volts: f64,
+    /// Traceable direct-path dark reference. `None` for the historical
+    /// rejected-port geometry, where the same-detector complement cancels the
+    /// dark offset. Additive for older V1 readers and writers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dark_reference: Option<PhotodiodeDarkReferenceV1>,
     /// Named full-extinction anchor after dark subtraction.
-    pub total_power_volts: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_power_volts: Option<f64>,
+}
+
+/// How a direct-path blocked-light reference entered the session state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PhotodiodeDarkSourceV1 {
+    /// Captured from the owner's settled raw detector window while the
+    /// operator had physically blocked the light.
+    MeasuredLampOff,
+    /// Entered through the numeric setting rather than measured by the owner.
+    Manual,
+}
+
+/// Provenance for the direct camera/emission-path dark subtraction.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PhotodiodeDarkReferenceV1 {
+    pub dark_id: String,
+    pub source: PhotodiodeDarkSourceV1,
+    pub dark_volts: f64,
+    pub captured_at_unix_ms: u64,
+    /// Age when this enclosing summary or artifact was produced.
+    pub age_s: f64,
+}
+
+/// Physical location of the one Stage-A photodiode.
+///
+/// `RejectedPort` is the historical PBS-complement geometry and therefore the
+/// default when an older owner did not publish this additive field.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PhotodiodePlacementV1 {
+    #[default]
+    RejectedPort,
+    /// Direct sample of the path sent towards the camera, before a microscope
+    /// emission chain has been established.
+    CameraPath,
+    /// Direct sample of fluorescence after the emission filter.
+    EmissionPath,
 }
 
 /// Bounded optical result for one named run. It contains no raw or decimated
@@ -636,6 +713,14 @@ pub struct PhotodiodeCalibrationV1 {
 pub struct PhotodiodeOpticalSummaryV1 {
     pub run_id: RunId,
     pub calibration: PhotodiodeCalibrationV1,
+    /// Detector geometry used to derive `measured_log_contrast`.
+    #[serde(default)]
+    pub placement: PhotodiodePlacementV1,
+    /// Fraction of the local beam sent to the photodiode, e.g. `0.5` for a
+    /// 50:50 splitter. It is provenance; a constant fraction cancels from log
+    /// contrast and is not used as a scale correction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub splitter_fraction: Option<f64>,
     pub measured_log_contrast: f64,
     pub log_contrast_stddev: Option<f64>,
     pub excitation_min_volts: f64,
@@ -718,6 +803,16 @@ pub struct PhotodiodeSummaryV1 {
     pub active_recording: Option<PdqStartedReceiptV1>,
     pub last_finalized_recording: Option<PdqFinalizedReceiptV1>,
     pub optical_summary: Option<PhotodiodeOpticalSummaryV1>,
+    /// Current detector placement, available even while no optical window has
+    /// passed the estimator gates.
+    #[serde(default)]
+    pub placement: PhotodiodePlacementV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub splitter_fraction: Option<f64>,
+    /// Current direct-path dark provenance, even while another optical gate
+    /// withholds `optical_summary`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dark_reference: Option<PhotodiodeDarkReferenceV1>,
     /// Why `optical_summary` is absent, in the owner's own words.
     ///
     /// A withheld `a` is a fail-closed refusal, not missing data, and every
@@ -858,6 +953,7 @@ mod tests {
             revision: SemanticRevision(5),
             waveform: Some(WaveformV1::Constant { level_dac: 900 }),
             a1_configuration: None,
+            a2_configuration: None,
             acquisition_running: false,
             board_dac_code: None,
             firmware_configuration_revision: None,
