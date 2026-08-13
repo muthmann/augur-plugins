@@ -1,0 +1,217 @@
+# Immediate A2 follow-up for the current ATTO647 fluorescence chain.
+#
+# This file is intentionally fail-closed. Replace every TBD/zero gate with the
+# value or calibration ID measured during comparator/optical bring-up. The A2
+# plugin rejects the whole file before acquiring a lease while any remains.
+name = "a2-atto647-fluorescence-chain-followup"
+
+[camera]
+profile = "TBD" # Complete host profile with EXT_TRIGGER and sensor telemetry.
+
+[optical]
+transfer_scope = "fluorescence_chain"
+photodiode_placement = "emission_path"
+splitter_fraction_to_pd = 0.5
+optical_config_id = "TBD"
+
+[gates]
+firmware_a2_confirmed = false
+comparator_self_test_passed = false
+camera_external_trigger_confirmed = false
+h4_loopback_id = "TBD"
+h5_polarity_calibration_id = "TBD"
+optical_edge_calibration_id = "TBD"
+local_flux_calibration_id = "TBD"
+recorder_safety_limit_events_per_us = 0 # Pre-qualified before this protocol.
+
+[controller]
+v_null_dac = 0             # TBD: measured lower lobe endpoint
+v_peak_dac = 0             # TBD: measured absolute lobe maximum
+comparator_hysteresis = 1
+comparator_invert = false  # TBD: value frozen by H5
+min_half_us = 0            # TBD: max(5*tau_refr, A1 settling guard)
+sample_rate_hz = 500000
+block_samples = 256
+
+# Dark/sham and cadence commissioning. A pause means the operator must confirm
+# the stated physical condition before Continue. No failed row is overwritten.
+[[point]]
+label="floor_pre"
+role="floor_pre_shutter_closed"
+acquisition_mode="dark"
+duration_s=30.0
+settle_s=2
+pause_before=true
+
+[[point]]
+label="blocked_drive_sham"
+role="blocked_drive_sham"
+acquisition_mode="stepped"
+mean_u=0.30
+depth_a=0.45
+half_period_s=1.0
+transitions_per_polarity=100
+settle_s=2
+comparator_threshold_dac=0
+pause_before=true
+
+[[point]]
+label="polarity_cadence_2s"
+role="commissioning"
+acquisition_mode="stepped"
+mean_u=0.30
+depth_a=0.45
+half_period_s=2.0
+transitions_per_polarity=50
+settle_s=3
+comparator_threshold_dac=0
+pause_before=true
+
+[[point]]
+label="cadence_1s"
+role="commissioning"
+acquisition_mode="stepped"
+mean_u=0.30
+depth_a=0.45
+half_period_s=1.0
+transitions_per_polarity=50
+settle_s=3
+comparator_threshold_dac=0
+
+[[point]]
+label="cadence_0p5s"
+role="commissioning_conditional"
+acquisition_mode="stepped"
+mean_u=0.30
+depth_a=0.45
+half_period_s=0.5
+transitions_per_polarity=50
+settle_s=3
+comparator_threshold_dac=0
+pause_before=true
+
+[[point]]
+label="load_small"
+role="h21_load_reference"
+acquisition_mode="stepped"
+mean_u=0.30
+depth_a=0.45
+half_period_s=1.0
+transitions_per_polarity=200
+settle_s=3
+comparator_threshold_dac=0
+
+[[point]]
+label="load_larger"
+role="h21_load_test"
+acquisition_mode="stepped"
+mean_u=0.30
+depth_a=0.45
+half_period_s=1.0
+transitions_per_polarity=200
+settle_s=3
+comparator_threshold_dac=0
+pause_before=true
+
+# Opening references and the multi-depth identification block at mean_u=0.30.
+[[point]]
+label="ref_open_1"
+role="reference"
+acquisition_mode="stepped"
+mean_u=0.30
+depth_a=0.45
+half_period_s=1.0
+transitions_per_polarity=200
+settle_s=3
+comparator_threshold_dac=0
+[[point]]
+label="ref_open_2"
+role="reference"
+acquisition_mode="stepped"
+mean_u=0.30
+depth_a=0.45
+half_period_s=1.0
+transitions_per_polarity=200
+settle_s=3
+comparator_threshold_dac=0
+[[point]]
+label="ref_open_3"
+role="reference"
+acquisition_mode="stepped"
+mean_u=0.30
+depth_a=0.45
+half_period_s=1.0
+transitions_per_polarity=200
+settle_s=3
+comparator_threshold_dac=0
+[[point]]
+label="depth_low"
+role="identification"
+acquisition_mode="stepped"
+mean_u=0.30
+depth_a=0.28
+half_period_s=1.0
+transitions_per_polarity=500
+settle_s=3
+comparator_threshold_dac=0
+[[point]]
+label="depth_high"
+role="identification"
+acquisition_mode="stepped"
+mean_u=0.30
+depth_a=0.80
+half_period_s=1.0
+transitions_per_polarity=500
+settle_s=3
+comparator_threshold_dac=0
+
+# Flux/pedestal bridge matching A1. The order is non-monotonic to expose drift.
+[[point]]
+label="pedestal_u015"
+role="pedestal_core"
+acquisition_mode="stepped"
+mean_u=0.15
+depth_a=0.45
+half_period_s=1.0
+transitions_per_polarity=500
+settle_s=3
+comparator_threshold_dac=0
+[[point]]
+label="pedestal_u045"
+role="pedestal_core"
+acquisition_mode="stepped"
+mean_u=0.45
+depth_a=0.45
+half_period_s=1.0
+transitions_per_polarity=500
+settle_s=3
+comparator_threshold_dac=0
+[[point]]
+label="pedestal_u030"
+role="pedestal_core"
+acquisition_mode="stepped"
+mean_u=0.30
+depth_a=0.45
+half_period_s=1.0
+transitions_per_polarity=500
+settle_s=3
+comparator_threshold_dac=0
+
+[[point]]
+label="ref_close"
+role="reference"
+acquisition_mode="stepped"
+mean_u=0.30
+depth_a=0.45
+half_period_s=1.0
+transitions_per_polarity=200
+settle_s=3
+comparator_threshold_dac=0
+
+[[point]]
+label="floor_post"
+role="floor_post_shutter_closed"
+acquisition_mode="dark"
+duration_s=30.0
+settle_s=2
+pause_before=true
