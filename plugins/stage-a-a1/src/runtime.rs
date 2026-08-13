@@ -4622,24 +4622,6 @@ impl StageAA1Plugin {
                 .points
                 .iter()
                 .any(|point| point.diff_on.is_some() || point.diff_off.is_some());
-        if controls_camera && plan.camera.is_none() && !self.record_sensor_telemetry {
-            self.message =
-                "Protocol refused: enable Record sensor monitoring before a bias-controlled run"
-                    .into();
-            return;
-        }
-        if controls_camera {
-            let Some(sensor) = self.sensor.filter(|sensor| sensor.age_s <= 2.0) else {
-                self.message =
-                    "Protocol refused: camera bias control requires a fresh Sensor reading".into();
-                return;
-            };
-            if sensor.bias_codes.is_none() {
-                self.message =
-                    "Protocol refused: the Sensor reading contains no bias readback".into();
-                return;
-            }
-        }
 
         let now_ms = now_unix_ms();
         let lease_id = LeaseId::new(format!(
@@ -6407,10 +6389,10 @@ struct FilesSidecar {
     /// was recording.
     ///
     /// Absent whenever the host wrote no telemetry companion. Usually that is
-    /// the host's own **Record sensor monitoring** switch being off, not a
-    /// camera without a monitoring block: the switch governs the whole file
-    /// and A1 cannot ask for it. The single-point readings in `[sensor]` come
-    /// from the context bus and are there either way.
+    /// the confirmed camera configuration's **Record sensor monitoring** switch
+    /// being off, not a camera without a monitoring block. A protocol profile
+    /// can enable the switch through the generic host apply. The single-point
+    /// readings in `[sensor]` come from the context bus and are there either way.
     #[serde(skip_serializing_if = "Option::is_none")]
     sensor_readout: Option<String>,
 }
@@ -11047,41 +11029,81 @@ depth_a = 0.7
     }
 
     #[test]
-    fn camera_bias_control_fails_closed_without_a_sensor_reading() {
+    fn camera_bias_control_relies_on_the_hosts_confirmed_apply() {
         let folder = temp_folder("protocol-bias-no-sensor");
         let (mut plugin, _) = protocol_plugin(&folder, BIAS_PROTOCOL);
         plugin.sensor = None;
         let mut sink = ControlSink::default();
 
         control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+        let apply = sink.hosts.last().expect("host apply request");
+        assert!(matches!(
+            apply.command,
+            HostCommand::ApplyCameraConfiguration {
+                configuration: CameraConfigurationSourceV1::Current
+            }
+        ));
+        let apply_request_id = apply.request_id;
+        assert!(
+            sink.services.is_empty(),
+            "drive moved before host confirmation"
+        );
+
+        control_tick(
+            &mut plugin,
+            PluginControlInbox {
+                host_replies: vec![HostCommandReply {
+                    request_id: apply_request_id,
+                    outcome: HostCommandOutcome::Rejected {
+                        code: "camera_configuration_readback_timeout".into(),
+                        message: "fresh sensor readback was unavailable".into(),
+                    },
+                }],
+                ..PluginControlInbox::default()
+            },
+            &mut sink,
+        );
+        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
 
         assert!(plugin.protocol.is_none());
-        assert!(sink.services.is_empty() && sink.hosts.is_empty());
-        assert!(
-            plugin.message.contains("Sensor reading"),
-            "{}",
-            plugin.message
-        );
+        assert!(sink.services.is_empty());
+        assert!(!plugin.recording.is_active());
+        assert!(plugin.message.contains("readback"), "{}", plugin.message);
         let _ = std::fs::remove_dir_all(&folder);
     }
 
     #[test]
-    fn bias_only_protocol_fails_closed_when_sensor_recording_is_disabled() {
+    fn a_confirmed_configuration_with_sensor_recording_disabled_is_restored() {
         let folder = temp_folder("protocol-bias-sensor-recording-off");
         let (mut plugin, _) = protocol_plugin(&folder, BIAS_PROTOCOL);
-        plugin.sensor = Some(fresh_bias_sensor(105, 98));
+        plugin.sensor = None;
         plugin.record_sensor_telemetry = false;
         let mut sink = ControlSink::default();
 
         control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
-
-        assert!(plugin.protocol.is_none());
-        assert!(sink.services.is_empty() && sink.hosts.is_empty());
-        assert!(
-            plugin.message.contains("Record sensor monitoring"),
-            "{}",
-            plugin.message
+        let apply_request_id = sink.hosts.last().expect("host apply request").request_id;
+        let mut snapshot = camera_snapshot();
+        snapshot.global.record_sensor_telemetry = false;
+        control_tick(
+            &mut plugin,
+            PluginControlInbox {
+                host_replies: vec![current_configuration_reply(apply_request_id, snapshot)],
+                ..PluginControlInbox::default()
+            },
+            &mut sink,
         );
+        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+
+        assert!(!plugin.recording.is_active());
+        assert!(matches!(
+            sink.hosts.last().map(|request| &request.command),
+            Some(HostCommand::RestoreCameraConfiguration)
+        ));
+        assert!(plugin
+            .protocol
+            .as_ref()
+            .and_then(|run| run.finish_message.as_deref())
+            .is_some_and(|message| message.contains("Record sensor monitoring")));
         let _ = std::fs::remove_dir_all(&folder);
     }
 
@@ -11153,7 +11175,8 @@ depth_a = 0.7
     fn a_named_profile_is_applied_before_the_lease_and_restored_on_stop() {
         let folder = temp_folder("protocol-profile-restore");
         let (mut plugin, _) = protocol_plugin(&folder, PROFILE_PROTOCOL);
-        plugin.sensor = Some(fresh_bias_sensor(105, 98));
+        plugin.sensor = None;
+        plugin.record_sensor_telemetry = false;
         let mut sink = ControlSink::default();
 
         control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);

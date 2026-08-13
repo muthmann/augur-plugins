@@ -281,9 +281,12 @@ snapshot, profile revision, and hash travel with every recording.
 
 Camera values are applied immediately through the host camera-control path; the
 operator does not click Apply again. A point waits for a fresh sensor readback
-that confirms the requested codes. Sensor reading missing or disabled refuses
-the run. Completion, Stop, and abort restore the settings that were active
-before the protocol.
+that confirms the requested codes. The confirmed host snapshot is authoritative:
+a profile may enable Sensor reading in the same apply, without waiting for an
+operator action. Missing readback or a confirmed snapshot with Sensor reading
+disabled refuses the run. The active camera backend validates its own bias
+ranges. Completion, Stop, and abort restore the settings that were active before
+the protocol.
 
 ### Frequency generation and measurement limit (ADR 036)
 
