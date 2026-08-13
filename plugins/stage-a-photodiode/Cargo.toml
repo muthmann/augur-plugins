@@ -17,3 +17,6 @@ serialport.workspace = true
 # already a direct dependency here, so it adds nothing new to the build.
 stage-a-io = { path = "../../stage-a-io" }
 stage-a-plugin-contract = { path = "../../stage-a-plugin-contract" }
+
+[dev-dependencies]
+augur-plugin-stage-a-a1 = { path = "../stage-a-a1" }

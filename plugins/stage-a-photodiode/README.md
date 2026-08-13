@@ -5,16 +5,36 @@ free-running PDA1 `SamplesU16` stream the `stage-a-controller` firmware (0.4.0+)
 **second** USB serial port (20 kSa/s default). The port carries no commands, so this plugin is
 read-only by construction; the command port belongs to `stage-a-modulation`.
 
-## Modes
+## Detector placement and modes
+
+Set **Detector placement** to the physical geometry before recording:
+
+- **PBS rejected port** — complementary excitation. This is the legacy mode and
+  uses the learned `I_tot` anchor described below.
+- **camera path (direct)** — direct sample of the path sent to the camera.
+- **emission path (direct fluorescence)** — direct fluorescence after the
+  emission filter. Set **Fraction sent to PD** to the beamsplitter fraction
+  (`0.5` for 50:50), block the beam and press **Capture lamp-off dark**.
+
+The two direct modes compute `a = ln((V_max-D)/(V_min-D))`. They never use
+`I_tot`. The splitter fraction is written as provenance and is not used to
+rescale log contrast. Direct-path `a` is withheld until a lamp-off dark has
+been explicitly captured. The PD artifacts record its value, ID, source,
+capture time, and age. The numeric dark field is only a draft; pressing **Use
+manual dark** activates it with source `manual`. This explicit step prevents UI
+settings replay from replacing a captured lamp-off reference.
 
 - **RAW** — shows the ADC code and its voltage, `V = code · 3.3 / 4095`.
-- **EXCITATION** — the photodiode sits in the excitation path behind the PBS and measures the
+- **EXCITATION** — in rejected-port placement, the photodiode sits behind the PBS and measures the
   light *removed* from the beam: `I_pd = I_tot − I_exc`, so the plugin shows `I_exc = I_tot − I_pd`.
   `I_tot` is **learned, not entered**: it is the brightest smoothed reading the detector has taken
   since the port opened, which on the reject port is where the excitation is extinguished. The
   Pockels transfer sweep drives through that null by construction, so running it once teaches the
   anchor. There is no dark level either — a DC offset cancels exactly out of the complement.
   See [ADR 024](../../docs/adr/024-stage-a-photodiode-learns-its-own-anchor.md).
+
+RAW/EXCITATION is a display choice. Detector placement is the scientific
+geometry and controls the estimator independently of the chart mode.
 
 ## Views
 
