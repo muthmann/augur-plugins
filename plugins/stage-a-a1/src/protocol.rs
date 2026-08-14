@@ -159,8 +159,20 @@ impl Protocol {
 
     /// Total bench time the protocol asks for, settling included.
     pub fn total_seconds(&self) -> f64 {
+        self.remaining_seconds(0)
+    }
+
+    /// Bench time the points from `index` onwards still ask for, settling
+    /// included. The point at `index` counts whole: it is the one in flight,
+    /// and the recording's own countdown says how far into it the run is.
+    ///
+    /// Recording overhead (camera start/stop, the lease handshake, the a₀
+    /// search) is not in here, so this is a lower bound on the wall clock —
+    /// the same quantity [`Self::total_seconds`] announces before the start.
+    pub fn remaining_seconds(&self, index: usize) -> f64 {
         self.points
             .iter()
+            .skip(index)
             .map(|point| point.duration_s as f64 + point.settle_s)
             .sum()
     }
@@ -940,6 +952,17 @@ depth_a = 0.5
         let protocol = parse(SAMPLE).expect("valid protocol");
         // 6 × (5 + 1.5) + 6 × (30 + 1.5)
         assert!((protocol.total_seconds() - (6.0 * 6.5 + 6.0 * 31.5)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn remaining_seconds_drops_the_points_already_done() {
+        let protocol = parse(SAMPLE).expect("valid protocol");
+        // The point in flight counts whole, so after six 6.5 s points only the
+        // six 31.5 s ones are left.
+        assert!((protocol.remaining_seconds(6) - 6.0 * 31.5).abs() < 1e-9);
+        // Past the end nothing is left, rather than an index panic.
+        assert_eq!(protocol.remaining_seconds(protocol.points.len()), 0.0);
+        assert!((protocol.remaining_seconds(0) - protocol.total_seconds()).abs() < 1e-9);
     }
 
     #[test]

@@ -323,7 +323,10 @@ acceptance before high-frequency data is treated as qualified.
 - **Validated up front**: ranges, bounds, the `MAX_POINTS = 4096` product limit
   and the same whole-cycle window check the ladder makes against its lowest
   frequency — all on the button press, before the drive moves. The point count
-  and expected bench time are reported first.
+  and expected bench time are reported first, and the bench time still to run
+  stays on the protocol's own status line: the opening message is overwritten by
+  the first point, so an operator who looked away would otherwise never see it
+  again.
 - **A refused point is skipped, not fatal**, carrying the modulation owner's own
   wording. Because the per-point message is overwritten within the same tick,
   the reasons are kept on the run and shown in the status pane and the closing

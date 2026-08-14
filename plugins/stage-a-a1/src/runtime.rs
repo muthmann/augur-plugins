@@ -205,6 +205,19 @@ fn frequency_label(hz: f64) -> String {
     format!("{hz:.3} Hz")
 }
 
+/// A stretch of bench time in the largest unit that still reads as a number an
+/// operator can act on: seconds below two minutes, then minutes, then hours.
+fn format_bench_time(seconds: f64) -> String {
+    let seconds = seconds.max(0.0);
+    if seconds < 120.0 {
+        format!("{seconds:.0} s")
+    } else if seconds < 5_400.0 {
+        format!("{:.0} min", seconds / 60.0)
+    } else {
+        format!("{:.1} h", seconds / 3_600.0)
+    }
+}
+
 /// Upper-cases the first character, so a blocker written as a sentence fragment
 /// ("the total power …") can also stand as its own sentence in the status panel.
 fn capitalize_first(text: &str) -> String {
@@ -4641,10 +4654,10 @@ impl StageAA1Plugin {
 
         let (means, frequencies, depths) = plan.axis_counts();
         let total = plan.points.len();
-        let minutes = plan.total_seconds() / 60.0;
+        let bench_time = format_bench_time(plan.total_seconds());
         self.message = format!(
             "Protocol '{}': {total} recordings ({means} × ū, {frequencies} × f, {depths} × a), \
-             about {minutes:.0} min of bench time — preparing the camera and modulation lease…",
+             about {bench_time} of bench time — preparing the camera and modulation lease…",
             plan.name
         );
         self.protocol = Some(ProtocolRun {
@@ -7660,13 +7673,18 @@ impl Plugin for StageAA1Plugin {
             color: None,
         }];
         if let Some(run) = self.protocol.as_ref() {
+            // The bench time left belongs on this line, not in the transient
+            // message: the message that announces it at the start is overwritten
+            // by the first point's own line, so an operator who looked away had
+            // no way to see how long the survey still runs.
             entries.push(StatusEntry::Text(format!(
-                "Protocol '{}': point {}/{} — {} recorded, {} skipped",
+                "Protocol '{}': point {}/{} — {} recorded, {} skipped, about {} of bench time left",
                 run.plan.name,
                 (run.index + 1).min(run.plan.points.len()),
                 run.plan.points.len(),
                 run.recorded,
                 run.failed.len(),
+                format_bench_time(run.plan.remaining_seconds(run.index)),
             )));
             // The per-point message is overwritten within the tick that skips a
             // point, so the most recent reason lives here instead of scrolling
@@ -8075,6 +8093,17 @@ mod tests {
         fn request_host(&mut self, request: &HostCommandRequest) {
             self.hosts.push(request.clone());
         }
+    }
+
+    #[test]
+    fn bench_time_reads_in_the_unit_the_operator_needs() {
+        assert_eq!(format_bench_time(45.0), "45 s");
+        assert_eq!(format_bench_time(119.0), "119 s");
+        assert_eq!(format_bench_time(120.0), "2 min");
+        assert_eq!(format_bench_time(3_600.0), "60 min");
+        assert_eq!(format_bench_time(7_200.0), "2.0 h");
+        // A finished survey reads as no time left, never as a negative one.
+        assert_eq!(format_bench_time(-1.0), "0 s");
     }
 
     /// Mirrors the ordering of [`StageAA1Plugin::process_control`].
