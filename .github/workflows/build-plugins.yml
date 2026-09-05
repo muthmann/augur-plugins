@@ -26,9 +26,9 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # A1 uses the camera-profile and confirmed-readback host commands introduced
-  # by the paired augur-rs PR. Move this back to `main` after that PR lands.
-  AUGUR_RS_REF: ${{ inputs.augur_rs_ref || 'feat/plugin-apply-biases' }}
+  # The paired camera-session changes are part of augur-rs main. Keep manual
+  # runs overridable so older or diagnostic host revisions remain testable.
+  AUGUR_RS_REF: ${{ inputs.augur_rs_ref || 'main' }}
 
 jobs:
   build:
