@@ -1661,6 +1661,9 @@ impl StageAPhotodiodePlugin {
             "photodiode_placement": self.placement,
             "splitter_fraction": (self.placement != PhotodiodePlacementV1::RejectedPort)
                 .then_some(self.splitter_fraction),
+            "reference_set_id": Some(self.reference_set_id.trim())
+                .filter(|value| !value.is_empty()),
+            "load_ohms": self.load_ohms,
             "direct_dark_volts": (self.placement != PhotodiodePlacementV1::RejectedPort)
                 .then(|| self.direct_dark_volts()).flatten(),
             "direct_dark_reference": (self.placement != PhotodiodePlacementV1::RejectedPort)
@@ -2191,6 +2194,9 @@ impl StageAPhotodiodePlugin {
             placement: self.placement,
             splitter_fraction: (self.placement != PhotodiodePlacementV1::RejectedPort)
                 .then_some(self.splitter_fraction),
+            reference_set_id: Some(self.reference_set_id.trim().to_owned())
+                .filter(|value| !value.is_empty()),
+            load_ohms: Some(self.load_ohms),
             dark_reference: (self.placement != PhotodiodePlacementV1::RejectedPort)
                 .then(|| self.published_direct_dark())
                 .flatten(),
@@ -4471,6 +4477,8 @@ mod tests {
         let summary = plugin.control_summary();
         assert_eq!(summary.placement, PhotodiodePlacementV1::EmissionPath);
         assert_eq!(summary.splitter_fraction, Some(0.5));
+        assert_eq!(summary.reference_set_id, None);
+        assert_eq!(summary.load_ohms, Some(470_000.0));
         assert!(summary.optical_summary.is_some());
     }
 
@@ -5591,6 +5599,8 @@ mod tests {
         assert_eq!(sidecar["kind"], "recording");
         assert_eq!(sidecar["samples_written"], 4);
         assert_eq!(sidecar["pdq_frames"], 1);
+        assert_eq!(sidecar["reference_set_id"], Value::Null);
+        assert_eq!(sidecar["load_ohms"], 470_000.0);
         assert_eq!(sidecar["valid"], true);
 
         std::fs::remove_dir_all(dir).unwrap();

@@ -17,20 +17,24 @@ use sha2::{Digest, Sha256};
 use stage_a_plugin_contract::{
     A2AcquisitionConfigV1, ClientId, ConnectionStateV1, LeaseId, ModulationCommandV1,
     ModulationRequestV1, ModulationResponseV1, ModulationStateV1, OpticalTargetV1, PdqReceiptV1,
-    PdqStartSpecV1, PdqTerminationV1, PhotodiodeCommandV1, PhotodiodeLevelV1,
-    PhotodiodePlacementV1, PhotodiodeRequestV1, PhotodiodeResponseV1, PhotodiodeSummaryV1,
-    RequestId, RequestOutcomeV1, RunId, SemanticRevision, WaveformV1,
-    CTX_STAGE_A_MODULATION_STATE_V1, CTX_STAGE_A_PHOTODIODE_SUMMARY_V1,
+    PdqStartSpecV1, PdqTerminationV1, PhotodiodeCommandV1, PhotodiodeDarkReferenceV1,
+    PhotodiodeLevelV1, PhotodiodePlacementV1, PhotodiodeRequestV1, PhotodiodeResponseV1,
+    PhotodiodeSummaryV1, RequestId, RequestOutcomeV1, RunId, SemanticRevision, StreamIntegrityV1,
+    WaveformV1, CTX_STAGE_A_MODULATION_STATE_V1, CTX_STAGE_A_PHOTODIODE_SUMMARY_V1,
     SERVICE_STAGE_A_MODULATION_CONTROL_V1, SERVICE_STAGE_A_PHOTODIODE_CONTROL_V1,
 };
 
-use crate::protocol::{self, Acquisition, Point, Protocol};
+use crate::protocol::{self, Acquisition, ControllerSetup, Point, Protocol};
 
 const ID: &str = "stage-a.a2";
 const MOD_ID: &str = "stage-a.modulation";
 const PD_ID: &str = "stage-a.photodiode";
 const TIMEOUT_MS: u64 = 20_000;
 const LEASE_TTL_MS: u64 = 60_000;
+/// Conservative fail-closed limit for the first small-ROI A2 runs. The actual
+/// peak is written per point; H21 can later lower this bound without changing
+/// every protocol file.
+const RECORDER_SAFETY_LIMIT_EVENTS_PER_US: u64 = 6;
 
 /// Settling half-period guard, in microseconds.
 ///
@@ -262,8 +266,27 @@ struct MeasuredThreshold {
     measured_at_unix_ms: u64,
 }
 
+/// PD-owned state frozen when the run starts. This replaces optical and
+/// reference IDs copied by hand into the protocol.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct ResolvedPhotodiode {
+    owner_instance: String,
+    placement: PhotodiodePlacementV1,
+    splitter_fraction: Option<f64>,
+    reference_set_id: Option<String>,
+    load_ohms: Option<f64>,
+    dark_reference: Option<PhotodiodeDarkReferenceV1>,
+    sample_rate_hz: Option<u32>,
+    stream_epoch: u64,
+    stream_integrity: StreamIntegrityV1,
+}
+
 struct Run {
     protocol: Protocol,
+    /// Runner-owned settings used for this acquisition. These are not repeated
+    /// in every point protocol and are written verbatim into the sidecar.
+    controller: ControllerSetup,
+    photodiode_setup: ResolvedPhotodiode,
     /// Owner-resolved controller values, frozen once at preflight so every
     /// point of the run cites the same lobe and the same step floor.
     resolved: ResolvedController,
@@ -345,7 +368,7 @@ impl Default for StageAA2Plugin {
             run: None,
             request: 0,
             revision: 0,
-            message: "Choose an output folder and a fully qualified A2 protocol".into(),
+            message: "Choose an A2 point protocol".into(),
             modulation: None,
             photodiode: None,
             settings: None,
@@ -383,9 +406,6 @@ impl StageAA2Plugin {
         }
         if self.run.is_some() {
             return Some("an A2 protocol is already running".into());
-        }
-        if self.output_folder.trim().is_empty() {
-            return Some("choose an output folder".into());
         }
         if self.protocol_path.trim().is_empty() {
             return Some("choose an A2 protocol".into());
@@ -426,6 +446,14 @@ impl StageAA2Plugin {
         {
             return Some("set and confirm the photodiode splitter fraction to 0.5".into());
         }
+        if self
+            .photodiode
+            .as_ref()
+            .and_then(|summary| summary.data_dir.as_deref())
+            .is_none_or(|folder| folder.trim().is_empty())
+        {
+            return Some("choose the data folder in the photodiode plugin".into());
+        }
         if self.sensor.and_then(|s| s.pixel_dead_time_us).is_none() {
             return Some("sensor pixel-dead-time readout is missing".into());
         }
@@ -461,11 +489,23 @@ impl StageAA2Plugin {
                 return;
             }
         };
-        // Everything below happens before the camera profile is applied and
+        // Everything below happens before the camera configuration is applied and
         // before either owner lease is acquired: an unresolvable lobe, an
         // unresolvable step floor or an unreachable plateau must refuse while
         // the bench is still untouched.
-        let resolved = match resolve_controller(&plan, self.modulation.as_ref(), self.sensor) {
+        let controller = ControllerSetup::default();
+        let photodiode_setup = resolve_photodiode(
+            self.photodiode
+                .as_ref()
+                .expect("blocker confirmed the photodiode owner"),
+        );
+        self.output_folder = self
+            .photodiode
+            .as_ref()
+            .and_then(|summary| summary.data_dir.clone())
+            .expect("blocker confirmed the photodiode data folder");
+        let resolved = match resolve_controller(&controller, self.modulation.as_ref(), self.sensor)
+        {
             Ok(resolved) => resolved,
             Err(error) => {
                 self.message = format!("A2 refused before hardware moved: {error}");
@@ -483,11 +523,7 @@ impl StageAA2Plugin {
                 return;
             }
         };
-        let measurement_id = if self.measurement_id.trim().is_empty() {
-            format!("A2-{}", compact_time())
-        } else {
-            safe(self.measurement_id.trim())
-        };
+        let measurement_id = format!("A2-{}", compact_time());
         self.measurement_id = measurement_id.clone();
         let hash = hex_hash(text.as_bytes());
         let protocol_archive_path =
@@ -500,6 +536,8 @@ impl StageAA2Plugin {
             };
         self.run = Some(Run {
             protocol: plan,
+            controller,
+            photodiode_setup,
             resolved,
             pedestals,
             thresholds: BTreeMap::new(),
@@ -537,9 +575,7 @@ impl StageAA2Plugin {
         self.send_host(
             control,
             HostCommand::ApplyCameraConfiguration {
-                configuration: CameraConfigurationSourceV1::NamedProfile {
-                    name: self.run.as_ref().unwrap().protocol.camera.profile.clone(),
-                },
+                configuration: CameraConfigurationSourceV1::Current,
             },
         );
     }
@@ -719,7 +755,7 @@ impl StageAA2Plugin {
             let r = self.run.as_ref().unwrap();
             (
                 r.protocol.points[r.index].acquisition.clone(),
-                r.protocol.controller.clone(),
+                r.controller.clone(),
                 r.resolved.clone(),
             )
         };
@@ -1008,18 +1044,11 @@ impl StageAA2Plugin {
             ("role", p.role.clone()),
             ("acquisition_mode", acquisition_mode(&p.acquisition).into()),
             ("duration_s", p.acquisition_seconds().to_string()),
-            ("transfer_scope", r.protocol.optical.transfer_scope.clone()),
+            ("transfer_scope", "fluorescence_chain".into()),
+            ("scientific_status", "requires_offline_h4_h5_review".into()),
             (
                 "photodiode_placement",
-                r.protocol.optical.photodiode_placement.clone(),
-            ),
-            (
-                "splitter_fraction_to_pd",
-                r.protocol.optical.splitter_fraction_to_pd.to_string(),
-            ),
-            (
-                "optical_config_id",
-                r.protocol.optical.optical_config_id.clone(),
+                photodiode_placement_name(r.photodiode_setup.placement).into(),
             ),
             // Owner-resolved, not retyped: the run still cites the lobe and the
             // step floor it actually ran on.
@@ -1037,6 +1066,25 @@ impl StageAA2Plugin {
             ("min_half_us_source", r.resolved.min_half_us_source.into()),
         ] {
             m.insert(k.into(), v);
+        }
+        if let Some(fraction) = r.photodiode_setup.splitter_fraction {
+            m.insert("splitter_fraction_to_pd".into(), fraction.to_string());
+        }
+        if let Some(reference_set_id) = r.photodiode_setup.reference_set_id.as_ref() {
+            m.insert(
+                "photodiode_reference_set_id".into(),
+                reference_set_id.clone(),
+            );
+        }
+        if let Some(load_ohms) = r.photodiode_setup.load_ohms {
+            m.insert("photodiode_load_ohms".into(), load_ohms.to_string());
+        }
+        if let Some(reference) = r.photodiode_setup.dark_reference.as_ref() {
+            m.insert("photodiode_dark_id".into(), reference.dark_id.clone());
+            m.insert(
+                "photodiode_dark_volts".into(),
+                reference.dark_volts.to_string(),
+            );
         }
         match p.acquisition {
             Acquisition::Dark { duration_s } => {
@@ -1386,7 +1434,7 @@ impl StageAA2Plugin {
                 let spec = PdqStartSpecV1 {
                     pdq_path: format!("{}/{}.pdq", r.measurement_id, r.run_id),
                     sidecar_path: format!("{}/{}.pd.json", r.measurement_id, r.run_id),
-                    expected_sample_rate_hz: Some(r.protocol.controller.sample_rate_hz),
+                    expected_sample_rate_hz: Some(r.controller.sample_rate_hz),
                     expected_stream_epoch: self.photodiode.as_ref().map(|p| p.stream.stream_epoch),
                     metadata: self.metadata(),
                     root_dir: Some(self.output_folder.clone()),
@@ -1612,13 +1660,7 @@ impl StageAA2Plugin {
                     readback: _,
                     readback_age_s,
                 } => {
-                    let requested = self.run.as_ref().unwrap().protocol.camera.profile.clone();
-                    let refusal = camera_configuration_refusal(
-                        &snapshot,
-                        &provenance,
-                        &requested,
-                        readback_age_s,
-                    );
+                    let refusal = camera_configuration_refusal(&snapshot, readback_age_s);
                     let run = self.run.as_mut().unwrap();
                     run.camera_snapshot = Some(snapshot);
                     run.camera_provenance = Some(provenance);
@@ -1638,7 +1680,7 @@ impl StageAA2Plugin {
                 }
                 outcome => self.fail(
                     control,
-                    format!("camera profile was not applied and confirmed: {outcome:?}"),
+                    format!("camera configuration was not applied and confirmed: {outcome:?}"),
                 ),
             }
         } else if phase == Phase::RestoreCamera {
@@ -1687,17 +1729,17 @@ impl StageAA2Plugin {
         struct Side<'a> {
             schema_version: u32,
             experiment: &'static str,
+            scientific_status: &'static str,
             protocol_path: &'a str,
             protocol_sha256: &'a str,
             protocol_archive_path: &'a str,
             protocol_name: &'a str,
             protocol_row: usize,
-            camera_profile: &'a str,
+            camera_source: &'static str,
             camera_provenance: Option<&'a CameraConfigurationProvenanceV1>,
             camera_readback_age_s: Option<f64>,
-            optical: &'a protocol::OpticalSetup,
-            gates: &'a protocol::Gates,
-            controller: &'a protocol::ControllerSetup,
+            photodiode_setup: &'a ResolvedPhotodiode,
+            controller: &'a ControllerSetup,
             /// Kind-1 values the protocol no longer states, with the owner
             /// provenance that replaces having typed them.
             resolved_controller: &'a ResolvedController,
@@ -1715,17 +1757,17 @@ impl StageAA2Plugin {
         let s = Side {
             schema_version: 1,
             experiment: "A2",
+            scientific_status: "requires_offline_h4_h5_review",
             protocol_path: &r.protocol_path,
             protocol_sha256: &r.protocol_sha256,
             protocol_archive_path: &r.protocol_archive_path,
             protocol_name: &r.protocol.name,
             protocol_row: r.index + 1,
-            camera_profile: &r.protocol.camera.profile,
+            camera_source: "current_host_configuration",
             camera_provenance: r.camera_provenance.as_ref(),
             camera_readback_age_s: r.camera_readback_age_s,
-            optical: &r.protocol.optical,
-            gates: &r.protocol.gates,
-            controller: &r.protocol.controller,
+            photodiode_setup: &r.photodiode_setup,
+            controller: &r.controller,
             resolved_controller: &r.resolved,
             point: &r.protocol.points[r.index],
             evidence: &r.evidence,
@@ -1804,8 +1846,7 @@ impl Plugin for StageAA2Plugin {
                     r.evidence.falling_triggers += 1
                 }
             }
-            if r.evidence.peak_events_per_us > r.protocol.gates.recorder_safety_limit_events_per_us
-            {
+            if r.evidence.peak_events_per_us > RECORDER_SAFETY_LIMIT_EVENTS_PER_US {
                 r.stop = true;
                 r.evidence.failure = Some(format!(
                     "pre-qualified recorder safety limit exceeded: {} events/us",
@@ -1874,8 +1915,6 @@ impl Plugin for StageAA2Plugin {
                     ),
                     default_open: true,
                     items: vec![
-                        SettingItem { key: "output_folder".into(), label: "Output folder".into(), tooltip: None, kind: SettingKind::Path { dialog: PathDialogKind::Directory, default: self.output_folder.clone() } },
-                        SettingItem { key: "measurement_id".into(), label: "Measurement id".into(), tooltip: None, kind: SettingKind::Text { default: self.measurement_id.clone() } },
                         SettingItem { key: "protocol_path".into(), label: "Protocol".into(), tooltip: None, kind: SettingKind::Path { dialog: PathDialogKind::OpenFile, default: self.protocol_path.clone() } },
                         SettingItem { key: "run_protocol".into(), label: "Run protocol".into(), tooltip: None, kind: SettingKind::Button { enabled: true } },
                         SettingItem { key: "continue_run".into(), label: "Continue".into(), tooltip: None, kind: SettingKind::Button { enabled: true } },
@@ -1885,7 +1924,7 @@ impl Plugin for StageAA2Plugin {
                 SettingsSection {
                     label: "Before the first A2 run".into(),
                     description: Some(
-                        "1. Record the generic dark, crosstalk and static-light data in Guided PD references. Copy its reference set ID into the A2 protocol.\n\n2. Keep H4 loopback and H5 polarity/invert as comparator-specific A2 evidence.\n\n3. Run the optical-edge rows in the A2 protocol. A2 sets LOG_SQUARE, measures both plateaus, selects V50, records camera RAW plus PDQ, and restores the camera profile.\n\nDo not infer invert from the drawing. H5 fixes whether a physical rising optical edge is reported as rising or falling."
+                        "1. Record the generic dark, crosstalk and static-light data in Guided PD references. A2 reads the selected reference set automatically.\n\n2. Keep H4 loopback and H5 polarity/invert as comparator-specific A2 evidence.\n\n3. Run the optical-edge points. A2 sets LOG_SQUARE, measures both plateaus, selects V50, records camera RAW plus PDQ, and restores the camera configuration.\n\nDo not infer invert from the drawing. H5 fixes whether a physical rising optical edge is reported as rising or falling."
                             .into(),
                     ),
                     default_open: false,
@@ -1966,6 +2005,13 @@ fn safe(v: &str) -> String {
         })
         .collect()
 }
+fn photodiode_placement_name(placement: PhotodiodePlacementV1) -> &'static str {
+    match placement {
+        PhotodiodePlacementV1::RejectedPort => "rejected_port",
+        PhotodiodePlacementV1::CameraPath => "camera_path",
+        PhotodiodePlacementV1::EmissionPath => "emission_path",
+    }
+}
 fn hex_hash(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -2016,13 +2062,27 @@ fn pedestal_key(mean_u: f64, depth_a: f64) -> PedestalKey {
     )
 }
 
+fn resolve_photodiode(summary: &PhotodiodeSummaryV1) -> ResolvedPhotodiode {
+    ResolvedPhotodiode {
+        owner_instance: summary.owner_instance.to_string(),
+        placement: summary.placement,
+        splitter_fraction: summary.splitter_fraction,
+        reference_set_id: summary.reference_set_id.clone(),
+        load_ohms: summary.load_ohms,
+        dark_reference: summary.dark_reference.clone(),
+        sample_rate_hz: summary.stream.sample_rate_hz,
+        stream_epoch: summary.stream.stream_epoch,
+        stream_integrity: summary.stream.integrity,
+    }
+}
+
 /// Resolves the Kind-1 controller values from their owners.
 ///
 /// Every branch either produces a value with its provenance or refuses. There
 /// is no default: an unresolvable lobe or an unresolvable step floor must stop
 /// the run while the bench is still untouched (ADR 040).
 fn resolve_controller(
-    plan: &Protocol,
+    controller: &ControllerSetup,
     modulation: Option<&ModulationStateV1>,
     sensor: Option<SensorMonitoringV1>,
 ) -> Result<ResolvedController, String> {
@@ -2051,10 +2111,10 @@ fn resolve_controller(
             drive.v_peak_dac
         ));
     }
-    if plan.controller.comparator_hysteresis > 3 {
+    if controller.comparator_hysteresis > 3 {
         return Err(format!(
             "comparator_hysteresis={} is outside the comparator's 0..=3 range",
-            plan.controller.comparator_hysteresis
+            controller.comparator_hysteresis
         ));
     }
     let Some(pixel_dead_time_us) = sensor.and_then(|s| s.pixel_dead_time_us) else {
@@ -2069,7 +2129,7 @@ fn resolve_controller(
         ));
     }
     let refractory_floor_us = (5.0 * f64::from(pixel_dead_time_us)).ceil() as u32;
-    let (min_half_us, min_half_us_source) = match plan.controller.min_half_us {
+    let (min_half_us, min_half_us_source) = match controller.min_half_us {
         // A frozen floor is kept verbatim, and still has to clear the sensor's
         // own refractory bound: freezing a number may tighten the floor, never
         // loosen it.
@@ -2080,7 +2140,7 @@ fn resolve_controller(
                      ({pixel_dead_time_us:.2} us)"
                 ));
             }
-            (frozen, "protocol")
+            (frozen, "runner_configuration")
         }
         None => (
             refractory_floor_us.max(SETTLING_GUARD_US),
@@ -2351,29 +2411,21 @@ fn validate_trigger_counts(
 
 fn camera_configuration_refusal(
     snapshot: &CameraConfigurationSnapshotV1,
-    provenance: &CameraConfigurationProvenanceV1,
-    requested_profile: &str,
     readback_age_s: f64,
 ) -> Option<String> {
-    if provenance.profile_name.as_deref() != Some(requested_profile) {
-        return Some(format!(
-            "host confirmed camera profile {:?}, expected {requested_profile:?}",
-            provenance.profile_name
-        ));
-    }
     if snapshot.digital_filter.stc_enabled
         || snapshot.digital_filter.trail_enabled
         || snapshot.digital_filter.erc_enabled != Some(false)
     {
         return Some(
-            "applied camera profile must explicitly confirm STC, Trail and ERC off".into(),
+            "applied camera configuration must explicitly confirm STC, Trail and ERC off".into(),
         );
     }
     if !snapshot.external_trigger.enabled {
-        return Some("applied camera profile has EXT_TRIGGER disabled".into());
+        return Some("applied camera configuration has EXT_TRIGGER disabled".into());
     }
     if !snapshot.global.record_sensor_telemetry {
-        return Some("applied camera profile does not record sensor telemetry".into());
+        return Some("applied camera configuration does not record sensor telemetry".into());
     }
     if !readback_age_s.is_finite() || readback_age_s < 0.0 {
         return Some("host returned an invalid sensor readback age".into());
@@ -2404,29 +2456,6 @@ mod tests {
     fn test_protocol() -> &'static str {
         r#"
 name="a2-e2e"
-[camera]
-profile="A2 qualified"
-[optical]
-transfer_scope="fluorescence_chain"
-photodiode_placement="emission_path"
-splitter_fraction_to_pd=0.5
-optical_config_id="opt-1"
-[gates]
-firmware_a2_confirmed=true
-comparator_self_test_passed=true
-camera_external_trigger_confirmed=true
-h4_loopback_id="h4-1"
-h5_polarity_calibration_id="h5-1"
-photodiode_reference_set_id="pdref-1"
-optical_edge_calibration_id="edge-1"
-local_flux_calibration_id="flux-1"
-recorder_safety_limit_events_per_us=1000
-[controller]
-comparator_hysteresis=1
-comparator_invert=false
-min_half_us=1000
-sample_rate_hz=500000
-block_samples=256
 [[point]]
 label="dark"
 role="floor"
@@ -2548,6 +2577,8 @@ settle_s=0
             optical_unavailable: None,
             placement: PhotodiodePlacementV1::EmissionPath,
             splitter_fraction: Some(0.5),
+            reference_set_id: Some("pdref-test".into()),
+            load_ohms: Some(470_000.0),
             dark_reference: None,
             synchronization: SynchronizationV1::Unsynced {
                 reason: UnsyncedReasonV1::NoLease,
@@ -2708,7 +2739,7 @@ settle_s=0
     }
 
     #[test]
-    fn camera_profile_requires_explicit_erc_off() {
+    fn camera_configuration_requires_explicit_erc_off() {
         use augur_plugin_api::{
             CameraBiasOffsetsV1, CameraDigitalFilterV1, CameraExternalTriggerV1,
             CameraGlobalSettingsV1, RoiV1,
@@ -2746,32 +2777,46 @@ settle_s=0
                 record_sensor_telemetry: true,
             },
         };
-        let provenance = CameraConfigurationProvenanceV1 {
-            source: "named_profile".into(),
-            profile_name: Some("A2 qualified".into()),
-            schema_version: 1,
-            profile_revision: Some(1),
-            sha256: "ab".repeat(32),
-        };
-        assert!(
-            camera_configuration_refusal(&snapshot, &provenance, "A2 qualified", 0.1)
-                .unwrap()
-                .contains("ERC")
-        );
+        assert!(camera_configuration_refusal(&snapshot, 0.1)
+            .unwrap()
+            .contains("ERC"));
         snapshot.digital_filter.erc_enabled = Some(false);
-        assert!(
-            camera_configuration_refusal(&snapshot, &provenance, "A2 qualified", 0.1).is_none()
-        );
+        assert!(camera_configuration_refusal(&snapshot, 0.1).is_none());
+    }
+
+    #[test]
+    fn a2_ui_does_not_ask_for_owner_data_or_manual_ids() {
+        let plugin = StageAA2Plugin::default();
+        let keys = plugin
+            .settings_schema()
+            .sections
+            .into_iter()
+            .flat_map(|section| section.items)
+            .map(|item| item.key)
+            .collect::<Vec<_>>();
+        assert!(!keys.iter().any(|key| key == "output_folder"));
+        assert!(!keys.iter().any(|key| key == "measurement_id"));
+        assert!(keys.iter().any(|key| key == "protocol_path"));
     }
 
     #[test]
     fn end_to_end_runs_paused_dark_then_stepped_and_restores_camera() {
         let mut plugin = ready_plugin("e2e-success");
+        let expected_output_folder = plugin
+            .photodiode
+            .as_ref()
+            .and_then(|summary| summary.data_dir.clone())
+            .unwrap();
         let mut control = MockControl::default();
         plugin.begin(&mut control);
+        assert_eq!(plugin.output_folder, expected_output_folder);
+        assert!(plugin.measurement_id.starts_with("A2-"));
+        let measurement_id = plugin.measurement_id.clone();
         assert!(matches!(
-            control.hosts.last().unwrap().command,
-            HostCommand::ApplyCameraConfiguration { .. }
+            &control.hosts.last().unwrap().command,
+            HostCommand::ApplyCameraConfiguration {
+                configuration: CameraConfigurationSourceV1::Current
+            }
         ));
         let apply_id = control.hosts.last().unwrap().request_id;
         plugin.host_reply(&mut control, apply_id, applied_camera_outcome());
@@ -2824,6 +2869,21 @@ settle_s=0
                 sha256: "ef".repeat(32),
                 duration_us: 1_000,
             },
+        );
+
+        let sidecar_path = Path::new(&expected_output_folder)
+            .join(&measurement_id)
+            .join(format!("{run_id}.a2.json"));
+        let sidecar: Value = serde_json::from_slice(&std::fs::read(sidecar_path).unwrap()).unwrap();
+        assert_eq!(sidecar["camera_source"], "current_host_configuration");
+        assert_eq!(
+            sidecar["photodiode_setup"]["reference_set_id"],
+            "pdref-test"
+        );
+        assert_eq!(sidecar["photodiode_setup"]["load_ohms"], 470_000.0);
+        assert_eq!(
+            sidecar["scientific_status"],
+            "requires_offline_h4_h5_review"
         );
 
         assert_eq!(plugin.run.as_ref().unwrap().index, 1);
@@ -2961,33 +3021,34 @@ settle_s=0
 
     #[test]
     fn a_missing_optical_drive_refuses_instead_of_defaulting_a_lobe() {
-        let plan = parsed(test_protocol());
+        let controller = ControllerSetup::default();
         let state = modulation_state(None, Some("lobe-1"));
-        let error =
-            resolve_controller(&plan, Some(&state), Some(test_sensor(Some(10.0)))).unwrap_err();
+        let error = resolve_controller(&controller, Some(&state), Some(test_sensor(Some(10.0))))
+            .unwrap_err();
         assert!(error.contains("optical_drive"), "{error}");
 
-        let error = resolve_controller(&plan, None, Some(test_sensor(Some(10.0)))).unwrap_err();
+        let error =
+            resolve_controller(&controller, None, Some(test_sensor(Some(10.0)))).unwrap_err();
         assert!(error.contains("modulation owner"), "{error}");
     }
 
     #[test]
     fn a_degenerate_lobe_refuses_against_the_resolved_values() {
-        let plan = parsed(test_protocol());
+        let controller = ControllerSetup::default();
         let mut drive = armed_optical_drive();
         drive.v_peak_dac = drive.v_null_dac;
         let state = modulation_state(Some(drive), Some("lobe-1"));
-        let error =
-            resolve_controller(&plan, Some(&state), Some(test_sensor(Some(10.0)))).unwrap_err();
+        let error = resolve_controller(&controller, Some(&state), Some(test_sensor(Some(10.0))))
+            .unwrap_err();
         assert!(error.contains("v_peak_dac"), "{error}");
     }
 
     #[test]
     fn the_resolved_lobe_and_its_calibration_id_reach_the_run_provenance() {
-        let plan = parsed(test_protocol());
+        let controller = ControllerSetup::default();
         let state = modulation_state(Some(armed_optical_drive()), Some("pockels-2026-08-01"));
         let resolved =
-            resolve_controller(&plan, Some(&state), Some(test_sensor(Some(10.0)))).unwrap();
+            resolve_controller(&controller, Some(&state), Some(test_sensor(Some(10.0)))).unwrap();
         assert_eq!(resolved.v_null_dac, 100);
         assert_eq!(resolved.v_peak_dac, 1_000);
         assert_eq!(resolved.lobe_source, "modulation_owner.optical_drive");
@@ -2999,26 +3060,25 @@ settle_s=0
         // A hand-entered lobe is recorded as such, never as a calibration.
         let state = modulation_state(Some(armed_optical_drive()), None);
         let resolved =
-            resolve_controller(&plan, Some(&state), Some(test_sensor(Some(10.0)))).unwrap();
+            resolve_controller(&controller, Some(&state), Some(test_sensor(Some(10.0)))).unwrap();
         assert_eq!(resolved.modulation_calibration_id, None);
     }
 
     #[test]
     fn an_absent_min_half_us_resolves_to_the_larger_of_refractory_and_settling_floors() {
-        let text = test_protocol().replace("min_half_us=1000\n", "");
-        let plan = parsed(&text);
+        let controller = ControllerSetup::default();
         let state = modulation_state(Some(armed_optical_drive()), Some("lobe-1"));
 
         // 5 x 10 us = 50 us, so the settling guard dominates.
         let resolved =
-            resolve_controller(&plan, Some(&state), Some(test_sensor(Some(10.0)))).unwrap();
+            resolve_controller(&controller, Some(&state), Some(test_sensor(Some(10.0)))).unwrap();
         assert_eq!(resolved.refractory_floor_us, 50);
         assert_eq!(resolved.min_half_us, SETTLING_GUARD_US);
         assert_eq!(resolved.min_half_us_source, "sensor_telemetry");
 
         // 5 x 400 us = 2000 us, so the sensor dominates.
         let resolved =
-            resolve_controller(&plan, Some(&state), Some(test_sensor(Some(400.0)))).unwrap();
+            resolve_controller(&controller, Some(&state), Some(test_sensor(Some(400.0)))).unwrap();
         assert_eq!(resolved.refractory_floor_us, 2_000);
         assert_eq!(resolved.min_half_us, 2_000);
         assert_eq!(resolved.min_half_us_source, "sensor_telemetry");
@@ -3026,28 +3086,31 @@ settle_s=0
 
     #[test]
     fn a_frozen_min_half_us_is_kept_and_still_checked_against_the_sensor() {
-        let plan = parsed(test_protocol());
+        let controller = ControllerSetup {
+            min_half_us: Some(1_000),
+            ..ControllerSetup::default()
+        };
         let state = modulation_state(Some(armed_optical_drive()), Some("lobe-1"));
         let resolved =
-            resolve_controller(&plan, Some(&state), Some(test_sensor(Some(10.0)))).unwrap();
+            resolve_controller(&controller, Some(&state), Some(test_sensor(Some(10.0)))).unwrap();
         assert_eq!(resolved.min_half_us, 1_000);
-        assert_eq!(resolved.min_half_us_source, "protocol");
+        assert_eq!(resolved.min_half_us_source, "runner_configuration");
 
         // The pre-existing runtime gate: a frozen floor under 5 x dead time is
         // still refused, and refused before anything moves.
-        let error =
-            resolve_controller(&plan, Some(&state), Some(test_sensor(Some(300.0)))).unwrap_err();
+        let error = resolve_controller(&controller, Some(&state), Some(test_sensor(Some(300.0))))
+            .unwrap_err();
         assert!(error.contains("5 x sensor dead time"), "{error}");
     }
 
     #[test]
     fn a_missing_pixel_dead_time_refuses_rather_than_resolving_a_floor_from_nothing() {
-        let text = test_protocol().replace("min_half_us=1000\n", "");
-        let plan = parsed(&text);
+        let controller = ControllerSetup::default();
         let state = modulation_state(Some(armed_optical_drive()), Some("lobe-1"));
-        let error = resolve_controller(&plan, Some(&state), Some(test_sensor(None))).unwrap_err();
+        let error =
+            resolve_controller(&controller, Some(&state), Some(test_sensor(None))).unwrap_err();
         assert!(error.contains("pixel-dead-time"), "{error}");
-        let error = resolve_controller(&plan, Some(&state), None).unwrap_err();
+        let error = resolve_controller(&controller, Some(&state), None).unwrap_err();
         assert!(error.contains("pixel-dead-time"), "{error}");
     }
 
@@ -3101,8 +3164,12 @@ settle_s=0
     fn plan_pedestals_covers_each_distinct_pair_once_and_skips_frozen_points() {
         let plan = parsed(auto_protocol());
         let state = modulation_state(Some(armed_optical_drive()), Some("lobe-1"));
-        let resolved =
-            resolve_controller(&plan, Some(&state), Some(test_sensor(Some(10.0)))).unwrap();
+        let resolved = resolve_controller(
+            &ControllerSetup::default(),
+            Some(&state),
+            Some(test_sensor(Some(10.0))),
+        )
+        .unwrap();
         let pedestals = plan_pedestals(&plan, &resolved).unwrap();
         // Two auto points share (300, 450); the third is frozen.
         assert_eq!(pedestals.len(), 1);
@@ -3210,29 +3277,6 @@ settle_s=0
     fn auto_protocol() -> &'static str {
         r#"
 name="a2-auto"
-[camera]
-profile="A2 qualified"
-[optical]
-transfer_scope="fluorescence_chain"
-photodiode_placement="emission_path"
-splitter_fraction_to_pd=0.5
-optical_config_id="opt-1"
-[gates]
-firmware_a2_confirmed=true
-comparator_self_test_passed=true
-camera_external_trigger_confirmed=true
-h4_loopback_id="h4-1"
-h5_polarity_calibration_id="h5-1"
-photodiode_reference_set_id="pdref-1"
-optical_edge_calibration_id="edge-1"
-local_flux_calibration_id="flux-1"
-recorder_safety_limit_events_per_us=1000
-[controller]
-comparator_hysteresis=1
-comparator_invert=false
-min_half_us=1000
-sample_rate_hz=500000
-block_samples=256
 [[point]]
 label="auto_a"
 role="identification"

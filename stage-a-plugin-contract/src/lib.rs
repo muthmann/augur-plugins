@@ -809,6 +809,12 @@ pub struct PhotodiodeSummaryV1 {
     pub placement: PhotodiodePlacementV1,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub splitter_fraction: Option<f64>,
+    /// Current guided-reference set selected by the PD owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_set_id: Option<String>,
+    /// Current photodiode termination/load setting in ohms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_ohms: Option<f64>,
     /// Current direct-path dark provenance, even while another optical gate
     /// withholds `optical_summary`.
     #[serde(default, skip_serializing_if = "Option::is_none")]

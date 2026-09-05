@@ -1,42 +1,9 @@
-# Immediate A2 follow-up for the current ATTO647 fluorescence chain.
+# Complete A2 point sequence for the current ATTO647 fluorescence chain.
 #
-# This file is intentionally fail-closed. Replace every TBD/zero gate with the
-# value or calibration ID measured during comparator/optical bring-up. The A2
-# plugin rejects the whole file before acquiring a lease while any remains.
+# This file describes only what to record. The runner reads camera,
+# modulation, photodiode and comparator provenance from their owners and writes
+# it into each measurement sidecar.
 name = "a2-atto647-fluorescence-chain-followup"
-
-[camera]
-profile = "A1-bias-v1-monitoring" # Complete host profile with EXT_TRIGGER and sensor telemetry.
-
-[optical]
-transfer_scope = "fluorescence_chain"
-photodiode_placement = "emission_path"
-splitter_fraction_to_pd = 0.5
-optical_config_id = "123"
-
-[gates]
-firmware_a2_confirmed = false
-comparator_self_test_passed = false
-camera_external_trigger_confirmed = false
-h4_loopback_id = "TBD"
-h5_polarity_calibration_id = "TBD"
-photodiode_reference_set_id = "TBD" # From Guided PD references.
-optical_edge_calibration_id = "TBD"
-local_flux_calibration_id = "TBD"
-recorder_safety_limit_events_per_us = 6 # Pre-qualified before this protocol.
-
-[controller]
-# The lobe endpoints are not stated here. The modulation owner publishes the
-# lobe it resolved (v_null_dac/v_peak_dac) together with the calibration ID of
-# the transfer inversion that produced it, and the runner reads both at
-# preflight. It refuses when the owner has no armed optical drive.
-comparator_hysteresis = 1
-comparator_invert = false  # TBD: value frozen by H5
-# min_half_us is omitted on purpose: the runner resolves
-# max(5*pixel_dead_time_us, settling guard) from sensor telemetry and records
-# the floor it used. Freeze a number here only to tighten it further.
-sample_rate_hz = 500000
-block_samples = 256
 
 # Dark/sham and cadence commissioning. A pause means the operator must confirm
 # the stated physical condition before Continue. No failed row is overwritten.
@@ -57,7 +24,6 @@ depth_a=0.45
 half_period_s=1.0
 transitions_per_polarity=100
 settle_s=2
-comparator_threshold_dac="auto"
 pause_before=true
 
 [[point]]
@@ -69,7 +35,6 @@ depth_a=0.45
 half_period_s=2.0
 transitions_per_polarity=50
 settle_s=3
-comparator_threshold_dac="auto"
 pause_before=true
 
 [[point]]
@@ -81,7 +46,6 @@ depth_a=0.45
 half_period_s=1.0
 transitions_per_polarity=50
 settle_s=3
-comparator_threshold_dac="auto"
 
 [[point]]
 label="cadence_0p5s"
@@ -92,7 +56,6 @@ depth_a=0.45
 half_period_s=0.5
 transitions_per_polarity=50
 settle_s=3
-comparator_threshold_dac="auto"
 pause_before=true
 
 [[point]]
@@ -104,7 +67,6 @@ depth_a=0.45
 half_period_s=1.0
 transitions_per_polarity=200
 settle_s=3
-comparator_threshold_dac="auto"
 
 [[point]]
 label="load_larger"
@@ -115,7 +77,6 @@ depth_a=0.45
 half_period_s=1.0
 transitions_per_polarity=200
 settle_s=3
-comparator_threshold_dac="auto"
 pause_before=true
 
 # Opening references and the multi-depth identification block at mean_u=0.30.
@@ -128,7 +89,6 @@ depth_a=0.45
 half_period_s=1.0
 transitions_per_polarity=200
 settle_s=3
-comparator_threshold_dac="auto"
 [[point]]
 label="ref_open_2"
 role="reference"
@@ -138,7 +98,6 @@ depth_a=0.45
 half_period_s=1.0
 transitions_per_polarity=200
 settle_s=3
-comparator_threshold_dac="auto"
 [[point]]
 label="ref_open_3"
 role="reference"
@@ -148,7 +107,6 @@ depth_a=0.45
 half_period_s=1.0
 transitions_per_polarity=200
 settle_s=3
-comparator_threshold_dac="auto"
 [[point]]
 label="depth_low"
 role="identification"
@@ -158,7 +116,6 @@ depth_a=0.28
 half_period_s=1.0
 transitions_per_polarity=500
 settle_s=3
-comparator_threshold_dac="auto"
 [[point]]
 label="depth_high"
 role="identification"
@@ -168,7 +125,6 @@ depth_a=0.80
 half_period_s=1.0
 transitions_per_polarity=500
 settle_s=3
-comparator_threshold_dac="auto"
 
 # Flux/pedestal bridge matching A1. The order is non-monotonic to expose drift.
 [[point]]
@@ -180,7 +136,6 @@ depth_a=0.45
 half_period_s=1.0
 transitions_per_polarity=500
 settle_s=3
-comparator_threshold_dac="auto"
 [[point]]
 label="pedestal_u045"
 role="pedestal_core"
@@ -190,7 +145,6 @@ depth_a=0.45
 half_period_s=1.0
 transitions_per_polarity=500
 settle_s=3
-comparator_threshold_dac="auto"
 [[point]]
 label="pedestal_u030"
 role="pedestal_core"
@@ -200,7 +154,6 @@ depth_a=0.45
 half_period_s=1.0
 transitions_per_polarity=500
 settle_s=3
-comparator_threshold_dac="auto"
 
 [[point]]
 label="ref_close"
@@ -211,7 +164,6 @@ depth_a=0.45
 half_period_s=1.0
 transitions_per_polarity=200
 settle_s=3
-comparator_threshold_dac="auto"
 
 [[point]]
 label="floor_post"

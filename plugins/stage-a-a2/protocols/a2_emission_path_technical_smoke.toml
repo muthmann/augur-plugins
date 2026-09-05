@@ -1,0 +1,34 @@
+# Short end-to-end A2 hardware test.
+#
+# This file describes only what to record. The runner reads the active camera,
+# modulation and photodiode state and writes it automatically into the RAW,
+# PDQ and A2 sidecars. The comparator threshold is measured automatically from
+# the two photodiode plateaus.
+name = "a2-emission-path-technical-smoke"
+
+[[point]]
+label = "technical_floor_pre"
+role = "technical_floor_pre_shutter_closed"
+acquisition_mode = "dark"
+duration_s = 10.0
+settle_s = 2.0
+pause_before = true
+
+[[point]]
+label = "technical_step_1s"
+role = "technical_smoke"
+acquisition_mode = "stepped"
+mean_u = 0.30
+depth_a = 0.45
+half_period_s = 1.0
+transitions_per_polarity = 10
+settle_s = 3.0
+pause_before = true
+
+[[point]]
+label = "technical_floor_post"
+role = "technical_floor_post_shutter_closed"
+acquisition_mode = "dark"
+duration_s = 10.0
+settle_s = 2.0
+pause_before = true

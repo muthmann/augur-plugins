@@ -8272,6 +8272,8 @@ mod tests {
             optical_unavailable: None,
             placement: stage_a_plugin_contract::PhotodiodePlacementV1::RejectedPort,
             splitter_fraction: None,
+            reference_set_id: None,
+            load_ohms: None,
             dark_reference: None,
             synchronization: stage_a_plugin_contract::SynchronizationV1::Unsynced {
                 reason: stage_a_plugin_contract::UnsyncedReasonV1::NoLease,
@@ -9027,6 +9029,8 @@ mod tests {
             optical_unavailable: None,
             placement: stage_a_plugin_contract::PhotodiodePlacementV1::RejectedPort,
             splitter_fraction: None,
+            reference_set_id: None,
+            load_ohms: None,
             dark_reference: None,
             synchronization: SynchronizationV1::Unsynced {
                 reason: stage_a_plugin_contract::UnsyncedReasonV1::NoLease,
@@ -9101,6 +9105,8 @@ mod tests {
             optical_unavailable: None,
             placement: stage_a_plugin_contract::PhotodiodePlacementV1::RejectedPort,
             splitter_fraction: None,
+            reference_set_id: None,
+            load_ohms: None,
             dark_reference: None,
             synchronization: SynchronizationV1::Unsynced {
                 reason: UnsyncedReasonV1::NoLease,
