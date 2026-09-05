@@ -2800,6 +2800,25 @@ settle_s=0
     }
 
     #[test]
+    fn manifest_declares_every_camera_command_used_by_a2() {
+        let manifest: toml::Value = toml::from_str(include_str!("../plugin.toml")).unwrap();
+        let commands = manifest["host_commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(toml::Value::as_str)
+            .collect::<Vec<_>>();
+        for required in [
+            "start_recording",
+            "stop_recording",
+            "apply_camera_configuration",
+            "restore_camera_configuration",
+        ] {
+            assert!(commands.contains(&required), "missing {required}");
+        }
+    }
+
+    #[test]
     fn end_to_end_runs_paused_dark_then_stepped_and_restores_camera() {
         let mut plugin = ready_plugin("e2e-success");
         let expected_output_folder = plugin
