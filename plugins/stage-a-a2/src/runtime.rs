@@ -16,11 +16,11 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use stage_a_plugin_contract::{
     A2AcquisitionConfigV1, ClientId, ConnectionStateV1, LeaseId, ModulationCommandV1,
-    ModulationRequestV1, ModulationResponseV1, ModulationStateV1, OpticalTargetV1, PdqReceiptV1,
-    PdqStartSpecV1, PdqTerminationV1, PhotodiodeCommandV1, PhotodiodeDarkReferenceV1,
-    PhotodiodeLevelV1, PhotodiodePlacementV1, PhotodiodeRequestV1, PhotodiodeResponseV1,
-    PhotodiodeSummaryV1, RequestId, RequestOutcomeV1, RunId, SemanticRevision, StreamIntegrityV1,
-    WaveformV1, CTX_STAGE_A_MODULATION_STATE_V1, CTX_STAGE_A_PHOTODIODE_SUMMARY_V1,
+    ModulationRequestV1, ModulationResponseV1, ModulationStateV1, PdqReceiptV1, PdqStartSpecV1,
+    PdqTerminationV1, PhotodiodeCommandV1, PhotodiodeDarkReferenceV1, PhotodiodeLevelV1,
+    PhotodiodePlacementV1, PhotodiodeRequestV1, PhotodiodeResponseV1, PhotodiodeSummaryV1,
+    RequestId, RequestOutcomeV1, RunId, SemanticRevision, StreamIntegrityV1, WaveformV1,
+    CTX_STAGE_A_MODULATION_STATE_V1, CTX_STAGE_A_PHOTODIODE_SUMMARY_V1,
     SERVICE_STAGE_A_MODULATION_CONTROL_V1, SERVICE_STAGE_A_PHOTODIODE_CONTROL_V1,
 };
 
@@ -182,15 +182,8 @@ struct ResolvedController {
     lobe_source: &'static str,
     v_null_dac: u16,
     v_peak_dac: u16,
-    optical_target: OpticalTargetV1,
-    requested_mean_u_milli: u32,
-    resolved_mean_u_milli: u32,
-    internal_u_milli: u32,
-    armed_depth_a_milli: u32,
-    /// Which measured Pockels transfer inversion produced the lobe. `None`
-    /// means the modulation operator entered the endpoints by hand, and the run
-    /// says so rather than implying a calibration that does not exist.
-    modulation_calibration_id: Option<String>,
+    /// Which measured Pockels transfer calibration produced the lobe.
+    modulation_calibration_id: String,
     modulation_owner_instance: String,
     min_half_us: u32,
     /// `"protocol"` or `"sensor_telemetry"`.
@@ -307,6 +300,9 @@ struct Run {
     phase: Phase,
     pending: Option<(PendingKind, u64, u64)>,
     lease: LeaseId,
+    /// Stable run identity bound to both owner leases for the complete protocol.
+    lease_run_id: String,
+    /// Per-point identity used for RAW, PDQ and sidecar file names.
     run_id: String,
     deadline_ms: u64,
     next_renew_ms: u64,
@@ -460,10 +456,12 @@ impl StageAA2Plugin {
         if self
             .modulation
             .as_ref()
-            .is_none_or(|state| state.optical_drive.is_none())
+            .is_none_or(|state| state.optical_lobe.is_none())
         {
             return Some(
-                "arm a calibrated optical drive on the modulation owner so the A2 lobe resolves"
+                "In the modulation plugin, apply the measured transfer curve with 'Apply to \
+                 V_null / V_peak'. Do not set mean_u or depth_a there; A2 sets every measurement \
+                 point from its protocol automatically."
                     .into(),
             );
         }
@@ -546,11 +544,12 @@ impl StageAA2Plugin {
             protocol_path: self.protocol_path.clone(),
             protocol_sha256: hash,
             protocol_archive_path,
-            measurement_id,
+            measurement_id: measurement_id.clone(),
             index: 0,
             phase: Phase::ApplyCamera,
             pending: None,
             lease: LeaseId::new(format!("a2-{}", now_ms())),
+            lease_run_id: measurement_id.clone(),
             run_id: String::new(),
             deadline_ms: 0,
             next_renew_ms: now_ms() + 30_000,
@@ -595,11 +594,11 @@ impl StageAA2Plugin {
         revision: bool,
     ) {
         let request_id = self.next_id();
-        let (lease, run_id, owner) = {
+        let (lease, lease_run_id, owner) = {
             let run = self.run.as_ref().unwrap();
             (
                 run.lease.clone(),
-                run.run_id.clone(),
+                run.lease_run_id.clone(),
                 self.modulation.as_ref().map(|s| s.owner_instance.clone()),
             )
         };
@@ -607,9 +606,7 @@ impl StageAA2Plugin {
         e.lease_id = Some(lease);
         e.target_owner_instance = owner;
         e.issued_at_unix_ms = now_ms();
-        if !run_id.is_empty() {
-            e.run_id = Some(RunId::new(run_id));
-        }
+        e.run_id = Some(RunId::new(lease_run_id));
         if revision {
             e.requested_revision = Some(self.next_revision());
         }
@@ -630,11 +627,11 @@ impl StageAA2Plugin {
         revision: bool,
     ) {
         let request_id = self.next_id();
-        let (lease, run_id, owner) = {
+        let (lease, lease_run_id, owner) = {
             let run = self.run.as_ref().unwrap();
             (
                 run.lease.clone(),
-                run.run_id.clone(),
+                run.lease_run_id.clone(),
                 self.photodiode.as_ref().map(|s| s.owner_instance.clone()),
             )
         };
@@ -642,9 +639,7 @@ impl StageAA2Plugin {
         e.lease_id = Some(lease);
         e.target_owner_instance = owner;
         e.issued_at_unix_ms = now_ms();
-        if !run_id.is_empty() {
-            e.run_id = Some(RunId::new(run_id));
-        }
+        e.run_id = Some(RunId::new(lease_run_id));
         if revision {
             e.requested_revision = Some(self.next_revision());
         }
@@ -674,7 +669,7 @@ impl StageAA2Plugin {
         };
         if should_pause(&p, self.run.as_ref().unwrap().pause_acknowledged) {
             self.run.as_mut().unwrap().phase = Phase::Paused;
-            self.message = format!("Paused before {}", p.label);
+            self.message = pause_message(&p);
             return;
         }
         let run = self.run.as_mut().unwrap();
@@ -1057,10 +1052,7 @@ impl StageAA2Plugin {
             ("lobe_source", r.resolved.lobe_source.into()),
             (
                 "modulation_calibration_id",
-                r.resolved
-                    .modulation_calibration_id
-                    .clone()
-                    .unwrap_or_else(|| "operator_entered_lobe".into()),
+                r.resolved.modulation_calibration_id.clone(),
             ),
             ("min_half_us", r.resolved.min_half_us.to_string()),
             ("min_half_us_source", r.resolved.min_half_us_source.into()),
@@ -1576,15 +1568,21 @@ impl StageAA2Plugin {
                     true,
                 );
             } else {
-                self.fail(
-                    control,
-                    response
-                        .common
-                        .error
-                        .as_ref()
-                        .map(|e| e.message.clone())
-                        .unwrap_or_else(|| "modulation owner rejected A2".into()),
+                let reason = response.common.error.as_ref().map_or_else(
+                    || {
+                        "The modulation plugin rejected A2 without an error detail. Check its \
+                         status line, then start A2 again."
+                            .into()
+                    },
+                    |error| {
+                        owner_rejection_message(
+                            PendingKind::Mod,
+                            &format!("{:?}", error.code),
+                            &error.message,
+                        )
+                    },
                 );
+                self.fail(control, reason);
             }
             return;
         }
@@ -1869,6 +1867,7 @@ impl Plugin for StageAA2Plugin {
                     self.accepted(c, expected.unwrap().0, &payload)
                 }
                 PluginServiceOutcome::Rejected { code, message } => {
+                    let kind = expected.unwrap().0;
                     let phase = self.run.as_ref().unwrap().phase;
                     if phase == Phase::ReleasePd {
                         self.run.as_mut().unwrap().pd_leased = false;
@@ -1894,7 +1893,7 @@ impl Plugin for StageAA2Plugin {
                             true,
                         );
                     } else {
-                        self.fail(c, format!("{code}: {message}"))
+                        self.fail(c, owner_rejection_message(kind, &code, &message))
                     }
                 }
             }
@@ -2092,23 +2091,24 @@ fn resolve_controller(
                 .into(),
         );
     };
-    let Some(drive) = state.optical_drive.as_ref() else {
+    let Some(lobe) = state.optical_lobe.as_ref() else {
         return Err(
-            "the modulation owner publishes no optical_drive; arm a calibrated optical drive so \
-             V_null/V_peak resolve"
+            "the modulation plugin has no applied optical calibration. Open its transfer-curve \
+             calibration and select 'Apply to V_null / V_peak'. A2 sets mean_u and depth_a from \
+             the protocol; you do not set a measurement point in the modulation plugin"
                 .into(),
         );
     };
-    if drive.v_peak_dac <= drive.v_null_dac {
+    if lobe.v_peak_dac <= lobe.v_null_dac {
         return Err(format!(
             "resolved lobe is not usable: v_peak_dac={} must exceed v_null_dac={}",
-            drive.v_peak_dac, drive.v_null_dac
+            lobe.v_peak_dac, lobe.v_null_dac
         ));
     }
-    if drive.v_peak_dac > STIMULUS_MAX_CODE {
+    if lobe.v_peak_dac > STIMULUS_MAX_CODE {
         return Err(format!(
             "resolved lobe maximum {} is outside the stimulus DAC range 0..={STIMULUS_MAX_CODE}",
-            drive.v_peak_dac
+            lobe.v_peak_dac
         ));
     }
     if controller.comparator_hysteresis > 3 {
@@ -2148,15 +2148,10 @@ fn resolve_controller(
         ),
     };
     Ok(ResolvedController {
-        lobe_source: "modulation_owner.optical_drive",
-        v_null_dac: drive.v_null_dac,
-        v_peak_dac: drive.v_peak_dac,
-        optical_target: drive.target,
-        requested_mean_u_milli: drive.requested_mean_u_milli,
-        resolved_mean_u_milli: drive.resolved_mean_u_milli,
-        internal_u_milli: drive.internal_u_milli,
-        armed_depth_a_milli: drive.depth_a_milli,
-        modulation_calibration_id: state.calibration_id.clone(),
+        lobe_source: "modulation_owner.optical_lobe",
+        v_null_dac: lobe.v_null_dac,
+        v_peak_dac: lobe.v_peak_dac,
+        modulation_calibration_id: lobe.calibration_id.clone(),
         modulation_owner_instance: state.owner_instance.to_string(),
         min_half_us,
         min_half_us_source,
@@ -2386,6 +2381,52 @@ fn should_pause(point: &Point, acknowledged: bool) -> bool {
     point.pause_before && !acknowledged
 }
 
+fn pause_message(point: &Point) -> String {
+    match point.acquisition {
+        Acquisition::Dark { duration_s } => format!(
+            "Paused before '{}': close or block the optical path so no light reaches the camera \
+             or photodiode. Check that the photodiode trace shows only the dark baseline. Then \
+             press Continue. A2 switches modulation off and records {duration_s:.3} s \
+             automatically.",
+            point.label
+        ),
+        Acquisition::Stepped {
+            mean_u,
+            depth_a,
+            half_period_s,
+            ..
+        } => format!(
+            "Paused before '{}': open the optical path and confirm the sample is ready. Do not \
+             set a measurement point in the modulation plugin. A2 automatically commands \
+             mean_u={mean_u:.3}, depth_a={depth_a:.3}, and half-period={half_period_s:.6} s from \
+             this protocol. Then press Continue.",
+            point.label
+        ),
+    }
+}
+
+fn owner_rejection_message(kind: PendingKind, code: &str, message: &str) -> String {
+    let owner = match kind {
+        PendingKind::Mod => "modulation plugin",
+        PendingKind::Pd => "photodiode plugin",
+        PendingKind::Host => "camera host",
+    };
+    let lease_problem = code.to_ascii_lowercase().contains("lease")
+        || message.to_ascii_lowercase().contains("lease");
+    if lease_problem {
+        return format!(
+            "The {owner} rejected the A2 run because its lease state does not match ({code}: \
+             {message}). This is a software state problem, not a hardware measurement failure. \
+             Stop A2, reload A2, the modulation plugin and the photodiode plugin, then start the \
+             protocol again."
+        );
+    }
+    format!(
+        "The {owner} rejected the current A2 step ({code}: {message}). Check that plugin's status \
+         line for the required action, then start A2 again."
+    )
+}
+
 fn validate_trigger_counts(
     acquisition: &Acquisition,
     rising: u64,
@@ -2480,18 +2521,6 @@ settle_s=0
         std::env::temp_dir().join(format!("stage-a-a2-{label}-{}", now_ms()))
     }
 
-    fn armed_optical_drive() -> stage_a_plugin_contract::OpticalDriveStateV1 {
-        stage_a_plugin_contract::OpticalDriveStateV1 {
-            target: OpticalTargetV1::LogSine,
-            requested_mean_u_milli: 300,
-            resolved_mean_u_milli: 300,
-            internal_u_milli: 290,
-            depth_a_milli: 450,
-            v_null_dac: 100,
-            v_peak_dac: 1_000,
-        }
-    }
-
     fn ready_plugin(label: &str) -> StageAA2Plugin {
         use stage_a_plugin_contract::{
             ControllerStateV1, FreshnessV1, OwnerInstanceId, PhotodiodeStreamV1, StreamIntegrityV1,
@@ -2548,7 +2577,12 @@ settle_s=0
                 valid_for_ms: 60_000,
             },
             calibration_id: Some("lobe-1".into()),
-            optical_drive: Some(armed_optical_drive()),
+            optical_lobe: Some(stage_a_plugin_contract::OpticalLobeStateV1 {
+                calibration_id: "lobe-1".into(),
+                v_null_dac: 100,
+                v_peak_dac: 1_000,
+            }),
+            optical_drive: None,
         };
         let photodiode = PhotodiodeSummaryV1 {
             contract_version: CONTRACT_VERSION_V1,
@@ -2720,6 +2754,49 @@ settle_s=0
     }
 
     #[test]
+    fn pause_messages_separate_physical_actions_from_automatic_settings() {
+        let dark = pause_message(&paused_point());
+        assert!(dark.contains("close or block the optical path"), "{dark}");
+        assert!(dark.contains("press Continue"), "{dark}");
+        assert!(dark.contains("automatically"), "{dark}");
+
+        let stepped = Point {
+            label: "technical_pre".into(),
+            role: "technical".into(),
+            settle_s: 0.0,
+            pause_before: true,
+            acquisition: Acquisition::Stepped {
+                mean_u: 0.3,
+                depth_a: 0.45,
+                half_period_s: 0.001,
+                transitions_per_polarity: 2,
+                comparator_threshold_dac: ComparatorThreshold::Auto,
+            },
+        };
+        let message = pause_message(&stepped);
+        assert!(message.contains("open the optical path"), "{message}");
+        assert!(
+            message.contains("Do not set a measurement point"),
+            "{message}"
+        );
+        assert!(message.contains("mean_u=0.300"), "{message}");
+        assert!(message.contains("depth_a=0.450"), "{message}");
+        assert!(message.contains("press Continue"), "{message}");
+    }
+
+    #[test]
+    fn lease_rejection_names_the_problem_and_recovery_action() {
+        let message = owner_rejection_message(
+            PendingKind::Mod,
+            "lease_mismatch",
+            "request run does not match the leased run",
+        );
+        assert!(message.contains("software state problem"), "{message}");
+        assert!(message.contains("reload A2"), "{message}");
+        assert!(message.contains("modulation plugin"), "{message}");
+    }
+
+    #[test]
     fn dark_points_do_not_require_external_triggers() {
         assert!(validate_trigger_counts(&paused_point().acquisition, 0, 0).is_ok());
         assert!(!starts_modulation(&paused_point().acquisition));
@@ -2841,7 +2918,14 @@ settle_s=0
         plugin.host_reply(&mut control, apply_id, applied_camera_outcome());
         assert_eq!(plugin.run.as_ref().unwrap().phase, Phase::AcquireMod);
 
+        let acquire_mod: ModulationRequestV1 =
+            serde_json::from_value(control.services.last().unwrap().payload.clone()).unwrap();
+        let lease_run_id = acquire_mod.run_id.clone().expect("modulation lease run id");
+
         plugin.accepted(&mut control, PendingKind::Mod, &Value::Null);
+        let acquire_pd: PhotodiodeRequestV1 =
+            serde_json::from_value(control.services.last().unwrap().payload.clone()).unwrap();
+        assert_eq!(acquire_pd.run_id.as_ref(), Some(&lease_run_id));
         plugin.accepted(&mut control, PendingKind::Pd, &Value::Null);
         assert_eq!(plugin.run.as_ref().unwrap().phase, Phase::Paused);
         plugin.continue_pending = true;
@@ -2849,6 +2933,7 @@ settle_s=0
         assert_eq!(plugin.run.as_ref().unwrap().phase, Phase::Prepare);
         let dark_prepare: ModulationRequestV1 =
             serde_json::from_value(control.services.last().unwrap().payload.clone()).unwrap();
+        assert_eq!(dark_prepare.run_id.as_ref(), Some(&lease_run_id));
         assert!(matches!(
             dark_prepare.command,
             ModulationCommandV1::StopAcquisition { .. }
@@ -3027,24 +3112,35 @@ settle_s=0
         protocol::parse(text).unwrap()
     }
 
+    fn calibrated_lobe(calibration_id: &str) -> stage_a_plugin_contract::OpticalLobeStateV1 {
+        stage_a_plugin_contract::OpticalLobeStateV1 {
+            calibration_id: calibration_id.into(),
+            v_null_dac: 100,
+            v_peak_dac: 1_000,
+        }
+    }
+
     fn modulation_state(
-        drive: Option<stage_a_plugin_contract::OpticalDriveStateV1>,
-        calibration_id: Option<&str>,
+        lobe: Option<stage_a_plugin_contract::OpticalLobeStateV1>,
     ) -> ModulationStateV1 {
         let mut plugin = ready_plugin("resolve-helper");
         let mut state = plugin.modulation.take().unwrap();
-        state.optical_drive = drive;
-        state.calibration_id = calibration_id.map(str::to_owned);
+        state.optical_lobe = lobe;
+        state.optical_drive = None;
         state
     }
 
     #[test]
-    fn a_missing_optical_drive_refuses_instead_of_defaulting_a_lobe() {
+    fn an_applied_lobe_is_required_but_an_armed_measurement_point_is_not() {
         let controller = ControllerSetup::default();
-        let state = modulation_state(None, Some("lobe-1"));
+        let state = modulation_state(None);
         let error = resolve_controller(&controller, Some(&state), Some(test_sensor(Some(10.0))))
             .unwrap_err();
-        assert!(error.contains("optical_drive"), "{error}");
+        assert!(error.contains("Apply to V_null / V_peak"), "{error}");
+
+        let state = modulation_state(Some(calibrated_lobe("lobe-1")));
+        assert!(state.optical_drive.is_none());
+        resolve_controller(&controller, Some(&state), Some(test_sensor(Some(10.0)))).unwrap();
 
         let error =
             resolve_controller(&controller, None, Some(test_sensor(Some(10.0)))).unwrap_err();
@@ -3054,9 +3150,9 @@ settle_s=0
     #[test]
     fn a_degenerate_lobe_refuses_against_the_resolved_values() {
         let controller = ControllerSetup::default();
-        let mut drive = armed_optical_drive();
-        drive.v_peak_dac = drive.v_null_dac;
-        let state = modulation_state(Some(drive), Some("lobe-1"));
+        let mut lobe = calibrated_lobe("lobe-1");
+        lobe.v_peak_dac = lobe.v_null_dac;
+        let state = modulation_state(Some(lobe));
         let error = resolve_controller(&controller, Some(&state), Some(test_sensor(Some(10.0))))
             .unwrap_err();
         assert!(error.contains("v_peak_dac"), "{error}");
@@ -3065,28 +3161,19 @@ settle_s=0
     #[test]
     fn the_resolved_lobe_and_its_calibration_id_reach_the_run_provenance() {
         let controller = ControllerSetup::default();
-        let state = modulation_state(Some(armed_optical_drive()), Some("pockels-2026-08-01"));
+        let state = modulation_state(Some(calibrated_lobe("pockels-2026-08-01")));
         let resolved =
             resolve_controller(&controller, Some(&state), Some(test_sensor(Some(10.0)))).unwrap();
         assert_eq!(resolved.v_null_dac, 100);
         assert_eq!(resolved.v_peak_dac, 1_000);
-        assert_eq!(resolved.lobe_source, "modulation_owner.optical_drive");
-        assert_eq!(
-            resolved.modulation_calibration_id.as_deref(),
-            Some("pockels-2026-08-01")
-        );
-
-        // A hand-entered lobe is recorded as such, never as a calibration.
-        let state = modulation_state(Some(armed_optical_drive()), None);
-        let resolved =
-            resolve_controller(&controller, Some(&state), Some(test_sensor(Some(10.0)))).unwrap();
-        assert_eq!(resolved.modulation_calibration_id, None);
+        assert_eq!(resolved.lobe_source, "modulation_owner.optical_lobe");
+        assert_eq!(resolved.modulation_calibration_id, "pockels-2026-08-01");
     }
 
     #[test]
     fn an_absent_min_half_us_resolves_to_the_larger_of_refractory_and_settling_floors() {
         let controller = ControllerSetup::default();
-        let state = modulation_state(Some(armed_optical_drive()), Some("lobe-1"));
+        let state = modulation_state(Some(calibrated_lobe("lobe-1")));
 
         // 5 x 10 us = 50 us, so the settling guard dominates.
         let resolved =
@@ -3109,7 +3196,7 @@ settle_s=0
             min_half_us: Some(1_000),
             ..ControllerSetup::default()
         };
-        let state = modulation_state(Some(armed_optical_drive()), Some("lobe-1"));
+        let state = modulation_state(Some(calibrated_lobe("lobe-1")));
         let resolved =
             resolve_controller(&controller, Some(&state), Some(test_sensor(Some(10.0)))).unwrap();
         assert_eq!(resolved.min_half_us, 1_000);
@@ -3125,7 +3212,7 @@ settle_s=0
     #[test]
     fn a_missing_pixel_dead_time_refuses_rather_than_resolving_a_floor_from_nothing() {
         let controller = ControllerSetup::default();
-        let state = modulation_state(Some(armed_optical_drive()), Some("lobe-1"));
+        let state = modulation_state(Some(calibrated_lobe("lobe-1")));
         let error =
             resolve_controller(&controller, Some(&state), Some(test_sensor(None))).unwrap_err();
         assert!(error.contains("pixel-dead-time"), "{error}");
@@ -3182,7 +3269,7 @@ settle_s=0
     #[test]
     fn plan_pedestals_covers_each_distinct_pair_once_and_skips_frozen_points() {
         let plan = parsed(auto_protocol());
-        let state = modulation_state(Some(armed_optical_drive()), Some("lobe-1"));
+        let state = modulation_state(Some(calibrated_lobe("lobe-1")));
         let resolved = resolve_controller(
             &ControllerSetup::default(),
             Some(&state),
@@ -3568,7 +3655,7 @@ comparator_threshold_dac=500
     #[test]
     fn an_unresolvable_lobe_refuses_before_the_camera_is_touched() {
         let mut plugin = ready_auto_plugin("auto-no-lobe");
-        plugin.modulation.as_mut().unwrap().optical_drive = None;
+        plugin.modulation.as_mut().unwrap().optical_lobe = None;
         let mut control = MockControl::default();
         plugin.begin(&mut control);
         assert!(plugin.run.is_none());

@@ -19,8 +19,11 @@ must be on. STC, Trail and ERC must be off. The A2 sidecar links the host camera
 and sensor-monitoring companions. The exact point protocol is archived by
 content hash in the measurement folder.
 
-The lobe endpoints and calibration ID come from the modulation owner. Placement,
-splitter fraction, load resistance, reference-set ID, dark reference and stream
+The applied lobe endpoints and calibration ID come from the modulation owner,
+independent of the mode, `mean_u` or `depth_a` currently shown there. A2 sets
+each point from the protocol automatically. The operator only applies the
+measured transfer curve once. Placement, splitter fraction, load resistance,
+reference-set ID, dark reference and stream
 state come from the photodiode owner. The step floor is calculated as
 `max(5 * pixel_dead_time_us, settling guard)` from sensor telemetry. The runner
 also saves its actual comparator settings. An unavailable required value stops
@@ -42,6 +45,11 @@ For the first end-to-end hardware check, use
 brackets around ten slow transitions per polarity. It runs when the live owner
 checks pass. It is a commissioning run, not yet a quantitative A2 result. The
 sidecar marks that H4/H5 review is still required offline.
+
+When a point has `pause_before = true`, the status text names the required
+physical action. Dark points ask the operator to block the optical path. Stepped
+points ask the operator to open it and confirm the sample. After **Continue**,
+A2 sets modulation, comparator and recording values itself.
 
 Production firmware mirrors comparator marker frames (`source=2`) onto the
 non-blocking photodiode stream, so PDQ contains the independent diagnostic edge

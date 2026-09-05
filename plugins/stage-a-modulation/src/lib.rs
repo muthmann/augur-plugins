@@ -47,9 +47,9 @@ use stage_a_plugin_contract::{
     A1AcquisitionConfigV1, A2AcquisitionConfigV1, ClientId, ConnectionStateV1, ControllerStateV1,
     FreshnessV1, LeaseId, LeaseSnapshotV1, ModulationCommandV1, ModulationRequestV1,
     ModulationResponseV1, ModulationStateV1, ModulationTargetV1, OpticalDriveStateV1,
-    OpticalTargetV1, OwnerInstanceId, PhotodiodeLevelV1, PhotodiodeSummaryV1, RequestOutcomeV1,
-    ResponseCommonV1, RunId, SemanticRevision, ServiceErrorCodeV1, ServiceErrorV1,
-    SynchronizationV1, UnsyncedReasonV1, WaveformV1, CONTRACT_VERSION_V1,
+    OpticalLobeStateV1, OpticalTargetV1, OwnerInstanceId, PhotodiodeLevelV1, PhotodiodeSummaryV1,
+    RequestOutcomeV1, ResponseCommonV1, RunId, SemanticRevision, ServiceErrorCodeV1,
+    ServiceErrorV1, SynchronizationV1, UnsyncedReasonV1, WaveformV1, CONTRACT_VERSION_V1,
     CTX_STAGE_A_MODULATION_STATE_V1, CTX_STAGE_A_PHOTODIODE_SUMMARY_V1,
     DRIVE_FREQUENCY_MAX_MILLIHZ, DRIVE_FREQUENCY_MIN_MILLIHZ, PLUGIN_ID_STAGE_A_MODULATION,
     PLUGIN_ID_STAGE_A_PHOTODIODE, SERVICE_STAGE_A_MODULATION_CONTROL_V1,
@@ -1268,6 +1268,19 @@ impl StageAModulationPlugin {
         })
     }
 
+    /// Publishes the applied calibration independently of the currently armed
+    /// mode and point. A protocol runner owns its measurement points and needs
+    /// only these calibrated lobe endpoints to construct them.
+    fn optical_lobe_state(&self) -> Option<OpticalLobeStateV1> {
+        let calibration_id = self.calibration_id.clone()?;
+        let inversion = self.resolved_lobe().ok()?.inversion;
+        Some(OpticalLobeStateV1 {
+            calibration_id,
+            v_null_dac: u16::try_from(inversion.dac_for_u(0.0).round() as i64).ok()?,
+            v_peak_dac: u16::try_from(inversion.dac_for_u(1.0).round() as i64).ok()?,
+        })
+    }
+
     /// Builds the single MOD command carrying the complete current drive
     /// settings (mode, method, band, frequency). Shared by the operator path
     /// (`send_modulation`) and the leased `SetOpticalDepth` service command.
@@ -2380,6 +2393,7 @@ impl StageAModulationPlugin {
                 valid_for_ms: 1_500,
             },
             calibration_id: self.calibration_id.clone(),
+            optical_lobe: self.optical_lobe_state(),
             optical_drive: self.optical_drive_state(),
         }
     }
@@ -5065,6 +5079,23 @@ mod tests {
         assert_eq!(drive.v_null_dac, 400);
         assert_eq!(drive.v_peak_dac, 1_300);
         assert_eq!(state.calibration_id.as_deref(), Some("cal-test"));
+    }
+
+    #[test]
+    fn applied_lobe_is_published_without_an_armed_optical_point() {
+        let mut plugin = live_plugin();
+        plugin.method = DriveMethod::Calibrated;
+        plugin.mode = Mode::Const;
+        plugin.v_null_dac = 400;
+        plugin.v_peak_dac = 1_300;
+        plugin.calibration_id = Some("cal-test".into());
+
+        let state = plugin.control_state();
+        assert!(state.optical_drive.is_none());
+        let lobe = state.optical_lobe.expect("applied optical lobe");
+        assert_eq!(lobe.calibration_id, "cal-test");
+        assert_eq!(lobe.v_null_dac, 400);
+        assert_eq!(lobe.v_peak_dac, 1_300);
     }
 
     #[test]
