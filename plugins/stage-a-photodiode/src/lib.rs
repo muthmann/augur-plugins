@@ -128,6 +128,85 @@ enum Mode {
     Excitation,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReferenceKind {
+    ElectronicsDark,
+    DriveCrosstalk,
+    StaticOptical,
+    OpticalEdges,
+}
+
+impl ReferenceKind {
+    const VARIANTS: [Self; 4] = [
+        Self::ElectronicsDark,
+        Self::DriveCrosstalk,
+        Self::StaticOptical,
+        Self::OpticalEdges,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::ElectronicsDark => "1 - electronics dark",
+            Self::DriveCrosstalk => "2 - blocked drive crosstalk",
+            Self::StaticOptical => "3 - static optical signal",
+            Self::OpticalEdges => "4 - optical edges with comparator",
+        }
+    }
+
+    fn slug(self) -> &'static str {
+        match self {
+            Self::ElectronicsDark => "electronics_dark",
+            Self::DriveCrosstalk => "blocked_drive_crosstalk",
+            Self::StaticOptical => "static_optical",
+            Self::OpticalEdges => "optical_edges",
+        }
+    }
+
+    fn duration_s(self) -> u64 {
+        match self {
+            Self::ElectronicsDark | Self::DriveCrosstalk | Self::StaticOptical => 30,
+            Self::OpticalEdges => 100,
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::ElectronicsDark => Self::DriveCrosstalk,
+            Self::DriveCrosstalk => Self::StaticOptical,
+            Self::StaticOptical => Self::OpticalEdges,
+            Self::OpticalEdges => Self::OpticalEdges,
+        }
+    }
+
+    fn instruction(self) -> &'static str {
+        match self {
+            Self::ElectronicsDark => {
+                "Block all light before the photodiode. The modulation must be safely off."
+            }
+            Self::DriveCrosstalk => {
+                "Keep the light blocked and run the normal A1/A2 modulation. This measures electrical pickup."
+            }
+            Self::StaticOptical => {
+                "Open the optical path and keep the drive constant. Do not modulate during this capture."
+            }
+            Self::OpticalEdges => {
+                "Use the A2 workflow for automatic 1 s optical steps and comparator markers. Standalone mode only records an already running sequence."
+            }
+        }
+    }
+
+    fn from_name(name: &str) -> Option<Self> {
+        Self::VARIANTS.into_iter().find(|kind| kind.name() == name)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ActiveReferenceCapture {
+    kind: ReferenceKind,
+    set_id: String,
+    deadline_unix_ms: u64,
+}
+
 const PHOTODIODE_PLACEMENTS: [PhotodiodePlacementV1; 3] = [
     PhotodiodePlacementV1::RejectedPort,
     PhotodiodePlacementV1::CameraPath,
@@ -898,13 +977,21 @@ pub struct StageAPhotodiodePlugin {
     time_axis: TimeAxis,
     /// Overlay the phase-0 trigger markers on the chart (opt-in).
     show_markers: bool,
+    /// Overlay A2 comparator state changes independently of phase-0 markers.
+    show_comparator_markers: bool,
     data_dir: String,
+    reference_set_id: String,
+    reference_kind: ReferenceKind,
+    load_ohms: f64,
+    active_reference: Option<ActiveReferenceCapture>,
     // -- momentary-button press forwarding (see PressLatch) --
     press_save_snapshot: PressLatch,
     press_capture_direct_dark: PressLatch,
     press_use_manual_direct_dark: PressLatch,
     press_record_start: PressLatch,
     press_record_stop: PressLatch,
+    press_reference_start: PressLatch,
+    press_reference_abort: PressLatch,
 }
 
 /// Forwards momentary button presses across the host's UI-mirror → live-worker
@@ -1016,12 +1103,19 @@ impl Default for StageAPhotodiodePlugin {
             avg_sync_freq_hz: 0.0,
             time_axis: TimeAxis::BeforeNow,
             show_markers: false,
+            show_comparator_markers: false,
             data_dir: String::new(),
+            reference_set_id: String::new(),
+            reference_kind: ReferenceKind::ElectronicsDark,
+            load_ohms: 470_000.0,
+            active_reference: None,
             press_save_snapshot: PressLatch::default(),
             press_capture_direct_dark: PressLatch::default(),
             press_use_manual_direct_dark: PressLatch::default(),
             press_record_start: PressLatch::default(),
             press_record_stop: PressLatch::default(),
+            press_reference_start: PressLatch::default(),
+            press_reference_abort: PressLatch::default(),
         }
     }
 }
@@ -1321,6 +1415,80 @@ impl StageAPhotodiodePlugin {
         Ok(())
     }
 
+    fn start_reference_capture(&mut self) -> Result<(), String> {
+        if self.runtime_role != PluginRuntimeRole::LiveWorker || !self.effects_allowed {
+            return Err("reference capture is allowed only on the active live worker".into());
+        }
+        if self.lease.is_some() {
+            return Err("the A1/A2 workflow currently owns photodiode recording".into());
+        }
+        if !self.connected() {
+            return Err("connect the photodiode stream first".into());
+        }
+        let kind = self.reference_kind;
+        let set_id = if self.reference_set_id.trim().is_empty() {
+            format!("PDREF-{}", timestamp_slug())
+        } else {
+            self.reference_set_id.trim().to_owned()
+        };
+        if !set_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+        {
+            return Err("reference set ID may contain only letters, numbers, '-' and '_'".into());
+        }
+        let root = self.resolved_data_dir()?.join(&set_id);
+        std::fs::create_dir_all(&root)
+            .map_err(|error| format!("creating {} failed: {error}", root.display()))?;
+        let stem = format!("{}__{}", set_id, kind.slug());
+        let pdq_path = root.join(format!("{stem}.pdq"));
+        let sidecar_path = root.join(format!("{stem}.json"));
+        let mut metadata = BTreeMap::new();
+        metadata.insert("recording_kind".into(), "photodiode_reference".into());
+        metadata.insert("reference_set_id".into(), set_id.clone());
+        metadata.insert("reference_kind".into(), kind.slug().into());
+        metadata.insert("planned_duration_s".into(), kind.duration_s().to_string());
+        metadata.insert("load_ohms".into(), format!("{:.0}", self.load_ohms));
+        metadata.insert("operator_instruction".into(), kind.instruction().into());
+        self.open_recording(
+            RunId::new(format!("{set_id}-{}", kind.slug())),
+            pdq_path.clone(),
+            sidecar_path.clone(),
+            pdq_path.to_string_lossy().into_owned(),
+            sidecar_path.to_string_lossy().into_owned(),
+            metadata,
+            true,
+        )?;
+        self.reference_set_id = set_id.clone();
+        self.active_reference = Some(ActiveReferenceCapture {
+            kind,
+            set_id,
+            deadline_unix_ms: now_unix_ms() + kind.duration_s() * 1_000,
+        });
+        self.last_save_note = Some(format!(
+            "reference {} recording for {} s",
+            kind.slug(),
+            kind.duration_s()
+        ));
+        Ok(())
+    }
+
+    fn finish_reference_capture(&mut self, termination: PdqTerminationV1) -> Result<(), String> {
+        let active = self.active_reference.take();
+        self.finalize_recording(termination)?;
+        if let Some(active) = active {
+            self.last_save_note = Some(format!(
+                "reference saved: {}/{}",
+                active.set_id,
+                active.kind.slug()
+            ));
+            if termination == PdqTerminationV1::Completed {
+                self.reference_kind = active.kind.next();
+            }
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn open_recording(
         &mut self,
@@ -1405,8 +1573,12 @@ impl StageAPhotodiodePlugin {
     }
 
     fn stop_recording(&mut self) -> Result<(), String> {
-        self.finalize_recording(PdqTerminationV1::OperatorStopped)
-            .map(|_| ())
+        if self.active_reference.is_some() {
+            self.finish_reference_capture(PdqTerminationV1::OperatorStopped)
+        } else {
+            self.finalize_recording(PdqTerminationV1::OperatorStopped)
+                .map(|_| ())
+        }
     }
 
     fn finalize_recording(
@@ -2061,6 +2233,7 @@ impl StageAPhotodiodePlugin {
             if let Err(error) = self.finalize_recording(PdqTerminationV1::Aborted) {
                 self.last_error = Some(error);
             }
+            self.active_reference = None;
             // Deliberately keep `connect_requested`: it is the operator's
             // *intent*, and this branch is what the UI mirror runs on every
             // control tick. Clearing it there resets the checkbox before the
@@ -2420,6 +2593,42 @@ impl StageAPhotodiodePlugin {
                 if !points.is_empty() {
                     lines.push(Series1dLine {
                         name: "phase-0 trigger".into(),
+                        points,
+                    });
+                }
+            }
+        }
+        if self.show_comparator_markers && !state.comparator_markers.is_empty() {
+            let first_visible = state.ring_first_index + start as u64;
+            let y_range = lines
+                .iter()
+                .flat_map(|line| line.points.iter())
+                .map(|point| point.y)
+                .fold(None::<(f64, f64)>, |acc, y| {
+                    Some(acc.map_or((y, y), |(lo, hi)| (lo.min(y), hi.max(y))))
+                });
+            if let Some((y_lo, y_hi)) = y_range {
+                let x_for = |index: u64| -> f64 {
+                    let device_t = index as f64 / rate;
+                    match self.time_axis {
+                        TimeAxis::BeforeNow => device_t - latest_x_index as f64 / rate,
+                        TimeAxis::Segment => device_t,
+                    }
+                };
+                let mut points = Vec::with_capacity(state.comparator_markers.len() * 3);
+                for &(index, level) in &state.comparator_markers {
+                    if index < first_visible || index > latest_x_index {
+                        continue;
+                    }
+                    let x = x_for(index);
+                    let marker_top = if level == 0 { y_lo } else { y_hi };
+                    points.push(Series1dPoint { x, y: y_lo });
+                    points.push(Series1dPoint { x, y: marker_top });
+                    points.push(Series1dPoint { x, y: y_lo });
+                }
+                if !points.is_empty() {
+                    lines.push(Series1dLine {
+                        name: "comparator state".into(),
                         points,
                     });
                 }
@@ -2895,6 +3104,7 @@ impl Plugin for StageAPhotodiodePlugin {
             if let Err(err) = self.finalize_recording(termination) {
                 self.last_error = Some(err);
             }
+            self.active_reference = None;
             self.disconnect();
             self.lease = None;
         }
@@ -2906,6 +3116,7 @@ impl Plugin for StageAPhotodiodePlugin {
             if let Err(error) = self.finalize_recording(PdqTerminationV1::Aborted) {
                 self.last_error = Some(error);
             }
+            self.active_reference = None;
             // Demoting to the UI mirror drops the hardware, not the operator's
             // connect intent — see `apply_execution_context`.
             self.disconnect();
@@ -2932,6 +3143,7 @@ impl Plugin for StageAPhotodiodePlugin {
             if let Err(error) = self.finalize_recording(PdqTerminationV1::Aborted) {
                 self.last_error = Some(error);
             }
+            self.active_reference = None;
             // Runs every replayed frame, so it must not clear the intent
             // either — the port stays closed because `connect()` is guarded.
             self.disconnect();
@@ -2942,6 +3154,15 @@ impl Plugin for StageAPhotodiodePlugin {
     fn process_control(&mut self, context: &mut PluginControlContext<'_>) {
         let execution = context.execution();
         self.apply_execution_context(&execution);
+        if self
+            .active_reference
+            .as_ref()
+            .is_some_and(|capture| now_unix_ms() >= capture.deadline_unix_ms)
+        {
+            if let Err(error) = self.finish_reference_capture(PdqTerminationV1::Completed) {
+                self.last_error = Some(error);
+            }
+        }
     }
 
     fn handle_service_request(
@@ -3259,6 +3480,93 @@ impl Plugin for StageAPhotodiodePlugin {
                                 default: self.show_markers,
                             },
                         },
+                        SettingItem {
+                            key: "show_comparator_markers".into(),
+                            label: "Show comparator markers".into(),
+                            tooltip: Some(
+                                "Overlay A2 comparator state changes from marker source 2. This is separate from phase-0 timing markers."
+                                    .into(),
+                            ),
+                            kind: SettingKind::Bool {
+                                default: self.show_comparator_markers,
+                            },
+                        },
+                    ],
+                },
+                SettingsSection {
+                    label: "Guided PD references".into(),
+                    description: Some(format!(
+                        "Step: {}\nDuration: {} s\n\n{}\n\nThe capture stops automatically and is saved as a raw PDQ plus JSON. A1/A2 owns automatic modulation; this panel does not change the drive behind an active workflow.",
+                        self.reference_kind.name(),
+                        self.reference_kind.duration_s(),
+                        self.reference_kind.instruction()
+                    )),
+                    default_open: false,
+                    items: vec![
+                        SettingItem {
+                            key: "reference_set_id".into(),
+                            label: "Reference set ID".into(),
+                            tooltip: Some(
+                                "Use the same ID in the A2 protocol. Leave empty to generate PDREF-<time>."
+                                    .into(),
+                            ),
+                            kind: SettingKind::Text {
+                                default: self.reference_set_id.clone(),
+                            },
+                        },
+                        SettingItem {
+                            key: "reference_kind".into(),
+                            label: "Reference step".into(),
+                            tooltip: Some(
+                                "Select the physical condition, follow the instruction above, then start."
+                                    .into(),
+                            ),
+                            kind: SettingKind::Enum {
+                                variants: ReferenceKind::VARIANTS
+                                    .iter()
+                                    .map(|kind| kind.name().to_owned())
+                                    .collect(),
+                                default: ReferenceKind::VARIANTS
+                                    .iter()
+                                    .position(|kind| *kind == self.reference_kind)
+                                    .unwrap_or(0),
+                            },
+                        },
+                        SettingItem {
+                            key: "load_ohms".into(),
+                            label: "PD termination / load".into(),
+                            tooltip: Some(
+                                "Stored as provenance. Current setup: 470000 ohm.".into(),
+                            ),
+                            kind: SettingKind::F64Drag {
+                                min: 1.0,
+                                max: 10_000_000.0,
+                                speed: 1_000.0,
+                                default: self.load_ohms,
+                            },
+                        },
+                        SettingItem {
+                            key: "reference_start".into(),
+                            label: "Start this reference".into(),
+                            tooltip: Some(
+                                "Starts the fixed-length raw capture. Existing files are never overwritten."
+                                    .into(),
+                            ),
+                            kind: SettingKind::Button {
+                                enabled: !self.data_dir.trim().is_empty()
+                                    && !self.recording_active(),
+                            },
+                        },
+                        SettingItem {
+                            key: "reference_abort".into(),
+                            label: "Abort reference".into(),
+                            tooltip: Some(
+                                "Stops the current reference and marks it as aborted.".into(),
+                            ),
+                            kind: SettingKind::Button {
+                                enabled: self.active_reference.is_some(),
+                            },
+                        },
                     ],
                 },
                 SettingsSection {
@@ -3375,6 +3683,7 @@ impl Plugin for StageAPhotodiodePlugin {
             "window_s" => Some(json!(self.window_s)),
             "avg_samples" => Some(json!(self.avg_samples)),
             "show_markers" => Some(json!(self.show_markers)),
+            "show_comparator_markers" => Some(json!(self.show_comparator_markers)),
             "avg_sync_freq_hz" => Some(json!(self.avg_sync_freq_hz)),
             "time_axis" => {
                 let index = TimeAxis::VARIANTS
@@ -3384,6 +3693,14 @@ impl Plugin for StageAPhotodiodePlugin {
                 Some(json!(index))
             }
             "data_dir" => Some(json!(self.data_dir)),
+            "reference_set_id" => Some(json!(self.reference_set_id)),
+            "reference_kind" => Some(json!(ReferenceKind::VARIANTS
+                .iter()
+                .position(|kind| *kind == self.reference_kind)
+                .unwrap_or(0))),
+            "load_ohms" => Some(json!(self.load_ohms)),
+            "reference_start" => Some(self.press_reference_start.value()),
+            "reference_abort" => Some(self.press_reference_abort.value()),
             "cache_s" => Some(json!(self
                 .shared
                 .lock()
@@ -3496,6 +3813,9 @@ impl Plugin for StageAPhotodiodePlugin {
                 if requested {
                     self.connect();
                 } else {
+                    if self.active_reference.is_some() {
+                        self.finish_reference_capture(PdqTerminationV1::Aborted)?;
+                    }
                     self.disconnect();
                 }
                 Ok(())
@@ -3510,6 +3830,12 @@ impl Plugin for StageAPhotodiodePlugin {
             }
             "show_markers" => {
                 self.show_markers = value.as_bool().ok_or("show_markers must be a boolean")?;
+                Ok(())
+            }
+            "show_comparator_markers" => {
+                self.show_comparator_markers = value
+                    .as_bool()
+                    .ok_or("show_comparator_markers must be a boolean")?;
                 Ok(())
             }
             "window_s" => {
@@ -3542,6 +3868,52 @@ impl Plugin for StageAPhotodiodePlugin {
                     .as_str()
                     .ok_or("data_dir must be a string")?
                     .to_owned();
+                Ok(())
+            }
+            "reference_set_id" => {
+                self.reference_set_id = value
+                    .as_str()
+                    .ok_or("reference_set_id must be a string")?
+                    .trim()
+                    .to_owned();
+                Ok(())
+            }
+            "reference_kind" => {
+                let names: Vec<String> = ReferenceKind::VARIANTS
+                    .iter()
+                    .map(|kind| kind.name().to_owned())
+                    .collect();
+                let name = enum_choice(&value, &names)?;
+                self.reference_kind = ReferenceKind::from_name(&name)
+                    .ok_or_else(|| format!("unknown reference kind: {name}"))?;
+                Ok(())
+            }
+            "load_ohms" => {
+                let ohms = value.as_f64().ok_or("load_ohms must be a number")?;
+                if !ohms.is_finite() || ohms <= 0.0 {
+                    return Err("load_ohms must be positive".into());
+                }
+                self.load_ohms = ohms;
+                Ok(())
+            }
+            "reference_start" => {
+                if self.press_reference_start.accept(&value) {
+                    match self.start_reference_capture() {
+                        Ok(()) => self.last_error = None,
+                        Err(error) => self.last_error = Some(error),
+                    }
+                    self.generation.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(())
+            }
+            "reference_abort" => {
+                if self.press_reference_abort.accept(&value) && self.active_reference.is_some() {
+                    match self.finish_reference_capture(PdqTerminationV1::Aborted) {
+                        Ok(()) => self.last_error = None,
+                        Err(error) => self.last_error = Some(error),
+                    }
+                    self.generation.fetch_add(1, Ordering::Relaxed);
+                }
                 Ok(())
             }
             "cache_s" => {
@@ -3710,6 +4082,24 @@ impl Plugin for StageAPhotodiodePlugin {
                     state.markers.len()
                 )));
             }
+            if !state.comparator_markers.is_empty() {
+                entries.push(StatusEntry::Text(format!(
+                    "Comparator: {} state markers received",
+                    state.comparator_markers.len()
+                )));
+            }
+        }
+        if let Some(reference) = &self.active_reference {
+            let remaining_s = reference
+                .deadline_unix_ms
+                .saturating_sub(now_unix_ms())
+                .div_ceil(1_000);
+            entries.push(StatusEntry::Text(format!(
+                "PD reference: {} ({} s remaining, set {})",
+                reference.kind.slug(),
+                remaining_s,
+                reference.set_id
+            )));
         }
         if self.recording_active() {
             let (samples, path) = self
@@ -5098,6 +5488,61 @@ mod tests {
         plugin.set_setting("record_stop", json!(true)).unwrap();
         assert!(plugin.last_error.is_none());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn guided_reference_uses_a_fixed_named_capture_and_metadata() {
+        let dir = temp_dir("guided-reference");
+        let mut plugin = StageAPhotodiodePlugin {
+            port_hint: "mock".into(),
+            ..live_plugin()
+        };
+        plugin.connect();
+        plugin
+            .set_setting("data_dir", json!(dir.display().to_string()))
+            .unwrap();
+        plugin
+            .set_setting("reference_set_id", json!("PDREF-bench-01"))
+            .unwrap();
+        plugin.set_setting("reference_kind", json!(1)).unwrap();
+        plugin.set_setting("reference_start", json!(true)).unwrap();
+        assert!(plugin.recording_active());
+        let active = plugin.active_reference.as_ref().expect("active reference");
+        assert_eq!(active.kind, ReferenceKind::DriveCrosstalk);
+        assert!(active.deadline_unix_ms >= now_unix_ms() + 29_000);
+
+        plugin
+            .finish_reference_capture(PdqTerminationV1::Completed)
+            .unwrap();
+        assert_eq!(plugin.reference_kind, ReferenceKind::StaticOptical);
+        let sidecar_path = dir
+            .join("PDREF-bench-01")
+            .join("PDREF-bench-01__blocked_drive_crosstalk.json");
+        let sidecar: Value = serde_json::from_slice(&std::fs::read(sidecar_path).unwrap()).unwrap();
+        assert_eq!(
+            sidecar["metadata"]["recording_kind"],
+            "photodiode_reference"
+        );
+        assert_eq!(sidecar["metadata"]["planned_duration_s"], "30");
+        assert_eq!(sidecar["metadata"]["load_ohms"], "470000");
+        assert_eq!(sidecar["termination"], "completed");
+        plugin.disconnect();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn comparator_overlay_is_separate_from_phase_zero_markers() {
+        let mut plugin = StageAPhotodiodePlugin::default();
+        plugin.show_comparator_markers = true;
+        plugin.avg_samples = 1;
+        {
+            let mut state = plugin.shared.lock().unwrap();
+            state.ingest(0, 1_000, 0, &[100, 101, 102, 103]);
+            state.push_comparator_marker(2, 1);
+        }
+        let series = plugin.series_dataset();
+        let names: Vec<&str> = series.lines.iter().map(|line| line.name.as_str()).collect();
+        assert_eq!(names, ["photodiode", "comparator state"]);
     }
 
     #[test]

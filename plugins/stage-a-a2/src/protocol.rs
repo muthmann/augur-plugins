@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 
 pub const MAX_POINTS: usize = 4_096;
@@ -34,22 +34,124 @@ pub struct Gates {
     pub camera_external_trigger_confirmed: bool,
     pub h4_loopback_id: String,
     pub h5_polarity_calibration_id: String,
+    /// Links this A2 run to the generic raw PD noise/reference captures.
+    pub photodiode_reference_set_id: String,
     pub optical_edge_calibration_id: String,
     pub local_flux_calibration_id: String,
     pub recorder_safety_limit_events_per_us: u64,
 }
 
+/// Controller settings a protocol still states for itself.
+///
+/// The lobe endpoints `v_null_dac`/`v_peak_dac` deliberately do **not** live
+/// here any more: the modulation owner already publishes the lobe it resolved,
+/// together with the calibration ID of the transfer inversion that produced it
+/// (ADR 040). Retyping them into the protocol duplicated an owner's state and
+/// could not be checked against anything. The runner reads them from
+/// `ModulationStateV1::optical_drive` at preflight and refuses when they are
+/// absent.
+///
+/// Unknown keys are rejected here rather than ignored: a file that still lists
+/// `v_null_dac`/`v_peak_dac` is a stale file, and silently dropping them would
+/// let an operator believe a lobe they typed is the lobe that ran.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ControllerSetup {
-    pub v_null_dac: u16,
-    pub v_peak_dac: u16,
     pub comparator_hysteresis: u8,
     pub comparator_invert: bool,
-    pub min_half_us: u32,
+    /// Host floor on the interval between optical steps, in microseconds.
+    ///
+    /// Optional. When absent the runner resolves
+    /// `max(5 * pixel_dead_time_us, settling guard)` from sensor telemetry and
+    /// records which floor it used. When present the value is kept verbatim and
+    /// still has to clear `5 * pixel_dead_time_us`, so freezing a number can
+    /// only ever tighten the floor, never loosen it.
+    #[serde(default)]
+    pub min_half_us: Option<u32>,
     #[serde(default = "default_sample_rate")]
     pub sample_rate_hz: u32,
     #[serde(default = "default_block_samples")]
     pub block_samples: u32,
+}
+
+/// How a stepped point gets the comparator threshold `V_50`.
+///
+/// `V_50` sits midway between the two optical plateaus, and those move with the
+/// operating flux — it is not a set-once calibration. [`Self::Auto`] is
+/// therefore the default: the runner drives both plateaus, reads the settled
+/// photodiode level at each and places the threshold at their midpoint, once
+/// per distinct `(mean_u, depth_a)` pedestal. A frozen code stays legal for a
+/// point whose threshold was established some other way, and is recorded as the
+/// operator's claim rather than as a measurement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ComparatorThreshold {
+    #[default]
+    Auto,
+    Frozen(u16),
+}
+
+impl ComparatorThreshold {
+    pub fn frozen_code(self) -> Option<u16> {
+        match self {
+            Self::Auto => None,
+            Self::Frozen(code) => Some(code),
+        }
+    }
+
+    pub fn is_auto(self) -> bool {
+        matches!(self, Self::Auto)
+    }
+
+    /// Stable token for sidecars and recorder metadata.
+    pub fn mode(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Frozen(_) => "frozen",
+        }
+    }
+}
+
+impl Serialize for ComparatorThreshold {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Auto => serializer.serialize_str("auto"),
+            Self::Frozen(code) => serializer.serialize_u16(*code),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ComparatorThreshold {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Mode(String),
+            Code(i64),
+        }
+        match Raw::deserialize(deserializer)? {
+            Raw::Mode(mode) => {
+                if mode.trim().eq_ignore_ascii_case("auto") {
+                    Ok(Self::Auto)
+                } else {
+                    Err(serde::de::Error::custom(format!(
+                        "comparator_threshold_dac must be \"auto\" or a frozen code in 1..=4095, \
+                         not {mode:?}"
+                    )))
+                }
+            }
+            Raw::Code(code) => u16::try_from(code).map(Self::Frozen).map_err(|_| {
+                serde::de::Error::custom(format!(
+                    "comparator_threshold_dac {code} is outside the frozen code range 1..=4095"
+                ))
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -74,7 +176,8 @@ pub enum Acquisition {
         depth_a: f64,
         half_period_s: f64,
         transitions_per_polarity: u32,
-        comparator_threshold_dac: u16,
+        #[serde(default)]
+        comparator_threshold_dac: ComparatorThreshold,
     },
 }
 
@@ -163,6 +266,10 @@ impl Protocol {
                 self.gates.h5_polarity_calibration_id.as_str(),
             ),
             (
+                "photodiode_reference_set_id",
+                self.gates.photodiode_reference_set_id.as_str(),
+            ),
+            (
                 "optical_edge_calibration_id",
                 self.gates.optical_edge_calibration_id.as_str(),
             ),
@@ -182,9 +289,18 @@ impl Protocol {
             ));
         }
         let c = &self.controller;
-        if c.v_peak_dac <= c.v_null_dac || c.comparator_hysteresis > 3 || c.min_half_us == 0 {
+        if c.comparator_hysteresis > 3 {
             return Err(ProtocolError(
-                "controller lobe, hysteresis or min_half_us is not frozen".into(),
+                "comparator_hysteresis must be a frozen level in 0..=3".into(),
+            ));
+        }
+        // A present-but-zero floor is an unfinished edit, not "resolve it for
+        // me": omitting the key is how a protocol asks for owner resolution.
+        if c.min_half_us == Some(0) {
+            return Err(ProtocolError(
+                "min_half_us is present but zero; omit the key to resolve the floor from sensor \
+                 telemetry, or freeze a positive value"
+                    .into(),
             ));
         }
         for (index, p) in self.points.iter().enumerate() {
@@ -226,17 +342,26 @@ impl Protocol {
                             index + 1
                         )));
                     }
-                    if half_period_s * 1e6 < f64::from(c.min_half_us) {
-                        return Err(ProtocolError(format!(
-                            "point {} half-period violates min_half_us",
-                            index + 1
-                        )));
+                    // Only checkable here when the protocol froze the floor. A
+                    // protocol that leaves it to owner resolution is checked
+                    // against the resolved floor at preflight, before any
+                    // camera apply or owner lease.
+                    if let Some(min_half_us) = c.min_half_us {
+                        if half_period_s * 1e6 < f64::from(min_half_us) {
+                            return Err(ProtocolError(format!(
+                                "point {} half-period violates min_half_us",
+                                index + 1
+                            )));
+                        }
                     }
-                    if !(1..=4_095).contains(&comparator_threshold_dac) {
-                        return Err(ProtocolError(format!(
-                            "point {} comparator_threshold_dac must be a frozen code in 1..=4095",
-                            index + 1
-                        )));
+                    if let Some(code) = comparator_threshold_dac.frozen_code() {
+                        if !(1..=4_095).contains(&code) {
+                            return Err(ProtocolError(format!(
+                                "point {} comparator_threshold_dac must be \"auto\" or a frozen \
+                                 code in 1..=4095",
+                                index + 1
+                            )));
+                        }
                     }
                 }
             }
@@ -276,12 +401,11 @@ comparator_self_test_passed=true
 camera_external_trigger_confirmed=true
 h4_loopback_id="h4-1"
 h5_polarity_calibration_id="h5-1"
+photodiode_reference_set_id="pdref-1"
 optical_edge_calibration_id="edge-1"
 local_flux_calibration_id="flux-1"
 recorder_safety_limit_events_per_us=1000
 [controller]
-v_null_dac=100
-v_peak_dac=1000
 comparator_hysteresis=1
 comparator_invert=false
 min_half_us=100
@@ -326,6 +450,18 @@ comparator_threshold_dac=500
     }
 
     #[test]
+    fn a2_requires_the_generic_photodiode_reference_set_id() {
+        let text = BASE.replace(
+            "photodiode_reference_set_id=\"pdref-1\"",
+            "photodiode_reference_set_id=\"TBD\"",
+        );
+        assert!(parse(&text)
+            .unwrap_err()
+            .0
+            .contains("photodiode_reference_set_id"));
+    }
+
+    #[test]
     fn shipped_followup_is_deliberately_not_runnable_before_bringup() {
         let text = include_str!("../protocols/a2_fluorescence_chain_followup.toml");
         let error = parse(text).unwrap_err().0;
@@ -336,5 +472,131 @@ comparator_threshold_dac=500
                 || error.contains("comparator_threshold_dac"),
             "unexpected refusal: {error}"
         );
+    }
+
+    #[test]
+    fn comparator_threshold_defaults_to_auto_when_the_key_is_absent() {
+        let text = BASE.replace("comparator_threshold_dac=500\n", "");
+        let protocol = parse(&text).unwrap();
+        let Acquisition::Stepped {
+            comparator_threshold_dac,
+            ..
+        } = protocol.points[0].acquisition
+        else {
+            panic!("expected a stepped point");
+        };
+        assert_eq!(comparator_threshold_dac, ComparatorThreshold::Auto);
+        assert!(comparator_threshold_dac.is_auto());
+        assert_eq!(comparator_threshold_dac.frozen_code(), None);
+    }
+
+    #[test]
+    fn comparator_threshold_accepts_the_explicit_auto_token_and_a_frozen_code() {
+        let auto = BASE.replace(
+            "comparator_threshold_dac=500",
+            "comparator_threshold_dac=\"auto\"",
+        );
+        let Acquisition::Stepped {
+            comparator_threshold_dac,
+            ..
+        } = parse(&auto).unwrap().points[0].acquisition
+        else {
+            panic!("expected a stepped point");
+        };
+        assert_eq!(comparator_threshold_dac, ComparatorThreshold::Auto);
+
+        let Acquisition::Stepped {
+            comparator_threshold_dac,
+            ..
+        } = parse(BASE).unwrap().points[0].acquisition
+        else {
+            panic!("expected a stepped point");
+        };
+        assert_eq!(comparator_threshold_dac, ComparatorThreshold::Frozen(500));
+        assert_eq!(comparator_threshold_dac.mode(), "frozen");
+    }
+
+    #[test]
+    fn a_frozen_comparator_threshold_outside_the_dac_range_still_refuses() {
+        let zero = BASE.replace("comparator_threshold_dac=500", "comparator_threshold_dac=0");
+        assert!(parse(&zero)
+            .unwrap_err()
+            .0
+            .contains("comparator_threshold_dac"));
+
+        let over = BASE.replace(
+            "comparator_threshold_dac=500",
+            "comparator_threshold_dac=4096",
+        );
+        assert!(parse(&over)
+            .unwrap_err()
+            .0
+            .contains("comparator_threshold_dac"));
+
+        let negative = BASE.replace(
+            "comparator_threshold_dac=500",
+            "comparator_threshold_dac=-1",
+        );
+        assert!(parse(&negative)
+            .unwrap_err()
+            .0
+            .contains("comparator_threshold_dac"));
+    }
+
+    #[test]
+    fn an_unknown_comparator_threshold_mode_is_not_silently_treated_as_auto() {
+        let text = BASE.replace(
+            "comparator_threshold_dac=500",
+            "comparator_threshold_dac=\"measure_it\"",
+        );
+        let error = parse(&text).unwrap_err().0;
+        assert!(error.contains("comparator_threshold_dac"), "{error}");
+    }
+
+    #[test]
+    fn min_half_us_may_be_omitted_for_owner_resolution_but_never_zero() {
+        let omitted = BASE.replace("min_half_us=100\n", "");
+        assert_eq!(parse(&omitted).unwrap().controller.min_half_us, None);
+
+        let zero = BASE.replace("min_half_us=100", "min_half_us=0");
+        assert!(parse(&zero).unwrap_err().0.contains("min_half_us"));
+    }
+
+    #[test]
+    fn a_frozen_min_half_us_still_bounds_every_stepped_half_period() {
+        let text = BASE.replace("min_half_us=100", "min_half_us=1000000");
+        assert!(parse(&text).unwrap_err().0.contains("min_half_us"));
+    }
+
+    #[test]
+    fn an_omitted_min_half_us_leaves_the_half_period_check_to_preflight() {
+        // Without a frozen floor the schema cannot judge the half period, so it
+        // must not pretend to: the runner checks it against the resolved floor
+        // before any owner lease.
+        let text = BASE
+            .replace("min_half_us=100\n", "")
+            .replace("half_period_s=0.5", "half_period_s=0.000001");
+        assert!(parse(&text).is_ok());
+    }
+
+    #[test]
+    fn hysteresis_above_the_comparator_range_refuses() {
+        let text = BASE.replace("comparator_hysteresis=1", "comparator_hysteresis=4");
+        assert!(parse(&text)
+            .unwrap_err()
+            .0
+            .contains("comparator_hysteresis"));
+    }
+
+    #[test]
+    fn the_lobe_endpoints_are_no_longer_a_protocol_field() {
+        // Kind-1 values are owner-resolved (ADR 040). A file that still carries
+        // them is a stale file, and silently ignoring the keys would let a run
+        // cite a lobe nothing checked.
+        let text = BASE.replace(
+            "comparator_hysteresis=1",
+            "v_null_dac=100\nv_peak_dac=1000\ncomparator_hysteresis=1",
+        );
+        assert!(parse(&text).is_err());
     }
 }

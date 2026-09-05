@@ -42,6 +42,34 @@ geometry and controls the estimator independently of the chart mode.
 - a compact status table with the newest code/value, moving average, integrity,
   recording state, and connection state.
 
+## Guided reference recordings
+
+Open **Guided PD references** for raw captures that describe the detector noise
+and the current analogue chain. Choose one reference-set ID and keep it for the
+whole bench configuration. The plugin creates one folder with clearly named
+PDQ and JSON files. It never overwrites an existing reference. The JSON records
+the detector placement, splitter fraction, duration, reference type and PD load
+(470 kOhm for the current setup).
+
+The four steps are:
+
+1. **Electronics dark, 30 s:** block all light before the PD and keep modulation
+   safely off. This measures the ADC, cable and amplified PD background.
+2. **Blocked drive crosstalk, 30 s:** keep the light blocked and run the normal
+   experiment modulation. This separates electrical pickup from optical light.
+3. **Static optical signal, 30 s:** open the path, use a constant drive and do
+   not modulate. This measures noise at the real DC level.
+4. **Optical edges, 100 s:** use the A2 workflow for automatic 1 s steps. The
+   standalone PD button can record an already running sequence, but it does not
+   take hardware ownership from A1 or A2.
+
+Each standalone capture stops automatically and advances the panel to the next
+step. Advanced noise or trigger-error
+analysis is intentionally offline; the raw samples and markers are the source
+of truth. Modulation remains in A1/A2 because those workflows own the command
+port and can restore the hardware safely. Comparator threshold, hysteresis and
+polarity are therefore not duplicated in this general PD panel.
+
 ## Ports
 
 **Use `auto` (default recommendation):** it listens briefly on every attached USB serial port and
