@@ -9,6 +9,23 @@ modulation and photodiode owners and the host camera recorder.
 
 - The full TOML is parsed and all hardware/optical gates are checked before a
   lease is acquired.
+- Values an owner already publishes are resolved from the owner, not retyped
+  (ADR 040). The lobe endpoints come from `ModulationStateV1::optical_drive` and
+  the run records them with the owner's `calibration_id`; a missing armed drive
+  refuses. `min_half_us` may be omitted, in which case the runner resolves
+  `max(5 * pixel_dead_time_us, settling guard)` from sensor telemetry and every
+  stepped half period is checked against the resolved floor. All of this happens
+  before the camera apply and before either lease.
+- `comparator_threshold_dac` defaults to `auto`. `V_50` moves with the operating
+  flux, so per distinct `(mean_u, depth_a)` pedestal the runner holds both
+  plateaus as constant drives, reads the settled `PhotodiodeLevelV1` at each,
+  proves through `end_sample_index` that the averaging window began after the
+  drive was acknowledged, and places the threshold at their midpoint via the
+  existing `CMP thr=` path. A clipped window, a stream restart, a plateau span
+  under 20 mV, an unsettled window or a midpoint outside the threshold DAC's
+  0–2500 mV range refuses the point. The ADC (0–3300 mV) and the threshold DAC
+  (0–2500 mV) do not share a reference, so the conversion always goes through
+  millivolts — an ADC code is never copied across as a threshold code.
 - A named, complete camera profile is applied and confirmed before either
   hardware lease. EXT_TRIGGER and sensor telemetry must be on; STC, Trail and
   ERC must be explicitly off. The host restores the pre-run state on success,
@@ -48,3 +65,10 @@ photodiode stream path, so a PDQ can carry the independent comparator-edge
 record. Camera-clock EXT_TRIGGER remains the latency clock of record. Marker
 drops are explicit firmware integrity evidence; H4 loopback and H5
 polarity/offset calibration remain mandatory and are cited in the protocol.
+
+Before the first A2 run, record the generic electronics-dark,
+blocked-drive-crosstalk and static-light files in the PD plugin. Copy their
+`photodiode_reference_set_id` into the A2 protocol. This links later offline
+noise and timing analysis to the exact reference files. It does not replace H4
+or H5: those remain A2 comparator qualifications. The A2 settings panel keeps
+this boundary in one collapsed instruction section.

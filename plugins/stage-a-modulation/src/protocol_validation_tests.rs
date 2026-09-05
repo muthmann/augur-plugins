@@ -30,8 +30,23 @@ struct Fixture {
     expected_points: usize,
 }
 
-fn fixtures() -> [Fixture; 5] {
+fn fixtures() -> [Fixture; 8] {
     [
+        Fixture {
+            name: "a1_lux_dark_offset.csv",
+            csv: include_str!("../../stage-a-a1/protocols/a1_lux_dark_offset.csv"),
+            expected_points: 1,
+        },
+        Fixture {
+            name: "a1_illuminated_smoke.csv",
+            csv: include_str!("../../stage-a-a1/protocols/a1_illuminated_smoke.csv"),
+            expected_points: 1,
+        },
+        Fixture {
+            name: "a1_fc_flux_discriminator.csv",
+            csv: include_str!("../../stage-a-a1/protocols/a1_fc_flux_discriminator.csv"),
+            expected_points: 297,
+        },
         Fixture {
             name: "a1_triage_90min.csv",
             csv: include_str!("../../stage-a-a1/protocols/a1_triage_90min.csv"),

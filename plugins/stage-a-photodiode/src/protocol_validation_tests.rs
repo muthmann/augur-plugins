@@ -11,6 +11,18 @@ const BENCH_RATE_HZ: u32 = 500_000;
 fn shipped_a1_protocols_retain_two_cycles_at_their_lowest_frequency() {
     let fixtures = [
         (
+            "a1_lux_dark_offset.csv",
+            include_str!("../../stage-a-a1/protocols/a1_lux_dark_offset.csv"),
+        ),
+        (
+            "a1_illuminated_smoke.csv",
+            include_str!("../../stage-a-a1/protocols/a1_illuminated_smoke.csv"),
+        ),
+        (
+            "a1_fc_flux_discriminator.csv",
+            include_str!("../../stage-a-a1/protocols/a1_fc_flux_discriminator.csv"),
+        ),
+        (
             "a1_triage_90min.csv",
             include_str!("../../stage-a-a1/protocols/a1_triage_90min.csv"),
         ),

@@ -35,6 +35,29 @@ source (the camera `EXT_TRIGGER` belongs to A1's camera-clock analysis, not here
   ("phase-0 trigger") on the chart.
 - The **modulation frequency is derived from the marker spacing** (`f = rate / mean marker gap`) and
   shown in the status; the mock emits synthetic markers so the overlay works without hardware.
+- **Show comparator markers** separately overlays A2 comparator state markers
+  (`source=2`). It does not mix them into the phase-0 timing ring.
+
+## Guided PD references
+
+The collapsed **Guided PD references** panel records reusable raw reference data
+without adding analysis controls to the live readout. A reference-set ID groups
+four named captures: 30 s electronics dark, 30 s blocked-drive crosstalk, 30 s
+static optical signal, and 100 s optical edges. Each capture stops
+automatically, uses exclusive file creation, and writes its type, planned
+duration, physical placement, splitter fraction and PD load to the sidecar.
+After a successful capture, the panel advances to the next step. The operator
+can still select a previous step to repeat it with a new reference-set ID.
+
+The panel guides the physical condition but does not duplicate command-port
+ownership. A1 or A2 sets modulated drive states. In particular, A2 owns the
+optical-edge sequence and comparator configuration. This keeps comparator H4,
+H5, threshold, hysteresis and `invert` out of the generic PD UI. The current
+470 kOhm load is a recorded configuration value, not a software filter.
+
+These recordings support later offline noise models and trigger-time uncertainty
+estimates. The plugin does not claim that background subtraction can recover a
+crossing that the comparator never observed.
 
 ## Modes
 
