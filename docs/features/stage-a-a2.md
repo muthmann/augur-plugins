@@ -13,9 +13,12 @@ automatically and uses the data folder selected in the photodiode plugin.
 - The TOML contains only the measurement points. Live hardware state is checked
   before a lease is acquired.
 - Values an owner already publishes are resolved from the owner, not retyped
-  (ADR 040). The lobe endpoints come from `ModulationStateV1::optical_drive` and
-  the run records them with the owner's `calibration_id`; a missing armed drive
-  refuses. `min_half_us` may be omitted, in which case the runner resolves
+  (ADR 040). The applied lobe endpoints and calibration ID come from
+  `ModulationStateV1::optical_lobe`, independent of the currently armed mode or
+  point. A2 commands every `mean_u` and `depth_a` from the protocol itself. A
+  missing applied calibration refuses with an instruction to use **Apply to
+  V_null / V_peak** in the modulation plugin. `min_half_us` may be omitted, in
+  which case the runner resolves
   `max(5 * pixel_dead_time_us, settling guard)` from sensor telemetry and every
   stepped half period is checked against the resolved floor. All of this happens
   before the camera apply and before either lease.
@@ -38,6 +41,9 @@ automatically and uses the data folder selected in the photodiode plugin.
 - Dark points record camera RAW and photodiode PDQ for their declared duration
   with modulation forced safe/off. Stepped points additionally require the
   commanded number of both EXT_TRIGGER polarities (tolerance: one edge).
+- A pause is only an operator checkpoint for a physical action. Its message
+  tells the operator to block or open the optical path, explains what A2 will
+  set automatically, and says when to press **Continue**.
 - A sidecar records protocol identity/SHA-256, point, commanded pedestal/depth,
   the actual comparator configuration, modulation calibration, photodiode
   placement, splitter fraction, load resistance, reference-set ID, dark

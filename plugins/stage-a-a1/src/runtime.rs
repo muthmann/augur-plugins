@@ -8195,6 +8195,7 @@ mod tests {
                 valid_for_ms: 5_000,
             },
             calibration_id: Some("pockels-test".into()),
+            optical_lobe: None,
             optical_drive: None,
         }
     }

@@ -461,6 +461,16 @@ pub struct OpticalDriveStateV1 {
     pub v_peak_dac: u16,
 }
 
+/// Applied, measured monotonic optical lobe. Unlike [`OpticalDriveStateV1`],
+/// this is independent of the drive mode and operating point currently shown
+/// in the modulation UI. Protocol runners use it to command their own points.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpticalLobeStateV1 {
+    pub calibration_id: String,
+    pub v_null_dac: u16,
+    pub v_peak_dac: u16,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModulationStateV1 {
     pub contract_version: u16,
@@ -482,6 +492,10 @@ pub struct ModulationStateV1 {
     /// entered the lobe parameters by hand. Additive in V1.
     #[serde(default)]
     pub calibration_id: Option<String>,
+    /// Applied calibration available to protocol runners even when no optical
+    /// drive is currently armed.
+    #[serde(default)]
+    pub optical_lobe: Option<OpticalLobeStateV1>,
     /// Additive V1 optical-drive provenance.
     #[serde(default)]
     pub optical_drive: Option<OpticalDriveStateV1>,
@@ -994,6 +1008,11 @@ mod tests {
                 valid_for_ms: 500,
             },
             calibration_id: Some("pockels-20260724-120000".into()),
+            optical_lobe: Some(OpticalLobeStateV1 {
+                calibration_id: "pockels-20260724-120000".into(),
+                v_null_dac: 1_160,
+                v_peak_dac: 1_630,
+            }),
             optical_drive: Some(OpticalDriveStateV1 {
                 target: OpticalTargetV1::LogSine,
                 requested_mean_u_milli: 400,
@@ -1025,10 +1044,12 @@ mod tests {
         let mut legacy = serde_json::to_value(&snapshot).expect("serializes");
         let object = legacy.as_object_mut().expect("state object");
         object.remove("calibration_id");
+        object.remove("optical_lobe");
         object.remove("optical_drive");
         let decoded_legacy: ModulationStateV1 =
             serde_json::from_value(legacy).expect("pre-provenance state decodes");
         assert!(decoded_legacy.calibration_id.is_none());
+        assert!(decoded_legacy.optical_lobe.is_none());
         assert!(decoded_legacy.optical_drive.is_none());
     }
 
