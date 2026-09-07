@@ -21,14 +21,16 @@ not this.
 
 Treat the two failure classes differently.
 
-A rejection that proves no recording started — the host refused with
-`recording_start_failed` while the camera was still being started and no RAW path
-exists — is retried on the same point after 1, 2 and 4 s. Any other outcome is not
-retried, because a partly written recording must not be repeated silently.
+Every failed recording is repeated on the same point after 1, 2 and 4 s. The
+recording coordinator is idle by then, so a repeat cannot collide with a recording
+the host still holds, and each attempt writes its own timestamped files and sidecar,
+so a partial attempt stays beside the one that worked instead of being overwritten.
 
-A recording that still does not complete ends the run at that point. Skipping keeps
-a doomed survey running: the failures that cost points are rarely specific to one
-point, and an unattended bench cannot judge that.
+A point whose retries are used up is lost, named with the owner's own reason, and
+the survey goes on. Three lost points in a row end the run: at that scale it is the
+bench that failed, not the point, and the rest of the file would be empty as well.
+Every way a point can be lost — a refused drive retarget, a failed recording —
+counts towards the same streak.
 
 Check the placement's dark provenance at the button press. A photodiode on the
 camera or emission path with no dark reference refuses the whole protocol, in the
@@ -41,13 +43,14 @@ run waits, so a failed camera does not hold the modulation owner as well.
 
 ## Consequences
 
-A single transient camera failure costs seconds, not a measurement point, and a
-persistent one costs one run instead of a bench day. A survey that cannot produce a
-quantitative sidecar never starts.
+A transient failure — a refused camera start, a dropped trigger marker, a photodiode
+that missed one window — costs seconds instead of a measurement point, and a
+persistent one costs four points instead of a bench day. A survey that cannot produce
+a quantitative sidecar at all never starts.
 
-The cost is that a failure unrelated to the camera — an incomplete photodiode file,
-a failed camera stop — also ends the run. Whether those deserve a consecutive-failure
-budget instead is open, and needs bench evidence about how often they occur alone.
+The cost is that a measurement folder can hold the files of an attempt that failed
+next to the ones that worked. The per-attempt sidecar names which files belong
+together, and the run's closing summary names every lost point with its reason.
 
 Failure wording no longer counts camera retries when there were none; the reason the
 run stopped is the reason it reports.

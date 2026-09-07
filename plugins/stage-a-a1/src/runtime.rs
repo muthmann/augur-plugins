@@ -100,7 +100,14 @@ const DEFAULT_ANALYSIS_WINDOW_MS: i64 = 2_000;
 /// Give up waiting for a control-plane reply after this many milliseconds.
 const REPLY_TIMEOUT_MS: u64 = 15_000;
 const CAMERA_RESTORE_MAX_ATTEMPTS: u8 = 3;
-const CAMERA_START_RETRY_DELAYS_MS: [u64; 3] = [1_000, 2_000, 4_000];
+/// Wait this long before repeating a point whose recording failed. A bench
+/// wobble — a refused camera start, a dropped trigger marker — costs seconds
+/// instead of a measurement point.
+const POINT_RETRY_DELAYS_MS: [u64; 3] = [1_000, 2_000, 4_000];
+/// End the run once this many points in a row are lost. Retrying forever turns
+/// a broken bench into a full file of empty points; stopping at the first loss
+/// throws away a survey that only stumbled.
+const MAX_CONSECUTIVE_FAILED_POINTS: usize = 3;
 /// Upper bound on retained phase-0 markers in the no-EventStore fallback path.
 const MAX_MARKERS: usize = 65_536;
 /// Give up waiting for the photodiode-measured `a` to reach a sweep target
@@ -889,8 +896,8 @@ struct ProtocolRun {
     bias_confirmation: Option<(CameraBiasOffsetsV1, SensorBiasReadbackV1, f64)>,
     restore_req: Option<u64>,
     restore_attempts: u8,
-    camera_start_retries: usize,
-    camera_start_retryable: bool,
+    point_retries: usize,
+    consecutive_failures: usize,
     restore_confirmed: bool,
     restore_error: Option<String>,
     finish_message: Option<String>,
@@ -2664,6 +2671,33 @@ impl StageAA1Plugin {
         }
     }
 
+    /// Which artifacts never arrived, named one by one.
+    ///
+    /// "not every file was finalized" is the whole report an unattended run
+    /// leaves behind for the point it lost, and it names no subsystem to look
+    /// at. Say which side did not deliver.
+    fn unfinalized_artifacts(&self) -> String {
+        let mut missing = Vec::new();
+        if !self.recording.cam_complete {
+            missing.push("the camera RAW was not finalized");
+        }
+        if !self.recording.pd_finalized {
+            missing.push("the photodiode never finalized its PDQ");
+        } else if !self.recording.pd_valid {
+            missing.push("the photodiode rejected its own recording");
+        }
+        if self.recording.pd_pdq_path.is_none() {
+            missing.push("no PDQ path was reported");
+        }
+        if self.recording.pd_sidecar_path.is_none() {
+            missing.push("no photodiode sidecar path was reported");
+        }
+        if missing.is_empty() {
+            return "not every file was finalized".into();
+        }
+        missing.join("; ")
+    }
+
     fn finish_recording(&mut self, context: &mut impl RecordingControl) {
         let clean = self.recording.cam_complete
             && self.recording.pd_finalized
@@ -2678,7 +2712,7 @@ impl StageAA1Plugin {
             .recording
             .failure
             .clone()
-            .unwrap_or_else(|| "not every file was finalized".into());
+            .unwrap_or_else(|| self.unfinalized_artifacts());
         let message = match (sidecar, clean) {
             (Ok(path), true) => format!("Saved recording {} → {path}", self.recording.id),
             (Ok(path), false) => format!(
@@ -4731,8 +4765,8 @@ impl StageAA1Plugin {
             bias_confirmation: None,
             restore_req: None,
             restore_attempts: 0,
-            camera_start_retries: 0,
-            camera_start_retryable: false,
+            point_retries: 0,
+            consecutive_failures: 0,
             restore_confirmed: false,
             restore_error: None,
             finish_message: None,
@@ -4944,14 +4978,26 @@ impl StageAA1Plugin {
         };
         let index = run.index;
         run.failed.push((index, reason.clone()));
+        run.consecutive_failures += 1;
+        let consecutive = run.consecutive_failures;
         let point = run.plan.points[index].clone();
         self.message = format!(
-            "Protocol point {} (ū={:.2}, f={}, a={:.2}) skipped: {reason}",
+            "Protocol point {} (ū={:.2}, f={:.3} Hz, a={:.2}) skipped: {reason}",
             index + 1,
             point.mean_u,
-            frequency_label(point.frequency_hz),
+            point.frequency_hz,
             point.depth_a,
         );
+        if consecutive >= MAX_CONSECUTIVE_FAILED_POINTS {
+            // The bench, not the point, is broken: the same failure is about to
+            // consume the rest of the file.
+            let message = format!(
+                "Protocol aborted at point {}: {consecutive} points in a row failed — last: {reason}",
+                index + 1
+            );
+            self.finish_protocol(context, message);
+            return;
+        }
         self.advance_protocol(context);
     }
 
@@ -4961,8 +5007,7 @@ impl StageAA1Plugin {
             return;
         };
         run.index += 1;
-        run.camera_start_retries = 0;
-        run.camera_start_retryable = false;
+        run.point_retries = 0;
         run.last_activity_ms = now_unix_ms();
         if run.index < run.plan.points.len() && !run.stop_requested {
             self.send_protocol_point(context);
@@ -5136,7 +5181,6 @@ impl StageAA1Plugin {
                 self.pending_duration_s = Some(duration_s);
                 if let Some(run) = self.protocol.as_mut() {
                     run.phase = ProtocolPhase::Recording;
-                    run.camera_start_retryable = false;
                     run.last_activity_ms = now_ms;
                 }
                 // The row says what it is: a protocol can carry its own
@@ -5168,6 +5212,7 @@ impl StageAA1Plugin {
                 if self.recording_completed_ok {
                     if let Some(run) = self.protocol.as_mut() {
                         run.recorded += 1;
+                        run.consecutive_failures = 0;
                     }
                     self.advance_protocol(context);
                 } else {
@@ -5234,42 +5279,33 @@ impl StageAA1Plugin {
         }
     }
 
-    /// Only a host rejection that guarantees no camera recording started can
-    /// retry. Unknown start outcomes and partial recordings must stop the run.
+    /// Repeat a point whose recording failed, then hand it to the skip path.
+    ///
+    /// The recording coordinator is idle by the time this runs, so a repeat
+    /// cannot collide with a recording the host still holds. Each attempt
+    /// writes its own timestamped files and its own sidecar, so a partial
+    /// attempt stays in the measurement folder next to the one that worked
+    /// instead of being overwritten by it.
     fn recover_protocol_recording(&mut self, context: &mut impl RecordingControl, now_ms: u64) {
         let reason = self.message.clone();
         let Some(run) = self.protocol.as_mut() else {
             return;
         };
-        if run.camera_start_retryable {
-            if let Some(delay) = CAMERA_START_RETRY_DELAYS_MS.get(run.camera_start_retries) {
-                run.camera_start_retries += 1;
-                run.camera_start_retryable = false;
-                run.phase = ProtocolPhase::Settling;
-                run.settle_until_ms = now_ms.saturating_add(*delay);
-                self.message = format!(
-                    "Protocol point {}: camera start retry {}/{} in {} s: {reason}",
-                    run.index + 1,
-                    run.camera_start_retries,
-                    CAMERA_START_RETRY_DELAYS_MS.len(),
-                    delay / 1_000
-                );
-                return;
-            }
-        }
-        let message = if run.camera_start_retries == 0 {
-            // Naming camera retries that never happened sends the operator to
-            // the wrong subsystem: most of these are a refused sidecar or a
-            // photodiode gate, not the camera.
-            format!("Protocol aborted at point {}: {reason}", run.index + 1)
-        } else {
-            format!(
-                "Protocol aborted at point {} after {} camera start retries: {reason}",
+        if let Some(delay) = POINT_RETRY_DELAYS_MS.get(run.point_retries) {
+            run.point_retries += 1;
+            run.phase = ProtocolPhase::Settling;
+            run.settle_until_ms = now_ms.saturating_add(*delay);
+            self.message = format!(
+                "Protocol point {}: retry {}/{} in {} s: {reason}",
                 run.index + 1,
-                run.camera_start_retries
-            )
-        };
-        self.finish_protocol(context, message);
+                run.point_retries,
+                POINT_RETRY_DELAYS_MS.len(),
+                delay / 1_000
+            );
+            return;
+        }
+        run.point_retries = 0;
+        self.fail_protocol_point(context, reason);
     }
 
     /// Routes modulation-service replies belonging to the protocol run.
@@ -5768,11 +5804,6 @@ impl StageAA1Plugin {
                     // Stop the rest of the recording; drive_recording resolves the
                     // abort from the current phase on the next tick.
                     self.note_failure(format!("Camera recording rejected ({code}): {message}"));
-                    if let Some(run) = self.protocol.as_mut() {
-                        run.camera_start_retryable = code == "recording_start_failed"
-                            && self.recording.cam_raw_path.is_none()
-                            && self.recording.phase == RecPhase::StartingCamera;
-                    }
                     self.recording.cam_rejected = true;
                     self.recording.stop_requested = true;
                 }
@@ -10979,6 +11010,21 @@ depth_a = 0.7
         let _ = std::fs::remove_dir_all(&folder);
     }
 
+    const THREE_POINT_PROTOCOL: &str = r#"
+name = "three-point"
+version = "test-v2"
+
+[defaults]
+duration_s = 3
+settle_s = 0.0
+
+[[block]]
+name = "triple"
+mean_u = [0.4, 0.6, 0.8]
+frequency_hz = 25.0
+depth_a = 0.7
+"#;
+
     const BIAS_PROTOCOL: &str = r#"
 name = "bias-point"
 
@@ -11625,22 +11671,18 @@ depth_a = 0.7
     }
 
     #[test]
-    fn protocol_retries_camera_start_on_same_point_and_advances_only_after_success() {
-        let folder = temp_folder("protocol-start-retry");
+    fn protocol_repeats_a_failed_point_before_it_counts_as_lost() {
+        let folder = temp_folder("protocol-point-retry");
         let (mut plugin, _) = protocol_plugin(&folder, TWO_POINT_PROTOCOL);
         let mut sink = ControlSink::default();
         control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
-        {
-            let run = plugin.protocol.as_mut().unwrap();
-            run.phase = ProtocolPhase::Recording;
-            run.camera_start_retryable = true;
-        }
+        plugin.protocol.as_mut().unwrap().phase = ProtocolPhase::Recording;
         plugin.message = "Camera recording rejected (recording_start_failed): timeout".into();
         plugin.recover_protocol_recording(&mut sink, now_unix_ms());
         let run = plugin.protocol.as_ref().unwrap();
-        assert_eq!(run.index, 0);
+        assert_eq!(run.index, 0, "the same point is repeated");
         assert!(run.failed.is_empty());
-        assert_eq!(run.camera_start_retries, 1);
+        assert_eq!(run.point_retries, 1);
         assert_eq!(run.phase, ProtocolPhase::Settling);
         let before = sink.hosts.len();
         control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
@@ -11651,49 +11693,63 @@ depth_a = 0.7
         let run = plugin.protocol.as_ref().unwrap();
         assert_eq!(run.index, 1);
         assert_eq!(run.recorded, 1);
-        assert_eq!(run.camera_start_retries, 0);
+        assert_eq!(run.point_retries, 0);
+        assert_eq!(run.consecutive_failures, 0);
         let _ = std::fs::remove_dir_all(folder);
     }
 
     #[test]
-    fn protocol_camera_retry_exhaustion_restores_without_skipping_ahead() {
-        let folder = temp_folder("protocol-start-exhausted");
+    fn protocol_keeps_running_after_one_point_is_lost() {
+        let folder = temp_folder("protocol-point-lost");
         let (mut plugin, _) = protocol_plugin(&folder, TWO_POINT_PROTOCOL);
         let mut sink = ControlSink::default();
         control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
-        plugin.protocol.as_mut().unwrap().camera_session_active = true;
-        for delay in CAMERA_START_RETRY_DELAYS_MS {
-            plugin.protocol.as_mut().unwrap().camera_start_retryable = true;
+        for delay in POINT_RETRY_DELAYS_MS {
+            plugin.message = "the photodiode saw no trigger markers".into();
             plugin.recover_protocol_recording(&mut sink, 100);
             let run = plugin.protocol.as_ref().unwrap();
             assert_eq!(run.index, 0);
             assert!(run.failed.is_empty());
             assert_eq!(run.settle_until_ms, 100 + delay);
         }
-        // One more failure past the last delay ends the run at this point.
-        plugin.protocol.as_mut().unwrap().camera_start_retryable = true;
+        // The retries are used up: the point is lost, the survey goes on.
         plugin.recover_protocol_recording(&mut sink, 100);
         let run = plugin.protocol.as_ref().unwrap();
-        assert_eq!(run.index, 0);
-        assert!(run.failed.is_empty());
-        assert_eq!(
-            plugin.protocol.as_ref().unwrap().phase,
-            ProtocolPhase::RestoringCamera
-        );
-        assert!(matches!(
-            sink.hosts.last().unwrap().command,
-            HostCommand::RestoreCameraConfiguration
-        ));
+        assert_eq!(run.index, 1);
+        assert_eq!(run.failed.len(), 1);
+        assert_eq!(run.consecutive_failures, 1);
+        assert_eq!(run.point_retries, 0);
+        let _ = std::fs::remove_dir_all(folder);
+    }
+
+    /// Retrying forever would fill a file with empty points; the run ends once
+    /// the bench, not the point, is what failed.
+    #[test]
+    fn protocol_stops_once_points_keep_failing() {
+        let folder = temp_folder("protocol-points-keep-failing");
+        let (mut plugin, _) = protocol_plugin(&folder, THREE_POINT_PROTOCOL);
+        let mut sink = ControlSink::default();
+        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+        plugin.protocol.as_mut().unwrap().camera_session_active = true;
+        for _ in 0..MAX_CONSECUTIVE_FAILED_POINTS {
+            plugin.protocol.as_mut().unwrap().point_retries = POINT_RETRY_DELAYS_MS.len();
+            plugin.message = "the photodiode never finalized its PDQ".into();
+            plugin.recover_protocol_recording(&mut sink, 100);
+        }
+        let run = plugin.protocol.as_ref().unwrap();
+        assert_eq!(run.failed.len(), MAX_CONSECUTIVE_FAILED_POINTS);
+        assert_eq!(run.phase, ProtocolPhase::RestoringCamera);
+        let closing = run.finish_message.clone().unwrap_or_default();
+        assert!(closing.contains("in a row failed"), "{closing}");
         let _ = std::fs::remove_dir_all(folder);
     }
 
     #[test]
-    fn protocol_stop_during_camera_backoff_does_not_start_another_recording() {
+    fn protocol_stop_during_point_backoff_does_not_start_another_recording() {
         let folder = temp_folder("protocol-stop-backoff");
         let (mut plugin, _) = protocol_plugin(&folder, TWO_POINT_PROTOCOL);
         let mut sink = ControlSink::default();
         control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
-        plugin.protocol.as_mut().unwrap().camera_start_retryable = true;
         plugin.recover_protocol_recording(&mut sink, now_unix_ms());
         let before = sink.hosts.len();
         plugin.request_stop();
@@ -11701,22 +11757,6 @@ depth_a = 0.7
         assert_eq!(sink.hosts.len(), before);
         assert!(plugin.protocol.is_none());
         assert!(!plugin.recording.is_active());
-        let _ = std::fs::remove_dir_all(folder);
-    }
-
-    #[test]
-    fn ambiguous_camera_failure_aborts_protocol_without_retry() {
-        let folder = temp_folder("protocol-ambiguous-start");
-        let (mut plugin, _) = protocol_plugin(&folder, TWO_POINT_PROTOCOL);
-        let mut sink = ControlSink::default();
-        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
-        plugin.protocol.as_mut().unwrap().camera_session_active = true;
-        plugin.message = "Timed out starting camera recording".into();
-        plugin.recover_protocol_recording(&mut sink, now_unix_ms());
-        let run = plugin.protocol.as_ref().unwrap();
-        assert_eq!(run.index, 0);
-        assert_eq!(run.camera_start_retries, 0);
-        assert_eq!(run.phase, ProtocolPhase::RestoringCamera);
         let _ = std::fs::remove_dir_all(folder);
     }
 

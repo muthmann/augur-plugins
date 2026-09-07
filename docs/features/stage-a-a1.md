@@ -333,10 +333,12 @@ acceptance before high-frequency data is treated as qualified.
 - **A refused point is skipped, not fatal**, carrying the modulation owner's own
   wording. Because the per-point message is overwritten within the same tick,
   the reasons are kept on the run and shown in the status pane and the closing
-  summary. A *recording* that fails is the exception: a rejected camera start is
-  retried on the same point after 1, 2 and 4 s, and any recording that still
-  does not complete ends the run there. A survey that skipped on every failure
-  ran to the end of the file with almost no data — see ADR 043.
+  summary. A failed *recording* is first repeated on the same point after 1, 2 and
+  4 s; only then is the point lost. Three lost points in a row end the run — a
+  survey that skipped on every failure ran to the end of the file with almost no
+  data, and one that stopped at the first stumble threw away the rest. The
+  refusal names the artifact that was missing, not just "not every file was
+  finalized" — see ADR 043.
 
 ### Qualified laboratory protocols
 
