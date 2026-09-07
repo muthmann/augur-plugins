@@ -15,7 +15,7 @@ on:
       augur_rs_ref:
         description: "augur-rs ref to build against (branch, tag or SHA)"
         required: false
-        default: fix/gui-layout-and-alignment
+        default: v2.1.1
 
 concurrency:
   group: build-plugins-${{ github.ref }}
@@ -41,7 +41,7 @@ jobs:
           - os: macos-latest
             name: macOS (arm64)
             bundle: macos-arm64
-          - os: macos-13
+          - os: macos-15-intel
             name: macOS (x86_64)
             bundle: macos-x86_64
           - os: ubuntu-latest
@@ -120,6 +120,25 @@ jobs:
       - name: Stage installable plugin folders
         working-directory: augur-plugins
         run: bash scripts/install-built-plugins.sh --profile release --dest "dist/${{ matrix.bundle }}"
+
+      - name: Set up Python for the lab watcher
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Test the independent lab watcher
+        working-directory: augur-plugins
+        run: python scripts/test_stage_a_watch.py
+
+      - name: Build the Windows lab watcher
+        if: runner.os == 'Windows'
+        working-directory: augur-plugins
+        run: |
+          python -m pip install pyinstaller==6.16.0
+          python -m PyInstaller --noconfirm --clean --onefile --name Laborwache \
+            --distpath dist/windows-x86_64/lab-watch --workpath target/lab-watch \
+            --specpath target scripts/stage_a_watch.py
+          cp docs/features/stage-a-lab-watch.md dist/windows-x86_64/lab-watch/README.md
 
       - name: Write build provenance
         working-directory: augur-plugins

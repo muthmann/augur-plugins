@@ -26,3 +26,7 @@ Repository-level feature notes for larger plugin suites, interface migrations, a
 - [Action Requests And Single-Cluster Refit](./action-requests-and-refit.md) — plugin-declared host actions, eveSMLM refit/commit/discard flow on the `augur.evesmlm.refit_preview` dataset.
 - [Reconstruction Workflow](./reconstruction.md) — accumulated localization tables rendered and exported by the host.
 - [eveSMLM Pipeline](./evesmlm.md) — candidate finding, fitting, and post-processing as three chainable plugins, chained through the shared `evesmlm-types` contract crate rather than through each other: every plugin exports `augur_plugin_vtable`, so a plugin-to-plugin rlib dependency duplicated that symbol and failed to link on Linux and Windows while macOS accepted it (ADR 031).
+
+A2 production capture modes and synchronization evidence: [ADR 041](../adr/041-stage-a-a2-drive-sync-capture.md).
+
+- [Windows lab watcher](stage-a-lab-watch.md): independent RAW/PDQ progress warnings to an iPhone through ntfy.
