@@ -15,16 +15,16 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use stage_a_plugin_contract::{
-    A2AcquisitionConfigV1, ClientId, ConnectionStateV1, LeaseId, ModulationCommandV1,
-    ModulationRequestV1, ModulationResponseV1, ModulationStateV1, PdqReceiptV1, PdqStartSpecV1,
-    PdqTerminationV1, PhotodiodeCommandV1, PhotodiodeDarkReferenceV1, PhotodiodeLevelV1,
-    PhotodiodePlacementV1, PhotodiodeRequestV1, PhotodiodeResponseV1, PhotodiodeSummaryV1,
-    RequestId, RequestOutcomeV1, RunId, SemanticRevision, StreamIntegrityV1, WaveformV1,
-    CTX_STAGE_A_MODULATION_STATE_V1, CTX_STAGE_A_PHOTODIODE_SUMMARY_V1,
+    A2AcquisitionConfigV1, A2TimingReferenceV1, ClientId, ConnectionStateV1, LeaseId,
+    ModulationCommandV1, ModulationRequestV1, ModulationResponseV1, ModulationStateV1,
+    PdqReceiptV1, PdqStartSpecV1, PdqTerminationV1, PhotodiodeCommandV1, PhotodiodeDarkReferenceV1,
+    PhotodiodeLevelV1, PhotodiodePlacementV1, PhotodiodeRequestV1, PhotodiodeResponseV1,
+    PhotodiodeSummaryV1, RequestId, RequestOutcomeV1, RunId, SemanticRevision, StreamIntegrityV1,
+    WaveformV1, CTX_STAGE_A_MODULATION_STATE_V1, CTX_STAGE_A_PHOTODIODE_SUMMARY_V1,
     SERVICE_STAGE_A_MODULATION_CONTROL_V1, SERVICE_STAGE_A_PHOTODIODE_CONTROL_V1,
 };
 
-use crate::protocol::{self, Acquisition, ControllerSetup, Point, Protocol};
+use crate::protocol::{self, Acquisition, ControllerSetup, Point, Protocol, TriggerValidation};
 
 const ID: &str = "stage-a.a2";
 const MOD_ID: &str = "stage-a.modulation";
@@ -69,13 +69,12 @@ const PLATEAU_SETTLE_MS: u64 = 250;
 /// How long after that a level window whose start provably follows the
 /// acknowledged drive is waited for, before the point is refused.
 const PLATEAU_LEVEL_TIMEOUT_MS: u64 = 5_000;
-/// Smallest plateau-to-plateau span a threshold may be placed inside, in volts.
-/// 20 mV, the same floor the bring-up program warns at.
-const MIN_PLATEAU_SPAN_VOLTS: f64 = 0.020;
-/// Largest share of the plateau span either settled window may itself wander
-/// over. A settled `CONST` hold has a small peak-to-peak; a drifting or still
-/// slewing one does not, and its mean is not a plateau.
-const MAX_PLATEAU_WINDOW_SPREAD_FRACTION: f64 = 0.5;
+/// Eight independent owner windows, each at least 20 ms, after settling.
+const PLATEAU_WINDOWS: usize = 8;
+const MIN_LEVEL_WINDOW_SECONDS: f64 = 0.020;
+/// Keep at least two threshold-DAC codes on either side of the midpoint.
+const MIN_PLATEAU_SPAN_VOLTS: f64 = 4.0 * 2.5 / 4095.0;
+const MAX_PLATEAU_MEAN_SPREAD_FRACTION: f64 = 0.25;
 
 /// Quantized `(mean_u_milli, depth_a_milli)` pedestal a threshold is measured
 /// for. The milli units are exactly what `A2AcquisitionConfigV1` carries to the
@@ -127,10 +126,11 @@ enum Phase {
     PlateauHighDrive,
     PlateauHighLevel,
     Prepare,
+    QuietBeforeCapture,
+    StartStimulus,
     Settle,
     StartCamera,
     StartPd,
-    StartMod,
     Recording,
     StopMod,
     FinalizePd,
@@ -146,6 +146,8 @@ enum PendingKind {
     Mod,
     Pd,
     Host,
+    RenewMod,
+    RenewPd,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -160,6 +162,9 @@ struct PointEvidence {
     sensor_monitoring_path: Option<String>,
     pdq_path: Option<String>,
     pdq_sha256: Option<String>,
+    pdq_marker_counts: Option<stage_a_plugin_contract::PdqMarkerCountsV1>,
+    marker_diagnostics_before: Option<stage_a_plugin_contract::A2MarkerDiagnosticsV1>,
+    marker_diagnostics_after: Option<stage_a_plugin_contract::A2MarkerDiagnosticsV1>,
     /// `"auto"` or `"frozen"`: whether this point's threshold was measured by
     /// the runner or asserted by the protocol.
     comparator_threshold_mode: Option<&'static str>,
@@ -170,6 +175,9 @@ struct PointEvidence {
     /// sidecar is self-contained.
     threshold_measurement: Option<MeasuredThreshold>,
     valid: bool,
+    /// Quality concerns do not imply file corruption. Strict protocols stop;
+    /// diagnostic protocols retain these captures for explicit offline review.
+    warnings: Vec<String>,
     failure: Option<String>,
 }
 
@@ -188,7 +196,7 @@ struct ResolvedController {
     min_half_us: u32,
     /// `"protocol"` or `"sensor_telemetry"`.
     min_half_us_source: &'static str,
-    pixel_dead_time_us: f32,
+    pixel_dead_time_us: Option<f32>,
     refractory_floor_us: u32,
     settling_guard_us: u32,
 }
@@ -212,6 +220,8 @@ struct PlateauStep {
     acknowledged_sample_index: u64,
     stream_epoch: u64,
     level: Option<PhotodiodeLevelV1>,
+    windows: [Option<PhotodiodeLevelV1>; PLATEAU_WINDOWS],
+    window_count: usize,
 }
 
 impl PlateauStep {
@@ -221,6 +231,8 @@ impl PlateauStep {
             acknowledged_sample_index: 0,
             stream_epoch: 0,
             level: None,
+            windows: [None; PLATEAU_WINDOWS],
+            window_count: 0,
         }
     }
 }
@@ -245,6 +257,12 @@ struct MeasuredThreshold {
     high_plateau_volts: f64,
     low_window_peak_to_peak_volts: f64,
     high_window_peak_to_peak_volts: f64,
+    low_windows: Vec<PhotodiodeLevelV1>,
+    high_windows: Vec<PhotodiodeLevelV1>,
+    low_mean_spread_volts: f64,
+    high_mean_spread_volts: f64,
+    mean_difference_standard_error_volts: f64,
+    noisy_crossing_requires_review: bool,
     span_volts: f64,
     midpoint_volts: f64,
     threshold_dac: u16,
@@ -323,6 +341,9 @@ struct Run {
     last_event_bin_us: Option<u64>,
     last_event_bin_count: u64,
     evidence: PointEvidence,
+    review_points: usize,
+    cleanup_failures: Vec<String>,
+    pd_progress: Option<(u64, u64)>,
 }
 
 pub struct StageAA2Plugin {
@@ -450,9 +471,6 @@ impl StageAA2Plugin {
         {
             return Some("choose the data folder in the photodiode plugin".into());
         }
-        if self.sensor.and_then(|s| s.pixel_dead_time_us).is_none() {
-            return Some("sensor pixel-dead-time readout is missing".into());
-        }
         if self
             .modulation
             .as_ref()
@@ -491,7 +509,10 @@ impl StageAA2Plugin {
         // before either owner lease is acquired: an unresolvable lobe, an
         // unresolvable step floor or an unreachable plateau must refuse while
         // the bench is still untouched.
-        let controller = ControllerSetup::default();
+        let controller = ControllerSetup {
+            min_half_us: (plan.timing_reference == A2TimingReferenceV1::DriveSync).then_some(0),
+            ..ControllerSetup::default()
+        };
         let photodiode_setup = resolve_photodiode(
             self.photodiode
                 .as_ref()
@@ -570,6 +591,9 @@ impl StageAA2Plugin {
             last_event_bin_us: None,
             last_event_bin_count: 0,
             evidence: PointEvidence::default(),
+            review_points: 0,
+            cleanup_failures: Vec::new(),
+            pd_progress: None,
         });
         self.send_host(
             control,
@@ -593,6 +617,11 @@ impl StageAA2Plugin {
         command: ModulationCommandV1,
         revision: bool,
     ) {
+        let pending_kind = if matches!(command, ModulationCommandV1::RenewLease { .. }) {
+            PendingKind::RenewMod
+        } else {
+            PendingKind::Mod
+        };
         let request_id = self.next_id();
         let (lease, lease_run_id, owner) = {
             let run = self.run.as_ref().unwrap();
@@ -617,7 +646,7 @@ impl StageAA2Plugin {
             service: SERVICE_STAGE_A_MODULATION_CONTROL_V1.into(),
             payload: serde_json::to_value(e).unwrap(),
         });
-        self.run.as_mut().unwrap().pending = Some((PendingKind::Mod, request_id, now_ms()));
+        self.run.as_mut().unwrap().pending = Some((pending_kind, request_id, now_ms()));
     }
 
     fn send_pd(
@@ -626,6 +655,11 @@ impl StageAA2Plugin {
         command: PhotodiodeCommandV1,
         revision: bool,
     ) {
+        let pending_kind = if matches!(command, PhotodiodeCommandV1::RenewLease { .. }) {
+            PendingKind::RenewPd
+        } else {
+            PendingKind::Pd
+        };
         let request_id = self.next_id();
         let (lease, lease_run_id, owner) = {
             let run = self.run.as_ref().unwrap();
@@ -650,7 +684,7 @@ impl StageAA2Plugin {
             service: SERVICE_STAGE_A_PHOTODIODE_CONTROL_V1.into(),
             payload: serde_json::to_value(e).unwrap(),
         });
-        self.run.as_mut().unwrap().pending = Some((PendingKind::Pd, request_id, now_ms()));
+        self.run.as_mut().unwrap().pending = Some((pending_kind, request_id, now_ms()));
     }
 
     fn send_host(&mut self, control: &mut impl Control, command: HostCommand) {
@@ -667,11 +701,6 @@ impl StageAA2Plugin {
             let r = self.run.as_ref().unwrap();
             r.protocol.points[r.index].clone()
         };
-        if should_pause(&p, self.run.as_ref().unwrap().pause_acknowledged) {
-            self.run.as_mut().unwrap().phase = Phase::Paused;
-            self.message = pause_message(&p);
-            return;
-        }
         let run = self.run.as_mut().unwrap();
         run.phase = Phase::Prepare;
         run.run_id = format!(
@@ -685,10 +714,15 @@ impl StageAA2Plugin {
         run.last_event_bin_count = 0;
         run.camera_stop_attempts = 0;
         run.probe = None;
+        if should_pause(&p, self.run.as_ref().unwrap().pause_acknowledged) {
+            self.run.as_mut().unwrap().phase = Phase::Paused;
+            self.message = pause_message(&p);
+            return;
+        }
         match p.acquisition {
             Acquisition::Dark { .. } => self.send_mod(
                 control,
-                ModulationCommandV1::StopAcquisition {
+                ModulationCommandV1::SafeOff {
                     reason: "A2 dark acquisition: force modulation safe/off".into(),
                 },
                 true,
@@ -699,6 +733,17 @@ impl StageAA2Plugin {
                 comparator_threshold_dac,
                 ..
             } => {
+                if self.run.as_ref().unwrap().protocol.timing_reference
+                    == A2TimingReferenceV1::DriveSync
+                {
+                    self.run
+                        .as_mut()
+                        .unwrap()
+                        .evidence
+                        .comparator_threshold_mode = Some("unused_drive_sync");
+                    self.send_prepare_a2(control, 0);
+                    return;
+                }
                 let key = pedestal_key(mean_u, depth_a);
                 self.run
                     .as_mut()
@@ -706,18 +751,6 @@ impl StageAA2Plugin {
                     .evidence
                     .comparator_threshold_mode = Some(comparator_threshold_dac.mode());
                 if let Some(code) = comparator_threshold_dac.frozen_code() {
-                    self.send_prepare_a2(control, code);
-                    return;
-                }
-                // `V_50` moves with the operating flux, so it is measured once
-                // per pedestal and reused by every point that shares one.
-                let measured = self
-                    .run
-                    .as_ref()
-                    .and_then(|run| run.thresholds.get(&key).cloned());
-                if let Some(measured) = measured {
-                    let code = measured.threshold_dac;
-                    self.run.as_mut().unwrap().evidence.threshold_measurement = Some(measured);
                     self.send_prepare_a2(control, code);
                     return;
                 }
@@ -770,6 +803,7 @@ impl StageAA2Plugin {
         };
         let hz = 1.0 / (2.0 * half_period_s);
         let configuration = A2AcquisitionConfigV1 {
+            timing_reference: self.run.as_ref().unwrap().protocol.timing_reference,
             mean_u_milli: (mean_u * 1000.0).round() as u32,
             depth_a_milli: (depth_a * 1000.0).round() as u32,
             frequency_millihz: (hz * 1000.0).round() as u64,
@@ -787,9 +821,12 @@ impl StageAA2Plugin {
         {
             let run = self.run.as_mut().unwrap();
             run.phase = Phase::Prepare;
+            run.modulation_active = true;
             run.probe = None;
             run.evidence.expected_triggers_per_polarity = u64::from(transitions_per_polarity);
-            run.evidence.comparator_threshold_dac = Some(threshold_dac);
+            run.evidence.comparator_threshold_dac = (run.protocol.timing_reference
+                == A2TimingReferenceV1::Comparator)
+                .then_some(threshold_dac);
         }
         self.send_mod(
             control,
@@ -812,6 +849,7 @@ impl StageAA2Plugin {
                 high: PlateauStep::new(plateaus.high_dac),
             });
             run.phase = Phase::PlateauLowDrive;
+            run.modulation_active = true;
         }
         self.message = format!(
             "Measuring V50 at mean_u={} m, a={} m: holding the dim plateau (DAC {})",
@@ -853,11 +891,26 @@ impl StageAA2Plugin {
             );
             return;
         }
+        let Some(_rate) = self
+            .photodiode
+            .as_ref()
+            .and_then(|pd| pd.stream.sample_rate_hz)
+            .filter(|r| *r > 0)
+        else {
+            self.fail(
+                control,
+                "photodiode sample rate is unavailable during V50 measurement".into(),
+            );
+            return;
+        };
         let now = now_ms();
         let run = self.run.as_mut().unwrap();
         if let Some(probe) = run.probe.as_mut() {
             let step = if low { &mut probe.low } else { &mut probe.high };
             step.acknowledged_sample_index = acknowledged_sample_index;
+            // The first accepted window must begin after the full settling guard.
+            step.windows = [None; PLATEAU_WINDOWS];
+            step.window_count = 0;
             step.stream_epoch = stream_epoch;
         }
         run.phase = if low {
@@ -920,18 +973,36 @@ impl StageAA2Plugin {
             );
             return;
         }
+        let rate = self
+            .photodiode
+            .as_ref()
+            .and_then(|pd| pd.stream.sample_rate_hz)
+            .unwrap_or(0);
+        let settled_index = step
+            .acknowledged_sample_index
+            .saturating_add(u64::from(rate) * PLATEAU_SETTLE_MS / 1000);
+        let previous_end = step
+            .windows
+            .iter()
+            .flatten()
+            .last()
+            .map_or(settled_index, |window| window.end_sample_index);
         let qualified = level.filter(|level| {
-            level.sample_count > 0
+            rate > 0
+                && level.sample_count >= (f64::from(rate) * MIN_LEVEL_WINDOW_SECONDS).ceil() as u64
                 && level.end_sample_index >= level.sample_count
-                && level.end_sample_index - level.sample_count >= step.acknowledged_sample_index
+                && level.end_sample_index - level.sample_count >= previous_end
         });
         let Some(level) = qualified else {
             if now >= timeout {
                 self.fail(
                     control,
                     format!(
-                        "no photodiode level window began after the acknowledged plateau drive \
-                         within {PLATEAU_LEVEL_TIMEOUT_MS} ms"
+                        "V50 {} plateau at DAC {}: only {}/{} fresh non-overlapping 20 ms windows \
+                         began after the acknowledged drive and 250 ms settling guard within {} ms; \
+                         last window end={:?}, required start >= {previous_end}. Check the PD stream for stale or short windows",
+                        if low { "dim" } else { "bright" }, step.level_dac, step.window_count,
+                        PLATEAU_WINDOWS, PLATEAU_LEVEL_TIMEOUT_MS, level.map(|v| v.end_sample_index)
                     ),
                 );
             }
@@ -948,6 +1019,27 @@ impl StageAA2Plugin {
             );
             return;
         }
+        if !level.mean_volts.is_finite()
+            || !level.peak_to_peak_volts.is_finite()
+            || level.peak_to_peak_volts < 0.0
+        {
+            self.fail(
+                control,
+                "photodiode plateau contains invalid voltage statistics".into(),
+            );
+            return;
+        }
+        let aggregate = {
+            let probe = self.run.as_mut().unwrap().probe.as_mut().unwrap();
+            let step = if low { &mut probe.low } else { &mut probe.high };
+            step.windows[step.window_count] = Some(level);
+            step.window_count += 1;
+            if step.window_count < PLATEAU_WINDOWS {
+                return;
+            }
+            aggregate_levels(step)
+        };
+        let level = aggregate;
         if low {
             let high_dac = {
                 let run = self.run.as_mut().unwrap();
@@ -1007,6 +1099,13 @@ impl StageAA2Plugin {
             }
         };
         let code = measured.threshold_dac;
+        if measured.noisy_crossing_requires_review {
+            self.run.as_mut().unwrap().evidence.warnings.push(format!(
+                "Photodiode raw noise is large: dim/bright peak-to-peak {:.1}/{:.1} mV, step {:.1} mV. \
+                 The averaged V50 is resolved; individual trigger timing needs offline review",
+                measured.low_window_peak_to_peak_volts * 1000.0,
+                measured.high_window_peak_to_peak_volts * 1000.0, measured.span_volts * 1000.0));
+        }
         self.message = format!(
             "V50 at mean_u={} m, a={} m: {:.1} mV span, threshold DAC {code}",
             measured.mean_u_milli,
@@ -1041,6 +1140,36 @@ impl StageAA2Plugin {
             ("duration_s", p.acquisition_seconds().to_string()),
             ("transfer_scope", "fluorescence_chain".into()),
             ("scientific_status", "requires_offline_h4_h5_review".into()),
+            ("photodiode_timebase", "continuous_dma_no_START".into()),
+            (
+                "sync_onset",
+                if r.protocol.timing_reference == A2TimingReferenceV1::DriveSync {
+                    "quiet_then_drive_after_both_recorders_open"
+                } else {
+                    "continuous_comparator"
+                }
+                .into(),
+            ),
+            (
+                "timing_reference",
+                format!("{:?}", r.protocol.timing_reference),
+            ),
+            (
+                "pd_marker_sample_index",
+                if r.evidence
+                    .marker_diagnostics_before
+                    .is_some_and(|d| d.dma_sample_clock)
+                {
+                    "dma_cursor_v1"
+                } else {
+                    "unverified_or_foreground_estimate"
+                }
+                .into(),
+            ),
+            (
+                "trigger_validation",
+                format!("{:?}", r.protocol.trigger_validation),
+            ),
             (
                 "photodiode_placement",
                 photodiode_placement_name(r.photodiode_setup.placement).into(),
@@ -1153,6 +1282,17 @@ impl StageAA2Plugin {
     }
 
     fn release_next(&mut self, control: &mut impl Control) {
+        if self.run.as_ref().is_some_and(|r| {
+            r.abort_reason.is_some() && !r.run_id.is_empty() && r.index < r.protocol.points.len()
+        }) {
+            if let Err(error) = self.write_sidecar() {
+                let run = self.run.as_mut().unwrap();
+                let problem = format!("cannot save A2 sidecar: {error}");
+                if !run.cleanup_failures.contains(&problem) {
+                    run.cleanup_failures.push(problem);
+                }
+            }
+        }
         let Some(run) = self.run.as_ref() else { return };
         if run.pd_leased {
             self.run.as_mut().unwrap().phase = Phase::ReleasePd;
@@ -1180,6 +1320,11 @@ impl StageAA2Plugin {
                     "{}; camera restore was not confirmed after 3 attempts",
                     self.message
                 );
+                self.run
+                    .as_mut()
+                    .unwrap()
+                    .cleanup_failures
+                    .push("camera restore was not confirmed after 3 attempts".into());
                 self.run.as_mut().unwrap().camera_session_active = false;
                 self.finish_run();
                 return;
@@ -1200,30 +1345,65 @@ impl StageAA2Plugin {
     }
 
     fn finish_run(&mut self) {
-        let failed = self
-            .run
-            .as_ref()
-            .and_then(|run| run.abort_reason.as_ref())
-            .is_some();
-        if !failed {
-            self.message = "A2 protocol finished; inspect point sidecars and offline first-event distributions".into();
+        if let Some(run) = self.run.as_mut() {
+            if run.index >= run.protocol.points.len() {
+                run.index = run.protocol.points.len() - 1;
+            }
         }
-        self.run = None;
+        if self.run.as_ref().is_some_and(|r| !r.run_id.is_empty()) {
+            if let Err(error) = self.write_sidecar() {
+                self.run
+                    .as_mut()
+                    .unwrap()
+                    .abort_reason
+                    .get_or_insert(format!("cannot save final A2 sidecar: {error}"));
+            }
+        }
+        if let Some(run) = self.run.take() {
+            self.message = if let Some(reason) = run.abort_reason {
+                format!(
+                    "A2 stopped: {reason}. Files retained in {}/{}",
+                    self.output_folder, run.measurement_id
+                )
+            } else if run.review_points > 0 {
+                format!("A2 capture finished; {} point(s) require offline timing review. This is not a passed latency measurement. Files: {}/{}",
+                    run.review_points, self.output_folder, run.measurement_id)
+            } else {
+                format!("A2 acquisition checks passed; H4/H5 and offline first-event analysis remain required. Files: {}/{}",
+                    self.output_folder, run.measurement_id)
+            };
+            if !run.cleanup_failures.is_empty() {
+                self.message.push_str(&format!(
+                    "; CLEANUP NOT CONFIRMED: {}",
+                    run.cleanup_failures.join("; ")
+                ));
+            }
+        }
     }
 
     fn fail(&mut self, control: &mut impl Control, reason: String) {
-        self.message = format!("A2 failed closed: {reason}");
         let Some(run) = self.run.as_mut() else { return };
+        let reason = format!(
+            "point {} '{}' ({:?}): {reason}",
+            run.index + 1,
+            run.protocol
+                .points
+                .get(run.index)
+                .map_or("cleanup", |p| p.label.as_str()),
+            run.phase
+        );
         run.stop = true;
-        run.evidence.failure = Some(reason.clone());
-        run.abort_reason = Some(reason);
+        run.evidence.valid = false;
+        run.evidence.failure.get_or_insert(reason.clone());
+        run.abort_reason.get_or_insert(reason);
+        self.message = format!("A2 stopped: {}", run.abort_reason.as_deref().unwrap());
         run.pending = None;
         if run.modulation_active {
             run.phase = Phase::StopMod;
             self.send_mod(
                 control,
-                ModulationCommandV1::StopAcquisition {
-                    reason: "A2 abort".into(),
+                ModulationCommandV1::SetWaveform {
+                    waveform: WaveformV1::Off,
                 },
                 true,
             );
@@ -1255,7 +1435,7 @@ impl StageAA2Plugin {
                 r.abort_reason = Some("operator stopped A2".into());
             }
         }
-        if self.continue_pending {
+        if self.continue_pending && !self.run.as_ref().is_some_and(|r| r.stop) {
             self.continue_pending = false;
             if self.run.as_ref().is_some_and(|r| r.phase == Phase::Paused) {
                 self.run.as_mut().unwrap().pause_acknowledged = true;
@@ -1263,15 +1443,71 @@ impl StageAA2Plugin {
             }
         }
         let Some(run) = self.run.as_ref() else { return };
+        if !run.stop
+            && !matches!(
+                run.phase,
+                Phase::ReleasePd | Phase::ReleaseMod | Phase::RestoreCamera
+            )
+        {
+            let owner_changed = self.modulation.as_ref().is_none_or(|m| {
+                m.owner_instance.as_str() != run.resolved.modulation_owner_instance
+                    || !matches!(m.connection, ConnectionStateV1::Connected { .. })
+            }) || self.photodiode.as_ref().is_none_or(|p| {
+                p.owner_instance.as_str() != run.photodiode_setup.owner_instance
+                    || !matches!(p.connection, ConnectionStateV1::Connected { .. })
+            });
+            if owner_changed {
+                self.fail(
+                    control,
+                    "device owner disconnected or restarted during A2".into(),
+                );
+                return;
+            }
+        }
+        if run.phase == Phase::Recording && !run.stop {
+            let current = self
+                .photodiode
+                .as_ref()
+                .and_then(|pd| pd.stream.sample_range)
+                .map(|r| r.end_sample_index_exclusive);
+            let now = now_ms();
+            let run = self.run.as_mut().unwrap();
+            let previous = run.pd_progress;
+            if let Some(index) = current {
+                if previous.is_none_or(|(old, _)| old != index) {
+                    run.pd_progress = Some((index, now));
+                }
+            }
+            if previous.is_some_and(|(_, at)| now.saturating_sub(at) > 5_000)
+                && previous == run.pd_progress
+            {
+                self.fail(
+                    control,
+                    "photodiode samples stopped advancing for 5 s during recording".into(),
+                );
+                return;
+            }
+        }
+        let run = self.run.as_ref().unwrap();
         if let Some((_, _, sent)) = run.pending {
             if now_ms().saturating_sub(sent) > TIMEOUT_MS {
                 match run.phase {
                     Phase::ReleasePd => {
+                        self.run
+                            .as_mut()
+                            .unwrap()
+                            .cleanup_failures
+                            .push("photodiode lease release timed out".into());
                         self.run.as_mut().unwrap().pd_leased = false;
                         self.run.as_mut().unwrap().pending = None;
                         self.release_next(control);
                     }
                     Phase::ReleaseMod => {
+                        self.run
+                            .as_mut()
+                            .unwrap()
+                            .cleanup_failures
+                            .push("modulation safe-off/release timed out".into());
                         self.run.as_mut().unwrap().mod_leased = false;
                         self.run.as_mut().unwrap().pending = None;
                         self.release_next(control);
@@ -1280,7 +1516,9 @@ impl StageAA2Plugin {
                         let run = self.run.as_mut().unwrap();
                         run.pending = None;
                         run.pd_recording = false;
-                        run.evidence.failure = Some("photodiode finalize timed out".into());
+                        run.evidence
+                            .failure
+                            .get_or_insert("photodiode finalize timed out".into());
                         self.stop_camera(control);
                     }
                     Phase::StopCamera => {
@@ -1290,13 +1528,25 @@ impl StageAA2Plugin {
                         } else {
                             let run = self.run.as_mut().unwrap();
                             run.camera_recording = false;
-                            run.evidence.failure =
-                                Some("camera stop timed out after 3 attempts".into());
-                            let _ = self.write_sidecar();
+                            run.evidence.valid = false;
+                            run.stop = true;
+                            let reason = "camera stop timed out after 3 attempts".to_string();
+                            run.evidence.failure.get_or_insert(reason.clone());
+                            run.abort_reason.get_or_insert(reason);
                             self.release_next(control);
                         }
                     }
-                    _ => self.fail(control, "owner/host reply timed out".into()),
+                    Phase::StopMod => {
+                        let run = self.run.as_mut().unwrap();
+                        run.modulation_active = false;
+                        run.cleanup_failures
+                            .push("modulation stop timed out; release will retry safe-off".into());
+                        self.fail(control, "modulation stop timed out".into());
+                    }
+                    _ => self.fail(
+                        control,
+                        format!("owner/host reply timed out after {TIMEOUT_MS} ms"),
+                    ),
                 }
             }
             return;
@@ -1315,14 +1565,24 @@ impl StageAA2Plugin {
             let reason = run
                 .abort_reason
                 .clone()
+                .or_else(|| run.evidence.failure.clone())
                 .unwrap_or_else(|| "A2 stopped".into());
             self.fail(control, reason);
             return;
         }
-        if !matches!(
-            run.phase,
-            Phase::AcquireMod | Phase::AcquirePd | Phase::ReleasePd | Phase::ReleaseMod
-        ) && now_ms() >= run.next_renew_ms
+        if run.mod_leased
+            && run.pd_leased
+            && !run.stop
+            && !matches!(
+                run.phase,
+                Phase::StopMod
+                    | Phase::FinalizePd
+                    | Phase::StopCamera
+                    | Phase::ReleasePd
+                    | Phase::ReleaseMod
+                    | Phase::RestoreCamera
+            )
+            && now_ms() >= run.next_renew_ms
         {
             self.send_mod(
                 control,
@@ -1368,8 +1628,8 @@ impl StageAA2Plugin {
                     self.run.as_mut().unwrap().phase = Phase::StopMod;
                     self.send_mod(
                         control,
-                        ModulationCommandV1::StopAcquisition {
-                            reason: "A2 point complete".into(),
+                        ModulationCommandV1::SetWaveform {
+                            waveform: WaveformV1::Off,
                         },
                         true,
                     );
@@ -1382,16 +1642,88 @@ impl StageAA2Plugin {
 
     fn accepted(&mut self, control: &mut impl Control, kind: PendingKind, payload: &Value) {
         let phase = self.run.as_ref().unwrap().phase;
-        if kind == PendingKind::Mod {
-            if let Ok(response) = serde_json::from_value::<ModulationResponseV1>(payload.clone()) {
-                if response.common.outcome == RequestOutcomeV1::InProgress {
-                    self.run.as_mut().unwrap().pending =
-                        Some((PendingKind::Mod, response.common.request_id.0, now_ms()));
-                    return;
+        if kind != PendingKind::Host {
+            let common = match kind {
+                PendingKind::Mod | PendingKind::RenewMod => {
+                    serde_json::from_value::<ModulationResponseV1>(payload.clone())
+                        .map(|r| r.common)
+                }
+                _ => serde_json::from_value::<PhotodiodeResponseV1>(payload.clone())
+                    .map(|r| r.common),
+            };
+            match common {
+                Ok(common) => {
+                    let run = self.run.as_ref().unwrap();
+                    let owner = match kind {
+                        PendingKind::Mod | PendingKind::RenewMod => {
+                            &run.resolved.modulation_owner_instance
+                        }
+                        _ => &run.photodiode_setup.owner_instance,
+                    };
+                    if run
+                        .pending
+                        .is_none_or(|(_, id, _)| id != common.request_id.0)
+                        || common.owner_instance.as_str() != owner
+                        || common
+                            .run_id
+                            .as_ref()
+                            .is_none_or(|id| id.as_str() != run.lease_run_id)
+                    {
+                        self.rejected(
+                            control,
+                            kind,
+                            "stale or mismatched owner response identity".into(),
+                        );
+                        return;
+                    }
+                    if common.outcome == RequestOutcomeV1::Rejected {
+                        let detail = common.error.map_or_else(
+                            || "owner rejected without details".into(),
+                            |e| owner_rejection_message(kind, &format!("{:?}", e.code), &e.message),
+                        );
+                        self.rejected(control, kind, detail);
+                        return;
+                    }
+                    if common.outcome == RequestOutcomeV1::InProgress {
+                        return;
+                    }
+                }
+                Err(_) => {
+                    if !cfg!(test) || !payload.is_null() {
+                        self.rejected(control, kind, "owner returned a malformed response".into());
+                        return;
+                    }
                 }
             }
         }
+        if kind == PendingKind::RenewMod {
+            self.run.as_mut().unwrap().pending = None;
+            self.send_pd(
+                control,
+                PhotodiodeCommandV1::RenewLease {
+                    ttl_ms: LEASE_TTL_MS,
+                },
+                false,
+            );
+            return;
+        }
+        if kind == PendingKind::RenewPd {
+            self.run.as_mut().unwrap().pending = None;
+            self.run.as_mut().unwrap().next_renew_ms = now_ms() + 20_000;
+            return;
+        }
         self.run.as_mut().unwrap().pending = None;
+        if kind == PendingKind::Mod {
+            if let Ok(response) = serde_json::from_value::<ModulationResponseV1>(payload.clone()) {
+                let evidence = &mut self.run.as_mut().unwrap().evidence;
+                if phase == Phase::Prepare || phase == Phase::StartStimulus {
+                    evidence.marker_diagnostics_before = response.marker_diagnostics;
+                }
+                if phase == Phase::StopMod {
+                    evidence.marker_diagnostics_after = response.marker_diagnostics;
+                }
+            }
+        }
         match (kind, phase) {
             (PendingKind::Mod, Phase::AcquireMod) => {
                 let run = self.run.as_mut().unwrap();
@@ -1415,11 +1747,28 @@ impl StageAA2Plugin {
             (PendingKind::Mod, Phase::PlateauHighDrive) => {
                 self.plateau_drive_acknowledged(control, false)
             }
-            (PendingKind::Mod, Phase::Prepare) => {
+            (PendingKind::Mod, Phase::Prepare)
+                if self.run.as_ref().unwrap().protocol.timing_reference
+                    == A2TimingReferenceV1::DriveSync
+                    && starts_modulation(&self.point().unwrap().acquisition) =>
+            {
+                self.run.as_mut().unwrap().phase = Phase::QuietBeforeCapture;
+                self.send_mod(
+                    control,
+                    ModulationCommandV1::SetWaveform {
+                        waveform: WaveformV1::Off,
+                    },
+                    true,
+                );
+            }
+            (PendingKind::Mod, Phase::Prepare | Phase::QuietBeforeCapture) => {
                 let settle = (self.point().unwrap().settle_s * 1000.0) as u64;
                 let r = self.run.as_mut().unwrap();
+                if phase == Phase::QuietBeforeCapture {
+                    r.modulation_active = false;
+                }
                 r.phase = Phase::Settle;
-                r.deadline_ms = now_ms() + settle;
+                r.deadline_ms = now_ms() + settle.max(250);
             }
             (PendingKind::Host, Phase::StartCamera) => {
                 let r = self.run.as_ref().unwrap();
@@ -1442,28 +1791,46 @@ impl StageAA2Plugin {
                     true,
                 );
             }
-            (PendingKind::Pd, Phase::StartPd) => {
-                if !starts_modulation(&self.point().unwrap().acquisition) {
-                    let seconds = self.point().unwrap().acquisition_seconds();
-                    let r = self.run.as_mut().unwrap();
-                    r.phase = Phase::Recording;
-                    r.deadline_ms = now_ms() + (seconds * 1000.0) as u64;
-                } else {
-                    let run = self.run.as_mut().unwrap();
-                    run.phase = Phase::StartMod;
-                    run.modulation_active = true;
-                    self.send_mod(control, ModulationCommandV1::StartAcquisition, true);
-                }
+            (PendingKind::Pd, Phase::StartPd)
+                if self.run.as_ref().unwrap().protocol.timing_reference
+                    == A2TimingReferenceV1::DriveSync
+                    && starts_modulation(&self.point().unwrap().acquisition) =>
+            {
+                // Both files are open before the first phase-zero pulse. The quiet
+                // lead-in makes the first shared cycle identifiable independently
+                // of USB/host recorder start latency.
+                self.send_prepare_a2(control, 0);
+                self.run.as_mut().unwrap().phase = Phase::StartStimulus;
             }
-            (PendingKind::Mod, Phase::StartMod) => {
+            (PendingKind::Pd, Phase::StartPd) | (PendingKind::Mod, Phase::StartStimulus) => {
                 let seconds = self.point().unwrap().acquisition_seconds();
                 let r = self.run.as_mut().unwrap();
                 r.phase = Phase::Recording;
-                r.deadline_ms = now_ms() + (seconds * 1000.0) as u64;
+                r.pd_progress = Some((
+                    self.photodiode
+                        .as_ref()
+                        .and_then(|pd| pd.stream.sample_range)
+                        .map_or(0, |range| range.end_sample_index_exclusive),
+                    now_ms(),
+                ));
+                r.deadline_ms = now_ms() + (seconds * 1000.0).ceil() as u64;
+                self.message = format!(
+                    "Recording point {}: {} ({seconds:.3} s)",
+                    r.index + 1,
+                    r.protocol.points[r.index].label
+                );
             }
             (PendingKind::Mod, Phase::StopMod) => {
                 let run = self.run.as_mut().unwrap();
                 run.modulation_active = false;
+                if !run.pd_recording {
+                    if run.camera_recording {
+                        self.stop_camera(control);
+                    } else {
+                        self.release_next(control);
+                    }
+                    return;
+                }
                 run.phase = Phase::FinalizePd;
                 let termination = if run.abort_reason.is_some() {
                     PdqTerminationV1::Aborted
@@ -1483,12 +1850,28 @@ impl StageAA2Plugin {
                         Some(PdqReceiptV1::Finalized(receipt)) => Some(receipt),
                         _ => None,
                     });
+                let requested_seconds = self.point().unwrap().acquisition_seconds();
                 let e = &mut self.run.as_mut().unwrap().evidence;
                 if let Some(receipt) = finalized {
+                    let seconds = receipt
+                        .sample_range
+                        .zip(receipt.sample_rate_hz)
+                        .filter(|(_, rate)| *rate > 0)
+                        .map(|(range, rate)| range.sample_count as f64 / f64::from(rate));
+                    if seconds.is_none_or(|s| s + 0.05 < requested_seconds) {
+                        e.failure.get_or_insert(format!("PDQ does not cover the requested {:.3} s: sampled duration={seconds:?} s", requested_seconds));
+                    }
+                    e.pdq_marker_counts = receipt.marker_counts;
                     e.pdq_path = Some(receipt.pdq_path);
                     e.pdq_sha256 = Some(receipt.sha256.to_string());
-                    if !receipt.valid {
-                        e.failure = Some("PDQ receipt invalid".into());
+                    if !receipt.valid
+                        || !receipt.integrity.is_clean()
+                        || receipt.sample_frames_written == 0
+                        || receipt.segment_count != 1
+                        || receipt.termination != PdqTerminationV1::Completed
+                    {
+                        e.failure.get_or_insert(format!("PDQ receipt invalid: termination={:?}, sample frames={}, segments={}, integrity={:?}",
+                            receipt.termination, receipt.sample_frames_written, receipt.segment_count, receipt.integrity));
                     }
                 } else {
                     e.failure = Some("photodiode owner returned no finalized PDQ receipt".into());
@@ -1504,14 +1887,6 @@ impl StageAA2Plugin {
                 self.run.as_mut().unwrap().mod_leased = false;
                 self.release_next(control);
             }
-            (PendingKind::Mod, _) => self.send_pd(
-                control,
-                PhotodiodeCommandV1::RenewLease {
-                    ttl_ms: LEASE_TTL_MS,
-                },
-                false,
-            ),
-            (PendingKind::Pd, _) => self.run.as_mut().unwrap().next_renew_ms = now_ms() + 30_000,
             _ => {}
         }
     }
@@ -1534,8 +1909,43 @@ impl StageAA2Plugin {
         }
     }
 
+    fn rejected(&mut self, control: &mut impl Control, kind: PendingKind, reason: String) {
+        let Some(run) = self.run.as_mut() else { return };
+        run.pending = None;
+        match run.phase {
+            Phase::ReleasePd | Phase::ReleaseMod => {
+                run.cleanup_failures.push(reason);
+                if run.phase == Phase::ReleasePd {
+                    run.pd_leased = false;
+                } else {
+                    run.mod_leased = false;
+                }
+                self.release_next(control);
+            }
+            Phase::FinalizePd => {
+                run.pd_recording = false;
+                run.evidence.failure.get_or_insert(reason.clone());
+                run.abort_reason.get_or_insert(reason);
+                run.stop = true;
+                self.stop_camera(control);
+            }
+            Phase::StopMod => {
+                run.modulation_active = false;
+                run.cleanup_failures.push(format!(
+                    "modulation stop rejected: {reason}; release will retry safe-off"
+                ));
+                self.fail(control, reason);
+            }
+            _ => {
+                let _ = kind;
+                self.fail(control, reason);
+            }
+        }
+    }
+
     fn finish_async_mod(&mut self, control: &mut impl Control) {
-        let Some((PendingKind::Mod, request_id, _)) = self.run.as_ref().and_then(|r| r.pending)
+        let Some((kind @ (PendingKind::Mod | PendingKind::RenewMod), request_id, _)) =
+            self.run.as_ref().and_then(|r| r.pending)
         else {
             return;
         };
@@ -1551,71 +1961,68 @@ impl StageAA2Plugin {
         {
             return;
         }
-        if response.common.outcome == RequestOutcomeV1::Rejected {
-            let phase = self.run.as_ref().unwrap().phase;
-            if phase == Phase::ReleaseMod {
-                self.run.as_mut().unwrap().mod_leased = false;
-                self.release_next(control);
-            } else if phase == Phase::StopMod {
-                let run = self.run.as_mut().unwrap();
-                run.modulation_active = false;
-                run.phase = Phase::FinalizePd;
-                self.send_pd(
-                    control,
-                    PhotodiodeCommandV1::FinalizeRecording {
-                        termination: PdqTerminationV1::Aborted,
-                    },
-                    true,
-                );
-            } else {
-                let reason = response.common.error.as_ref().map_or_else(
-                    || {
-                        "The modulation plugin rejected A2 without an error detail. Check its \
-                         status line, then start A2 again."
-                            .into()
-                    },
-                    |error| {
-                        owner_rejection_message(
-                            PendingKind::Mod,
-                            &format!("{:?}", error.code),
-                            &error.message,
-                        )
-                    },
-                );
-                self.fail(control, reason);
-            }
-            return;
-        }
         let payload = serde_json::to_value(response).unwrap_or(Value::Null);
-        self.accepted(control, PendingKind::Mod, &payload);
+        self.accepted(control, kind, &payload);
     }
 
     fn finish_point(&mut self, control: &mut impl Control, outcome: &HostCommandOutcome) {
         if let HostCommandOutcome::RecordingFinalized {
             actual_raw_path,
-            size: _,
+            size,
             sha256,
-            duration_us: _,
+            duration_us,
         } = outcome
         {
             let acquisition = {
                 let run = self.run.as_ref().unwrap();
                 run.protocol.points[run.index].acquisition.clone()
             };
+            let reference = self.run.as_ref().unwrap().protocol.timing_reference;
             let e = &mut self.run.as_mut().unwrap().evidence;
             e.raw_path = Some(actual_raw_path.clone());
             e.raw_sha256 = Some(sha256.clone());
+            if *size == 0 || *duration_us == 0 {
+                e.failure
+                    .get_or_insert("camera receipt contains no recorded data".into());
+            }
             let trigger_problem =
                 validate_trigger_counts(&acquisition, e.rising_triggers, e.falling_triggers).err();
-            if e.failure.is_none() {
-                e.failure = trigger_problem;
+            if let Some(problem) = trigger_problem {
+                e.warnings.push(problem);
             }
-            e.valid = e.failure.is_none();
+            if starts_modulation(&acquisition) {
+                match (e.marker_diagnostics_before, e.marker_diagnostics_after) {
+                    (Some(before), Some(after)) if before.dma_sample_clock && after.dma_sample_clock
+                        && before.marker_drops == after.marker_drops
+                        && before.stream_marker_drops == after.stream_marker_drops => {},
+                    counters => e.warnings.push(format!("Firmware marker-loss evidence needs review: {counters:?}. \
+                        Missing DMA-clock confirmation/status counters, resets or increasing drops prevent an assumed one-to-one clock match")),
+                }
+                match e.pdq_marker_counts {
+                    Some(c) if c.invalid_level == 0 && match reference {
+                        A2TimingReferenceV1::Comparator => c.comparator_rising > 0 && c.comparator_falling > 0,
+                        A2TimingReferenceV1::DriveSync => c.phase_zero > 0,
+                    } => {},
+                    counts => e.warnings.push(format!("PDQ shared time reference is missing or incomplete: {counts:?}. \
+                        Do not align by edge ordinal alone; inspect marker source, level and device ticks against camera RAW triggers")),
+                }
+            }
+            e.valid = e.failure.is_none() && e.warnings.is_empty();
             self.run.as_mut().unwrap().camera_recording = false;
-        } else if let HostCommandOutcome::RecordingPartial { reason, .. } = outcome {
+        } else if let HostCommandOutcome::RecordingPartial {
+            actual_raw_path,
+            sha256,
+            reason,
+            ..
+        } = outcome
+        {
             let run = self.run.as_mut().unwrap();
             run.camera_recording = false;
-            run.evidence.failure = Some(format!("RAW finalized partially: {reason}"));
+            run.evidence.raw_path = Some(actual_raw_path.clone());
+            run.evidence.raw_sha256 = sha256.clone();
+            run.evidence
+                .failure
+                .get_or_insert(format!("RAW finalized partially: {reason}"));
         } else if self.run.as_ref().unwrap().camera_stop_attempts < 3 {
             self.stop_camera(control);
             return;
@@ -1626,12 +2033,33 @@ impl StageAA2Plugin {
                 "camera stop was not confirmed after 3 attempts: {outcome:?}"
             ));
         }
-        let _ = self.write_sidecar();
-        if self
-            .run
-            .as_ref()
-            .is_some_and(|run| run.abort_reason.is_some())
         {
+            let r = self.run.as_mut().unwrap();
+            if r.evidence.failure.is_none() && !r.evidence.warnings.is_empty() {
+                if r.protocol.trigger_validation == TriggerValidation::Strict {
+                    r.evidence.failure = Some(r.evidence.warnings.join("; "));
+                } else {
+                    r.review_points += 1;
+                }
+            }
+            if let Some(reason) = r.evidence.failure.clone() {
+                r.evidence.valid = false;
+                r.stop = true;
+                r.abort_reason.get_or_insert(format!(
+                    "point {} '{}': {reason}",
+                    r.index + 1,
+                    r.protocol.points[r.index].label
+                ));
+            }
+        }
+        if let Err(error) = self.write_sidecar() {
+            let run = self.run.as_mut().unwrap();
+            run.stop = true;
+            run.evidence.valid = false;
+            run.abort_reason
+                .get_or_insert(format!("cannot save A2 sidecar: {error}"));
+        }
+        if self.run.as_ref().is_some_and(|run| run.stop) {
             self.release_next(control);
         } else {
             self.advance(control);
@@ -1692,10 +2120,9 @@ impl StageAA2Plugin {
                 self.run.as_mut().unwrap().restore_attempts += 1;
                 self.send_host(control, HostCommand::RestoreCameraConfiguration);
             } else {
-                self.message = format!(
-                    "{}; camera restore was not confirmed after 3 attempts: {:?}",
-                    self.message, outcome
-                );
+                self.run.as_mut().unwrap().cleanup_failures.push(format!(
+                    "camera restore was not confirmed after 3 attempts: {outcome:?}"
+                ));
                 self.run.as_mut().unwrap().camera_session_active = false;
                 self.finish_run();
             }
@@ -1726,8 +2153,11 @@ impl StageAA2Plugin {
         #[derive(Serialize)]
         struct Side<'a> {
             schema_version: u32,
+            trigger_validation: TriggerValidation,
+            cleanup_failures: &'a [String],
             experiment: &'static str,
             scientific_status: &'static str,
+            timing_reference: A2TimingReferenceV1,
             protocol_path: &'a str,
             protocol_sha256: &'a str,
             protocol_archive_path: &'a str,
@@ -1753,9 +2183,12 @@ impl StageAA2Plugin {
             age_s: f64,
         }
         let s = Side {
-            schema_version: 1,
+            schema_version: 2,
+            trigger_validation: r.protocol.trigger_validation,
+            cleanup_failures: &r.cleanup_failures,
             experiment: "A2",
             scientific_status: "requires_offline_h4_h5_review",
+            timing_reference: r.protocol.timing_reference,
             protocol_path: &r.protocol_path,
             protocol_sha256: &r.protocol_sha256,
             protocol_archive_path: &r.protocol_archive_path,
@@ -1838,18 +2271,27 @@ impl Plugin for StageAA2Plugin {
                     r.evidence.peak_events_per_us.max(r.last_event_bin_count);
             }
             for t in frame.external_triggers() {
+                if r.camera_snapshot
+                    .as_ref()
+                    .is_some_and(|s| i32::from(s.external_trigger.channel) != i32::from(t.id))
+                {
+                    continue;
+                }
                 if t.is_rising() {
                     r.evidence.rising_triggers += 1
                 } else {
                     r.evidence.falling_triggers += 1
                 }
             }
-            if r.evidence.peak_events_per_us > RECORDER_SAFETY_LIMIT_EVENTS_PER_US {
-                r.stop = true;
-                r.evidence.failure = Some(format!(
-                    "pre-qualified recorder safety limit exceeded: {} events/us",
-                    r.evidence.peak_events_per_us
-                ));
+            if r.evidence.peak_events_per_us > RECORDER_SAFETY_LIMIT_EVENTS_PER_US
+                && !r
+                    .evidence
+                    .warnings
+                    .iter()
+                    .any(|v| v.starts_with("Event-load review"))
+            {
+                r.evidence.warnings.push(format!("Event-load review: preview peak {} events/us exceeds the conservative {} events/us advisory; H21 must be evaluated offline",
+                    r.evidence.peak_events_per_us, RECORDER_SAFETY_LIMIT_EVENTS_PER_US));
             }
         }
     }
@@ -1867,34 +2309,11 @@ impl Plugin for StageAA2Plugin {
                     self.accepted(c, expected.unwrap().0, &payload)
                 }
                 PluginServiceOutcome::Rejected { code, message } => {
-                    let kind = expected.unwrap().0;
-                    let phase = self.run.as_ref().unwrap().phase;
-                    if phase == Phase::ReleasePd {
-                        self.run.as_mut().unwrap().pd_leased = false;
-                        self.release_next(c);
-                    } else if phase == Phase::ReleaseMod {
-                        self.run.as_mut().unwrap().mod_leased = false;
-                        self.release_next(c);
-                    } else if phase == Phase::FinalizePd {
-                        let run = self.run.as_mut().unwrap();
-                        run.pd_recording = false;
-                        run.evidence.failure = Some(format!("{code}: {message}"));
-                        self.stop_camera(c);
-                    } else if phase == Phase::StopMod {
-                        let run = self.run.as_mut().unwrap();
-                        run.modulation_active = false;
-                        run.evidence.failure = Some(format!("{code}: {message}"));
-                        run.phase = Phase::FinalizePd;
-                        self.send_pd(
-                            c,
-                            PhotodiodeCommandV1::FinalizeRecording {
-                                termination: PdqTerminationV1::Aborted,
-                            },
-                            true,
-                        );
-                    } else {
-                        self.fail(c, owner_rejection_message(kind, &code, &message))
-                    }
+                    self.rejected(
+                        c,
+                        expected.unwrap().0,
+                        owner_rejection_message(expected.unwrap().0, &code, &message),
+                    );
                 }
             }
         }
@@ -2117,6 +2536,23 @@ fn resolve_controller(
             controller.comparator_hysteresis
         ));
     }
+    if controller.min_half_us == Some(0) {
+        let dead_time = sensor
+            .and_then(|s| s.pixel_dead_time_us)
+            .filter(|v| v.is_finite() && *v > 0.0);
+        return Ok(ResolvedController {
+            lobe_source: "modulation_owner.optical_lobe",
+            v_null_dac: lobe.v_null_dac,
+            v_peak_dac: lobe.v_peak_dac,
+            modulation_calibration_id: lobe.calibration_id.clone(),
+            modulation_owner_instance: state.owner_instance.to_string(),
+            min_half_us: 0,
+            min_half_us_source: "offline_timing_review",
+            pixel_dead_time_us: dead_time,
+            refractory_floor_us: dead_time.map_or(0, |v| (5.0 * f64::from(v)).ceil() as u32),
+            settling_guard_us: 0,
+        });
+    }
     let Some(pixel_dead_time_us) = sensor.and_then(|s| s.pixel_dead_time_us) else {
         return Err(
             "sensor pixel-dead-time readout is missing, so the A2 step floor cannot be resolved"
@@ -2155,7 +2591,7 @@ fn resolve_controller(
         modulation_owner_instance: state.owner_instance.to_string(),
         min_half_us,
         min_half_us_source,
-        pixel_dead_time_us,
+        pixel_dead_time_us: Some(pixel_dead_time_us),
         refractory_floor_us,
         settling_guard_us: SETTLING_GUARD_US,
     })
@@ -2168,6 +2604,24 @@ fn resolve_controller(
 /// checked here instead, still before the camera apply and the owner leases.
 fn check_half_periods(plan: &Protocol, min_half_us: u32) -> Result<(), String> {
     for (index, point) in plan.points.iter().enumerate() {
+        if !point.acquisition_seconds().is_finite()
+            || point.acquisition_seconds() > 86_400.0
+            || point.settle_s > 86_400.0
+        {
+            return Err(format!(
+                "point {} exceeds the 24-hour duration limit",
+                index + 1
+            ));
+        }
+        if let Acquisition::Stepped { half_period_s, .. } = point.acquisition {
+            let frequency = (500.0 / half_period_s).round() as u64;
+            if !stage_a_plugin_contract::drive_frequency_supported(frequency)
+                || 500_000_000.0 / (frequency as f64) < f64::from(min_half_us)
+            {
+                return Err(format!("point {} half-period cannot be produced within the firmware frequency range and resolved min_half_us", index + 1));
+            }
+        }
+
         let Acquisition::Stepped { half_period_s, .. } = point.acquisition else {
             continue;
         };
@@ -2271,9 +2725,7 @@ fn plan_pedestals(
         else {
             continue;
         };
-        if !comparator_threshold_dac.is_auto() {
-            continue;
-        }
+        let _ = comparator_threshold_dac;
         let key = pedestal_key(mean_u, depth_a);
         if pedestals.contains_key(&key) {
             continue;
@@ -2300,13 +2752,56 @@ fn threshold_code_for_volts(volts: f64) -> Result<u16, String> {
     }
     let millivolt = volts * 1000.0;
     let code = (millivolt * f64::from(THRESHOLD_MAX_CODE) / THRESHOLD_FULL_SCALE_MILLIVOLT).round();
-    if !(1.0..=f64::from(THRESHOLD_MAX_CODE)).contains(&code) {
+    if !(0.0..=THRESHOLD_FULL_SCALE_MILLIVOLT).contains(&millivolt)
+        || !(1.0..=f64::from(THRESHOLD_MAX_CODE)).contains(&code)
+    {
         return Err(format!(
             "plateau midpoint {millivolt:.1} mV is outside the 0..2500 mV comparator threshold \
              DAC range"
         ));
     }
     Ok(code as u16)
+}
+
+fn aggregate_levels(step: &PlateauStep) -> PhotodiodeLevelV1 {
+    let levels: Vec<_> = step.windows.iter().flatten().copied().collect();
+    let count: u64 = levels.iter().map(|v| v.sample_count).sum();
+    PhotodiodeLevelV1 {
+        mean_volts: levels
+            .iter()
+            .map(|v| v.mean_volts * v.sample_count as f64)
+            .sum::<f64>()
+            / count as f64,
+        peak_to_peak_volts: levels
+            .iter()
+            .map(|v| v.peak_to_peak_volts)
+            .fold(0.0, f64::max),
+        sample_count: count,
+        end_sample_index: levels.last().unwrap().end_sample_index,
+        clipped: levels.iter().any(|v| v.clipped),
+    }
+}
+
+fn mean_statistics(windows: &[PhotodiodeLevelV1]) -> (f64, f64) {
+    if windows.len() < 2 {
+        return (0.0, 0.0);
+    }
+    let n = windows.len() as f64;
+    let mean = windows.iter().map(|v| v.mean_volts).sum::<f64>() / n;
+    let variance = windows
+        .iter()
+        .map(|v| (v.mean_volts - mean).powi(2))
+        .sum::<f64>()
+        / (n - 1.0);
+    let min = windows
+        .iter()
+        .map(|v| v.mean_volts)
+        .fold(f64::INFINITY, f64::min);
+    let max = windows
+        .iter()
+        .map(|v| v.mean_volts)
+        .fold(f64::NEG_INFINITY, f64::max);
+    (max - min, (variance / n).sqrt())
 }
 
 /// Turns two settled plateaus into a `V_50`, or explains why it will not.
@@ -2318,26 +2813,35 @@ fn measured_threshold(
     let span_volts = high.mean_volts - low.mean_volts;
     if !span_volts.is_finite() || span_volts < MIN_PLATEAU_SPAN_VOLTS {
         return Err(format!(
-            "plateau span {:.1} mV is under the {:.0} mV floor at mean_u={} m, a={} m; a threshold \
-             placed in here would be sitting in noise",
+            "plateau span {:.3} mV is under the {:.3} mV threshold-DAC resolution floor at mean_u={} m, a={} m; increase the optical step",
             span_volts * 1000.0,
             MIN_PLATEAU_SPAN_VOLTS * 1000.0,
             probe.mean_u_milli,
             probe.depth_a_milli
         ));
     }
-    // A settled hold has a small peak-to-peak. A window that wanders over a
-    // large share of the very step it is meant to define was still slewing, and
-    // its mean is not a plateau.
-    let spread_ceiling = MAX_PLATEAU_WINDOW_SPREAD_FRACTION * span_volts;
-    for (label, level) in [("dim", low), ("bright", high)] {
-        if !level.peak_to_peak_volts.is_finite() || level.peak_to_peak_volts > spread_ceiling {
-            return Err(format!(
-                "{label} plateau window wanders {:.1} mV over a {:.1} mV step; it had not settled",
-                level.peak_to_peak_volts * 1000.0,
-                span_volts * 1000.0
-            ));
-        }
+    let low_windows: Vec<_> = probe.low.windows.iter().flatten().copied().collect();
+    let high_windows: Vec<_> = probe.high.windows.iter().flatten().copied().collect();
+    let (low_spread, low_se) = mean_statistics(&low_windows);
+    let (high_spread, high_se) = mean_statistics(&high_windows);
+    let difference_se = low_se.hypot(high_se);
+    if low_spread > MAX_PLATEAU_MEAN_SPREAD_FRACTION * span_volts
+        || high_spread > MAX_PLATEAU_MEAN_SPREAD_FRACTION * span_volts
+        || span_volts <= 6.0 * difference_se
+    {
+        return Err(format!(
+            "V50 unresolved: dim/bright mean {:.2}/{:.2} mV; step {:.2} mV; \
+            spread of independent window means {:.2}/{:.2} mV; mean-difference SE {:.2} mV. \
+            Raw peak-to-peak {:.1}/{:.1} mV. Increase optical step or reduce drift/noise",
+            low.mean_volts * 1000.0,
+            high.mean_volts * 1000.0,
+            span_volts * 1000.0,
+            low_spread * 1000.0,
+            high_spread * 1000.0,
+            difference_se * 1000.0,
+            low.peak_to_peak_volts * 1000.0,
+            high.peak_to_peak_volts * 1000.0
+        ));
     }
     let midpoint_volts = 0.5 * (low.mean_volts + high.mean_volts);
     let threshold_dac = threshold_code_for_volts(midpoint_volts)?;
@@ -2350,6 +2854,13 @@ fn measured_threshold(
         high_plateau_volts: high.mean_volts,
         low_window_peak_to_peak_volts: low.peak_to_peak_volts,
         high_window_peak_to_peak_volts: high.peak_to_peak_volts,
+        low_windows,
+        high_windows,
+        low_mean_spread_volts: low_spread,
+        high_mean_spread_volts: high_spread,
+        mean_difference_standard_error_volts: difference_se,
+        noisy_crossing_requires_review: low.peak_to_peak_volts > 0.5 * span_volts
+            || high.peak_to_peak_volts > 0.5 * span_volts,
         span_volts,
         midpoint_volts,
         threshold_dac,
@@ -2382,6 +2893,13 @@ fn should_pause(point: &Point, acknowledged: bool) -> bool {
 }
 
 fn pause_message(point: &Point) -> String {
+    if point.role == "blocked_drive_sham" {
+        return format!(
+            "Paused before '{}': keep the optical path blocked. A2 will run the drive \
+            and record the blocked-drive electrical/crosstalk reference. Then press Continue.",
+            point.label
+        );
+    }
     match point.acquisition {
         Acquisition::Dark { duration_s } => format!(
             "Paused before '{}': close or block the optical path so no light reaches the camera \
@@ -2407,8 +2925,8 @@ fn pause_message(point: &Point) -> String {
 
 fn owner_rejection_message(kind: PendingKind, code: &str, message: &str) -> String {
     let owner = match kind {
-        PendingKind::Mod => "modulation plugin",
-        PendingKind::Pd => "photodiode plugin",
+        PendingKind::Mod | PendingKind::RenewMod => "modulation plugin",
+        PendingKind::Pd | PendingKind::RenewPd => "photodiode plugin",
         PendingKind::Host => "camera host",
     };
     let lease_problem = code.to_ascii_lowercase().contains("lease")
@@ -2444,7 +2962,7 @@ fn validate_trigger_counts(
     let maximum = expected.saturating_add(1);
     if !(minimum..=maximum).contains(&rising) || !(minimum..=maximum).contains(&falling) {
         return Err(format!(
-            "external-trigger count implausible: expected {expected} +/- 1 per polarity, observed rising={rising}, falling={falling}"
+            "live-preview trigger count differs (preview is best-effort; verify RAW offline): expected {expected} +/- 1 per polarity, observed rising={rising}, falling={falling}"
         ));
     }
     Ok(())
@@ -2708,7 +3226,7 @@ settle_s=0
                 contract_version: CONTRACT_VERSION_V1,
                 request_id: RequestId(request_id),
                 owner_instance: OwnerInstanceId::new("pd-test"),
-                run_id: Some(RunId::new(run_id)),
+                run_id: Some(RunId::new(run_id.split("_r").next().unwrap())),
                 requested_revision: None,
                 acknowledged_revision: None,
                 outcome: RequestOutcomeV1::Applied,
@@ -2725,7 +3243,17 @@ settle_s=0
                 sha256: Sha256V1::parse("cd".repeat(32)).unwrap(),
                 frames_written: 1,
                 sample_frames_written: 1,
-                sample_range: None,
+                marker_counts: Some(stage_a_plugin_contract::PdqMarkerCountsV1 {
+                    comparator_rising: 2,
+                    comparator_falling: 2,
+                    phase_zero: 2,
+                    invalid_level: 0,
+                }),
+                sample_range: Some(stage_a_plugin_contract::SampleRangeV1 {
+                    first_sample_index: 0,
+                    end_sample_index_exclusive: 5_000,
+                    sample_count: 5_000,
+                }),
                 sample_rate_hz: Some(500_000),
                 segment_count: 1,
                 integrity: StreamIntegrityV1::default(),
@@ -2936,7 +3464,7 @@ settle_s=0
         assert_eq!(dark_prepare.run_id.as_ref(), Some(&lease_run_id));
         assert!(matches!(
             dark_prepare.command,
-            ModulationCommandV1::StopAcquisition { .. }
+            ModulationCommandV1::SafeOff { .. }
         ));
         plugin.accepted(&mut control, PendingKind::Mod, &Value::Null);
         plugin.run.as_mut().unwrap().deadline_ms = 0;
@@ -3011,12 +3539,26 @@ settle_s=0
             },
         );
         plugin.accepted(&mut control, PendingKind::Pd, &Value::Null);
-        assert_eq!(plugin.run.as_ref().unwrap().phase, Phase::StartMod);
-        plugin.accepted(&mut control, PendingKind::Mod, &Value::Null);
+        assert_eq!(plugin.run.as_ref().unwrap().phase, Phase::Recording);
+        assert!(
+            !control.services.iter().any(|request| {
+                serde_json::from_value::<ModulationRequestV1>(request.payload.clone())
+                    .is_ok_and(|r| matches!(r.command, ModulationCommandV1::StartAcquisition))
+            }),
+            "A2 must never reset the PD sample clock with START"
+        );
         {
             let run = plugin.run.as_mut().unwrap();
             run.evidence.rising_triggers = 2;
             run.evidence.falling_triggers = 2;
+            let counters = stage_a_plugin_contract::A2MarkerDiagnosticsV1 {
+                dma_sample_clock: true,
+                marker_drops: 0,
+                stream_marker_drops: 0,
+                observed_at_unix_ms: now_ms(),
+            };
+            run.evidence.marker_diagnostics_before = Some(counters);
+            run.evidence.marker_diagnostics_after = Some(counters);
             run.deadline_ms = 0;
         }
         plugin.drive(&mut control);
@@ -3091,7 +3633,7 @@ settle_s=0
             },
         );
         assert!(plugin.run.is_none());
-        assert!(plugin.message.contains("failed closed"));
+        assert!(plugin.message.contains("A2 stopped"));
     }
 
     // ---------------------------------------------------------------------
@@ -3267,7 +3809,7 @@ settle_s=0
     }
 
     #[test]
-    fn plan_pedestals_covers_each_distinct_pair_once_and_skips_frozen_points() {
+    fn plan_pedestals_validates_frozen_points_too() {
         let plan = parsed(auto_protocol());
         let state = modulation_state(Some(calibrated_lobe("lobe-1")));
         let resolved = resolve_controller(
@@ -3282,7 +3824,7 @@ settle_s=0
         assert!(pedestals.contains_key(&(300, 450)));
 
         let frozen_only = parsed(test_protocol());
-        assert!(plan_pedestals(&frozen_only, &resolved).unwrap().is_empty());
+        assert_eq!(plan_pedestals(&frozen_only, &resolved).unwrap().len(), 1);
     }
 
     #[test]
@@ -3332,12 +3874,16 @@ settle_s=0
                 acknowledged_sample_index: 1_000,
                 stream_epoch: 1,
                 level: Some(low),
+                windows: [Some(low); PLATEAU_WINDOWS],
+                window_count: PLATEAU_WINDOWS,
             },
             high: PlateauStep {
                 level_dac: 478,
                 acknowledged_sample_index: 2_000,
                 stream_epoch: 1,
                 level: Some(high),
+                windows: [Some(high); PLATEAU_WINDOWS],
+                window_count: PLATEAU_WINDOWS,
             },
         }
     }
@@ -3360,9 +3906,9 @@ settle_s=0
     #[test]
     fn a_span_too_small_to_hold_a_threshold_refuses_rather_than_centring_in_noise() {
         let low = level(1.000, 0.0005, 1_500, 400, false);
-        let high = level(1.005, 0.0005, 2_500, 400, false);
+        let high = level(1.001, 0.0005, 2_500, 400, false);
         let error = measured_threshold(&probe(low, high), low, high).unwrap_err();
-        assert!(error.contains("under the 20 mV floor"), "{error}");
+        assert!(error.contains("threshold-DAC resolution floor"), "{error}");
     }
 
     #[test]
@@ -3373,11 +3919,23 @@ settle_s=0
     }
 
     #[test]
-    fn a_plateau_window_that_had_not_settled_refuses() {
-        let low = level(1.0, 0.15, 1_500, 400, false);
-        let high = level(1.2, 0.001, 2_500, 400, false);
-        let error = measured_threshold(&probe(low, high), low, high).unwrap_err();
-        assert!(error.contains("had not settled"), "{error}");
+    fn stable_means_with_large_raw_noise_remain_recordable_but_require_review() {
+        let low = level(0.380, 0.380, 1_500, 400, false);
+        let high = level(0.400, 0.380, 2_500, 400, false);
+        let result = measured_threshold(&probe(low, high), low, high).unwrap();
+        assert!((result.midpoint_volts - 0.390).abs() < 1e-10);
+        assert!(result.noisy_crossing_requires_review);
+        assert_eq!(result.low_windows.len(), PLATEAU_WINDOWS);
+    }
+
+    #[test]
+    fn drifting_window_means_refuse_even_when_raw_samples_do_not_clip() {
+        let low = level(0.38, 0.380, 1_500, 400, false);
+        let high = level(0.40, 0.380, 2_500, 400, false);
+        let mut p = probe(low, high);
+        p.low.windows[3].as_mut().unwrap().mean_volts += 0.015;
+        let error = measured_threshold(&p, low, high).unwrap_err();
+        assert!(error.contains("V50 unresolved"), "{error}");
     }
 
     fn auto_protocol() -> &'static str {
@@ -3436,6 +3994,33 @@ comparator_threshold_dac=500
         pd.stream.level = published;
     }
 
+    fn publish_plateau_windows(
+        plugin: &mut StageAA2Plugin,
+        control: &mut MockControl,
+        mean: f64,
+        raw_spread: f64,
+    ) {
+        let run = plugin.run.as_ref().unwrap();
+        let probe = run.probe.unwrap();
+        let step = if run.phase == Phase::PlateauLowLevel {
+            probe.low
+        } else {
+            probe.high
+        };
+        let mut end = step.acknowledged_sample_index + 125_000;
+        for _ in 0..PLATEAU_WINDOWS {
+            end += 10_000;
+            publish_stream(
+                plugin,
+                step.stream_epoch,
+                end,
+                Some(level(mean, raw_spread, end, 10_000, false)),
+            );
+            plugin.run.as_mut().unwrap().deadline_ms = 0;
+            plugin.drive(control);
+        }
+    }
+
     /// Walks a fresh plugin as far as "the dim plateau is commanded and
     /// acknowledged", which is where every Stage-2 refusal path branches.
     fn plugin_at_low_plateau(label: &str) -> (StageAA2Plugin, MockControl) {
@@ -3481,16 +4066,7 @@ comparator_threshold_dac=500
         );
 
         plugin.accepted(&mut control, PendingKind::Mod, &Value::Null);
-        // A window ending at 1500 over 400 samples starts at 1100, after the
-        // drive was acknowledged at 1000.
-        publish_stream(
-            &mut plugin,
-            1,
-            1_500,
-            Some(level(1.0, 0.001, 1_500, 400, false)),
-        );
-        plugin.run.as_mut().unwrap().deadline_ms = 0;
-        plugin.drive(&mut control);
+        publish_plateau_windows(&mut plugin, &mut control, 1.0, 0.001);
         assert_eq!(plugin.run.as_ref().unwrap().phase, Phase::PlateauHighDrive);
         let request: ModulationRequestV1 =
             serde_json::from_value(control.services.last().unwrap().payload.clone()).unwrap();
@@ -3504,14 +4080,15 @@ comparator_threshold_dac=500
         );
 
         plugin.accepted(&mut control, PendingKind::Mod, &Value::Null);
-        publish_stream(
-            &mut plugin,
-            1,
-            3_000,
-            Some(level(1.2, 0.001, 3_000, 400, false)),
-        );
-        plugin.run.as_mut().unwrap().deadline_ms = 0;
-        plugin.drive(&mut control);
+        let high_ack = plugin
+            .run
+            .as_ref()
+            .unwrap()
+            .probe
+            .unwrap()
+            .high
+            .acknowledged_sample_index;
+        publish_plateau_windows(&mut plugin, &mut control, 1.2, 0.001);
 
         assert_eq!(plugin.run.as_ref().unwrap().phase, Phase::Prepare);
         let request: ModulationRequestV1 =
@@ -3531,25 +4108,16 @@ comparator_threshold_dac=500
         assert_eq!(measurement.low_level_dac, plateaus.low_dac);
         assert_eq!(measurement.high_level_dac, plateaus.high_dac);
         assert_eq!(measurement.low_drive_acknowledged_sample_index, 1_000);
-        assert_eq!(measurement.high_drive_acknowledged_sample_index, 1_500);
+        assert_eq!(measurement.high_drive_acknowledged_sample_index, high_ack);
 
-        // A second point on the same pedestal reuses the measurement instead of
-        // driving the plateaus again.
-        let services_before = control.services.len();
+        // Repeated coordinates are remeasured: flux or baseline may have drifted.
         {
             let run = plugin.run.as_mut().unwrap();
             run.pending = None;
             run.index = 1;
         }
         plugin.prepare(&mut control);
-        assert_eq!(plugin.run.as_ref().unwrap().phase, Phase::Prepare);
-        assert_eq!(control.services.len(), services_before + 1);
-        let request: ModulationRequestV1 =
-            serde_json::from_value(control.services.last().unwrap().payload.clone()).unwrap();
-        let ModulationCommandV1::PrepareA2 { configuration } = request.command else {
-            panic!("expected the cached threshold to go straight to PrepareA2");
-        };
-        assert_eq!(configuration.comparator_threshold_dac, 1_802);
+        assert_eq!(plugin.run.as_ref().unwrap().phase, Phase::PlateauLowDrive);
 
         // A frozen point keeps its own code and is recorded as a claim.
         {
@@ -3581,8 +4149,8 @@ comparator_threshold_dac=500
         publish_stream(
             &mut plugin,
             1,
-            1_500,
-            Some(level(3.29, 0.001, 1_500, 400, true)),
+            136_000,
+            Some(level(3.29, 0.001, 136_000, 10_000, true)),
         );
         plugin.run.as_mut().unwrap().deadline_ms = 0;
         plugin.drive(&mut control);
@@ -3662,6 +4230,346 @@ comparator_threshold_dac=500
         assert!(control.hosts.is_empty(), "no camera command may be issued");
         assert!(control.services.is_empty(), "no owner lease may be taken");
         assert!(plugin.message.contains("refused"), "{}", plugin.message);
+    }
+    #[test]
+    fn repeated_or_overlapping_pd_windows_do_not_create_false_precision() {
+        let (mut plugin, mut control) = plugin_at_low_plateau("overlap");
+        publish_stream(
+            &mut plugin,
+            1,
+            136_000,
+            Some(level(0.38, 0.380, 136_000, 10_000, false)),
+        );
+        plugin.run.as_mut().unwrap().deadline_ms = 0;
+        for _ in 0..20 {
+            plugin.drive(&mut control);
+        }
+        assert_eq!(
+            plugin.run.as_ref().unwrap().probe.unwrap().low.window_count,
+            1
+        );
+        publish_stream(
+            &mut plugin,
+            1,
+            140_000,
+            Some(level(0.38, 0.380, 140_000, 10_000, false)),
+        );
+        plugin.drive(&mut control);
+        assert_eq!(
+            plugin.run.as_ref().unwrap().probe.unwrap().low.window_count,
+            1
+        );
+        assert_eq!(plugin.run.as_ref().unwrap().phase, Phase::PlateauLowLevel);
+    }
+
+    #[test]
+    fn a_window_sampled_before_settling_cannot_be_accepted_late() {
+        let (mut plugin, mut control) = plugin_at_low_plateau("settle-samples");
+        publish_stream(
+            &mut plugin,
+            1,
+            21_000,
+            Some(level(0.38, 0.001, 21_000, 10_000, false)),
+        );
+        plugin.run.as_mut().unwrap().deadline_ms = 0;
+        plugin.drive(&mut control);
+        assert_eq!(
+            plugin.run.as_ref().unwrap().probe.unwrap().low.window_count,
+            0
+        );
+    }
+
+    #[test]
+    fn lease_renewal_does_not_advance_the_plateau_state_machine() {
+        let (mut plugin, mut control) = plugin_at_low_plateau("renewal-phase");
+        plugin.run.as_mut().unwrap().next_renew_ms = 0;
+        plugin.drive(&mut control);
+        assert_eq!(
+            plugin.run.as_ref().unwrap().pending.unwrap().0,
+            PendingKind::RenewMod
+        );
+        plugin.accepted(&mut control, PendingKind::RenewMod, &Value::Null);
+        assert_eq!(
+            plugin.run.as_ref().unwrap().pending.unwrap().0,
+            PendingKind::RenewPd
+        );
+        plugin.accepted(&mut control, PendingKind::RenewPd, &Value::Null);
+        assert_eq!(plugin.run.as_ref().unwrap().phase, Phase::PlateauLowLevel);
+        assert!(plugin.run.as_ref().unwrap().next_renew_ms > now_ms());
+    }
+
+    #[test]
+    fn aborting_a_constant_probe_turns_off_the_drive_without_finalizing_an_unopened_pdq() {
+        let (mut plugin, mut control) = plugin_at_low_plateau("stop-plateau");
+        plugin.fail(&mut control, "test reason".into());
+        let request: ModulationRequestV1 =
+            serde_json::from_value(control.services.last().unwrap().payload.clone()).unwrap();
+        assert!(matches!(
+            request.command,
+            ModulationCommandV1::SetWaveform {
+                waveform: WaveformV1::Off
+            }
+        ));
+        plugin.accepted(&mut control, PendingKind::Mod, &Value::Null);
+        assert_eq!(plugin.run.as_ref().unwrap().phase, Phase::ReleasePd);
+        assert!(!control
+            .services
+            .iter()
+            .any(
+                |r| serde_json::from_value::<PhotodiodeRequestV1>(r.payload.clone()).is_ok_and(
+                    |r| matches!(r.command, PhotodiodeCommandV1::FinalizeRecording { .. })
+                )
+            ));
+        assert!(plugin
+            .run
+            .as_ref()
+            .unwrap()
+            .abort_reason
+            .as_ref()
+            .unwrap()
+            .contains("test reason"));
+    }
+
+    fn plugin_at_finalization(
+        label: &str,
+        policy: TriggerValidation,
+    ) -> (StageAA2Plugin, MockControl) {
+        let mut plugin = ready_plugin(label);
+        let mut control = MockControl::default();
+        plugin.begin(&mut control);
+        let run = plugin.run.as_mut().unwrap();
+        run.index = 1;
+        run.run_id = format!("{}_r002_step", run.measurement_id);
+        run.protocol.trigger_validation = policy;
+        run.phase = Phase::StopCamera;
+        run.pending = None;
+        run.camera_recording = true;
+        run.mod_leased = true;
+        run.pd_leased = true;
+        run.evidence.pdq_marker_counts = Some(stage_a_plugin_contract::PdqMarkerCountsV1 {
+            comparator_rising: 2,
+            comparator_falling: 2,
+            phase_zero: 2,
+            invalid_level: 0,
+        });
+        (plugin, control)
+    }
+
+    fn raw_finalized() -> HostCommandOutcome {
+        HostCommandOutcome::RecordingFinalized {
+            actual_raw_path: "/tmp/a2-test.raw".into(),
+            size: 100,
+            sha256: "12".repeat(32),
+            duration_us: 4000,
+        }
+    }
+
+    #[test]
+    fn a_bad_strict_point_never_advances_or_reports_success() {
+        let (mut plugin, mut control) =
+            plugin_at_finalization("strict-failure", TriggerValidation::Strict);
+        plugin.finish_point(&mut control, &raw_finalized());
+        assert_eq!(plugin.run.as_ref().unwrap().index, 1);
+        assert_eq!(plugin.run.as_ref().unwrap().phase, Phase::ReleasePd);
+        assert!(!plugin.run.as_ref().unwrap().evidence.valid);
+        assert!(plugin.run.as_ref().unwrap().abort_reason.is_some());
+        plugin.finish_run();
+        assert!(plugin.message.contains("A2 stopped"), "{}", plugin.message);
+    }
+
+    #[test]
+    fn offline_capture_keeps_noisy_trigger_data_and_marks_it_for_review() {
+        let (mut plugin, mut control) =
+            plugin_at_finalization("offline-noise", TriggerValidation::OfflineReview);
+        plugin.finish_point(&mut control, &raw_finalized());
+        assert_eq!(plugin.run.as_ref().unwrap().review_points, 1);
+        assert!(plugin.run.as_ref().unwrap().abort_reason.is_none());
+        plugin.finish_run();
+        assert!(
+            plugin.message.contains("require offline timing review"),
+            "{}",
+            plugin.message
+        );
+        assert!(!plugin.message.contains("checks passed"));
+    }
+
+    #[test]
+    fn file_corruption_stops_even_an_offline_capture() {
+        let (mut plugin, mut control) =
+            plugin_at_finalization("offline-corrupt", TriggerValidation::OfflineReview);
+        plugin.run.as_mut().unwrap().evidence.failure = Some("PDQ sample gap".into());
+        plugin.finish_point(&mut control, &raw_finalized());
+        assert_eq!(plugin.run.as_ref().unwrap().index, 1);
+        assert!(plugin
+            .run
+            .as_ref()
+            .unwrap()
+            .abort_reason
+            .as_ref()
+            .unwrap()
+            .contains("PDQ sample gap"));
+    }
+
+    #[test]
+    fn sidecar_write_failure_is_not_silently_ignored() {
+        let (mut plugin, mut control) =
+            plugin_at_finalization("sidecar-io", TriggerValidation::OfflineReview);
+        plugin.output_folder = "/dev/null".into();
+        plugin.finish_point(&mut control, &raw_finalized());
+        assert!(plugin
+            .run
+            .as_ref()
+            .unwrap()
+            .abort_reason
+            .as_ref()
+            .unwrap()
+            .contains("cannot save A2 sidecar"));
+    }
+
+    #[test]
+    fn a_stop_timeout_does_not_repeat_the_stop_forever() {
+        let (mut plugin, mut control) = plugin_at_low_plateau("stop-timeout");
+        plugin.fail(&mut control, "original plateau failure".into());
+        plugin.run.as_mut().unwrap().pending.as_mut().unwrap().2 = 0;
+        plugin.drive(&mut control);
+        assert_eq!(plugin.run.as_ref().unwrap().phase, Phase::ReleasePd);
+        assert!(plugin
+            .run
+            .as_ref()
+            .unwrap()
+            .abort_reason
+            .as_ref()
+            .unwrap()
+            .contains("original plateau failure"));
+        assert!(!plugin.run.as_ref().unwrap().cleanup_failures.is_empty());
+    }
+
+    #[test]
+    fn drive_sync_has_no_pd_amplitude_or_dead_time_precondition() {
+        let mut plugin = ready_auto_plugin("drive-sync");
+        let text = format!(
+            "timing_reference=\"drive_sync\"\ntrigger_validation=\"offline_review\"\n{}",
+            auto_protocol()
+        );
+        std::fs::write(&plugin.protocol_path, text).unwrap();
+        plugin.sensor = None;
+        plugin.photodiode.as_mut().unwrap().stream.level = None;
+        let mut control = MockControl::default();
+        plugin.begin(&mut control);
+        let apply = control.hosts.last().unwrap().request_id;
+        plugin.host_reply(&mut control, apply, applied_camera_outcome());
+        plugin.accepted(&mut control, PendingKind::Mod, &Value::Null);
+        plugin.accepted(&mut control, PendingKind::Pd, &Value::Null);
+        assert_eq!(plugin.run.as_ref().unwrap().phase, Phase::Prepare);
+        let request: ModulationRequestV1 =
+            serde_json::from_value(control.services.last().unwrap().payload.clone()).unwrap();
+        let ModulationCommandV1::PrepareA2 { configuration } = request.command else {
+            panic!("expected PrepareA2")
+        };
+        assert_eq!(
+            configuration.timing_reference,
+            A2TimingReferenceV1::DriveSync
+        );
+        assert_eq!(configuration.comparator_threshold_dac, 0);
+        assert_eq!(configuration.min_half_us, 0);
+        assert!(plugin
+            .run
+            .as_ref()
+            .unwrap()
+            .evidence
+            .threshold_measurement
+            .is_none());
+        assert!(plugin
+            .run
+            .as_ref()
+            .unwrap()
+            .resolved
+            .pixel_dead_time_us
+            .is_none());
+    }
+
+    #[test]
+    fn voltage_above_dac_rail_is_not_rounded_back_into_range() {
+        assert!(threshold_code_for_volts(2.5001).is_err());
+    }
+
+    #[test]
+    fn blocked_drive_sham_instructions_do_not_open_the_optical_path() {
+        let mut p = paused_point();
+        p.role = "blocked_drive_sham".into();
+        let message = pause_message(&p);
+        assert!(message.contains("keep the optical path blocked"));
+        assert!(!message.contains("open the optical path"));
+    }
+
+    #[test]
+    fn stopped_pd_stream_aborts_instead_of_saving_a_short_valid_file() {
+        let (mut plugin, mut control) = plugin_at_low_plateau("stalled-pd");
+        let index = plugin
+            .photodiode
+            .as_ref()
+            .unwrap()
+            .stream
+            .sample_range
+            .unwrap()
+            .end_sample_index_exclusive;
+        let run = plugin.run.as_mut().unwrap();
+        run.phase = Phase::Recording;
+        run.pd_recording = true;
+        run.pd_progress = Some((index, now_ms() - 6000));
+        plugin.drive(&mut control);
+        assert!(plugin
+            .run
+            .as_ref()
+            .unwrap()
+            .abort_reason
+            .as_ref()
+            .unwrap()
+            .contains("stopped advancing"));
+    }
+
+    #[test]
+    fn exhausted_camera_stop_timeout_cannot_report_success() {
+        let (mut plugin, mut control) = plugin_at_low_plateau("camera-stop-timeout");
+        let run = plugin.run.as_mut().unwrap();
+        run.phase = Phase::StopCamera;
+        run.camera_stop_attempts = 3;
+        run.pending = Some((PendingKind::Host, 99, now_ms() - TIMEOUT_MS - 1));
+        run.camera_recording = true;
+        plugin.drive(&mut control);
+        let run = plugin.run.as_ref().unwrap();
+        assert!(run.stop);
+        assert!(run
+            .abort_reason
+            .as_ref()
+            .unwrap()
+            .contains("camera stop timed out"));
+    }
+    #[test]
+    fn drive_sync_starts_its_identifiable_pulse_train_after_both_recorders_open() {
+        let (mut plugin, mut control) = plugin_at_low_plateau("sync-onset");
+        let run = plugin.run.as_mut().unwrap();
+        run.protocol.timing_reference = A2TimingReferenceV1::DriveSync;
+        run.phase = Phase::Prepare;
+        plugin.accepted(&mut control, PendingKind::Mod, &Value::Null);
+        assert_eq!(
+            plugin.run.as_ref().unwrap().phase,
+            Phase::QuietBeforeCapture
+        );
+        plugin.accepted(&mut control, PendingKind::Mod, &Value::Null);
+        assert_eq!(plugin.run.as_ref().unwrap().phase, Phase::Settle);
+        assert!(!plugin.run.as_ref().unwrap().modulation_active);
+        plugin.run.as_mut().unwrap().deadline_ms = 0;
+        plugin.drive(&mut control);
+        assert_eq!(plugin.run.as_ref().unwrap().phase, Phase::StartCamera);
+        plugin.accepted(&mut control, PendingKind::Host, &Value::Null);
+        assert_eq!(plugin.run.as_ref().unwrap().phase, Phase::StartPd);
+        plugin.accepted(&mut control, PendingKind::Pd, &Value::Null);
+        let run = plugin.run.as_ref().unwrap();
+        assert!(run.pd_recording && run.camera_recording);
+        assert_eq!(run.phase, Phase::StartStimulus);
+        plugin.accepted(&mut control, PendingKind::Mod, &Value::Null);
+        assert_eq!(plugin.run.as_ref().unwrap().phase, Phase::Recording);
     }
 }
 

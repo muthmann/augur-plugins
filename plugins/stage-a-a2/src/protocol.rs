@@ -12,8 +12,21 @@ pub const MAX_POINTS: usize = 4_096;
 #[serde(deny_unknown_fields)]
 pub struct Protocol {
     pub name: String,
+    #[serde(default)]
+    pub trigger_validation: TriggerValidation,
+    #[serde(default)]
+    pub timing_reference: stage_a_plugin_contract::A2TimingReferenceV1,
     #[serde(rename = "point")]
     pub points: Vec<Point>,
+}
+
+/// Noisy captures can be retained for review without declaring timing valid.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TriggerValidation {
+    #[default]
+    Strict,
+    OfflineReview,
 }
 
 /// A2 controller values that are owned by the A2 runner, not by the protocol.
@@ -341,5 +354,74 @@ duration_s = 30
     fn shipped_followup_is_point_only_and_parseable() {
         let text = include_str!("../protocols/a2_fluorescence_chain_followup.toml");
         assert!(!parse(text).unwrap().points.is_empty());
+    }
+    #[test]
+    fn production_drive_sync_schedule_is_valid_and_matches_cycle_mean_targets() {
+        let plan = parse(include_str!("../protocols/a2_production_drive_sync.toml")).unwrap();
+        assert_eq!(
+            plan.timing_reference,
+            stage_a_plugin_contract::A2TimingReferenceV1::DriveSync
+        );
+        assert_eq!(plan.trigger_validation, TriggerValidation::OfflineReview);
+        assert_eq!(plan.points.len(), 43);
+        assert_eq!(plan.total_seconds(), 7337.0);
+        let mut seen = std::collections::BTreeMap::new();
+        for p in &plan.points {
+            if let Acquisition::Stepped {
+                mean_u, depth_a, ..
+            } = p.acquisition
+            {
+                assert!(mean_u * (0.5 * depth_a).exp() <= 1.0);
+                if p.label.starts_with("grid_") {
+                    let target: f64 = p
+                        .label
+                        .split('_')
+                        .nth(2)
+                        .unwrap()
+                        .trim_start_matches("flux")
+                        .parse::<f64>()
+                        .unwrap()
+                        / 1000.0;
+                    assert!((mean_u * (0.5 * depth_a).cosh() - target).abs() < 0.0007);
+                    *seen
+                        .entry((
+                            (target * 1000.0).round() as u32,
+                            (depth_a * 1000.0).round() as u32,
+                        ))
+                        .or_insert(0) += 1;
+                }
+            }
+        }
+        assert_eq!(seen.len(), 15);
+        assert!(seen.values().all(|n| *n == 2));
+        let smoke = parse(include_str!("../protocols/a2_drive_sync_smoke.toml")).unwrap();
+        assert_eq!(smoke.total_seconds(), 37.0);
+    }
+    #[test]
+    fn short_core_keeps_three_fluxes_three_depths_and_physical_controls() {
+        let plan = parse(include_str!("../protocols/a2_core_drive_sync.toml")).unwrap();
+        assert_eq!(plan.points.len(), 19);
+        assert_eq!(plan.total_seconds(), 1195.0);
+        assert_eq!(plan.trigger_validation, TriggerValidation::OfflineReview);
+        assert_eq!(
+            plan.timing_reference,
+            stage_a_plugin_contract::A2TimingReferenceV1::DriveSync
+        );
+        assert_eq!(
+            plan.points
+                .iter()
+                .filter(|p| p.role == "identification_core")
+                .count(),
+            9
+        );
+        assert_eq!(plan.points.iter().filter(|p| p.pause_before).count(), 4);
+        assert_eq!(
+            plan.points
+                .iter()
+                .filter(|p| matches!(p.acquisition, Acquisition::Dark { .. }))
+                .count(),
+            2
+        );
+        assert!(plan.points.iter().any(|p| p.role == "blocked_drive_sham"));
     }
 }

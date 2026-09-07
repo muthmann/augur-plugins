@@ -9493,6 +9493,7 @@ mod tests {
                         sha256: Sha256V1::parse("ab".repeat(32)).expect("sha"),
                         frames_written: 1,
                         sample_frames_written: 1,
+                        marker_counts: None,
                         sample_range: None,
                         sample_rate_hz: Some(20_000),
                         segment_count: 1,
