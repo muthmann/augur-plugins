@@ -100,6 +100,7 @@ const DEFAULT_ANALYSIS_WINDOW_MS: i64 = 2_000;
 /// Give up waiting for a control-plane reply after this many milliseconds.
 const REPLY_TIMEOUT_MS: u64 = 15_000;
 const CAMERA_RESTORE_MAX_ATTEMPTS: u8 = 3;
+const CAMERA_START_RETRY_DELAYS_MS: [u64; 3] = [1_000, 2_000, 4_000];
 /// Upper bound on retained phase-0 markers in the no-EventStore fallback path.
 const MAX_MARKERS: usize = 65_536;
 /// Give up waiting for the photodiode-measured `a` to reach a sweep target
@@ -878,6 +879,8 @@ struct ProtocolRun {
     bias_confirmation: Option<(CameraBiasOffsetsV1, SensorBiasReadbackV1, f64)>,
     restore_req: Option<u64>,
     restore_attempts: u8,
+    camera_start_retries: usize,
+    camera_start_retryable: bool,
     restore_confirmed: bool,
     restore_error: Option<String>,
     finish_message: Option<String>,
@@ -1316,6 +1319,13 @@ impl StageAA1Plugin {
             self.message = "Frequency sweep stop requested".into();
         }
         if let Some(protocol) = self.protocol.as_mut() {
+            if protocol.phase == ProtocolPhase::RestoringCamera
+                && protocol.restore_req.is_none()
+                && !protocol.restore_confirmed
+            {
+                protocol.restore_attempts = 0;
+                protocol.restore_error = None;
+            }
             protocol.stop_requested = true;
             self.message = "Protocol stop requested".into();
         }
@@ -4680,6 +4690,8 @@ impl StageAA1Plugin {
             bias_confirmation: None,
             restore_req: None,
             restore_attempts: 0,
+            camera_start_retries: 0,
+            camera_start_retryable: false,
             restore_confirmed: false,
             restore_error: None,
             finish_message: None,
@@ -4908,6 +4920,8 @@ impl StageAA1Plugin {
             return;
         };
         run.index += 1;
+        run.camera_start_retries = 0;
+        run.camera_start_retryable = false;
         run.last_activity_ms = now_unix_ms();
         if run.index < run.plan.points.len() && !run.stop_requested {
             self.send_protocol_point(context);
@@ -5081,6 +5095,7 @@ impl StageAA1Plugin {
                 self.pending_duration_s = Some(duration_s);
                 if let Some(run) = self.protocol.as_mut() {
                     run.phase = ProtocolPhase::Recording;
+                    run.camera_start_retryable = false;
                     run.last_activity_ms = now_ms;
                 }
                 // The row says what it is: a protocol can carry its own
@@ -5115,8 +5130,7 @@ impl StageAA1Plugin {
                     }
                     self.advance_protocol(context);
                 } else {
-                    let reason = self.message.clone();
-                    self.fail_protocol_point(context, reason);
+                    self.recover_protocol_recording(context, now_ms);
                 }
             }
             ProtocolPhase::RestoringCamera => {
@@ -5154,21 +5168,60 @@ impl StageAA1Plugin {
                 } else if restore_attempts < CAMERA_RESTORE_MAX_ATTEMPTS {
                     self.request_protocol_camera_restore(context);
                 } else {
-                    let message = self
-                        .protocol
-                        .as_mut()
-                        .and_then(|run| run.finish_message.take())
-                        .unwrap_or_else(|| "Protocol ended".into());
-                    self.complete_protocol(
-                        context,
-                        format!(
-                            "{message} — ERROR: pre-run camera settings were not confirmed restored after {restore_attempts} attempts ({})",
-                            restore_error.unwrap_or_else(|| "unknown restore failure".into())
-                        ),
+                    let run = self.protocol.as_mut().expect("active protocol");
+                    let message = run.finish_message.as_deref().unwrap_or("Protocol ended");
+                    self.message = format!(
+                        "{message} — ERROR: pre-run camera settings were not confirmed restored after {restore_attempts} attempts ({}). Press Stop to retry restoration.",
+                        restore_error.unwrap_or_else(|| "unknown restore failure".into())
                     );
+                    // Keep the camera recovery state, but stop holding the drive
+                    // lease indefinitely while waiting for operator recovery.
+                    if run.lease_granted {
+                        run.lease_granted = false;
+                        let lease_id = run.lease_id.clone();
+                        let request = self.modulation_request(
+                            ModulationCommandV1::ReleaseLease {
+                                safe_off: true,
+                                reason: "a1 camera restoration failed".into(),
+                            },
+                            &lease_id,
+                        );
+                        context.request_service(&request);
+                    }
                 }
             }
         }
+    }
+
+    /// Only a host rejection that guarantees no camera recording started can
+    /// retry. Unknown start outcomes and partial recordings must stop the run.
+    fn recover_protocol_recording(&mut self, context: &mut impl RecordingControl, now_ms: u64) {
+        let reason = self.message.clone();
+        let Some(run) = self.protocol.as_mut() else {
+            return;
+        };
+        if run.camera_start_retryable {
+            if let Some(delay) = CAMERA_START_RETRY_DELAYS_MS.get(run.camera_start_retries) {
+                run.camera_start_retries += 1;
+                run.camera_start_retryable = false;
+                run.phase = ProtocolPhase::Settling;
+                run.settle_until_ms = now_ms.saturating_add(*delay);
+                self.message = format!(
+                    "Protocol point {}: camera start retry {}/{} in {} s: {reason}",
+                    run.index + 1,
+                    run.camera_start_retries,
+                    CAMERA_START_RETRY_DELAYS_MS.len(),
+                    delay / 1_000
+                );
+                return;
+            }
+        }
+        let message = format!(
+            "Protocol aborted at point {} after {} camera start retries: {reason}",
+            run.index + 1,
+            run.camera_start_retries
+        );
+        self.finish_protocol(context, message);
     }
 
     /// Routes modulation-service replies belonging to the protocol run.
@@ -5667,6 +5720,11 @@ impl StageAA1Plugin {
                     // Stop the rest of the recording; drive_recording resolves the
                     // abort from the current phase on the next tick.
                     self.note_failure(format!("Camera recording rejected ({code}): {message}"));
+                    if let Some(run) = self.protocol.as_mut() {
+                        run.camera_start_retryable = code == "recording_start_failed"
+                            && self.recording.cam_raw_path.is_none()
+                            && self.recording.phase == RecPhase::StartingCamera;
+                    }
                     self.recording.cam_rejected = true;
                     self.recording.stop_requested = true;
                 }
@@ -11447,7 +11505,7 @@ depth_a = 0.7
             }
         }
 
-        assert!(plugin.protocol.is_none());
+        assert!(plugin.protocol.is_some());
         assert!(plugin.message.contains("ERROR"), "{}", plugin.message);
         assert!(
             !plugin.message.ends_with("pre-run camera settings restored"),
@@ -11455,7 +11513,130 @@ depth_a = 0.7
             plugin.message
         );
 
+        let hosts_before = sink.hosts.len();
+        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+        assert_eq!(
+            sink.hosts.len(),
+            hosts_before,
+            "must wait for explicit retry"
+        );
+        plugin.request_stop();
+        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+        assert_eq!(sink.hosts.len(), hosts_before + 1);
+        let request_id = sink.hosts.last().unwrap().request_id;
+        control_tick(
+            &mut plugin,
+            PluginControlInbox {
+                host_replies: vec![HostCommandReply {
+                    request_id,
+                    outcome: HostCommandOutcome::CameraConfigurationRestored {
+                        readback: fresh_bias_sensor(105, 98).bias_codes.expect("biases"),
+                        readback_age_s: 0.05,
+                    },
+                }],
+                ..PluginControlInbox::default()
+            },
+            &mut sink,
+        );
+        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+        assert!(plugin.protocol.is_none());
         let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn protocol_retries_camera_start_on_same_point_and_advances_only_after_success() {
+        let folder = temp_folder("protocol-start-retry");
+        let (mut plugin, _) = protocol_plugin(&folder, TWO_POINT_PROTOCOL);
+        let mut sink = ControlSink::default();
+        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+        {
+            let run = plugin.protocol.as_mut().unwrap();
+            run.phase = ProtocolPhase::Recording;
+            run.camera_start_retryable = true;
+        }
+        plugin.message = "Camera recording rejected (recording_start_failed): timeout".into();
+        plugin.recover_protocol_recording(&mut sink, now_unix_ms());
+        let run = plugin.protocol.as_ref().unwrap();
+        assert_eq!(run.index, 0);
+        assert!(run.failed.is_empty());
+        assert_eq!(run.camera_start_retries, 1);
+        assert_eq!(run.phase, ProtocolPhase::Settling);
+        let before = sink.hosts.len();
+        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+        assert_eq!(sink.hosts.len(), before, "backoff must not start early");
+        plugin.protocol.as_mut().unwrap().phase = ProtocolPhase::Recording;
+        plugin.recording_completed_ok = true;
+        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+        let run = plugin.protocol.as_ref().unwrap();
+        assert_eq!(run.index, 1);
+        assert_eq!(run.recorded, 1);
+        assert_eq!(run.camera_start_retries, 0);
+        let _ = std::fs::remove_dir_all(folder);
+    }
+
+    #[test]
+    fn protocol_camera_retry_exhaustion_restores_without_skipping_ahead() {
+        let folder = temp_folder("protocol-start-exhausted");
+        let (mut plugin, _) = protocol_plugin(&folder, TWO_POINT_PROTOCOL);
+        let mut sink = ControlSink::default();
+        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+        plugin.protocol.as_mut().unwrap().camera_session_active = true;
+        for delay in CAMERA_START_RETRY_DELAYS_MS {
+            plugin.protocol.as_mut().unwrap().camera_start_retryable = true;
+            plugin.recover_protocol_recording(&mut sink, 100);
+            let run = plugin.protocol.as_ref().unwrap();
+            assert_eq!(run.index, 0);
+            assert!(run.failed.is_empty());
+            assert_eq!(run.settle_until_ms, 100 + delay);
+        }
+        // One more failure past the last delay ends the run at this point.
+        plugin.protocol.as_mut().unwrap().camera_start_retryable = true;
+        plugin.recover_protocol_recording(&mut sink, 100);
+        let run = plugin.protocol.as_ref().unwrap();
+        assert_eq!(run.index, 0);
+        assert!(run.failed.is_empty());
+        assert_eq!(
+            plugin.protocol.as_ref().unwrap().phase,
+            ProtocolPhase::RestoringCamera
+        );
+        assert!(matches!(
+            sink.hosts.last().unwrap().command,
+            HostCommand::RestoreCameraConfiguration
+        ));
+        let _ = std::fs::remove_dir_all(folder);
+    }
+
+    #[test]
+    fn protocol_stop_during_camera_backoff_does_not_start_another_recording() {
+        let folder = temp_folder("protocol-stop-backoff");
+        let (mut plugin, _) = protocol_plugin(&folder, TWO_POINT_PROTOCOL);
+        let mut sink = ControlSink::default();
+        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+        plugin.protocol.as_mut().unwrap().camera_start_retryable = true;
+        plugin.recover_protocol_recording(&mut sink, now_unix_ms());
+        let before = sink.hosts.len();
+        plugin.request_stop();
+        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+        assert_eq!(sink.hosts.len(), before);
+        assert!(plugin.protocol.is_none());
+        assert!(!plugin.recording.is_active());
+        let _ = std::fs::remove_dir_all(folder);
+    }
+
+    #[test]
+    fn ambiguous_camera_failure_aborts_protocol_without_retry() {
+        let folder = temp_folder("protocol-ambiguous-start");
+        let (mut plugin, _) = protocol_plugin(&folder, TWO_POINT_PROTOCOL);
+        let mut sink = ControlSink::default();
+        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+        plugin.protocol.as_mut().unwrap().camera_session_active = true;
+        plugin.message = "Timed out starting camera recording".into();
+        plugin.recover_protocol_recording(&mut sink, now_unix_ms());
+        let run = plugin.protocol.as_ref().unwrap();
+        assert_eq!(run.index, 0);
+        assert_eq!(run.camera_start_retries, 0);
+        assert_eq!(run.phase, ProtocolPhase::RestoringCamera);
+        let _ = std::fs::remove_dir_all(folder);
     }
 
     /// The reason a protocol exists rather than three nested button presses:
