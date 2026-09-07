@@ -3082,6 +3082,7 @@ settle_s=0
             capabilities: vec![],
             lease: None,
             controller_state: ControllerStateV1::Configured,
+            controller_mode: Some("A2".into()),
             active_run_id: None,
             requested: None,
             acknowledged: None,

@@ -32,15 +32,6 @@ pub const DRIVE_DAC_UPDATE_RATE_HZ: u32 = 40_000;
 /// shape-resolution acceptance threshold.
 pub const A1_MIN_SAMPLES_PER_CYCLE: u32 = 16;
 
-/// The window the firmware's `CONFIG rate_hz` accepts (`stage-a-controller`:
-/// 100 Sa/s up to `kPortableMaxSampleRateHz`). Stated here so a plugin refuses
-/// an impossible rate at the press instead of collecting a `RANGE` error from
-/// the controller in the middle of a run.
-pub const FIRMWARE_MIN_SAMPLE_RATE_HZ: u32 = 100;
-pub const FIRMWARE_MAX_SAMPLE_RATE_HZ: u32 = 100_000;
-/// `kMaxSamplesPerBlock` in the firmware's board configuration.
-pub const FIRMWARE_MAX_BLOCK_SAMPLES: u32 = 256;
-
 pub fn drive_frequency_supported(frequency_millihz: u64) -> bool {
     (DRIVE_FREQUENCY_MIN_MILLIHZ..=DRIVE_FREQUENCY_MAX_MILLIHZ).contains(&frequency_millihz)
 }
@@ -284,21 +275,6 @@ pub enum WaveformV1 {
     },
 }
 
-/// The A1 acquisition state the firmware's `CONFIG` verb actually carries.
-///
-/// It holds no drive fields. `CONFIG` accepts `mode`, `rate_hz`,
-/// `block_samples`, `raw` and `summary` and answers anything else with
-/// `SYNTAX unknown_config_field`, so a waveform or a DAC code here would only
-/// have been rejected on the wire. The drive is commanded separately, through
-/// `MOD`, at every measurement point.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct A1AcquisitionConfigV1 {
-    pub sample_rate_hz: u32,
-    pub block_samples: u32,
-    pub emit_raw_samples: bool,
-    pub emit_summary: bool,
-}
-
 /// Complete, firmware-level configuration for one A2 step-latency point.
 ///
 /// The optical coordinates are calibrated lobe coordinates, not physical
@@ -396,9 +372,13 @@ pub enum ModulationCommandV1 {
     SetOperatingPoint {
         mean_u_milli: u32,
     },
-    PrepareA1 {
-        configuration: A1AcquisitionConfigV1,
-    },
+    /// Put the controller into `mode=A1` — the comparator parked and a phase-0
+    /// marker stamped on the photodiode stream at every cycle.
+    ///
+    /// It carries nothing: `CONFIG` also sets the acquisition rate, block size
+    /// and output flags, and those belong to the controller's owner, which
+    /// reads them back from `STATUS` and preserves them across the mode change.
+    PrepareA1,
     /// Stop the current controller acquisition, enter firmware mode A2,
     /// configure the optical log-square and its 50 % comparator, and require
     /// the board to echo `trigger_source=comparator` with the comparator armed.
@@ -432,7 +412,6 @@ pub enum ControllerStateV1 {
 pub struct ModulationTargetV1 {
     pub revision: SemanticRevision,
     pub waveform: Option<WaveformV1>,
-    pub a1_configuration: Option<A1AcquisitionConfigV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub a2_configuration: Option<A2AcquisitionConfigV1>,
     pub acquisition_running: bool,
@@ -511,6 +490,13 @@ pub struct ModulationStateV1 {
     pub capabilities: Vec<String>,
     pub lease: Option<LeaseSnapshotV1>,
     pub controller_state: ControllerStateV1,
+    /// The controller's experiment mode as it last reported it (`A1`, `A2`,
+    /// `A3`). It decides whether the photodiode stream carries phase-0 markers
+    /// at all, so a consumer can refuse — or restore — the mode it needs.
+    ///
+    /// Additive in V1: absent from older owners, and older consumers ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub controller_mode: Option<String>,
     pub active_run_id: Option<RunId>,
     pub requested: Option<ModulationTargetV1>,
     pub acknowledged: Option<ModulationTargetV1>,
@@ -964,14 +950,7 @@ mod tests {
         let mut request = ModulationRequestV1::new(
             RequestId(12),
             ClientId::from("stage-a-a1"),
-            ModulationCommandV1::PrepareA1 {
-                configuration: A1AcquisitionConfigV1 {
-                    sample_rate_hz: 20_000,
-                    block_samples: 256,
-                    emit_raw_samples: true,
-                    emit_summary: true,
-                },
-            },
+            ModulationCommandV1::PrepareA1,
         );
         request.target_owner_instance = Some(OwnerInstanceId::from("mod-owner-1"));
         request.lease_id = Some(LeaseId::from("lease-a1"));
@@ -981,10 +960,9 @@ mod tests {
 
         let json = serde_json::to_value(&request).expect("serializes");
         assert_eq!(json["command"]["kind"], "prepare_a1");
-        // The A1 configuration carries the controller's `CONFIG` fields only —
-        // the drive is commanded through `MOD`, never here.
-        assert_eq!(json["command"]["configuration"]["sample_rate_hz"], 20_000);
-        assert!(json["command"]["configuration"]["frequency_millihz"].is_null());
+        // It asks for the mode and nothing else: the acquisition settings the
+        // same `CONFIG` carries belong to the controller's owner.
+        assert!(json["command"]["configuration"].is_null());
         let decoded: ModulationRequestV1 = serde_json::from_value(json).expect("deserializes");
         assert_eq!(decoded, request);
     }
@@ -1010,7 +988,6 @@ mod tests {
         let requested = ModulationTargetV1 {
             revision: SemanticRevision(5),
             waveform: Some(WaveformV1::Constant { level_dac: 900 }),
-            a1_configuration: None,
             a2_configuration: None,
             acquisition_running: false,
             board_dac_code: None,
@@ -1033,6 +1010,7 @@ mod tests {
             capabilities: vec!["MOD".into(), "PDSTREAM".into()],
             lease: None,
             controller_state: ControllerStateV1::SafeIdle,
+            controller_mode: Some("A1".into()),
             active_run_id: None,
             requested: Some(requested),
             acknowledged: Some(acknowledged),

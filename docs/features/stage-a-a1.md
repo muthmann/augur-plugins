@@ -320,10 +320,12 @@ acceptance before high-frequency data is treated as qualified.
   its predecessor would be recorded under parameters the file does not name.
 - **The file's `duration_s` wins** over the panel's, or the survey would not be
   reproducible from the protocol alone.
-- **The controller's mode is stated, not inherited**: the run sends `PrepareA1`
-  with the lease, so the firmware stamps the phase-0 markers the photodiode
+- **The controller's mode is stated, not inherited**: when the modulation owner
+  reports a controller that is not in `A1`, the run asks for the mode before its
+  first point, so the firmware stamps the phase-0 markers the photodiode
   measures `a` from. Without it a survey that followed A2 work ran against the
-  optical comparator and produced no `a` at all — see ADR 044.
+  optical comparator and produced no `a` at all. A controller already in A1 is
+  left alone — the change would restart the photodiode stream — see ADR 044.
 - **Validated up front**: ranges, bounds, the `MAX_POINTS = 4096` product limit,
   the same whole-cycle window check the ladder makes against its lowest
   frequency, and — for a measured depth — the placement's dark provenance: a

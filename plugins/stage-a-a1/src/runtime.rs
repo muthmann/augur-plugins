@@ -59,12 +59,11 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use stage_a_plugin_contract::{
-    A1AcquisitionConfigV1, ClientId, ConnectionStateV1, LeaseId, LeaseSnapshotV1,
-    ModulationCommandV1, ModulationRequestV1, ModulationStateV1, OpticalTargetV1, PdqReceiptV1,
-    PdqStartSpecV1, PhotodiodeCommandV1, PhotodiodeOpticalSummaryV1, PhotodiodeRequestV1,
-    PhotodiodeResponseV1, PhotodiodeSummaryV1, RequestId, RunId, SemanticRevision, WaveformV1,
-    CTX_STAGE_A_MODULATION_STATE_V1, CTX_STAGE_A_PHOTODIODE_SUMMARY_V1, FIRMWARE_MAX_BLOCK_SAMPLES,
-    FIRMWARE_MAX_SAMPLE_RATE_HZ, FIRMWARE_MIN_SAMPLE_RATE_HZ,
+    ClientId, ConnectionStateV1, LeaseId, LeaseSnapshotV1, ModulationCommandV1,
+    ModulationRequestV1, ModulationStateV1, OpticalTargetV1, PdqReceiptV1, PdqStartSpecV1,
+    PhotodiodeCommandV1, PhotodiodeOpticalSummaryV1, PhotodiodeRequestV1, PhotodiodeResponseV1,
+    PhotodiodeSummaryV1, RequestId, RunId, SemanticRevision, WaveformV1,
+    CTX_STAGE_A_MODULATION_STATE_V1, CTX_STAGE_A_PHOTODIODE_SUMMARY_V1,
     SERVICE_STAGE_A_MODULATION_CONTROL_V1, SERVICE_STAGE_A_PHOTODIODE_CONTROL_V1,
 };
 
@@ -1749,38 +1748,6 @@ impl StageAA1Plugin {
         Some(format!(
             "{reason} (or switch \"Depth a source\" to the commanded drive to work open loop)"
         ))
-    }
-
-    /// The controller state an A1 run needs, refused here when the bench cannot
-    /// support it.
-    ///
-    /// `CONFIG` carries the stream rate together with the mode, so the rate has
-    /// to be the one the photodiode is already streaming at — anything else
-    /// would reconfigure the owner's sampler behind its back.
-    fn firmware_a1_configuration(&self) -> Result<A1AcquisitionConfigV1, String> {
-        let Some(rate_hz) = self
-            .photodiode
-            .as_ref()
-            .and_then(|state| state.stream.sample_rate_hz)
-        else {
-            return Err(
-                "the photodiode reports no sample rate, so A1 cannot state the controller's \
-                 stream rate"
-                    .into(),
-            );
-        };
-        if !(FIRMWARE_MIN_SAMPLE_RATE_HZ..=FIRMWARE_MAX_SAMPLE_RATE_HZ).contains(&rate_hz) {
-            return Err(format!(
-                "the photodiode streams at {rate_hz} Sa/s, outside the controller's CONFIG window \
-                 of {FIRMWARE_MIN_SAMPLE_RATE_HZ}..={FIRMWARE_MAX_SAMPLE_RATE_HZ} Sa/s"
-            ));
-        }
-        Ok(A1AcquisitionConfigV1 {
-            sample_rate_hz: rate_hz,
-            block_samples: FIRMWARE_MAX_BLOCK_SAMPLES,
-            emit_raw_samples: true,
-            emit_summary: true,
-        })
     }
 
     /// Why the selected placement can never anchor a measured `a`, read from
@@ -5167,26 +5134,27 @@ impl StageAA1Plugin {
                 // instead, and nothing puts the mode back — so a survey that
                 // followed A2 work measured nothing until the controller was
                 // power-cycled. State the mode rather than inherit it.
-                let prepare_req = if self
-                    .protocol
+                // Only when the mode is actually wrong: `CONFIG` is refused
+                // while the acquisition runs, so a mode change stops and
+                // restarts the photodiode stream, and a run that needs no
+                // change must not pay for that.
+                let needs_mode = self
+                    .modulation
                     .as_ref()
-                    .is_some_and(|run| !run.firmware_prepared)
+                    .map(|state| state.controller_mode.as_deref() != Some("A1"))
+                    .unwrap_or(false);
+                let prepare_req = if needs_mode
+                    && self
+                        .protocol
+                        .as_ref()
+                        .is_some_and(|run| !run.firmware_prepared)
                 {
-                    let configuration = match self.firmware_a1_configuration() {
-                        Ok(configuration) => configuration,
-                        Err(reason) => {
-                            self.finish_protocol(context, format!("Protocol aborted: {reason}"));
-                            return;
-                        }
-                    };
                     let Some(lease_id) = self.protocol.as_ref().map(|run| run.lease_id.clone())
                     else {
                         return;
                     };
-                    let request = self.modulation_request(
-                        ModulationCommandV1::PrepareA1 { configuration },
-                        &lease_id,
-                    );
+                    let request =
+                        self.modulation_request(ModulationCommandV1::PrepareA1, &lease_id);
                     context.request_service(&request);
                     Some(request.request_id)
                 } else {
@@ -8398,6 +8366,7 @@ mod tests {
             capabilities: Vec::new(),
             lease: None,
             controller_state: stage_a_plugin_contract::ControllerStateV1::Configured,
+            controller_mode: Some("A1".into()),
             active_run_id: None,
             requested: None,
             acknowledged: None,
@@ -8666,7 +8635,6 @@ mod tests {
                 max_dac: 900,
                 frequency_millihz: (hz * 1_000.0).round() as u64,
             }),
-            a1_configuration: None,
             a2_configuration: None,
             acquisition_running: true,
             board_dac_code: None,
@@ -11750,12 +11718,13 @@ depth_a = 0.7
     }
 
     /// The controller only stamps the phase-0 markers the photodiode measures
-    /// `a` from while it is in A1 mode, and nothing puts the mode back after A2
+    /// `a` from while it is in A1 mode, and nothing put the mode back after A2
     /// work — a survey that followed an A2 session measured nothing at all.
     #[test]
-    fn a_protocol_puts_the_controller_into_a1_mode_before_its_first_point() {
+    fn a_protocol_puts_a_controller_left_in_a2_back_into_a1_mode() {
         let folder = temp_folder("protocol-prepare-a1");
         let (mut plugin, _) = protocol_plugin(&folder, TWO_POINT_PROTOCOL);
+        plugin.modulation.as_mut().unwrap().controller_mode = Some("A2".into());
         let mut sink = ControlSink::default();
         control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
         let lease_req = sink.services[0].request_id;
@@ -11772,7 +11741,7 @@ depth_a = 0.7
             .position(|request| {
                 matches!(
                     modulation_command(request),
-                    Some(ModulationCommandV1::PrepareA1 { .. })
+                    Some(ModulationCommandV1::PrepareA1)
                 )
             })
             .expect("the run states the controller mode");
@@ -11790,23 +11759,13 @@ depth_a = 0.7
             prepare_at < first_drive_at,
             "the mode has to be set before the drive moves"
         );
-        let Some(ModulationCommandV1::PrepareA1 { configuration }) =
-            modulation_command(&sink.services[prepare_at])
-        else {
-            unreachable!("checked above");
-        };
-        // The controller's CONFIG carries the stream rate with the mode, so it
-        // must be the rate the photodiode already runs at.
-        assert_eq!(configuration.sample_rate_hz, 20_000);
-        assert_eq!(configuration.block_samples, FIRMWARE_MAX_BLOCK_SAMPLES);
-        assert!(configuration.emit_raw_samples);
 
         // A controller that refuses the mode ends the run rather than
         // measuring against a trigger nothing is driving.
         let prepare_req = sink.services[prepare_at].request_id;
         control_tick(
             &mut plugin,
-            inbox_with(vec![rejected(prepare_req, "RANGE invalid_rate_hz")]),
+            inbox_with(vec![rejected(prepare_req, "STATE stop_before_config")]),
             &mut sink,
         );
         control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
@@ -11814,6 +11773,32 @@ depth_a = 0.7
             plugin.message.contains("refused A1 mode"),
             "{}",
             plugin.message
+        );
+        let _ = std::fs::remove_dir_all(folder);
+    }
+
+    /// A controller already in A1 must not be reconfigured: `CONFIG` is refused
+    /// while the acquisition runs, so the mode change would stop and restart
+    /// the photodiode stream for nothing.
+    #[test]
+    fn a_controller_already_in_a1_is_left_alone() {
+        let folder = temp_folder("protocol-prepare-skip");
+        let (mut plugin, _) = protocol_plugin(&folder, TWO_POINT_PROTOCOL);
+        let mut sink = ControlSink::default();
+        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+        let lease_req = sink.services[0].request_id;
+        sink.services.clear();
+        control_tick(
+            &mut plugin,
+            inbox_with(vec![accepted(lease_req)]),
+            &mut sink,
+        );
+        assert!(
+            !sink.services.iter().any(|request| matches!(
+                modulation_command(request),
+                Some(ModulationCommandV1::PrepareA1)
+            )),
+            "the mode was already A1"
         );
         let _ = std::fs::remove_dir_all(folder);
     }

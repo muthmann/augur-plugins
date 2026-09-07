@@ -24,29 +24,35 @@ The command was also unsendable. `CONFIG` accepts `mode`, `rate_hz`,
 
 ## Decision
 
-A1 sends `PrepareA1` once per protocol run, when the modulation lease is granted and
-before the first point's drive commands. The owner applies its queue in order, so the
-run does not wait for the acknowledgement — but a refusal ends the run, because
+A1 asks the modulation owner for `mode=A1` when its protocol run takes the lease,
+and only when the owner's published `controller_mode` is not already `A1`. `CONFIG`
+is refused while the acquisition runs and `STOP` ends the photodiode stream, so a
+mode change costs a stream restart — a run that needs no change must not pay for it.
+
+`PrepareA1` carries nothing. `CONFIG` sets the acquisition rate, block size and
+output flags along with the mode, and those belong to the controller's owner: it
+reads them back from `STATUS`, restates them unchanged, and refuses the command
+while it has not seen them. The rate in `CONFIG` is the controller's portable-sampler
+rate, which is *not* the rate the photodiode streams at — the DMA path samples at its
+own fixed rate and stamps that into the frames. A1 deriving the one from the other
+refused every run on a 500 kSa/s bench.
+
+The sequence is `STOP` → `CONFIG mode=A1 …` → `START` when the acquisition was
+running, so the stream comes back the way it was found. A refusal ends the run:
 without A1 mode there is nothing to measure against.
-
-`A1AcquisitionConfigV1` carries only what `CONFIG` accepts: sample rate, block size
-and the two output flags. The drive stays with `MOD`, commanded per point. The
-controller's own bounds (`100..=100_000` Sa/s, `1..=256` samples per block) live in
-the contract crate and are checked by the owner before anything reaches the wire.
-
-The rate A1 states is the one the photodiode already streams at. `CONFIG` carries the
-rate together with the mode, so any other value would reconfigure the photodiode
-owner's sampler behind its back; a rate outside the controller's window refuses the
-run instead.
 
 ## Consequences
 
 An A1 survey no longer inherits an A2 session's trigger policy, and a controller that
 refuses the mode says so instead of producing points without `a`.
 
-The A1 sidecar loses `center_dac` and `amplitude_dac`. Both read the echoed
-`a1_configuration`, which no run ever populated, so both were absent from every
-artifact ever written.
+The A1 sidecar loses `center_dac` and `amplitude_dac`, and the modulation target
+loses `a1_configuration`. All three read a payload that no run ever populated, so
+they were absent from every artifact ever written.
+
+A run that finds the controller in A2 restarts the photodiode stream once, before
+its first recording. The photodiode treats that as a new segment, which it already
+does after every rate change.
 
 A2's own path is untouched and keeps two known divergences from the firmware:
 `validate_a2_configuration` accepts sample rates up to 500 kSa/s where the controller

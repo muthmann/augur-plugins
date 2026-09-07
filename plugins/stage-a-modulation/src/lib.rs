@@ -44,15 +44,14 @@ use serde_json::{json, Value};
 use stage_a_io::{Command, DeviceEvent, MockController, StageAClient, Transport};
 use stage_a_plugin_contract::drive_frequency_supported;
 use stage_a_plugin_contract::{
-    A1AcquisitionConfigV1, A2AcquisitionConfigV1, A2TimingReferenceV1, ClientId, ConnectionStateV1,
-    ControllerStateV1, FreshnessV1, LeaseId, LeaseSnapshotV1, ModulationCommandV1,
-    ModulationRequestV1, ModulationResponseV1, ModulationStateV1, ModulationTargetV1,
-    OpticalDriveStateV1, OpticalLobeStateV1, OpticalTargetV1, OwnerInstanceId, PhotodiodeLevelV1,
-    PhotodiodeSummaryV1, RequestOutcomeV1, ResponseCommonV1, RunId, SemanticRevision,
-    ServiceErrorCodeV1, ServiceErrorV1, SynchronizationV1, UnsyncedReasonV1, WaveformV1,
-    CONTRACT_VERSION_V1, CTX_STAGE_A_MODULATION_STATE_V1, CTX_STAGE_A_PHOTODIODE_SUMMARY_V1,
-    DRIVE_FREQUENCY_MAX_MILLIHZ, DRIVE_FREQUENCY_MIN_MILLIHZ, FIRMWARE_MAX_BLOCK_SAMPLES,
-    FIRMWARE_MAX_SAMPLE_RATE_HZ, FIRMWARE_MIN_SAMPLE_RATE_HZ, PLUGIN_ID_STAGE_A_MODULATION,
+    A2AcquisitionConfigV1, A2TimingReferenceV1, ClientId, ConnectionStateV1, ControllerStateV1,
+    FreshnessV1, LeaseId, LeaseSnapshotV1, ModulationCommandV1, ModulationRequestV1,
+    ModulationResponseV1, ModulationStateV1, ModulationTargetV1, OpticalDriveStateV1,
+    OpticalLobeStateV1, OpticalTargetV1, OwnerInstanceId, PhotodiodeLevelV1, PhotodiodeSummaryV1,
+    RequestOutcomeV1, ResponseCommonV1, RunId, SemanticRevision, ServiceErrorCodeV1,
+    ServiceErrorV1, SynchronizationV1, UnsyncedReasonV1, WaveformV1, CONTRACT_VERSION_V1,
+    CTX_STAGE_A_MODULATION_STATE_V1, CTX_STAGE_A_PHOTODIODE_SUMMARY_V1,
+    DRIVE_FREQUENCY_MAX_MILLIHZ, DRIVE_FREQUENCY_MIN_MILLIHZ, PLUGIN_ID_STAGE_A_MODULATION,
     PLUGIN_ID_STAGE_A_PHOTODIODE, SERVICE_STAGE_A_MODULATION_CONTROL_V1,
 };
 
@@ -274,6 +273,14 @@ struct DeviceState {
     board_freq_millihz: Option<u64>,
     last_error: Option<String>,
     controller_state: ControllerStateV1,
+    /// Acquisition settings echoed by `STATUS`/`CONFIG`. `CONFIG` needs a mode
+    /// *and* a rate, so a mode change has to restate the rest of the
+    /// controller's configuration rather than invent it.
+    controller_mode: Option<String>,
+    controller_rate_hz: Option<u32>,
+    controller_block_samples: Option<u32>,
+    controller_emit_raw: Option<bool>,
+    controller_emit_summary: Option<bool>,
     requested: Option<ModulationTargetV1>,
     acknowledged: Option<ModulationTargetV1>,
     last_response: Option<ModulationResponseV1>,
@@ -287,6 +294,11 @@ impl Default for DeviceState {
             connected: false,
             firmware: String::new(),
             capabilities: Vec::new(),
+            controller_mode: None,
+            controller_rate_hz: None,
+            controller_block_samples: None,
+            controller_emit_raw: None,
+            controller_emit_summary: None,
             board_code: None,
             board_mod: String::new(),
             board_wave: None,
@@ -333,7 +345,6 @@ impl DeviceState {
         Some(ModulationTargetV1 {
             revision: SemanticRevision(0),
             waveform: Some(waveform),
-            a1_configuration: None,
             a2_configuration: None,
             acquisition_running: self.controller_state == ControllerStateV1::Running,
             board_dac_code: self.board_code.and_then(|code| u16::try_from(code).ok()),
@@ -672,6 +683,24 @@ fn apply_reply_fields(state: &mut DeviceState, fields: &BTreeMap<String, String>
 
     if let Some(code) = fields.get("code").and_then(|v| v.parse::<i64>().ok()) {
         state.board_code = Some(code);
+    }
+    if let Some(mode) = fields.get("mode") {
+        state.controller_mode = Some(mode.clone());
+    }
+    if let Some(rate) = fields.get("rate_hz").and_then(|v| v.parse::<u32>().ok()) {
+        state.controller_rate_hz = Some(rate);
+    }
+    if let Some(block) = fields
+        .get("block_samples")
+        .and_then(|v| v.parse::<u32>().ok())
+    {
+        state.controller_block_samples = Some(block);
+    }
+    if let Some(raw) = fields.get("raw") {
+        state.controller_emit_raw = Some(raw == "1");
+    }
+    if let Some(summary) = fields.get("summary") {
+        state.controller_emit_summary = Some(summary == "1");
     }
     if let Some(controller) = fields.get("state") {
         state.controller_state = match controller.as_str() {
@@ -1859,7 +1888,6 @@ impl StageAModulationPlugin {
             .unwrap_or(ModulationTargetV1 {
                 revision,
                 waveform: None,
-                a1_configuration: None,
                 a2_configuration: None,
                 acquisition_running: false,
                 board_dac_code: None,
@@ -1869,6 +1897,28 @@ impl StageAModulationPlugin {
         target.board_dac_code = None;
         target.firmware_configuration_revision = None;
         target
+    }
+
+    /// The controller's own acquisition settings, as it last reported them.
+    ///
+    /// A mode change restates them, so a controller that has not reported yet
+    /// is refused rather than reconfigured from a guess.
+    fn controller_acquisition(&self) -> Result<ControllerAcquisition, ServiceErrorV1> {
+        let missing = || {
+            service_error(
+                ServiceErrorCodeV1::InvalidCommand,
+                "the controller has not reported its acquisition settings yet — connect and let \
+                 it answer STATUS first",
+                true,
+            )
+        };
+        let state = self.shared.state.lock().expect("device state lock");
+        Ok(ControllerAcquisition {
+            rate_hz: state.controller_rate_hz.ok_or_else(missing)?,
+            block_samples: state.controller_block_samples.ok_or_else(missing)?,
+            emit_raw: state.controller_emit_raw.unwrap_or(true),
+            emit_summary: state.controller_emit_summary.unwrap_or(true),
+        })
     }
 
     fn queue_service_operation(
@@ -2262,30 +2312,36 @@ impl StageAModulationPlugin {
                 self.shared.bump();
                 self.immediate_response(request, RequestOutcomeV1::Applied, None)
             }
-            ModulationCommandV1::PrepareA1 { configuration } => {
+            ModulationCommandV1::PrepareA1 => {
                 self.require_lease(request)?;
-                validate_a1_configuration(configuration)?;
+                let settings = self.controller_acquisition()?;
+                let was_running = self
+                    .shared
+                    .state
+                    .lock()
+                    .expect("device state lock")
+                    .controller_state
+                    == ControllerStateV1::Running;
                 let revision = self.requested_revision(request)?;
                 let mut target = self.base_target(revision);
-                target.a1_configuration = Some(configuration.clone());
-                target.acquisition_running = false;
-                self.queue_service_operation(
-                    request,
-                    target,
-                    vec![
-                        Command::new("STOP").field("reason", "prepare_a1"),
-                        a1_config_command(configuration),
-                    ],
-                    "PREPARE_A1",
-                    false,
-                )
+                target.acquisition_running = was_running;
+                // `CONFIG` is refused while the acquisition runs, and `STOP`
+                // ends the photodiode stream, so the sequence has to put the
+                // stream back where it found it.
+                let mut commands = vec![
+                    Command::new("STOP").field("reason", "prepare_a1"),
+                    a1_config_command(&settings),
+                ];
+                if was_running {
+                    commands.push(Command::new("START"));
+                }
+                self.queue_service_operation(request, target, commands, "PREPARE_A1", false)
             }
             ModulationCommandV1::PrepareA2 { configuration } => {
                 self.require_lease(request)?;
                 validate_a2_configuration(configuration)?;
                 let revision = self.requested_revision(request)?;
                 let mut target = self.base_target(revision);
-                target.a1_configuration = None;
                 target.a2_configuration = Some(configuration.clone());
                 target.acquisition_running = false;
                 self.queue_service_operation(
@@ -2403,6 +2459,7 @@ impl StageAModulationPlugin {
             capabilities: state.capabilities.clone(),
             lease: self.lease_snapshot(),
             controller_state: state.controller_state,
+            controller_mode: state.controller_mode.clone(),
             active_run_id: self.lease.as_ref().and_then(|lease| lease.run_id.clone()),
             requested: state.requested.clone(),
             // Service-path acknowledgements win; otherwise expose the
@@ -2836,41 +2893,31 @@ fn waveform_command(waveform: &WaveformV1) -> Command {
     }
 }
 
-/// `CONFIG mode=A1` — the trigger policy an A1 run needs.
+/// `CONFIG mode=A1` — the trigger policy an A1 run needs, with the
+/// controller's own acquisition settings restated unchanged.
 ///
 /// In A1 the firmware parks the comparator and stamps a phase-0 marker on the
 /// photodiode stream at every cycle; in A2 the comparator drives the camera
-/// trigger instead and no phase-0 marker is written. Only these five fields
-/// exist: anything else is answered with `SYNTAX unknown_config_field`, so the
-/// drive stays with `MOD`.
-fn a1_config_command(configuration: &A1AcquisitionConfigV1) -> Command {
+/// trigger instead and no phase-0 marker is written. `CONFIG` accepts only
+/// `mode`, `rate_hz`, `block_samples`, `raw` and `summary` — anything else is
+/// answered with `SYNTAX unknown_config_field` — and it requires a mode *and* a
+/// rate, so the mode cannot be changed without restating the rate.
+fn a1_config_command(settings: &ControllerAcquisition) -> Command {
     Command::new("CONFIG")
         .field("mode", "A1")
-        .field("rate_hz", configuration.sample_rate_hz)
-        .field("block_samples", configuration.block_samples)
-        .field("raw", u8::from(configuration.emit_raw_samples))
-        .field("summary", u8::from(configuration.emit_summary))
+        .field("rate_hz", settings.rate_hz)
+        .field("block_samples", settings.block_samples)
+        .field("raw", u8::from(settings.emit_raw))
+        .field("summary", u8::from(settings.emit_summary))
 }
 
-/// The firmware's own `CONFIG` bounds, refused here rather than at the bench.
-fn validate_a1_configuration(configuration: &A1AcquisitionConfigV1) -> Result<(), ServiceErrorV1> {
-    let invalid = |message: &str| service_error(ServiceErrorCodeV1::InvalidCommand, message, false);
-    if !(FIRMWARE_MIN_SAMPLE_RATE_HZ..=FIRMWARE_MAX_SAMPLE_RATE_HZ)
-        .contains(&configuration.sample_rate_hz)
-    {
-        return Err(invalid(&format!(
-            "A1 sample_rate_hz must be in {FIRMWARE_MIN_SAMPLE_RATE_HZ}..={FIRMWARE_MAX_SAMPLE_RATE_HZ}"
-        )));
-    }
-    if !(1..=FIRMWARE_MAX_BLOCK_SAMPLES).contains(&configuration.block_samples) {
-        return Err(invalid(&format!(
-            "A1 block_samples must be in 1..={FIRMWARE_MAX_BLOCK_SAMPLES}"
-        )));
-    }
-    if !configuration.emit_raw_samples && !configuration.emit_summary {
-        return Err(invalid("A1 must enable raw samples or summaries"));
-    }
-    Ok(())
+/// The acquisition settings a mode change has to carry over unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ControllerAcquisition {
+    rate_hz: u32,
+    block_samples: u32,
+    emit_raw: bool,
+    emit_summary: bool,
 }
 
 fn validate_a2_configuration(configuration: &A2AcquisitionConfigV1) -> Result<(), ServiceErrorV1> {
@@ -5568,18 +5615,17 @@ mod tests {
             None,
         );
         plugin.handle_service_request(&acquire, &live_execution());
+        {
+            // The mode change restates what the controller reported.
+            let mut state = plugin.shared.state.lock().expect("device state lock");
+            state.controller_rate_hz = Some(20_000);
+            state.controller_block_samples = Some(256);
+        }
         let prepare = service_request(
             &plugin,
             21,
             "workflow-a",
-            ModulationCommandV1::PrepareA1 {
-                configuration: A1AcquisitionConfigV1 {
-                    sample_rate_hz: 20_000,
-                    block_samples: 256,
-                    emit_raw_samples: true,
-                    emit_summary: true,
-                },
-            },
+            ModulationCommandV1::PrepareA1,
             Some(1),
         );
         let initial = plugin.handle_service_request(&prepare, &live_execution());
@@ -5716,38 +5762,22 @@ mod tests {
     }
 
     /// `CONFIG` answers any field it does not know with
-    /// `SYNTAX unknown_config_field`, so the A1 preparation must carry the five
-    /// it accepts and nothing else.
+    /// `SYNTAX unknown_config_field`, and it needs a mode *and* a rate, so the
+    /// mode change restates the controller's own acquisition settings.
     #[test]
     fn a1_config_matches_the_firmware_grammar() {
-        let config = A1AcquisitionConfigV1 {
-            sample_rate_hz: 20_000,
+        // The rate `CONFIG` carries is the controller's own portable-sampler
+        // rate from STATUS, not the DMA stream rate the photodiode reads.
+        let settings = ControllerAcquisition {
+            rate_hz: 20_000,
             block_samples: 256,
-            emit_raw_samples: true,
+            emit_raw: true,
             emit_summary: true,
         };
-        validate_a1_configuration(&config).unwrap();
         assert_eq!(
-            String::from_utf8(a1_config_command(&config).encode(1).unwrap()).unwrap(),
+            String::from_utf8(a1_config_command(&settings).encode(1).unwrap()).unwrap(),
             "@1 CONFIG mode=A1 rate_hz=20000 block_samples=256 raw=1 summary=1\n"
         );
-        // The controller's own bounds, refused here rather than at the bench.
-        assert!(validate_a1_configuration(&A1AcquisitionConfigV1 {
-            sample_rate_hz: 500_000,
-            ..config.clone()
-        })
-        .is_err());
-        assert!(validate_a1_configuration(&A1AcquisitionConfigV1 {
-            block_samples: 512,
-            ..config.clone()
-        })
-        .is_err());
-        assert!(validate_a1_configuration(&A1AcquisitionConfigV1 {
-            emit_raw_samples: false,
-            emit_summary: false,
-            ..config
-        })
-        .is_err());
     }
 
     #[test]
