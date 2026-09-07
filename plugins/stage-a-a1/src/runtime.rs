@@ -12690,7 +12690,13 @@ bias_refr_code,status,error\n\
         assert!(!text.contains("[camera_control]"));
         assert!(!text.contains("total_power_volts"));
         assert!(text.contains("[files]"));
-        assert!(text.contains("camera_config_sidecar = \"/data/A1-test/A1-test.toml\""));
+        // Compared against the same derivation, not a literal: `Path::join`
+        // renders the platform's separator, and the bench runs on Windows.
+        let parsed: toml::Value = toml::from_str(&text).expect("the sidecar is valid TOML");
+        assert_eq!(
+            parsed["files"]["camera_config_sidecar"].as_str(),
+            sibling_toml("/data/A1-test/A1-test.raw").as_deref(),
+        );
         let _ = std::fs::remove_file(&doc);
     }
 
