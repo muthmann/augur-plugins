@@ -645,6 +645,7 @@ struct RecordingSink {
     metadata: BTreeMap<String, String>,
     started_slug: String,
     samples_written: u64,
+    marker_counts: stage_a_plugin_contract::PdqMarkerCountsV1,
     write_error: Option<String>,
     /// Integrity counters at recording start, so the sidecar reports deltas
     /// for exactly the recorded span.
@@ -680,7 +681,23 @@ fn record_frame(recording: &SharedRecording, frame: &stage_a_io::Frame, samples:
         return;
     }
     match sink.writer.write_frame(frame) {
-        Ok(()) => sink.samples_written += samples as u64,
+        Ok(()) => {
+            sink.samples_written += samples as u64;
+            if let Some(marker) = frame.marker() {
+                let counts = &mut sink.marker_counts;
+                match (marker.source, marker.level) {
+                    (stage_a_io::wire::MARKER_SOURCE_PHASE0, 1) => counts.phase_zero += 1,
+                    (stage_a_io::wire::MARKER_SOURCE_COMPARATOR, 1) => {
+                        counts.comparator_rising += 1
+                    }
+                    (stage_a_io::wire::MARKER_SOURCE_COMPARATOR, 0) => {
+                        counts.comparator_falling += 1
+                    }
+                    (_, 2..=u8::MAX) => counts.invalid_level += 1,
+                    _ => {}
+                }
+            }
+        }
         Err(err) => sink.write_error = Some(format!("recording write failed: {err}")),
     }
 }
@@ -1558,6 +1575,7 @@ impl StageAPhotodiodePlugin {
             metadata,
             started_slug,
             samples_written: 0,
+            marker_counts: stage_a_plugin_contract::PdqMarkerCountsV1::default(),
             write_error: None,
             start_crc_failures: crc,
             start_resync_bytes: resync,
@@ -1630,6 +1648,7 @@ impl StageAPhotodiodePlugin {
                 .map_err(|err| format!("invalid recording digest: {err}"))?,
             frames_written: summary.frames_written,
             sample_frames_written: summary.sample_frames_written,
+            marker_counts: Some(sink.marker_counts),
             sample_range: summary.sample_range.map(|range| SampleRangeV1 {
                 first_sample_index: range.first_sample_index,
                 end_sample_index_exclusive: range.end_sample_index_exclusive,
@@ -1639,7 +1658,7 @@ impl StageAPhotodiodePlugin {
             segment_count: summary.sample_segments,
             integrity: contract_integrity,
             termination,
-            valid: summary.valid && write_error.is_none(),
+            valid: summary.valid && write_error.is_none() && samples > 0,
         };
         let sidecar = json!({
             "kind": "recording",
@@ -1651,6 +1670,7 @@ impl StageAPhotodiodePlugin {
             "samples_written": samples,
             "pdq_path": summary.path,
             "pdq_frames": summary.frames_written,
+            "marker_counts": receipt.marker_counts,
             "pdq_bytes": summary.bytes_written,
             "pdq_crc32": summary.file_crc32,
             "pdq_sha256": receipt.sha256.as_str(),
@@ -1678,7 +1698,7 @@ impl StageAPhotodiodePlugin {
                 "segment_restarts": summary.integrity.sequence_gaps,
                 "device_dropped_samples": summary.integrity.dropped_samples,
             },
-            "valid": summary.valid && write_error.is_none(),
+            "valid": summary.valid && write_error.is_none() && samples > 0,
             "write_error": write_error,
         });
         write_json(&sidecar_path, &sidecar)?;
@@ -5364,6 +5384,7 @@ mod tests {
             metadata: BTreeMap::new(),
             started_slug: "slug".into(),
             samples_written: 0,
+            marker_counts: stage_a_plugin_contract::PdqMarkerCountsV1::default(),
             write_error: None,
             start_crc_failures: 0,
             start_resync_bytes: 0,
@@ -5407,6 +5428,66 @@ mod tests {
             "the .pdq holds no marker frame: {frame_types:?}"
         );
         assert!(frame_types.contains(&FrameType::SamplesU16));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn comparator_edges_keep_source_level_tick_and_sample_index_through_pdq() {
+        let dir = temp_dir("a2-comparator-record");
+        let mut plugin = live_plugin();
+        plugin.data_dir = dir.to_string_lossy().into_owned();
+        let pdq_path = dir.join("edges.pdq");
+        *plugin.recording.lock().unwrap() = Some(RecordingSink {
+            writer: PdqWriter::create_new(&pdq_path).unwrap(),
+            pdq_path: pdq_path.clone(),
+            sidecar_path: dir.join("edges.json"),
+            pdq_path_label: "edges.pdq".into(),
+            sidecar_path_label: "edges.json".into(),
+            run_id: RunId::new("a2-edges"),
+            opened_at_unix_ms: 0,
+            stream_epoch: 0,
+            first_sample_index: None,
+            metadata: BTreeMap::new(),
+            started_slug: "test".into(),
+            samples_written: 0,
+            marker_counts: Default::default(),
+            write_error: None,
+            start_crc_failures: 0,
+            start_resync_bytes: 0,
+            start_device_dropped: 0,
+            start_segments: 0,
+        });
+        ingest_parse_event(
+            ParseEvent::Frame(mock_sample_frame(0, 100, &[1000; 16])),
+            &plugin.shared,
+            &plugin.recording,
+        );
+        for (seq, index, tick, level) in [(1, 102, 1001_u32, 1), (2, 112, 1021_u32, 0)] {
+            let mut frame = marker_frame(seq, index);
+            frame.payload[8..12].copy_from_slice(&tick.to_le_bytes());
+            frame.payload[12] = level;
+            frame.payload[13] = stage_a_io::wire::MARKER_SOURCE_COMPARATOR;
+            let frame = Frame::build(frame.header, frame.payload);
+            ingest_parse_event(ParseEvent::Frame(frame), &plugin.shared, &plugin.recording);
+        }
+        let receipt = plugin
+            .finalize_recording(PdqTerminationV1::Completed)
+            .unwrap()
+            .unwrap();
+        let counts = receipt.marker_counts.unwrap();
+        assert_eq!(counts.comparator_rising, 1);
+        assert_eq!(counts.comparator_falling, 1);
+        assert_eq!(counts.phase_zero, 0);
+        let mut reader = stage_a_io::PdqReader::open(&pdq_path).unwrap();
+        let mut edges = Vec::new();
+        while let Some(event) = reader.next_event().unwrap() {
+            if let stage_a_io::PdqReadEvent::Frame(frame) = event {
+                if let Some(m) = frame.marker() {
+                    edges.push((m.source, m.level, m.sample_index, m.tick_us));
+                }
+            }
+        }
+        assert_eq!(edges, vec![(2, 1, 102, 1001), (2, 0, 112, 1021)]);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

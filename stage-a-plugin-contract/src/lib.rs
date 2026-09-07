@@ -294,8 +294,18 @@ pub struct A1AcquisitionConfigV1 {
 /// The optical coordinates are calibrated lobe coordinates, not physical
 /// photon flux. `min_half_us` is a precomputed safety floor from the qualified
 /// A1/A5 timing bounds; the firmware enforces it and never guesses it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum A2TimingReferenceV1 {
+    #[default]
+    Comparator,
+    DriveSync,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct A2AcquisitionConfigV1 {
+    #[serde(default)]
+    pub timing_reference: A2TimingReferenceV1,
     pub mean_u_milli: u32,
     pub depth_a_milli: u32,
     pub frequency_millihz: u64,
@@ -420,8 +430,19 @@ pub struct ModulationTargetV1 {
     pub firmware_configuration_revision: Option<u64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct A2MarkerDiagnosticsV1 {
+    #[serde(default)]
+    pub dma_sample_clock: bool,
+    pub marker_drops: u64,
+    pub stream_marker_drops: u64,
+    pub observed_at_unix_ms: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModulationResponseV1 {
+    #[serde(default)]
+    pub marker_diagnostics: Option<A2MarkerDiagnosticsV1>,
     #[serde(flatten)]
     pub common: ResponseCommonV1,
     pub controller_state: ControllerStateV1,
@@ -600,6 +621,16 @@ pub enum PdqTerminationV1 {
     Aborted,
 }
 
+/// Counts of the marker frames actually persisted in a PDQ file. The payloads
+/// retain sample index, device tick, source and level for offline clock alignment.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PdqMarkerCountsV1 {
+    pub phase_zero: u64,
+    pub comparator_rising: u64,
+    pub comparator_falling: u64,
+    pub invalid_level: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PdqFinalizedReceiptV1 {
     pub run_id: RunId,
@@ -611,6 +642,8 @@ pub struct PdqFinalizedReceiptV1 {
     pub sha256: Sha256V1,
     pub frames_written: u64,
     pub sample_frames_written: u64,
+    #[serde(default)]
+    pub marker_counts: Option<PdqMarkerCountsV1>,
     pub sample_range: Option<SampleRangeV1>,
     pub sample_rate_hz: Option<u32>,
     pub segment_count: u64,
@@ -1065,6 +1098,7 @@ mod tests {
             sha256: Sha256V1::parse("ab".repeat(32)).expect("digest"),
             frames_written: 32,
             sample_frames_written: 30,
+            marker_counts: None,
             sample_range: Some(SampleRangeV1 {
                 first_sample_index: 10_000,
                 end_sample_index_exclusive: 17_680,

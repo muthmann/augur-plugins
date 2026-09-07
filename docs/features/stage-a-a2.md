@@ -1,85 +1,142 @@
 # Stage-A A2 latency automation
 
-A2 applies repeated calibrated optical log-square steps at several fluorescence
-pedestals and records the first camera event after each measured optical edge.
-The workflow plugin owns no serial port. It leases and orchestrates the permanent
-modulation and photodiode owners and the host camera recorder.
+A2 records synchronized camera RAW and photodiode PDQ at calibrated optical step
+points. It leases the existing modulation and photodiode owners and uses the host
+camera recorder. Latency, measured contrast, optical t50 and timing uncertainty are
+estimated offline. A completed capture is not proof of a qualified latency result.
 
-The A2 panel asks only for the point protocol. It creates the measurement ID
-automatically and uses the data folder selected in the photodiode plugin.
+## Production capture
+
+Use `plugins/stage-a-a2/protocols/a2_drive_sync_smoke.toml` first, then
+`a2_production_drive_sync.toml`. They explicitly select:
+
+```toml
+timing_reference = "drive_sync"
+trigger_validation = "offline_review"
+```
+
+The 43-point production schedule takes 7,337 seconds (122 min 17 s), including
+settling and excluding operator pauses, device acknowledgements and finalization.
+It has dark brackets, a blocked-drive reference, three cadence controls, seven
+repeated reference rows, and two passes through 3 flux targets × 5 depths. Each
+condition receives 200 commanded transitions per polarity across the two passes;
+partial boundary cycles must be removed offline. The 3-point smoke takes 37 seconds
+plus pauses and file operations. The older comparator templates remain available
+for qualified comparator experiments and keep their original strict defaults.
+
+For a time-limited first block, `a2_core_drive_sync.toml` records 19 rows in
+1,195 s (19 min 55 s) plus operator/file overhead. It keeps three flux targets,
+three depths (0.28/0.45/0.80), dark/sham/cadence controls and four short reference
+rows. Each grid condition has 50 commanded transitions per polarity before startup
+and boundary exclusions. It is a prioritized first dataset, not the same precision
+or drift replication as the full two-pass matrix. Keep the full file as an optional
+extension; do not claim A2 scientific closure solely from the shortened capture.
+A [separate Windows watcher](stage-a-lab-watch.md) can report missing file progress
+and saved A2 errors. It does not qualify the data or protect against PC/network loss.
+
+The camera trigger cable must receive **J24 digital phase-zero sync** for
+`drive_sync`. Do not leave it on the comparator output. Firmware confirms
+`J24_PHASE0`, an unarmed comparator and `SQUARE` before capture. J24 emits a narrow
+pulse once per period. Its falling edge ends that pulse; it is **not** the optical
+OFF transition. The PD stream records phase-zero markers (`source=1`) in its sample
+index space. Comparator captures instead use `source=2`, with explicit level,
+sample index and device microsecond tick. Wire framing remains PDA1-compatible.
+
+The pulse is recorded as a digital marker alongside the PD samples; it is not
+added electrically to the analog photodiode voltage. Both camera and PD must
+observe corresponding timing anchors. Their device clocks remain independent.
+A quiet interval precedes capture, and the stimulus is restarted only after both
+recorders are open. The first new pulse train gives an identifiable common onset;
+exclude the optical startup cycles from repeated-step estimates.
+Offline analysis must match pulse sequences, reject gaps, unwrap device ticks and
+fit offset and drift over each uninterrupted segment before mapping the measured
+PD t50 to camera time. Nominal half-period is only a search window for optical OFF.
+Never label the sync pulse's falling edge as optical OFF or align all rows by wall
+clock/edge ordinal alone.
 
 ## Acquisition contract
 
-- The TOML contains only the measurement points. Live hardware state is checked
-  before a lease is acquired.
-- Values an owner already publishes are resolved from the owner, not retyped
-  (ADR 040). The applied lobe endpoints and calibration ID come from
-  `ModulationStateV1::optical_lobe`, independent of the currently armed mode or
-  point. A2 commands every `mean_u` and `depth_a` from the protocol itself. A
-  missing applied calibration refuses with an instruction to use **Apply to
-  V_null / V_peak** in the modulation plugin. `min_half_us` may be omitted, in
-  which case the runner resolves
-  `max(5 * pixel_dead_time_us, settling guard)` from sensor telemetry and every
-  stepped half period is checked against the resolved floor. All of this happens
-  before the camera apply and before either lease.
-- `comparator_threshold_dac` defaults to `auto`. `V_50` moves with the operating
-  flux, so per distinct `(mean_u, depth_a)` pedestal the runner holds both
-  plateaus as constant drives, reads the settled `PhotodiodeLevelV1` at each,
-  proves through `end_sample_index` that the averaging window began after the
-  drive was acknowledged, and places the threshold at their midpoint via the
-  existing `CMP thr=` path. A clipped window, a stream restart, a plateau span
-  under 20 mV, an unsettled window or a midpoint outside the threshold DAC's
-  0–2500 mV range refuses the point. The ADC (0–3300 mV) and the threshold DAC
-  (0–2500 mV) do not share a reference, so the conversion always goes through
-  millivolts — an ADC code is never copied across as a threshold code.
-- The current complete camera configuration is applied and confirmed before
-  either hardware lease. EXT_TRIGGER and sensor telemetry must be on; STC,
-  Trail and ERC must be explicitly off. The host restores the pre-run state on
-  success, operator stop and failure.
-- `PrepareA2` is accepted only when firmware confirms comparator trigger source,
-  an armed comparator and `LOG_SQUARE`.
-- Dark points record camera RAW and photodiode PDQ for their declared duration
-  with modulation forced safe/off. Stepped points additionally require the
-  commanded number of both EXT_TRIGGER polarities (tolerance: one edge).
-- A pause is only an operator checkpoint for a physical action. Its message
-  tells the operator to block or open the optical path, explains what A2 will
-  set automatically, and says when to press **Continue**.
-- A sidecar records protocol identity/SHA-256, point, commanded pedestal/depth,
-  the actual comparator configuration, modulation calibration, photodiode
-  placement, splitter fraction, load resistance, reference-set ID, dark
-  reference, final file receipts, dynamic sensor values and trigger/load
-  evidence. It links the host-owned camera and sensor-monitoring companions
-  instead of duplicating their bias/configuration data. The exact protocol
-  source is archived once by SHA-256.
-- Implausible stepped trigger counts, a partial RAW/PDQ, an exceeded
-  pre-qualified recorder safety limit,
-  missing sensor dead-time, stale owner reply or expired lease fails closed.
-- The plugin contains no scientific fit. Censoring-aware first-event latency and
-  jitter are computed offline, ON and OFF separately.
+The panel asks for the protocol. The runner creates the measurement ID, uses the
+PD owner's data folder and archives the exact TOML by SHA-256. The host may put RAW
+in its own output folder; the A2 sidecar stores the returned absolute path and
+links camera-configuration and sensor-monitoring companions. Keep both folders.
 
-## Current bench topology
+Applied optical lobe/calibration, PD placement (`emission_path`), splitter fraction
+(0.5), gain/load and selected reference ID come from the owners (ADR 040). No manual
+copy of those values into TOML is required. A2 uses the current host camera state,
+applies and confirms it before recording, then requests restoration on every exit.
+EXT_TRIGGER and sensor telemetry are enabled; STC, Trail and ERC are disabled.
 
-The immediate protocol is scoped to `fluorescence_chain`: ATTO647 sample,
-fluorescence filter, 50:50 splitter, camera and the sole photodiode in the
-emission path. It does not use rejected-port complement geometry or `I_tot`.
+`drive_sync` skips comparator calibration and optical amplitude gates. No 20 mV
+minimum, peak-to-peak noise limit or measured dead-time gate prevents its capture.
+Unrepresentable DAC/frequency settings, unavailable owners, failed leases, missing
+or empty recordings, sample loss/discontinuity, short PD coverage and failed file
+writes remain acquisition errors. These conditions can destroy the requested data.
 
-## Hardware status
+A2 `mean_u` is the **geometric** step pedestal: low/high targets are
+`mean_u * exp(-a/2)` and `mean_u * exp(a/2)`. The production TOML uses
+`mean_u = target_cycle_mean / cosh(a/2)`, rounded to 0.001, to match A1's nominal
+cycle means 0.15, 0.30 and 0.45. Depths are 0.15, 0.28, 0.45, 0.80 and 1.30.
+A1's sixth depth 1.70 is intentionally not part of this A2 matrix. Large depths are
+model checks, not the small-step approximation. Matching commanded lobe means is
+not evidence of matching camera-port flux: use the concurrent emission PD.
 
-Firmware mode A2, `CMP`, `LOG_SQUARE`, `min_half_us`, comparator source ID 2 and
-trigger-source status exist in `stage-a-controller`. The sources build, but the
-comparator has not been bench-qualified. H4 loopback, H5 polarity/offset and the
-emission optical-edge qualification remain required before a quantitative A2
-result is accepted. They are review qualifications, not fields copied into each
-point protocol.
+`comparator` remains the backwards-compatible timing default. Each auto-threshold
+point measures eight separate PD windows per plateau after a sample-clock settling
+guard. It checks clipping, stream identity, spread/uncertainty of window means,
+threshold-DAC range and representability. Raw peak-to-peak noise becomes a recorded
+warning rather than a 20 mV criterion. These are threshold-placement diagnostics,
+not proof that an individual noisy edge has a precise t50. The threshold is measured
+again at each point, so an earlier reference is not silently reused after drift.
+The ADC 3.3 V reference and threshold DAC 2.5 V reference remain separate.
 
-The optional PDQ cross-check is not the A2 time base. Production firmware now
-mirrors comparator marker frames (`source=2`) through the non-blocking
-photodiode stream path, so a PDQ can carry the independent comparator-edge
-record. Camera-clock EXT_TRIGGER remains the latency clock of record. Marker
-drops are explicit firmware integrity evidence. The A2 sidecar marks that H4/H5
-review is required.
+## Recording, evidence and failures
 
-Before the first A2 run, record the generic electronics-dark,
-blocked-drive-crosstalk and static-light files in the PD plugin. The PD owner
-publishes the selected reference-set ID, and A2 stores it automatically. These
-files support later noise and timing analysis. They do not replace H4 or H5.
+A2 prepares the stimulus before recording and keeps the free-running 500 kSa/s DMA
+PD stream. It never issues command-port `START` inside PDQ capture: that command
+switches the ADC sampler and resets acquisition counters. `CONFIG rate_hz=20000`
+is the supported portable sampler setting; it does not reduce the independent
+DMA stream rate. Dark uses safe-off; point end stops the waveform explicitly.
+`STOP` alone stops the command sampler and is not a stimulus-off command.
+
+Lease renewals have separate reply kinds and cannot advance acquisition phases.
+Replies must match request, owner and run. Timeouts and cleanup retries are bounded.
+PD sample progression has a five-second watchdog. Finalized receipts must attest
+nonempty, contiguous, clean data of the requested duration. Failures retain paths,
+hashes and the first cause; sidecar failures and unconfirmed cleanup are visible.
+An aborted or failed point cannot become a successful completed protocol.
+
+A2 sidecar schema 2 includes timing policy, actual command values, firmware marker
+loss counters at command boundaries, PDQ marker counts, raw paths/hashes and
+cleanup evidence. Photodiode final receipts carry additive optional marker counts;
+old owners decode but missing evidence needs review. Live preview trigger counts
+and event-load peaks are best-effort diagnostics, not an authoritative RAW audit.
+`offline_review` retains these warnings and continues; it never converts them into
+a valid timing claim. `strict` stops on timing warnings. Hard acquisition errors
+stop either policy. Offline H4/H5 review is required even if acquisition checks pass.
+
+## Firmware and scientific limits
+
+Production `stage-a-controller` firmware now uses the DMA write cursor for the
+stream marker index (`STATUS marker_clock=dma_cursor_v1`). Foreground delays no
+longer enter its index calculation. Skipped DMA blocks advance physical sample time
+and increment loss evidence instead of compressing the time axis. Ambiguous cursor
+snapshots are counted as marker losses. Interrupt latency, ADC conversion/pipeline,
+2 µs sample quantization and the actual camera trigger path still need calibration.
+This implementation is not a hardware measurement of their error bounds.
+
+The firmware build to flash for normal operation is the `teensy41` build. The
+`a2_comparator` build is a standalone diagnostic and cannot run this capture path.
+A new host plugin alone does not update the Teensy. Verify the firmware marker-clock
+status, install matching runtime bundles, and fully restart the host before smoke.
+
+Noise references can characterize offset, noise and electrical crosstalk. A separate
+reference cannot reconstruct the random fluctuations in a later optical edge.
+With approximately 380 mV peak-to-peak fluctuations, 20 mV modulation is not by
+itself evidence of identifiable single-cycle t50. Preserve raw PD samples. Estimate
+mean edges over repeated cycles and report the residual per-cycle timing uncertainty;
+do not subtract reference noise as if it were the same noise realization.
+Intrinsic pixel jitter and absolute latency require bounded synchronization/input
+uncertainty. Otherwise report fluorescence-chain latency or drive-relative response.
+
+See [ADR 041](../adr/041-stage-a-a2-drive-sync-capture.md) for the compatibility decision.

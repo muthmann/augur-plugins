@@ -44,13 +44,13 @@ use serde_json::{json, Value};
 use stage_a_io::{Command, DeviceEvent, MockController, StageAClient, Transport};
 use stage_a_plugin_contract::drive_frequency_supported;
 use stage_a_plugin_contract::{
-    A1AcquisitionConfigV1, A2AcquisitionConfigV1, ClientId, ConnectionStateV1, ControllerStateV1,
-    FreshnessV1, LeaseId, LeaseSnapshotV1, ModulationCommandV1, ModulationRequestV1,
-    ModulationResponseV1, ModulationStateV1, ModulationTargetV1, OpticalDriveStateV1,
-    OpticalLobeStateV1, OpticalTargetV1, OwnerInstanceId, PhotodiodeLevelV1, PhotodiodeSummaryV1,
-    RequestOutcomeV1, ResponseCommonV1, RunId, SemanticRevision, ServiceErrorCodeV1,
-    ServiceErrorV1, SynchronizationV1, UnsyncedReasonV1, WaveformV1, CONTRACT_VERSION_V1,
-    CTX_STAGE_A_MODULATION_STATE_V1, CTX_STAGE_A_PHOTODIODE_SUMMARY_V1,
+    A1AcquisitionConfigV1, A2AcquisitionConfigV1, A2TimingReferenceV1, ClientId, ConnectionStateV1,
+    ControllerStateV1, FreshnessV1, LeaseId, LeaseSnapshotV1, ModulationCommandV1,
+    ModulationRequestV1, ModulationResponseV1, ModulationStateV1, ModulationTargetV1,
+    OpticalDriveStateV1, OpticalLobeStateV1, OpticalTargetV1, OwnerInstanceId, PhotodiodeLevelV1,
+    PhotodiodeSummaryV1, RequestOutcomeV1, ResponseCommonV1, RunId, SemanticRevision,
+    ServiceErrorCodeV1, ServiceErrorV1, SynchronizationV1, UnsyncedReasonV1, WaveformV1,
+    CONTRACT_VERSION_V1, CTX_STAGE_A_MODULATION_STATE_V1, CTX_STAGE_A_PHOTODIODE_SUMMARY_V1,
     DRIVE_FREQUENCY_MAX_MILLIHZ, DRIVE_FREQUENCY_MIN_MILLIHZ, PLUGIN_ID_STAGE_A_MODULATION,
     PLUGIN_ID_STAGE_A_PHOTODIODE, SERVICE_STAGE_A_MODULATION_CONTROL_V1,
 };
@@ -277,6 +277,7 @@ struct DeviceState {
     acknowledged: Option<ModulationTargetV1>,
     last_response: Option<ModulationResponseV1>,
     last_device_update_unix_ms: u64,
+    marker_diagnostics: Option<stage_a_plugin_contract::A2MarkerDiagnosticsV1>,
 }
 
 impl Default for DeviceState {
@@ -297,6 +298,7 @@ impl Default for DeviceState {
             acknowledged: None,
             last_response: None,
             last_device_update_unix_ms: 0,
+            marker_diagnostics: None,
         }
     }
 }
@@ -545,15 +547,28 @@ fn execute_operation<T: Transport>(
         }
     }
 
+    // Snapshot the firmware's loss counters at A2 command boundaries. USB
+    // frame CRCs cannot reveal a marker dropped before it was serialized.
+    if error.is_none()
+        && operation
+            .meta
+            .as_ref()
+            .is_some_and(|m| m.target.a2_configuration.is_some())
+    {
+        match client.request(&Command::new("STATUS")) {
+            Ok(fields) => merged.extend(fields),
+            Err(e) => error = Some(format!("A2 status readback failed: {e}")),
+        }
+    }
+
     if error.is_none() && operation.purpose == "PREPARE_A2" {
-        let prepared = merged.get("trigger_source").map(String::as_str) == Some("comparator")
-            && merged.get("cmp_armed").map(String::as_str) == Some("1")
-            && merged.get("mod_wave").map(String::as_str) == Some("LOG_SQUARE");
-        if !prepared {
-            error = Some(
-                "firmware did not confirm trigger_source=comparator, cmp_armed=1 and mod_wave=LOG_SQUARE"
-                    .into(),
-            );
+        let reference = operation
+            .meta
+            .as_ref()
+            .and_then(|m| m.target.a2_configuration.as_ref())
+            .map_or(A2TimingReferenceV1::Comparator, |c| c.timing_reference);
+        if let Err(reason) = verify_a2_prepared(&merged, reference) {
+            error = Some(reason);
         }
     }
 
@@ -563,6 +578,7 @@ fn execute_operation<T: Transport>(
         state.last_error = Some(format!("{}: {message}", operation.purpose));
         if let Some(meta) = operation.meta {
             state.last_response = Some(ModulationResponseV1 {
+                marker_diagnostics: state.marker_diagnostics,
                 common: ResponseCommonV1 {
                     contract_version: CONTRACT_VERSION_V1,
                     request_id: meta.request_id,
@@ -594,6 +610,7 @@ fn execute_operation<T: Transport>(
                 .and_then(|value| value.parse::<u64>().ok());
             state.acknowledged = Some(acknowledged.clone());
             state.last_response = Some(ModulationResponseV1 {
+                marker_diagnostics: state.marker_diagnostics,
                 common: ResponseCommonV1 {
                     contract_version: CONTRACT_VERSION_V1,
                     request_id: meta.request_id,
@@ -637,6 +654,21 @@ fn apply_status_reply(
 }
 
 fn apply_reply_fields(state: &mut DeviceState, fields: &BTreeMap<String, String>) {
+    if let (Some(marker_drops), Some(stream_marker_drops)) = (
+        fields.get("marker_drops").and_then(|v| v.parse().ok()),
+        fields
+            .get("stream_marker_drops")
+            .and_then(|v| v.parse().ok()),
+    ) {
+        state.marker_diagnostics = Some(stage_a_plugin_contract::A2MarkerDiagnosticsV1 {
+            dma_sample_clock: fields.get("marker_clock").map(String::as_str)
+                == Some("dma_cursor_v1"),
+            marker_drops,
+            stream_marker_drops,
+            observed_at_unix_ms: now_unix_ms(),
+        });
+    }
+
     if let Some(code) = fields.get("code").and_then(|v| v.parse::<i64>().ok()) {
         state.board_code = Some(code);
     }
@@ -1878,6 +1910,7 @@ impl StageAModulationPlugin {
         }
         self.shared.bump();
         Ok(ModulationResponseV1 {
+            marker_diagnostics: None,
             common: ResponseCommonV1 {
                 contract_version: CONTRACT_VERSION_V1,
                 request_id: request.request_id,
@@ -2256,12 +2289,7 @@ impl StageAModulationPlugin {
                 self.queue_service_operation(
                     request,
                     target,
-                    vec![
-                        Command::new("STOP").field("reason", "prepare_a2"),
-                        a2_config_command(configuration),
-                        a2_comparator_command(configuration),
-                        a2_log_square_command(configuration),
-                    ],
+                    a2_prepare_commands(configuration)?,
                     "PREPARE_A2",
                     false,
                 )
@@ -2303,6 +2331,7 @@ impl StageAModulationPlugin {
     ) -> Result<ModulationResponseV1, ServiceErrorV1> {
         let state = self.shared.state.lock().expect("device state lock");
         let response = ModulationResponseV1 {
+            marker_diagnostics: state.marker_diagnostics,
             common: ResponseCommonV1 {
                 contract_version: CONTRACT_VERSION_V1,
                 request_id: request.request_id,
@@ -2842,7 +2871,9 @@ fn validate_a2_configuration(configuration: &A2AcquisitionConfigV1) -> Result<()
     if configuration.v_peak_dac <= configuration.v_null_dac {
         return Err(invalid("A2 v_peak_dac must be greater than v_null_dac"));
     }
-    if !(1..=4_095).contains(&configuration.comparator_threshold_dac) {
+    if configuration.timing_reference == A2TimingReferenceV1::Comparator
+        && !(1..=4_095).contains(&configuration.comparator_threshold_dac)
+    {
         return Err(invalid("A2 comparator threshold must be in 1..=4095"));
     }
     if configuration.comparator_hysteresis > 3 {
@@ -2860,10 +2891,89 @@ fn validate_a2_configuration(configuration: &A2AcquisitionConfigV1) -> Result<()
     Ok(())
 }
 
+fn verify_a2_prepared(
+    fields: &BTreeMap<String, String>,
+    reference: A2TimingReferenceV1,
+) -> Result<(), String> {
+    let source = fields.get("trigger_source").map(String::as_str);
+    let wave = fields.get("mod_wave").map(String::as_str);
+    let comparator = fields.get("cmp_armed").map(String::as_str);
+    let valid = match reference {
+        A2TimingReferenceV1::Comparator => {
+            matches!(source, Some("PD_COMPARATOR" | "comparator"))
+                && comparator == Some("1")
+                && wave == Some("LOG_SQUARE")
+        }
+        A2TimingReferenceV1::DriveSync => {
+            source == Some("J24_PHASE0") && comparator == Some("0") && wave == Some("SQUARE")
+        }
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(format!("A2 {:?} preparation not confirmed: trigger_source={source:?}, cmp_armed={comparator:?}, mod_wave={wave:?}", reference))
+    }
+}
+
+fn a2_prepare_commands(c: &A2AcquisitionConfigV1) -> Result<Vec<Command>, ServiceErrorV1> {
+    let mut commands = vec![
+        Command::new("STOP").field("reason", "prepare_a2"),
+        a2_config_command(c),
+    ];
+    match c.timing_reference {
+        A2TimingReferenceV1::Comparator => {
+            commands.push(a2_comparator_command(c));
+            commands.push(a2_log_square_command(c));
+        }
+        A2TimingReferenceV1::DriveSync => {
+            let mean = f64::from(c.mean_u_milli) / 1000.0;
+            let depth = f64::from(c.depth_a_milli) / 1000.0;
+            let high = mean * (0.5 * depth).exp();
+            let low = mean * (-0.5 * depth).exp();
+            if !high.is_finite() || high > 1.0 {
+                return Err(service_error(
+                    ServiceErrorCodeV1::InvalidCommand,
+                    "A2 square exceeds the calibrated optical lobe",
+                    false,
+                ));
+            }
+            let code = |u: f64| {
+                (f64::from(c.v_null_dac)
+                    + 2.0 * f64::from(c.v_peak_dac - c.v_null_dac) / std::f64::consts::PI
+                        * u.sqrt().asin())
+                .round() as u16
+            };
+            let (low, high) = (code(low), code(high));
+            if low == high || high > 4095 {
+                return Err(service_error(
+                    ServiceErrorCodeV1::InvalidCommand,
+                    "A2 square is not representable by the stimulus DAC",
+                    false,
+                ));
+            }
+            commands.push(
+                Command::new("MOD")
+                    .field("wave", "SQUARE")
+                    .field("min", low)
+                    .field("level", high)
+                    .field("freq_mhz", c.frequency_millihz),
+            );
+        }
+    }
+    Ok(commands)
+}
+
 fn a2_config_command(configuration: &A2AcquisitionConfigV1) -> Command {
     Command::new("CONFIG")
-        .field("mode", "A2")
-        .field("rate_hz", configuration.sample_rate_hz)
+        .field(
+            "mode",
+            if configuration.timing_reference == A2TimingReferenceV1::Comparator {
+                "A2"
+            } else {
+                "A1"
+            },
+        )
+        .field("rate_hz", 20_000)
         .field("block_samples", configuration.block_samples)
         .field("raw", u8::from(configuration.emit_raw_samples))
         .field("summary", u8::from(configuration.emit_summary))
@@ -5593,6 +5703,7 @@ mod tests {
     #[test]
     fn a2_commands_match_the_firmware_grammar_and_use_lobe_span() {
         let config = A2AcquisitionConfigV1 {
+            timing_reference: A2TimingReferenceV1::Comparator,
             mean_u_milli: 300,
             depth_a_milli: 450,
             frequency_millihz: 500,
@@ -5610,7 +5721,7 @@ mod tests {
         validate_a2_configuration(&config).unwrap();
         assert_eq!(
             String::from_utf8(a2_config_command(&config).encode(1).unwrap()).unwrap(),
-            "@1 CONFIG mode=A2 rate_hz=500000 block_samples=256 raw=1 summary=1\n"
+            "@1 CONFIG mode=A2 rate_hz=20000 block_samples=256 raw=1 summary=1\n"
         );
         assert_eq!(
             String::from_utf8(a2_comparator_command(&config).encode(2).unwrap()).unwrap(),
@@ -5624,5 +5735,83 @@ mod tests {
         let mut unsafe_threshold = config;
         unsafe_threshold.comparator_threshold_dac = 0;
         assert!(validate_a2_configuration(&unsafe_threshold).is_err());
+    }
+    #[test]
+    fn a2_accepts_the_actual_firmware_trigger_names_and_rejects_wrong_modes() {
+        let mut fields = BTreeMap::from([
+            ("trigger_source".into(), "PD_COMPARATOR".into()),
+            ("cmp_armed".into(), "1".into()),
+            ("mod_wave".into(), "LOG_SQUARE".into()),
+        ]);
+        assert!(verify_a2_prepared(&fields, A2TimingReferenceV1::Comparator).is_ok());
+        assert!(verify_a2_prepared(&fields, A2TimingReferenceV1::DriveSync).is_err());
+        fields.insert("trigger_source".into(), "J24_PHASE0".into());
+        fields.insert("cmp_armed".into(), "0".into());
+        fields.insert("mod_wave".into(), "SQUARE".into());
+        assert!(verify_a2_prepared(&fields, A2TimingReferenceV1::DriveSync).is_ok());
+        assert!(verify_a2_prepared(&fields, A2TimingReferenceV1::Comparator).is_err());
+    }
+
+    #[test]
+    fn drive_sync_a2_prepares_with_real_owner_and_mock_transport_without_start() {
+        let mut plugin = live_plugin();
+        plugin.port_hint = "mock".into();
+        plugin.connect_requested = true;
+        plugin.connect();
+        wait_until(&plugin, Duration::from_secs(2), |p| p.device_connected());
+        let acquire = service_request(
+            &plugin,
+            80,
+            "workflow-a",
+            ModulationCommandV1::AcquireLease { ttl_ms: 10_000 },
+            None,
+        );
+        plugin.handle_service_request(&acquire, &live_execution());
+        let prepare = service_request(
+            &plugin,
+            81,
+            "workflow-a",
+            ModulationCommandV1::PrepareA2 {
+                configuration: A2AcquisitionConfigV1 {
+                    timing_reference: A2TimingReferenceV1::DriveSync,
+                    mean_u_milli: 300,
+                    depth_a_milli: 450,
+                    frequency_millihz: 500,
+                    min_half_us: 0,
+                    v_null_dac: 100,
+                    v_peak_dac: 1000,
+                    comparator_threshold_dac: 0,
+                    comparator_hysteresis: 1,
+                    comparator_invert: false,
+                    sample_rate_hz: 500_000,
+                    block_samples: 256,
+                    emit_raw_samples: true,
+                    emit_summary: true,
+                },
+            },
+            Some(1),
+        );
+        plugin.handle_service_request(&prepare, &live_execution());
+        wait_until(&plugin, Duration::from_secs(2), |p| {
+            p.shared
+                .state
+                .lock()
+                .unwrap()
+                .last_response
+                .as_ref()
+                .is_some_and(|r| {
+                    r.common.request_id.0 == 81 && r.common.outcome != RequestOutcomeV1::InProgress
+                })
+        });
+        let state = plugin.shared.state.lock().unwrap();
+        let response = state.last_response.as_ref().unwrap();
+        assert_eq!(
+            response.common.outcome,
+            RequestOutcomeV1::Applied,
+            "{response:?}"
+        );
+        assert!(response.marker_diagnostics.unwrap().dma_sample_clock);
+        assert_eq!(state.controller_state, ControllerStateV1::Configured);
+        assert_eq!(state.board_wave.as_deref(), Some("SQUARE"));
     }
 }
