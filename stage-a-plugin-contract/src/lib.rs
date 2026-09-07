@@ -32,6 +32,15 @@ pub const DRIVE_DAC_UPDATE_RATE_HZ: u32 = 40_000;
 /// shape-resolution acceptance threshold.
 pub const A1_MIN_SAMPLES_PER_CYCLE: u32 = 16;
 
+/// The window the firmware's `CONFIG rate_hz` accepts (`stage-a-controller`:
+/// 100 Sa/s up to `kPortableMaxSampleRateHz`). Stated here so a plugin refuses
+/// an impossible rate at the press instead of collecting a `RANGE` error from
+/// the controller in the middle of a run.
+pub const FIRMWARE_MIN_SAMPLE_RATE_HZ: u32 = 100;
+pub const FIRMWARE_MAX_SAMPLE_RATE_HZ: u32 = 100_000;
+/// `kMaxSamplesPerBlock` in the firmware's board configuration.
+pub const FIRMWARE_MAX_BLOCK_SAMPLES: u32 = 256;
+
 pub fn drive_frequency_supported(frequency_millihz: u64) -> bool {
     (DRIVE_FREQUENCY_MIN_MILLIHZ..=DRIVE_FREQUENCY_MAX_MILLIHZ).contains(&frequency_millihz)
 }
@@ -275,18 +284,19 @@ pub enum WaveformV1 {
     },
 }
 
-/// Complete semantic configuration for one A1 controller acquisition.
+/// The A1 acquisition state the firmware's `CONFIG` verb actually carries.
+///
+/// It holds no drive fields. `CONFIG` accepts `mode`, `rate_hz`,
+/// `block_samples`, `raw` and `summary` and answers anything else with
+/// `SYNTAX unknown_config_field`, so a waveform or a DAC code here would only
+/// have been rejected on the wire. The drive is commanded separately, through
+/// `MOD`, at every measurement point.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct A1AcquisitionConfigV1 {
-    pub waveform: PeriodicWaveformV1,
-    pub frequency_millihz: u64,
-    pub center_dac: u16,
-    pub amplitude_dac: u16,
     pub sample_rate_hz: u32,
     pub block_samples: u32,
     pub emit_raw_samples: bool,
     pub emit_summary: bool,
-    pub optical_lut_id: Option<String>,
 }
 
 /// Complete, firmware-level configuration for one A2 step-latency point.
@@ -956,15 +966,10 @@ mod tests {
             ClientId::from("stage-a-a1"),
             ModulationCommandV1::PrepareA1 {
                 configuration: A1AcquisitionConfigV1 {
-                    waveform: PeriodicWaveformV1::Sine,
-                    frequency_millihz: 10_000,
-                    center_dac: 2_048,
-                    amplitude_dac: 512,
                     sample_rate_hz: 20_000,
                     block_samples: 256,
                     emit_raw_samples: true,
                     emit_summary: true,
-                    optical_lut_id: Some("lut-2026-07".into()),
                 },
             },
         );
@@ -976,10 +981,10 @@ mod tests {
 
         let json = serde_json::to_value(&request).expect("serializes");
         assert_eq!(json["command"]["kind"], "prepare_a1");
-        assert_eq!(
-            json["command"]["configuration"]["frequency_millihz"],
-            10_000
-        );
+        // The A1 configuration carries the controller's `CONFIG` fields only —
+        // the drive is commanded through `MOD`, never here.
+        assert_eq!(json["command"]["configuration"]["sample_rate_hz"], 20_000);
+        assert!(json["command"]["configuration"]["frequency_millihz"].is_null());
         let decoded: ModulationRequestV1 = serde_json::from_value(json).expect("deserializes");
         assert_eq!(decoded, request);
     }

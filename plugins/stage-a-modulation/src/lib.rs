@@ -51,7 +51,8 @@ use stage_a_plugin_contract::{
     PhotodiodeSummaryV1, RequestOutcomeV1, ResponseCommonV1, RunId, SemanticRevision,
     ServiceErrorCodeV1, ServiceErrorV1, SynchronizationV1, UnsyncedReasonV1, WaveformV1,
     CONTRACT_VERSION_V1, CTX_STAGE_A_MODULATION_STATE_V1, CTX_STAGE_A_PHOTODIODE_SUMMARY_V1,
-    DRIVE_FREQUENCY_MAX_MILLIHZ, DRIVE_FREQUENCY_MIN_MILLIHZ, PLUGIN_ID_STAGE_A_MODULATION,
+    DRIVE_FREQUENCY_MAX_MILLIHZ, DRIVE_FREQUENCY_MIN_MILLIHZ, FIRMWARE_MAX_BLOCK_SAMPLES,
+    FIRMWARE_MAX_SAMPLE_RATE_HZ, FIRMWARE_MIN_SAMPLE_RATE_HZ, PLUGIN_ID_STAGE_A_MODULATION,
     PLUGIN_ID_STAGE_A_PHOTODIODE, SERVICE_STAGE_A_MODULATION_CONTROL_V1,
 };
 
@@ -2263,6 +2264,7 @@ impl StageAModulationPlugin {
             }
             ModulationCommandV1::PrepareA1 { configuration } => {
                 self.require_lease(request)?;
+                validate_a1_configuration(configuration)?;
                 let revision = self.requested_revision(request)?;
                 let mut target = self.base_target(revision);
                 target.a1_configuration = Some(configuration.clone());
@@ -2834,23 +2836,41 @@ fn waveform_command(waveform: &WaveformV1) -> Command {
     }
 }
 
+/// `CONFIG mode=A1` — the trigger policy an A1 run needs.
+///
+/// In A1 the firmware parks the comparator and stamps a phase-0 marker on the
+/// photodiode stream at every cycle; in A2 the comparator drives the camera
+/// trigger instead and no phase-0 marker is written. Only these five fields
+/// exist: anything else is answered with `SYNTAX unknown_config_field`, so the
+/// drive stays with `MOD`.
 fn a1_config_command(configuration: &A1AcquisitionConfigV1) -> Command {
     Command::new("CONFIG")
         .field("mode", "A1")
-        .field(
-            "wave",
-            match configuration.waveform {
-                stage_a_plugin_contract::PeriodicWaveformV1::Sine => "SINE",
-                stage_a_plugin_contract::PeriodicWaveformV1::Square => "SQUARE",
-            },
-        )
-        .field("freq_mhz", configuration.frequency_millihz)
-        .field("center_dac", configuration.center_dac)
-        .field("amplitude_dac", configuration.amplitude_dac)
         .field("rate_hz", configuration.sample_rate_hz)
         .field("block_samples", configuration.block_samples)
         .field("raw", u8::from(configuration.emit_raw_samples))
         .field("summary", u8::from(configuration.emit_summary))
+}
+
+/// The firmware's own `CONFIG` bounds, refused here rather than at the bench.
+fn validate_a1_configuration(configuration: &A1AcquisitionConfigV1) -> Result<(), ServiceErrorV1> {
+    let invalid = |message: &str| service_error(ServiceErrorCodeV1::InvalidCommand, message, false);
+    if !(FIRMWARE_MIN_SAMPLE_RATE_HZ..=FIRMWARE_MAX_SAMPLE_RATE_HZ)
+        .contains(&configuration.sample_rate_hz)
+    {
+        return Err(invalid(&format!(
+            "A1 sample_rate_hz must be in {FIRMWARE_MIN_SAMPLE_RATE_HZ}..={FIRMWARE_MAX_SAMPLE_RATE_HZ}"
+        )));
+    }
+    if !(1..=FIRMWARE_MAX_BLOCK_SAMPLES).contains(&configuration.block_samples) {
+        return Err(invalid(&format!(
+            "A1 block_samples must be in 1..={FIRMWARE_MAX_BLOCK_SAMPLES}"
+        )));
+    }
+    if !configuration.emit_raw_samples && !configuration.emit_summary {
+        return Err(invalid("A1 must enable raw samples or summaries"));
+    }
+    Ok(())
 }
 
 fn validate_a2_configuration(configuration: &A2AcquisitionConfigV1) -> Result<(), ServiceErrorV1> {
@@ -5554,15 +5574,10 @@ mod tests {
             "workflow-a",
             ModulationCommandV1::PrepareA1 {
                 configuration: A1AcquisitionConfigV1 {
-                    waveform: stage_a_plugin_contract::PeriodicWaveformV1::Sine,
-                    frequency_millihz: 10_000,
-                    center_dac: 1_000,
-                    amplitude_dac: 250,
                     sample_rate_hz: 20_000,
                     block_samples: 256,
                     emit_raw_samples: true,
                     emit_summary: true,
-                    optical_lut_id: None,
                 },
             },
             Some(1),
@@ -5698,6 +5713,41 @@ mod tests {
         plugin.apply_execution_context(&ExecutionContext::fail_closed());
         assert!(plugin.link.is_none());
         assert!(plugin.lease.is_none());
+    }
+
+    /// `CONFIG` answers any field it does not know with
+    /// `SYNTAX unknown_config_field`, so the A1 preparation must carry the five
+    /// it accepts and nothing else.
+    #[test]
+    fn a1_config_matches_the_firmware_grammar() {
+        let config = A1AcquisitionConfigV1 {
+            sample_rate_hz: 20_000,
+            block_samples: 256,
+            emit_raw_samples: true,
+            emit_summary: true,
+        };
+        validate_a1_configuration(&config).unwrap();
+        assert_eq!(
+            String::from_utf8(a1_config_command(&config).encode(1).unwrap()).unwrap(),
+            "@1 CONFIG mode=A1 rate_hz=20000 block_samples=256 raw=1 summary=1\n"
+        );
+        // The controller's own bounds, refused here rather than at the bench.
+        assert!(validate_a1_configuration(&A1AcquisitionConfigV1 {
+            sample_rate_hz: 500_000,
+            ..config.clone()
+        })
+        .is_err());
+        assert!(validate_a1_configuration(&A1AcquisitionConfigV1 {
+            block_samples: 512,
+            ..config.clone()
+        })
+        .is_err());
+        assert!(validate_a1_configuration(&A1AcquisitionConfigV1 {
+            emit_raw_samples: false,
+            emit_summary: false,
+            ..config
+        })
+        .is_err());
     }
 
     #[test]

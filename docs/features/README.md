@@ -31,4 +31,6 @@ A2 production capture modes and synchronization evidence: [ADR 041](../adr/041-s
 
 An A1 protocol retries a rejected camera start, stops on a failed recording and refuses a survey whose sidecars it could not write: [ADR 043](../adr/043-a1-protocol-failure-policy.md).
 
+An A1 run states the controller's experiment mode instead of inheriting it: [ADR 044](../adr/044-a1-states-the-controller-mode.md).
+
 - [Windows lab watcher](stage-a-lab-watch.md): independent RAW/PDQ progress warnings to an iPhone through ntfy.
