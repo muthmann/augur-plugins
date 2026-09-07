@@ -4,6 +4,8 @@ Repository-level feature notes for larger plugin suites, interface migrations, a
 
 ## Available Briefs
 
+- [Stage-A command completion and record preservation](../adr/046-stage-a-command-completion-and-record-preservation.md) — confirmed commands, automatic A1 acquisition restart, durable metadata and Windows validation.
+
 - [Stage-A Bench Stack](./stage-a.md) — Teensy-driven Stage-A bench: two serial ports, two minimal plugins, and the shared `stage-a-io` library.
 - [Stage-A Modulation](./stage-a-modulation.md) — orthogonal Manual/Calibrated drive methods and five waveform modes under one hard DAC ceiling, applied immediately on the command port. The coupled `ū`/`a` controls **clamp into the achievable range instead of refusing**, so a leftover depth can no longer make an optical mode unselectable, and both live bounds are shown in the control labels (ADR 025). `V_peak` is the one operator-facing name for the lobe maximum; the half-wave span is derived and never entered. The undocumented TOML `MOD`-step protocol runner was removed — declarative recording protocols belong to A1 (ADR 027). Port discovery is platform-aware and shared with the photodiode plugin, so `auto` finds the Teensy on Windows' nameless `COMn` ports too (ADR 032).
 - [Stage-A Optical Waveform Drive](./stage-a-optical-waveform.md) — pre-warps the DAC from measured `V_null`/`V_peak` endpoints, with target-specific headroom, Bessel-normalized cycle mean `ū`, and an explicit separation from physical flux `I_k`.
@@ -29,8 +31,12 @@ Repository-level feature notes for larger plugin suites, interface migrations, a
 
 A2 production capture modes and synchronization evidence: [ADR 041](../adr/041-stage-a-a2-drive-sync-capture.md).
 
+Photodiode evidence files are written off the stream reader thread: [ADR 042](../adr/042-photodiode-recording-writes-off-the-reader-thread.md).
+
 An A1 protocol retries a rejected camera start, stops on a failed recording and refuses a survey whose sidecars it could not write: [ADR 043](../adr/043-a1-protocol-failure-policy.md).
 
 An A1 run states the controller's experiment mode instead of inheriting it: [ADR 044](../adr/044-a1-states-the-controller-mode.md).
+
+A withheld photodiode `a` names which of the four gates holds it, and A1 renders a controller left outside `mode=A1`: [ADR 045](../adr/045-a-refused-a-names-which-gate-holds-it.md).
 
 - [Windows lab watcher](stage-a-lab-watch.md): independent RAW/PDQ progress warnings to an iPhone through ntfy.

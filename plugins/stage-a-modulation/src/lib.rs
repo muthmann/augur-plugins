@@ -356,6 +356,7 @@ impl DeviceState {
 #[derive(Clone)]
 struct OperationMeta {
     request_id: stage_a_plugin_contract::RequestId,
+    requester: ClientId,
     run_id: Option<RunId>,
     requested_revision: SemanticRevision,
     target: ModulationTargetV1,
@@ -375,6 +376,8 @@ struct SharedLink {
     /// slider drags coalesce instead of queueing.
     pending: Mutex<Option<PendingOperation>>,
     priority: Mutex<Option<PendingOperation>>,
+    automation: Mutex<VecDeque<PendingOperation>>,
+    completions: Mutex<VecDeque<(ClientId, ModulationResponseV1)>>,
     stop: AtomicBool,
     fail_closed_on_stop: AtomicBool,
     generation: AtomicU64,
@@ -386,6 +389,8 @@ impl SharedLink {
             state: Mutex::new(DeviceState::default()),
             pending: Mutex::new(None),
             priority: Mutex::new(None),
+            automation: Mutex::new(VecDeque::new()),
+            completions: Mutex::new(VecDeque::new()),
             stop: AtomicBool::new(false),
             fail_closed_on_stop: AtomicBool::new(false),
             generation: AtomicU64::new(1),
@@ -491,7 +496,15 @@ fn run_device<T: Transport>(mut client: StageAClient<T>, shared: Arc<SharedLink>
     let mut consecutive_errors = 0u32;
     while !shared.stop.load(Ordering::Relaxed) {
         let priority = shared.priority.lock().expect("priority lock").take();
-        let pending = priority.or_else(|| shared.pending.lock().expect("pending lock").take());
+        let pending = priority
+            .or_else(|| {
+                shared
+                    .automation
+                    .lock()
+                    .expect("automation lock")
+                    .pop_front()
+            })
+            .or_else(|| shared.pending.lock().expect("pending lock").take());
         if let Some(operation) = pending {
             if execute_operation(&mut client, &shared, operation) {
                 consecutive_errors = 0;
@@ -544,6 +557,7 @@ fn execute_operation<T: Transport>(
     shared: &SharedLink,
     operation: PendingOperation,
 ) -> bool {
+    let requester = operation.meta.as_ref().map(|meta| meta.requester.clone());
     let mut merged = BTreeMap::new();
     let mut error = None;
     for command in &operation.commands {
@@ -584,6 +598,16 @@ fn execute_operation<T: Transport>(
         }
     }
 
+    if error.is_none()
+        && operation.purpose == "PREPARE_A1"
+        && (merged.get("mode").map(String::as_str) != Some("A1")
+            || merged.get("state").map(String::as_str) != Some("RUNNING")
+            || merged.get("trigger_source").map(String::as_str) != Some("J24_PHASE0")
+            || merged.get("cmp_armed").map(String::as_str) != Some("0"))
+    {
+        error = Some("A1 preparation not confirmed: expected mode=A1, running acquisition, J24_PHASE0 and comparator off".into());
+    }
+
     let mut state = shared.state.lock().expect("device state lock");
     let succeeded = error.is_none();
     if let Some(message) = error {
@@ -615,6 +639,10 @@ fn execute_operation<T: Transport>(
         state.last_error = None;
         if let Some(meta) = operation.meta {
             let mut acknowledged = meta.target;
+            if operation.purpose == "MOD" {
+                acknowledged.waveform =
+                    state.board_echo_target().and_then(|target| target.waveform);
+            }
             acknowledged.board_dac_code =
                 state.board_code.and_then(|code| u16::try_from(code).ok());
             acknowledged.firmware_configuration_revision = merged
@@ -637,6 +665,15 @@ fn execute_operation<T: Transport>(
                 controller_state: state.controller_state,
                 acknowledged_target: Some(acknowledged),
             });
+        }
+    }
+    if let Some(requester) = requester {
+        if let Some(response) = state.last_response.clone() {
+            let mut completions = shared.completions.lock().expect("completions lock");
+            completions.push_back((requester, response));
+            while completions.len() > 128 {
+                completions.pop_front();
+            }
         }
     }
     state.last_device_update_unix_ms = now_unix_ms();
@@ -1936,9 +1973,18 @@ impl StageAModulationPlugin {
                 true,
             ));
         }
+        let mut automation = self.shared.automation.lock().expect("automation lock");
+        if !priority && automation.len() >= 64 {
+            return Err(service_error(
+                ServiceErrorCodeV1::InvalidCommand,
+                "controller command queue is full",
+                true,
+            ));
+        }
         let revision = target.revision;
         let meta = OperationMeta {
             request_id: request.request_id,
+            requester: request.requester.clone(),
             run_id: request.run_id.clone(),
             requested_revision: revision,
             target: target.clone(),
@@ -1954,11 +2000,13 @@ impl StageAModulationPlugin {
             meta: Some(meta),
         };
         if priority {
+            automation.clear();
             *self.shared.pending.lock().expect("pending lock") = None;
             *self.shared.priority.lock().expect("priority lock") = Some(operation);
         } else {
-            *self.shared.pending.lock().expect("pending lock") = Some(operation);
+            automation.push_back(operation);
         }
+        drop(automation);
         self.shared.bump();
         Ok(ModulationResponseV1 {
             marker_diagnostics: None,
@@ -2090,11 +2138,11 @@ impl StageAModulationPlugin {
                     self.deferred_release_ack_published = false;
                     return Ok(response);
                 }
-                self.end_lease();
-                self.deferred_release_request = None;
                 self.shared
                     .fail_closed_on_stop
                     .store(false, Ordering::Relaxed);
+                self.end_lease();
+                self.deferred_release_request = None;
                 self.immediate_response(request, RequestOutcomeV1::Applied, None)
             }
             ModulationCommandV1::SafeOff { reason } => {
@@ -2186,13 +2234,18 @@ impl StageAModulationPlugin {
                 // sweep point, so `end_lease` can hand it back. Only the
                 // first one: later points must not overwrite the original.
                 self.armed_depth_a.get_or_insert(previous);
-                *self.shared.pending.lock().expect("pending lock") = Some(PendingOperation {
-                    commands: vec![command],
-                    purpose: "MOD",
-                    meta: None,
-                });
-                self.shared.bump();
-                self.immediate_response(request, RequestOutcomeV1::Applied, None)
+                let revision = self
+                    .shared
+                    .state
+                    .lock()
+                    .expect("device state lock")
+                    .requested
+                    .as_ref()
+                    .map_or(SemanticRevision(1), |target| {
+                        SemanticRevision(target.revision.0 + 1)
+                    });
+                let target = self.base_target(revision);
+                self.queue_service_operation(request, target, vec![command], "MOD", false)
             }
             ModulationCommandV1::SetDriveFrequency { frequency_millihz } => {
                 self.require_lease(request)?;
@@ -2244,13 +2297,18 @@ impl StageAModulationPlugin {
                 // first retarget only, so `end_lease` hands back what they
                 // armed rather than the sweep's last point.
                 self.armed_frequency_hz.get_or_insert(previous);
-                *self.shared.pending.lock().expect("pending lock") = Some(PendingOperation {
-                    commands: vec![command],
-                    purpose: "MOD",
-                    meta: None,
-                });
-                self.shared.bump();
-                self.immediate_response(request, RequestOutcomeV1::Applied, None)
+                let revision = self
+                    .shared
+                    .state
+                    .lock()
+                    .expect("device state lock")
+                    .requested
+                    .as_ref()
+                    .map_or(SemanticRevision(1), |target| {
+                        SemanticRevision(target.revision.0 + 1)
+                    });
+                let target = self.base_target(revision);
+                self.queue_service_operation(request, target, vec![command], "MOD", false)
             }
             ModulationCommandV1::SetOperatingPoint { mean_u_milli } => {
                 self.require_lease(request)?;
@@ -2304,38 +2362,33 @@ impl StageAModulationPlugin {
                 // the first retarget only, so `end_lease` hands back what they
                 // armed rather than the sweep's last point.
                 self.armed_operating_point.get_or_insert(previous);
-                *self.shared.pending.lock().expect("pending lock") = Some(PendingOperation {
-                    commands: vec![command],
-                    purpose: "MOD",
-                    meta: None,
-                });
-                self.shared.bump();
-                self.immediate_response(request, RequestOutcomeV1::Applied, None)
-            }
-            ModulationCommandV1::PrepareA1 => {
-                self.require_lease(request)?;
-                let settings = self.controller_acquisition()?;
-                let was_running = self
+                let revision = self
                     .shared
                     .state
                     .lock()
                     .expect("device state lock")
-                    .controller_state
-                    == ControllerStateV1::Running;
+                    .requested
+                    .as_ref()
+                    .map_or(SemanticRevision(1), |target| {
+                        SemanticRevision(target.revision.0 + 1)
+                    });
+                let target = self.base_target(revision);
+                self.queue_service_operation(request, target, vec![command], "MOD", false)
+            }
+            ModulationCommandV1::PrepareA1 => {
+                self.require_lease(request)?;
+                let settings = self.controller_acquisition()?;
                 let revision = self.requested_revision(request)?;
                 let mut target = self.base_target(revision);
-                target.acquisition_running = was_running;
-                // `CONFIG` is refused while the acquisition runs, and `STOP`
-                // ends the photodiode stream, so the sequence has to put the
-                // stream back where it found it.
-                let mut commands = vec![
-                    Command::new("STOP").field("reason", "prepare_a1"),
-                    a1_config_command(&settings),
-                ];
-                if was_running {
-                    commands.push(Command::new("START"));
-                }
-                self.queue_service_operation(request, target, commands, "PREPARE_A1", false)
+                target.a2_configuration = None;
+                target.acquisition_running = true;
+                self.queue_service_operation(
+                    request,
+                    target,
+                    a1_prepare_commands(&settings),
+                    "PREPARE_A1",
+                    false,
+                )
             }
             ModulationCommandV1::PrepareA2 { configuration } => {
                 self.require_lease(request)?;
@@ -2494,6 +2547,11 @@ impl StageAModulationPlugin {
     /// rather than what the operator had armed. The calibration sweep already
     /// restores through `Sweep::restore`; this is the leased equivalent.
     fn end_lease(&mut self) {
+        self.shared
+            .automation
+            .lock()
+            .expect("automation lock")
+            .clear();
         self.lease = None;
         let depth = self.armed_depth_a.take();
         let frequency = self.armed_frequency_hz.take();
@@ -2507,7 +2565,9 @@ impl StageAModulationPlugin {
         if let Some(operating_point) = operating_point {
             self.operating_point = operating_point;
         }
-        if depth.is_some() || frequency.is_some() || operating_point.is_some() {
+        if (depth.is_some() || frequency.is_some() || operating_point.is_some())
+            && !self.shared.fail_closed_on_stop.load(Ordering::Relaxed)
+        {
             // Re-arm the board only if nobody else now owns the DAC;
             // `send_modulation` is itself guarded.
             self.send_modulation();
@@ -2525,6 +2585,11 @@ impl StageAModulationPlugin {
         self.shared
             .fail_closed_on_stop
             .store(true, Ordering::Relaxed);
+        self.shared
+            .automation
+            .lock()
+            .expect("automation lock")
+            .clear();
         *self.shared.pending.lock().expect("pending lock") = None;
         *self.shared.priority.lock().expect("priority lock") = Some(PendingOperation {
             commands: vec![
@@ -2902,6 +2967,24 @@ fn waveform_command(waveform: &WaveformV1) -> Command {
 /// `mode`, `rate_hz`, `block_samples`, `raw` and `summary` — anything else is
 /// answered with `SYNTAX unknown_config_field` — and it requires a mode *and* a
 /// rate, so the mode cannot be changed without restating the rate.
+/// The whole A1 preparation sequence, sent every time preparation is asked for.
+///
+/// A controller that *reports* `A1` has not necessarily been configured for A1:
+/// A2's drive-synchronized capture configures A1 mode itself, at A2's own
+/// sample rate, and the firmware releases an armed comparator only when a
+/// `CONFIG` leaves A2. Restating the configuration costs one stream restart per
+/// run and leaves the caller nothing to inherit. `CONFIG` is refused while the
+/// acquisition runs, so `STOP` comes first; the closing `STATUS` is what the
+/// readback check reads mode, state, trigger source and comparator from.
+fn a1_prepare_commands(settings: &ControllerAcquisition) -> Vec<Command> {
+    vec![
+        Command::new("STOP").field("reason", "prepare_a1"),
+        a1_config_command(settings),
+        Command::new("START"),
+        Command::new("STATUS"),
+    ]
+}
+
 fn a1_config_command(settings: &ControllerAcquisition) -> Command {
     Command::new("CONFIG")
         .field("mode", "A1")
@@ -3265,16 +3348,16 @@ impl Plugin for StageAModulationPlugin {
                 PluginServiceOutcome::Rejected { .. } => false,
             };
             if cached_in_progress {
-                let terminal = self
-                    .shared
-                    .state
-                    .lock()
-                    .ok()
-                    .and_then(|state| state.last_response.clone())
-                    .filter(|response| {
-                        response.common.request_id.0 == request.request_id
-                            && response.common.outcome != RequestOutcomeV1::InProgress
-                    });
+                let terminal = self.shared.completions.lock().ok().and_then(|responses| {
+                    responses
+                        .iter()
+                        .rev()
+                        .find(|(client, response)| {
+                            client.as_str() == request.source_plugin_id
+                                && response.common.request_id.0 == request.request_id
+                        })
+                        .map(|(_, response)| response.clone())
+                });
                 if let Some(terminal) = terminal {
                     let upgraded = accepted_service_reply(request, &terminal);
                     self.request_cache[index].1 = upgraded.clone();
@@ -5893,5 +5976,237 @@ mod tests {
         assert!(response.marker_diagnostics.unwrap().dma_sample_clock);
         assert_eq!(state.controller_state, ControllerStateV1::Configured);
         assert_eq!(state.board_wave.as_deref(), Some("SQUARE"));
+    }
+    /// A2's drive-synchronized capture configures A1 mode at its own sample
+    /// rate, and the firmware keeps an armed comparator until a `CONFIG`
+    /// leaves A2 — so "the controller already says A1" proves nothing about
+    /// what the acquisition runs with. Preparation always restates it.
+    #[test]
+    fn a1_preparation_always_restates_the_configuration() {
+        let settings = ControllerAcquisition {
+            rate_hz: 500_000,
+            block_samples: 2_048,
+            emit_raw: true,
+            emit_summary: true,
+        };
+        let rendered: Vec<String> = a1_prepare_commands(&settings)
+            .iter()
+            .map(|command| String::from_utf8(command.encode(1).expect("encodes")).unwrap())
+            .collect();
+        assert_eq!(
+            rendered,
+            vec![
+                "@1 STOP reason=prepare_a1\n".to_string(),
+                "@1 CONFIG mode=A1 rate_hz=500000 block_samples=2048 raw=1 summary=1\n".into(),
+                "@1 START\n".into(),
+                "@1 STATUS\n".into(),
+            ]
+        );
+    }
+
+    #[test]
+    fn queued_mode_and_drive_commands_all_reach_the_controller_and_remain_queryable() {
+        let mut plugin = live_plugin();
+        plugin.port_hint = "mock".into();
+        plugin.connect_requested = true;
+        plugin.connect();
+        wait_until(&plugin, Duration::from_secs(2), |owner| {
+            owner
+                .shared
+                .state
+                .lock()
+                .unwrap()
+                .controller_rate_hz
+                .is_some()
+        });
+        plugin.method = DriveMethod::Calibrated;
+        plugin.mode = Mode::OpticalLogSine;
+        plugin.calibration_id = Some("test-lobe".into());
+        let lease = service_request(
+            &plugin,
+            200,
+            "workflow-a",
+            ModulationCommandV1::AcquireLease { ttl_ms: 10_000 },
+            None,
+        );
+        plugin.handle_service_request(&lease, &live_execution());
+        let requests = [
+            service_request(
+                &plugin,
+                201,
+                "workflow-a",
+                ModulationCommandV1::PrepareA1,
+                Some(1),
+            ),
+            service_request(
+                &plugin,
+                202,
+                "workflow-a",
+                ModulationCommandV1::SetDriveFrequency {
+                    frequency_millihz: 5_000,
+                },
+                None,
+            ),
+            service_request(
+                &plugin,
+                203,
+                "workflow-a",
+                ModulationCommandV1::SetOpticalDepth { depth_a_milli: 500 },
+                None,
+            ),
+        ];
+        for request in &requests {
+            let reply = plugin.handle_service_request(request, &live_execution());
+            let PluginServiceOutcome::Accepted { payload } = reply.outcome else {
+                panic!("queue rejected");
+            };
+            let response: ModulationResponseV1 = serde_json::from_value(payload).unwrap();
+            assert_eq!(response.common.outcome, RequestOutcomeV1::InProgress);
+        }
+        wait_until(&plugin, Duration::from_secs(2), |owner| {
+            owner.shared.completions.lock().unwrap().len() == 3
+        });
+        for request in &requests {
+            let reply = plugin.handle_service_request(request, &live_execution());
+            let PluginServiceOutcome::Accepted { payload } = reply.outcome else {
+                panic!("completion rejected");
+            };
+            let response: ModulationResponseV1 = serde_json::from_value(payload).unwrap();
+            assert_eq!(
+                response.common.outcome,
+                RequestOutcomeV1::Applied,
+                "{:?}",
+                response.common.error
+            );
+        }
+        let state = plugin.control_state();
+        assert_eq!(state.controller_mode.as_deref(), Some("A1"));
+        assert_eq!(state.controller_state, ControllerStateV1::Running);
+        let target = state.acknowledged.unwrap();
+        assert!(matches!(
+            target.waveform,
+            Some(WaveformV1::Periodic {
+                frequency_millihz: 5_000,
+                ..
+            })
+        ));
+        plugin.disconnect();
+    }
+
+    #[test]
+    fn firmware_rejection_is_retained_after_a_later_success() {
+        let (mock, mut client) = MockService::spawn();
+        let shared = SharedLink::new();
+        for (id, command) in [
+            (1, Command::new("NOT_A_COMMAND")),
+            (2, Command::new("STATUS")),
+        ] {
+            let operation = PendingOperation {
+                commands: vec![command],
+                purpose: "TEST",
+                meta: Some(OperationMeta {
+                    request_id: stage_a_plugin_contract::RequestId(id),
+                    requester: ClientId::new("workflow"),
+                    run_id: None,
+                    requested_revision: SemanticRevision(id),
+                    owner_instance: OwnerInstanceId::new("test"),
+                    target: ModulationTargetV1 {
+                        revision: SemanticRevision(id),
+                        waveform: None,
+                        a2_configuration: None,
+                        acquisition_running: false,
+                        board_dac_code: None,
+                        firmware_configuration_revision: None,
+                    },
+                }),
+            };
+            assert_eq!(execute_operation(&mut client, &shared, operation), id == 2);
+        }
+        let completions = shared.completions.lock().unwrap();
+        assert_eq!(completions[0].1.common.outcome, RequestOutcomeV1::Rejected);
+        assert_eq!(completions[1].1.common.outcome, RequestOutcomeV1::Applied);
+        drop(mock);
+    }
+    #[test]
+    fn repeated_a2_drive_sync_to_a1_switches_restart_acquisition() {
+        let mut plugin = live_plugin();
+        plugin.port_hint = "mock".into();
+        plugin.connect_requested = true;
+        plugin.connect();
+        wait_until(&plugin, Duration::from_secs(2), |owner| {
+            owner
+                .shared
+                .state
+                .lock()
+                .unwrap()
+                .controller_rate_hz
+                .is_some()
+        });
+        let lease = service_request(
+            &plugin,
+            300,
+            "workflow-a",
+            ModulationCommandV1::AcquireLease { ttl_ms: 10_000 },
+            None,
+        );
+        plugin.handle_service_request(&lease, &live_execution());
+        for cycle in 0..5 {
+            let configuration = A2AcquisitionConfigV1 {
+                timing_reference: A2TimingReferenceV1::DriveSync,
+                mean_u_milli: 300,
+                depth_a_milli: 450,
+                frequency_millihz: 500,
+                min_half_us: 100_000,
+                v_null_dac: 100,
+                v_peak_dac: 1_000,
+                comparator_threshold_dac: 0,
+                comparator_hysteresis: 1,
+                comparator_invert: false,
+                sample_rate_hz: 500_000,
+                block_samples: 256,
+                emit_raw_samples: true,
+                emit_summary: true,
+            };
+            for (offset, command) in [
+                (0, ModulationCommandV1::PrepareA2 { configuration }),
+                (1, ModulationCommandV1::PrepareA1),
+            ] {
+                let revision = 1 + cycle * 2 + offset;
+                let request = service_request(
+                    &plugin,
+                    300 + revision,
+                    "workflow-a",
+                    command,
+                    Some(revision),
+                );
+                plugin.handle_service_request(&request, &live_execution());
+                wait_until(&plugin, Duration::from_secs(2), |owner| {
+                    owner
+                        .shared
+                        .completions
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|(_, r)| r.common.request_id.0 == 300 + revision)
+                });
+                let PluginServiceOutcome::Accepted { payload } = plugin
+                    .handle_service_request(&request, &live_execution())
+                    .outcome
+                else {
+                    panic!("command rejected");
+                };
+                let response: ModulationResponseV1 = serde_json::from_value(payload).unwrap();
+                assert_eq!(
+                    response.common.outcome,
+                    RequestOutcomeV1::Applied,
+                    "{:?}",
+                    response.common.error
+                );
+            }
+            let state = plugin.control_state();
+            assert_eq!(state.controller_state, ControllerStateV1::Running);
+            assert!(state.acknowledged.unwrap().a2_configuration.is_none());
+        }
+        plugin.disconnect();
     }
 }

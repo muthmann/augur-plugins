@@ -170,7 +170,29 @@ fn assert_service_accepts(
     context: &str,
 ) {
     let request = service_request(plugin, request_id, command);
-    let reply = plugin.handle_service_request(&request, &live_execution());
+    let started = std::time::Instant::now();
+    let reply = loop {
+        let reply = plugin.handle_service_request(&request, &live_execution());
+        if let PluginServiceOutcome::Accepted { payload } = &reply.outcome {
+            let response: stage_a_plugin_contract::ModulationResponseV1 =
+                serde_json::from_value(payload.clone()).unwrap();
+            if response.common.outcome == stage_a_plugin_contract::RequestOutcomeV1::InProgress {
+                assert!(
+                    started.elapsed() < std::time::Duration::from_secs(2),
+                    "{context}: no device completion"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                continue;
+            }
+            assert_eq!(
+                response.common.outcome,
+                stage_a_plugin_contract::RequestOutcomeV1::Applied,
+                "{context}: {:?}",
+                response.common.error
+            );
+        }
+        break reply;
+    };
     assert!(
         matches!(reply.outcome, PluginServiceOutcome::Accepted { .. }),
         "{context}: production modulation service rejected the request: {:?}",

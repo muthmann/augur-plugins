@@ -102,9 +102,26 @@ pub enum EstimateError {
     MissingDirectDarkReference,
     /// No marker-bounded window containing at least two complete modulation
     /// cycles fits inside the retained sample budget.
+    ///
+    /// Three benches reach this, and only one of them is about the window
+    /// length, so the fields carry what tells them apart: a stream that keeps
+    /// restarting (`restarted_seconds_ago`), a controller that stamps no
+    /// phase-0 marker at all (`marker_count == 0`), and markers whose sample
+    /// index misses the retained window entirely (`markers_outside_window`).
     IncompleteModulationCycles {
+        /// Phase-0 markers inside the retained window.
         marker_count: usize,
-        max_samples: usize,
+        /// Seconds of stream the window holds now.
+        retained_seconds: f64,
+        /// Seconds since the sample stream last restarted, when the restart is
+        /// recent enough to be why the window is short. A restart — dropped
+        /// samples, a rate change, a reconnect — clears the samples and their
+        /// markers together.
+        restarted_seconds_ago: Option<f64>,
+        /// Markers that arrived stamped before the retained window, i.e. on a
+        /// sample index the stream never reaches. Non-zero means the trigger
+        /// itself is fine and its clock is not.
+        markers_outside_window: u64,
     },
     /// Fewer samples than the estimator can use robustly.
     TooFewSamples { count: usize, minimum: usize },
@@ -151,12 +168,45 @@ impl std::fmt::Display for EstimateError {
             ),
             Self::IncompleteModulationCycles {
                 marker_count,
-                max_samples,
+                retained_seconds,
+                restarted_seconds_ago: Some(restarted_seconds_ago),
+                ..
+            } => write!(
+                f,
+                "the photodiode stream restarted {restarted_seconds_ago:.1} s ago, which cleared \
+                 the retained samples and their triggers with them — only {retained_seconds:.2} s \
+                 and {marker_count} trigger(s) are left. A stream that restarts again and again \
+                 is dropping samples: check the segment and drop counters in the photodiode panel"
+            ),
+            Self::IncompleteModulationCycles {
+                markers_outside_window,
+                retained_seconds,
+                ..
+            } if *markers_outside_window > 0 => write!(
+                f,
+                "{markers_outside_window} trigger(s) arrived in the last {retained_seconds:.1} s \
+                 stamped on a sample index the stream never reaches, so none of them bounds a \
+                 window — the marker clock and the sample clock disagree"
+            ),
+            Self::IncompleteModulationCycles {
+                marker_count: 0,
+                retained_seconds,
+                ..
+            } => write!(
+                f,
+                "no phase-0 trigger has arrived in the last {retained_seconds:.1} s — the \
+                 controller stamps one per modulation cycle only in mode=A1, and after A2 work \
+                 the comparator drives the trigger instead: check the modulation plugin's mode, \
+                 that the drive and ADC acquisition are running. PDQ markers are generated inside the controller; the camera trigger cable cannot restore missing PDQ markers"
+            ),
+            Self::IncompleteModulationCycles {
+                marker_count,
+                retained_seconds,
+                ..
             } => write!(
                 f,
                 "no stretch of samples covers two whole modulation cycles between triggers \
-                 ({marker_count} trigger(s) in the last {max_samples} samples) — lower the \
-                 frequency, or raise the photodiode cache length"
+                 ({marker_count} trigger(s) in the last {retained_seconds:.1} s) — wait for at least three phase-0 markers; if the window is too short, set the cache length to at least three modulation periods"
             ),
             Self::TooFewSamples { count, minimum } => write!(
                 f,

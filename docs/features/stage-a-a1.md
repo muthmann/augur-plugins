@@ -110,18 +110,28 @@ selected**.
 is the default and the source of record. It is also **fail-closed**: the
 photodiode publishes no `a` unless it can prove its estimator window covers
 whole modulation cycles, which it does from the firmware phase-0 **marker
-frames** on its own stream port. If those markers never arrive — no trigger, or
-a firmware build that does not stamp them — it refuses forever, with a reason
-that reads like a settings problem:
+frames** on its own stream port. If those markers never arrive — the controller
+outside `mode=A1`, an unplugged phase-0 cable, or a firmware build that does not
+stamp them — it refuses forever. The refusal names which of the four benches it
+is, because only one of them is the window length (ADR 045):
 
 ```
-No stretch of samples covers two whole modulation cycles between triggers
-(0 trigger(s) in the last 3446784 samples) — lower the frequency, or raise the
-photodiode cache length
+No phase-0 trigger has arrived in the last 17.8 s — the controller stamps one
+per modulation cycle only in mode=A1, and after A2 work the comparator drives
+the trigger instead: check the modulation plugin's mode, that the drive is
+armed and running, and the phase-0 cable
 ```
 
-Zero markers in millions of samples is a missing marker stream, not a short
-window, and no setting fixes it. **Depth `a` source** is the way past:
+The sidecar refusal quotes the reason that held **while the recording ran**, not
+the one read after the finalizes: the photodiode's optical section is latched
+during the recording (ADR 034) and its refusal now with it.
+
+The panel renders `Controller: mode=…` whenever the controller is not in A1, so
+that check has an answer without a serial terminal. A protocol run asks for A1
+mode itself (ADR 044); manual work on the panel does not.
+
+When no bench change brings the markers back, **Depth `a` source** is the way
+past:
 
 | Setting | `a` is | Needs | Verified against the light |
 |---|---|---|---|
@@ -714,3 +724,9 @@ Two cover the nested sweep (ADR 023): the whole 2 × 3 block records every depth
 at every frequency in depth order, on exactly **one** lease acquisition, never
 entering the search phase and finishing with `2/2 frequencies × 3 depths`; and a
 nested point's file stem carries both axes (`…_f50Hz_p03`).
+
+## Reliable capture and metadata (2026-09-07)
+
+A1 waits for controller completion before recording a protocol point. A stopped ADC is restarted during preparation, and so is one that A2 left running: the drive-synchronized A2 capture also configures A1 mode, at its own sample rate, so the mode string alone does not prove the acquisition is an A1 one. Missing live optical estimates are stored as optical_unavailable; they do not suppress the config file or turn a saved acquisition into a skipped point. Acquisition completion remains separate from scientific validity. Initial metadata is written before camera start. The output root also contains an append-only *_progress.jsonl log with point requests, outcomes and failure reasons.
+
+See [ADR 046](../adr/046-stage-a-command-completion-and-record-preservation.md) for the contract and Windows bench verification.

@@ -140,3 +140,9 @@ Intrinsic pixel jitter and absolute latency require bounded synchronization/inpu
 uncertainty. Otherwise report fluorescence-chain latency or drive-relative response.
 
 See [ADR 041](../adr/041-stage-a-a2-drive-sync-capture.md) for the compatibility decision.
+
+## Controller completion and initial records (2026-09-07)
+
+A2 uses the shared queued controller service and retains its existing completion, integrity and cleanup checks. Initial point metadata is now written before camera start. A write failure ends preparation through normal cleanup. Return to A1 restores running ADC acquisition even when A2 drive-sync left the controller in A1 mode but stopped.
+
+See [ADR 046](../adr/046-stage-a-command-completion-and-record-preservation.md) for the contract and Windows bench verification.

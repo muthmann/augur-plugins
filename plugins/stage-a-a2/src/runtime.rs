@@ -1595,6 +1595,13 @@ impl StageAA2Plugin {
         }
         match run.phase {
             Phase::Settle if now_ms() >= run.deadline_ms => {
+                if let Err(error) = self.write_sidecar() {
+                    self.fail(
+                        control,
+                        format!("cannot save A2 metadata before recording: {error}"),
+                    );
+                    return;
+                }
                 let meta = self.metadata();
                 let (run_id, base) = {
                     let r = self.run.as_ref().unwrap();
@@ -4415,7 +4422,9 @@ comparator_threshold_dac=500
     fn sidecar_write_failure_is_not_silently_ignored() {
         let (mut plugin, mut control) =
             plugin_at_finalization("sidecar-io", TriggerValidation::OfflineReview);
-        plugin.output_folder = "/dev/null".into();
+        let blocked = Path::new(&plugin.output_folder).join("not-a-directory");
+        std::fs::write(&blocked, b"blocked").unwrap();
+        plugin.output_folder = blocked.display().to_string();
         plugin.finish_point(&mut control, &raw_finalized());
         assert!(plugin
             .run
@@ -4571,6 +4580,24 @@ comparator_threshold_dac=500
         assert_eq!(run.phase, Phase::StartStimulus);
         plugin.accepted(&mut control, PendingKind::Mod, &Value::Null);
         assert_eq!(plugin.run.as_ref().unwrap().phase, Phase::Recording);
+    }
+    #[test]
+    fn metadata_is_saved_before_the_camera_is_started() {
+        let (mut plugin, mut control) =
+            plugin_at_finalization("initial-metadata", TriggerValidation::OfflineReview);
+        let run = plugin.run.as_mut().unwrap();
+        run.phase = Phase::Settle;
+        run.pending = None;
+        run.deadline_ms = 0;
+        run.next_renew_ms = u64::MAX;
+        let path = Path::new(&plugin.output_folder)
+            .join(&run.measurement_id)
+            .join(format!("{}.a2.json", run.run_id));
+        plugin.drive(&mut control);
+        assert!(
+            path.is_file(),
+            "point evidence must exist before acquisition"
+        );
     }
 }
 

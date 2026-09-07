@@ -113,6 +113,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends pkg-config libudev-dev
 
+      - name: Test Stage-A acquisition and controller contracts
+        working-directory: augur-plugins
+        run: cargo test -p augur-plugin-stage-a-a1 -p augur-plugin-stage-a-a2 -p augur-plugin-stage-a-modulation -p augur-plugin-stage-a-photodiode -p stage-a-io -p stage-a-plugin-contract
+
       - name: Build runtime plugins
         working-directory: augur-plugins
         run: bash scripts/build-runtime-plugins.sh --profile release

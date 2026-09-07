@@ -135,3 +135,9 @@ did enumerate.
 conditional settings blocks, method-resolved bands, manual optical-band inversion, hard-ceiling
 rejection, immediate mock transfer, board-code echo, square drive, and owner-service fail-safe
 behavior.
+
+## Automation command completion (2026-09-07)
+
+Automation commands use a bounded FIFO separate from the replaceable slider slot. Applied means the controller replied successfully, not that a command was queued. Completed replies remain queryable by requester and request ID. PrepareA1 always restates the A1 configuration (STOP, CONFIG, START, STATUS) and verifies running ADC acquisition and the phase-marker source, because A2's drive-synchronized capture also configures A1 mode. Safe-off clears queued work and does not restore an armed waveform during lease cleanup.
+
+See [ADR 046](../adr/046-stage-a-command-completion-and-record-preservation.md) for the contract and Windows bench verification.

@@ -36,6 +36,7 @@
 //!    `q_p(a, f)` fit is computed offline from the recordings; the live plot is a
 //!    quicklook.
 
+use stage_a_plugin_contract::{ModulationResponseV1, RequestOutcomeV1};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::collections::HashSet;
@@ -426,6 +427,14 @@ struct Recording {
     /// spent finalizing, and a finished recording lost its sidecar for having
     /// been *large* (ADR 034).
     optical: Option<PhotodiodeOpticalSummaryV1>,
+    /// Why the photodiode published no summary, latched on the same tick and
+    /// for the same reason as `optical`.
+    ///
+    /// The refusal is the whole report a lost point leaves behind, and read
+    /// after both finalizes it describes the bench *after* the recording: the
+    /// finalizes can restart the stream, and a just-restarted ring reports a
+    /// window 0.2 s long whatever the real gate was.
+    optical_blocker: Option<String>,
 }
 
 /// Where the amplitude sweep is within its per-point cycle.
@@ -898,8 +907,8 @@ struct ProtocolRun {
     restore_attempts: u8,
     point_retries: usize,
     consecutive_failures: usize,
-    /// `PrepareA1` in flight; the run does not wait for it, but a refusal is
-    /// fatal — without A1 mode there are no phase-0 markers to measure against.
+    /// `PrepareA1` in flight. No point is sent until the controller confirms
+    /// A1 mode and running acquisition.
     prepare_req: Option<u64>,
     /// The controller has been put into A1 mode for this run.
     firmware_prepared: bool,
@@ -1023,6 +1032,8 @@ pub struct StageAA1Plugin {
     /// aborted); the sweep uses this to decide between advancing and stopping.
     recording_completed_ok: bool,
     request_seq: u64,
+    modulation_requests: Vec<(PluginServiceRequest, u64)>,
+    modulation_poll_ms: u64,
     pd_revision_seq: u64,
     /// Role latched by the Start/Pilot/Background buttons, consumed next tick.
     pending_role: Option<RecRole>,
@@ -1150,6 +1161,8 @@ impl Default for StageAA1Plugin {
             recording: Recording::idle(),
             recording_completed_ok: false,
             request_seq: 0,
+            modulation_requests: Vec::new(),
+            modulation_poll_ms: 0,
             pd_revision_seq: 0,
             pending_role: None,
             loaded_key: None,
@@ -1235,6 +1248,7 @@ impl Recording {
             pd_rejected: false,
             failure: None,
             optical: None,
+            optical_blocker: None,
         }
     }
 
@@ -2488,6 +2502,12 @@ impl StageAA1Plugin {
             RecRole::Normal | RecRole::EventCount => {}
         }
 
+        if let Err(error) = self.write_sidecar() {
+            self.note_failure(format!(
+                "Cannot save measurement metadata before recording: {error}"
+            ));
+            return;
+        }
         self.start_camera(context);
     }
 
@@ -2709,6 +2729,7 @@ impl StageAA1Plugin {
             .failure
             .clone()
             .unwrap_or_else(|| self.unfinalized_artifacts());
+        let saved = sidecar.is_ok();
         let message = match (sidecar, clean) {
             (Ok(path), true) => format!("Saved recording {} → {path}", self.recording.id),
             (Ok(path), false) => format!(
@@ -2720,7 +2741,7 @@ impl StageAA1Plugin {
                 self.recording.id
             ),
         };
-        self.recording_completed_ok = clean;
+        self.recording_completed_ok = clean && saved;
         self.release_and_idle(context, message);
     }
 
@@ -2862,13 +2883,22 @@ impl StageAA1Plugin {
             .as_ref()
             .map(|state| state.owner_instance.clone());
         envelope.issued_at_unix_ms = now_unix_ms();
-        PluginServiceRequest {
+        envelope.requested_revision = Some(SemanticRevision(
+            self.modulation
+                .as_ref()
+                .and_then(|state| state.requested.as_ref())
+                .map_or(1, |target| target.revision.0 + 1),
+        ));
+        let request = PluginServiceRequest {
             request_id,
             source_plugin_id: A1_PLUGIN_ID.into(),
             target_plugin_id: MODULATION_PLUGIN_ID.into(),
             service: SERVICE_STAGE_A_MODULATION_CONTROL_V1.into(),
             payload: serde_json::to_value(&envelope).unwrap_or(Value::Null),
-        }
+        };
+        self.modulation_requests
+            .push((request.clone(), now_unix_ms()));
+        request
     }
 
     fn modulation_connected(&self) -> bool {
@@ -4685,34 +4715,25 @@ impl StageAA1Plugin {
             }
         };
         let source_sha256 = format!("{:x}", Sha256::digest(text.as_bytes()));
-        // The photodiode measures `a` over one window for every frequency, so
-        // the lowest frequency in the file decides whether the survey is
-        // measurable at all. Refuse the plan, not its 40th point.
-        let lowest = plan
-            .points
-            .iter()
-            .map(|point| point.frequency_hz)
-            .fold(f64::INFINITY, f64::min);
-        if lowest.is_finite() {
-            if let Err(reason) = self.optical_window_covers_a_cycle(lowest) {
-                self.message = format!(
-                    "Protocol refused at its lowest frequency ({}): {reason}",
-                    frequency_label(lowest)
-                );
-                return;
-            }
-        }
+        // A fixed protocol records commanded points for offline analysis. A
+        // live window from the previous frequency cannot qualify the next one.
         let highest = plan
             .points
             .iter()
             .map(|point| point.frequency_hz)
             .fold(0.0_f64, f64::max);
-        if let Some(blocker) = self.photodiode_measurement_blocker(highest) {
-            self.message = format!(
-                "Protocol refused at its highest frequency ({}): {blocker}",
-                frequency_label(highest)
-            );
-            return;
+        let acquisition_running = self.modulation.as_ref().is_some_and(|state| {
+            state.controller_mode.as_deref() == Some("A1")
+                && state.controller_state == stage_a_plugin_contract::ControllerStateV1::Running
+        });
+        if acquisition_running {
+            if let Some(blocker) = self.photodiode_measurement_blocker(highest) {
+                self.message = format!(
+                    "Protocol refused at its highest frequency ({}): {blocker}",
+                    frequency_label(highest)
+                );
+                return;
+            }
         }
 
         let controls_camera = plan.camera.is_some()
@@ -4821,6 +4842,36 @@ impl StageAA1Plugin {
         }
     }
 
+    fn append_protocol_event(&self, event: &str, detail: &str) -> Result<(), String> {
+        use std::io::Write;
+        let Some(run) = self.protocol.as_ref() else {
+            return Ok(());
+        };
+        let folder = Path::new(self.output_folder.trim());
+        std::fs::create_dir_all(folder).map_err(|error| error.to_string())?;
+        let path = folder.join(format!(
+            "{}_progress.jsonl",
+            sanitize_stem(run.lease_id.as_str())
+        ));
+        let point = run.point();
+        let entry = json!({
+            "schema": "stage-a.a1.progress.v1", "event": event, "detail": detail,
+            "at_unix_ms": now_unix_ms(), "protocol_sha256": run.source_sha256,
+            "protocol_path": run.source_path, "point_index": run.index + 1,
+            "point_total": run.plan.points.len(), "recorded": run.recorded,
+            "failed": run.failed, "point_label": point.map(|p| &p.block),
+            "frequency_hz": point.map(|p| p.frequency_hz), "depth_a": point.map(|p| p.depth_a),
+            "mean_u": point.map(|p| p.mean_u), "duration_s": point.map(|p| p.duration_s),
+        });
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(|error| error.to_string())?;
+        writeln!(file, "{entry}").map_err(|error| error.to_string())?;
+        file.sync_data().map_err(|error| error.to_string())
+    }
+
     /// Restore camera state before releasing the protocol lease and clearing
     /// the run. No success, stop, or abort path bypasses this function.
     fn finish_protocol(&mut self, context: &mut impl RecordingControl, message: String) {
@@ -4861,6 +4912,10 @@ impl StageAA1Plugin {
 
     /// Release the modulation lease after camera restoration has resolved.
     fn complete_protocol(&mut self, context: &mut impl RecordingControl, message: String) {
+        let message = match self.append_protocol_event("finished", &message) {
+            Ok(()) => message,
+            Err(error) => format!("{message}; cannot save protocol progress: {error}"),
+        };
         if let Some(run) = self.protocol.take() {
             if run.lease_granted {
                 let request = self.modulation_request(
@@ -4878,6 +4933,13 @@ impl StageAA1Plugin {
 
     /// Renew the lease and retarget all three axes at the current point.
     fn send_protocol_point(&mut self, context: &mut impl RecordingControl) {
+        if let Err(error) = self.append_protocol_event("point_requested", "") {
+            self.finish_protocol(
+                context,
+                format!("Protocol stopped: cannot save point progress: {error}"),
+            );
+            return;
+        }
         let Some(run) = self.protocol.as_ref() else {
             return;
         };
@@ -4986,6 +5048,13 @@ impl StageAA1Plugin {
             point.frequency_hz,
             point.depth_a,
         );
+        if let Err(error) = self.append_protocol_event("point_failed", &reason) {
+            self.finish_protocol(
+                context,
+                format!("Protocol stopped: {reason}; cannot save failure record: {error}"),
+            );
+            return;
+        }
         if consecutive >= MAX_CONSECUTIVE_FAILED_POINTS {
             // The bench, not the point, is broken: the same failure is about to
             // consume the rest of the file.
@@ -5001,6 +5070,13 @@ impl StageAA1Plugin {
 
     /// Step to the next point, or finish.
     fn advance_protocol(&mut self, context: &mut impl RecordingControl) {
+        if let Err(error) = self.append_protocol_event("point_finished", &self.message) {
+            self.finish_protocol(
+                context,
+                format!("Protocol stopped: cannot save point result: {error}"),
+            );
+            return;
+        }
         let Some(run) = self.protocol.as_mut() else {
             return;
         };
@@ -5134,14 +5210,28 @@ impl StageAA1Plugin {
                 // instead, and nothing puts the mode back — so a survey that
                 // followed A2 work measured nothing until the controller was
                 // power-cycled. State the mode rather than inherit it.
-                // Only when the mode is actually wrong: `CONFIG` is refused
-                // while the acquisition runs, so a mode change stops and
-                // restarts the photodiode stream, and a run that needs no
-                // change must not pay for that.
+                // Only when the acquisition is not already an A1 one: a
+                // mode change stops and restarts the photodiode stream, and a
+                // run that needs no change must not pay for that. The mode
+                // string alone does not prove it: A2's drive-synchronized
+                // capture configures `A1` too, at A2's own sample rate, so
+                // the A2 target it leaves behind counts as the wrong mode.
                 let needs_mode = self
                     .modulation
                     .as_ref()
-                    .map(|state| state.controller_mode.as_deref() != Some("A1"))
+                    .map(|state| {
+                        state.controller_mode.as_deref() != Some("A1")
+                            || state.controller_state
+                                != stage_a_plugin_contract::ControllerStateV1::Running
+                            || state
+                                .requested
+                                .as_ref()
+                                .is_some_and(|target| target.a2_configuration.is_some())
+                            || state
+                                .acknowledged
+                                .as_ref()
+                                .is_some_and(|target| target.a2_configuration.is_some())
+                    })
                     .unwrap_or(false);
                 let prepare_req = if needs_mode
                     && self
@@ -5160,13 +5250,25 @@ impl StageAA1Plugin {
                 } else {
                     None
                 };
-                // The owner applies its queue in order, so `CONFIG mode=A1`
-                // reaches the controller before this point's drive commands.
-                // The run therefore does not wait for the acknowledgement — it
-                // only has to hear a refusal.
                 if let (Some(request_id), Some(run)) = (prepare_req, self.protocol.as_mut()) {
                     run.prepare_req = Some(request_id);
                     run.firmware_prepared = true;
+                    run.last_activity_ms = now_ms;
+                }
+                if self
+                    .protocol
+                    .as_ref()
+                    .is_some_and(|run| run.prepare_req.is_some())
+                {
+                    if now_ms.saturating_sub(self.protocol.as_ref().unwrap().last_activity_ms)
+                        > REPLY_TIMEOUT_MS
+                    {
+                        self.finish_protocol(
+                            context,
+                            "Protocol aborted: controller did not confirm A1 mode".into(),
+                        );
+                    }
+                    return;
                 }
                 self.send_protocol_point(context);
             }
@@ -5204,6 +5306,21 @@ impl StageAA1Plugin {
             ProtocolPhase::Settling => {
                 if now_ms < settle_until_ms {
                     return;
+                }
+                if let Some(frequency) = self
+                    .protocol
+                    .as_ref()
+                    .and_then(|run| run.point())
+                    .map(|point| point.frequency_hz)
+                {
+                    if let Some(reason) = self.photodiode_measurement_blocker(frequency) {
+                        if now_ms.saturating_sub(settle_until_ms) > REPLY_TIMEOUT_MS {
+                            self.fail_protocol_point(context, reason);
+                        } else {
+                            self.message = format!("Waiting for photodiode readback: {reason}");
+                        }
+                        return;
+                    }
                 }
                 let duration_s = self
                     .protocol
@@ -5888,7 +6005,48 @@ impl StageAA1Plugin {
         }
     }
 
+    fn poll_modulation_requests(&mut self, context: &mut impl RecordingControl) {
+        let now = now_unix_ms();
+        if now.saturating_sub(self.modulation_poll_ms) < 200 {
+            return;
+        }
+        self.modulation_poll_ms = now;
+        self.modulation_requests
+            .retain(|(_, sent)| now.saturating_sub(*sent) <= REPLY_TIMEOUT_MS);
+        for (request, _) in &self.modulation_requests {
+            context.request_service(request);
+        }
+    }
+
     fn on_service_reply(&mut self, reply: &PluginServiceReply) {
+        let mut terminal = reply.clone();
+        if self
+            .modulation_requests
+            .iter()
+            .any(|(request, _)| request.request_id == reply.request_id)
+        {
+            if let PluginServiceOutcome::Accepted { payload } = &reply.outcome {
+                if let Ok(response) =
+                    serde_json::from_value::<ModulationResponseV1>(payload.clone())
+                {
+                    if response.common.outcome == RequestOutcomeV1::InProgress {
+                        return;
+                    }
+                    if response.common.outcome == RequestOutcomeV1::Rejected {
+                        terminal.outcome = PluginServiceOutcome::Rejected {
+                            code: "device_rejected".into(),
+                            message: response.common.error.map_or_else(
+                                || "controller rejected the command".into(),
+                                |error| error.message,
+                            ),
+                        };
+                    }
+                }
+            }
+            self.modulation_requests
+                .retain(|(request, _)| request.request_id != reply.request_id);
+        }
+        let reply = &terminal;
         if self.on_sweep_reply(reply)
             || self.on_a0_lock_reply(reply)
             || self.on_freq_sweep_reply(reply)
@@ -5953,9 +6111,14 @@ impl StageAA1Plugin {
         // the last sample — both finalizes, the gather — blocks this tick, so a
         // summary read afterwards is judged stale for time the recording itself
         // spent being written out.
-        if self.recording.is_active() {
-            if let Some(optical) = self.fresh_optical_summary() {
-                self.recording.optical = Some(optical.clone());
+        if self.recording.phase == RecPhase::Running {
+            match self.fresh_optical_summary() {
+                Some(optical) => {
+                    let optical = optical.clone();
+                    self.recording.optical = Some(optical);
+                    self.recording.optical_blocker = None;
+                }
+                None => self.recording.optical_blocker = self.optical_summary_blocker(),
             }
         }
         match self.recording.phase {
@@ -6085,25 +6248,18 @@ impl StageAA1Plugin {
             .and_then(|state| state.optical_drive.as_ref());
         // The recording's own conditions first, and only then a live read for a
         // sidecar written outside one.
-        let optical = self
-            .recording
-            .optical
-            .as_ref()
-            .or_else(|| self.fresh_optical_summary());
-        if optical.is_none() && self.depth_source == DepthSource::Photodiode {
-            // The refusal used to stop at "no fresh summary", which reads as a
-            // missing anchor and sends the operator to re-confirm one that was
-            // already fine. The owner knows which estimator gate rejected the
-            // window — a railed detector, too few whole cycles, a stopped
-            // stream — so hand its sentence on. This is the whole report an
-            // unattended protocol run leaves behind for the point it lost.
-            return Err(format!(
-                "cannot write a quantitative A1 sidecar without a fresh photodiode optical \
-                 summary that passed the selected placement's optical gates: {}",
-                self.optical_summary_blocker()
-                    .unwrap_or_else(|| "the photodiode gave no reason".into())
-            ));
-        }
+        let optical = self.recording.optical.as_ref().or_else(|| {
+            (self.recording.start_unix_ms == 0)
+                .then(|| self.fresh_optical_summary())
+                .flatten()
+        });
+        let optical_unavailable = optical.is_none().then(|| {
+            self.recording
+                .optical_blocker
+                .clone()
+                .or_else(|| self.optical_summary_blocker())
+                .unwrap_or_else(|| "no optical summary was available during recording".into())
+        });
         let raw_path = self
             .recording
             .cam_finalized_path
@@ -6165,6 +6321,14 @@ impl StageAA1Plugin {
 
         let doc = SidecarDoc {
             schema: "stage-a.a1.sidecar.v2".into(),
+            acquisition_complete: self.recording.cam_complete
+                && self.recording.pd_finalized
+                && self.recording.pd_valid
+                && self.recording.pd_pdq_path.is_some()
+                && self.recording.pd_sidecar_path.is_some(),
+            acquisition_failure: self.recording.failure.clone(),
+            scientific_status: "requires_offline_review".into(),
+            optical_unavailable,
             measurement_id: self.recording.id.clone(),
             file_stem: self.recording.stem.clone(),
             role: self.recording.role.label().into(),
@@ -6325,6 +6489,12 @@ impl StageAA1Plugin {
 #[derive(Serialize)]
 struct SidecarDoc {
     schema: String,
+    acquisition_complete: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    acquisition_failure: Option<String>,
+    scientific_status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    optical_unavailable: Option<String>,
     measurement_id: String,
     file_stem: String,
     role: String,
@@ -6986,6 +7156,7 @@ impl Plugin for StageAA1Plugin {
         }
         // Before the runners: a lease that lapses is not the runners' problem
         // to notice, and the owner safe-offs the drive the moment it does.
+        self.poll_modulation_requests(context);
         self.drive_lease_heartbeat(context);
         // Outermost first: the protocol and the frequency sweep each start the
         // stage below them, and each of those starts its own next stage, so one
@@ -8016,6 +8187,20 @@ impl Plugin for StageAA1Plugin {
                 )
             ),
         }));
+        // The mode the phase-0 markers depend on, stated only when it is the
+        // wrong one. The photodiode's refusal tells the operator to check it
+        // and nothing in either panel rendered it, so the check had no answer.
+        if let Some(mode) = self
+            .modulation
+            .as_ref()
+            .and_then(|state| state.controller_mode.as_deref())
+            .filter(|mode| *mode != "A1")
+        {
+            entries.push(StatusEntry::Text(format!(
+                "Controller: mode={mode} — the phase-0 markers `a` is measured from are stamped \
+                 only in A1. A protocol run asks for A1 itself; manual work here does not"
+            )));
+        }
         // Silent when the host reports nothing (replay, or a camera without a
         // monitoring block) rather than printing three dashes.
         if let Some(sensor) = self.sensor {
@@ -8365,7 +8550,7 @@ mod tests {
             },
             capabilities: Vec::new(),
             lease: None,
-            controller_state: stage_a_plugin_contract::ControllerStateV1::Configured,
+            controller_state: stage_a_plugin_contract::ControllerStateV1::Running,
             controller_mode: Some("A1".into()),
             active_run_id: None,
             requested: None,
@@ -8564,9 +8749,10 @@ mod tests {
         PhotodiodeSummaryV1 {
             optical_summary: None,
             optical_unavailable: Some(
-                "no stretch of samples covers two whole modulation cycles between triggers \
-                 (0 trigger(s) in the last 3446784 samples) — lower the frequency, or raise the \
-                 photodiode cache length"
+                "no phase-0 trigger has arrived in the last 17.8 s — the controller stamps one \
+                 per modulation cycle only in mode=A1, and after A2 work the comparator drives \
+                 the trigger instead: check the modulation plugin's mode, that the drive is \
+                 armed and running, and the phase-0 cable"
                     .into(),
             ),
             ..photodiode_measuring(1, 0.5)
@@ -8584,7 +8770,7 @@ mod tests {
 
         let blocker = plugin.depth_a_blocker().expect("a withheld a has a reason");
         assert!(
-            blocker.contains("two whole modulation cycles"),
+            blocker.contains("mode=A1"),
             "the owner's own words must survive: {blocker}"
         );
         assert!(
@@ -10411,6 +10597,43 @@ mod tests {
         let _ = std::fs::remove_dir_all(&folder);
     }
 
+    /// The reason has to be the one that held during the recording. Read after
+    /// both finalizes it describes the bench afterwards — and a finalize can
+    /// restart the stream, which reports a 0.2 s window whatever the gate was.
+    #[test]
+    fn a_refused_sidecar_quotes_the_reason_the_recording_ran_into() {
+        let folder = temp_folder("sidecar-latched-blocker");
+        let mut plugin = plugin_locking(1.0, &folder);
+        plugin.recording.folder = folder.display().to_string();
+        plugin.recording.id = "metadata-test".into();
+        if let Some(summary) = plugin.photodiode.as_mut() {
+            summary.optical_summary = None;
+            summary.optical_unavailable = Some(
+                "the photodiode stream restarted 0.2 s ago, which cleared the retained samples"
+                    .into(),
+            );
+        }
+        plugin.recording.optical_blocker = Some(
+            "no phase-0 trigger has arrived in the last 60.0 s — the controller stamps one per \
+             modulation cycle only in mode=A1"
+                .into(),
+        );
+
+        let path = plugin
+            .write_sidecar()
+            .expect("metadata must survive a missing estimate");
+        let error = std::fs::read_to_string(path).unwrap();
+        assert!(
+            error.contains("mode=A1"),
+            "the recording's own reason must survive the finalizes: {error}"
+        );
+        assert!(
+            !error.contains("restarted"),
+            "the post-finalize state is not the reason: {error}"
+        );
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
     /// The sidecar refusal is the whole report an unattended protocol run leaves
     /// behind for a point it lost — and it arrives after the recording has
     /// already run. Naming only the anchor sent the operator to re-confirm one
@@ -10420,18 +10643,21 @@ mod tests {
     fn a_refused_sidecar_quotes_the_owners_reason_not_just_the_anchor() {
         let folder = temp_folder("sidecar-blocker");
         let mut plugin = plugin_locking(1.0, &folder);
+        plugin.recording.folder = folder.display().to_string();
+        plugin.recording.id = "metadata-test".into();
         if let Some(summary) = plugin.photodiode.as_mut() {
             summary.optical_summary = None;
             summary.optical_unavailable = Some(
                 "no stretch of samples covers two whole modulation cycles between triggers \
-                 (2 trigger(s) in the last 10000000 samples)"
+                 (2 trigger(s) in the last 20.0 s)"
                     .into(),
             );
         }
 
-        let error = plugin
+        let path = plugin
             .write_sidecar()
-            .expect_err("no optical summary must refuse the sidecar");
+            .expect("metadata must survive a missing estimate");
+        let error = std::fs::read_to_string(path).unwrap();
         assert!(
             error.contains("two whole modulation cycles"),
             "the refusal must quote the owner: {error}"
@@ -11717,6 +11943,35 @@ depth_a = 0.7
         let _ = std::fs::remove_dir_all(folder);
     }
 
+    /// The photodiode's refusal for a bench with no phase-0 markers sends the
+    /// operator to check the controller's mode, so the panel has to render it.
+    #[test]
+    fn a_controller_outside_a1_mode_is_named_on_the_panel() {
+        let mut plugin = plugin_with_markers();
+        plugin.modulation = Some(ModulationStateV1 {
+            controller_mode: Some("A2".into()),
+            ..connected_modulation()
+        });
+        let status = |plugin: &StageAA1Plugin| {
+            plugin
+                .status_entries()
+                .iter()
+                .filter_map(|entry| match entry {
+                    StatusEntry::Text(text) => Some(text.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" | ")
+        };
+        let shown = status(&plugin);
+        assert!(shown.contains("mode=A2"), "{shown}");
+
+        // Silent on a correct bench: a line that is always there is not read.
+        plugin.modulation.as_mut().unwrap().controller_mode = Some("A1".into());
+        let shown = status(&plugin);
+        assert!(!shown.contains("Controller: mode="), "{shown}");
+    }
+
     /// The controller only stamps the phase-0 markers the photodiode measures
     /// `a` from while it is in A1 mode, and nothing put the mode back after A2
     /// work — a survey that followed an A2 session measured nothing at all.
@@ -11745,20 +12000,10 @@ depth_a = 0.7
                 )
             })
             .expect("the run states the controller mode");
-        let first_drive_at = sink
-            .services
-            .iter()
-            .position(|request| {
-                matches!(
-                    modulation_command(request),
-                    Some(ModulationCommandV1::SetOperatingPoint { .. })
-                )
-            })
-            .expect("the first point is commanded");
-        assert!(
-            prepare_at < first_drive_at,
-            "the mode has to be set before the drive moves"
-        );
+        assert!(!sink.services.iter().any(|request| matches!(
+            modulation_command(request),
+            Some(ModulationCommandV1::SetOperatingPoint { .. })
+        )));
 
         // A controller that refuses the mode ends the run rather than
         // measuring against a trigger nothing is driving.
@@ -13107,5 +13352,182 @@ bias_refr_code,status,error\n\
         plugin.on_discontinuity(PluginDiscontinuity::SourceChanged);
         assert!(plugin.response_points.is_empty());
         assert!(plugin.pilot_windows.is_none());
+    }
+    #[test]
+    fn protocol_restarts_an_a1_acquisition_stopped_by_a2() {
+        let folder = temp_folder("a1-stopped-after-a2");
+        let (mut plugin, _) = protocol_plugin(&folder, TWO_POINT_PROTOCOL);
+        plugin.modulation.as_mut().unwrap().controller_state =
+            stage_a_plugin_contract::ControllerStateV1::SafeIdle;
+        let mut sink = ControlSink::default();
+        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+        let lease = sink.services[0].request_id;
+        sink.services.clear();
+        control_tick(&mut plugin, inbox_with(vec![accepted(lease)]), &mut sink);
+        let prepare = sink
+            .services
+            .iter()
+            .find(|request| {
+                matches!(
+                    modulation_command(request),
+                    Some(ModulationCommandV1::PrepareA1)
+                )
+            })
+            .unwrap();
+        let request: ModulationRequestV1 = serde_json::from_value(prepare.payload.clone()).unwrap();
+        assert!(request.requested_revision.is_some());
+        assert!(
+            sink.hosts.is_empty(),
+            "no camera capture before preparation"
+        );
+    }
+
+    /// A2's drive-synchronized capture configures the controller *in A1 mode*,
+    /// at A2's own sample rate. A run that read the mode string alone found
+    /// "A1, running" and prepared nothing, so it measured against whatever A2
+    /// had left behind. The A2 target the owner still carries says otherwise.
+    #[test]
+    fn protocol_prepares_after_a_drive_synchronized_a2_capture() {
+        let folder = temp_folder("a1-after-a2-drive-sync");
+        let (mut plugin, _) = protocol_plugin(&folder, TWO_POINT_PROTOCOL);
+        let modulation = plugin.modulation.as_mut().unwrap();
+        // Exactly what such a capture leaves: A1 mode, a running acquisition,
+        // and an A2 target.
+        modulation.controller_mode = Some("A1".into());
+        modulation.controller_state = stage_a_plugin_contract::ControllerStateV1::Running;
+        modulation.acknowledged = Some(stage_a_plugin_contract::ModulationTargetV1 {
+            a2_configuration: Some(stage_a_plugin_contract::A2AcquisitionConfigV1 {
+                timing_reference: stage_a_plugin_contract::A2TimingReferenceV1::DriveSync,
+                mean_u_milli: 400,
+                depth_a_milli: 700,
+                frequency_millihz: 500,
+                min_half_us: 100_000,
+                v_null_dac: 100,
+                v_peak_dac: 1_000,
+                comparator_threshold_dac: 0,
+                comparator_hysteresis: 1,
+                comparator_invert: false,
+                sample_rate_hz: 20_000,
+                block_samples: 256,
+                emit_raw_samples: true,
+                emit_summary: true,
+            }),
+            ..acknowledged_sine(25.0)
+        });
+        let mut sink = ControlSink::default();
+        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+        let lease = sink.services[0].request_id;
+        sink.services.clear();
+        control_tick(&mut plugin, inbox_with(vec![accepted(lease)]), &mut sink);
+        assert!(
+            sink.services.iter().any(|request| matches!(
+                modulation_command(request),
+                Some(ModulationCommandV1::PrepareA1)
+            )),
+            "an A2 target is not an A1 acquisition"
+        );
+        assert!(
+            sink.hosts.is_empty(),
+            "no camera capture before preparation"
+        );
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn an_in_progress_drive_reply_cannot_start_recording() {
+        let folder = temp_folder("drive-not-yet-applied");
+        let (mut plugin, _) = protocol_plugin(&folder, TWO_POINT_PROTOCOL);
+        let mut sink = ControlSink::default();
+        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+        let lease = sink.services[0].request_id;
+        control_tick(&mut plugin, inbox_with(vec![accepted(lease)]), &mut sink);
+        let request_id = plugin.protocol.as_ref().unwrap().pending_reqs[0];
+        let mut reply = accepted(request_id);
+        let response = ModulationResponseV1 {
+            marker_diagnostics: None,
+            common: stage_a_plugin_contract::ResponseCommonV1 {
+                contract_version: 1,
+                request_id: RequestId(request_id),
+                owner_instance: OwnerInstanceId::new("test"),
+                run_id: None,
+                requested_revision: None,
+                acknowledged_revision: None,
+                outcome: RequestOutcomeV1::InProgress,
+                completed_at_unix_ms: None,
+                error: None,
+            },
+            controller_state: stage_a_plugin_contract::ControllerStateV1::Running,
+            acknowledged_target: None,
+        };
+        reply.outcome = PluginServiceOutcome::Accepted {
+            payload: serde_json::to_value(response).unwrap(),
+        };
+        plugin.on_service_reply(&reply);
+        assert!(plugin
+            .protocol
+            .as_ref()
+            .unwrap()
+            .pending_reqs
+            .contains(&request_id));
+        plugin.poll_modulation_requests(&mut sink);
+        assert!(
+            sink.services
+                .iter()
+                .filter(|r| r.request_id == request_id)
+                .count()
+                >= 2
+        );
+    }
+    #[test]
+    fn metadata_write_failure_cannot_count_as_a_completed_point() {
+        let folder = temp_folder("metadata-disk-failure");
+        std::fs::create_dir_all(&folder).unwrap();
+        let mut plugin = plugin_locking(1.0, &folder);
+        let blocked = folder.join("not-a-directory");
+        std::fs::write(&blocked, b"blocked").unwrap();
+        plugin.recording.folder = blocked.display().to_string();
+        plugin.recording.id = "test".into();
+        plugin.recording.cam_complete = true;
+        plugin.recording.pd_finalized = true;
+        plugin.recording.pd_valid = true;
+        plugin.recording.pd_pdq_path = Some("missing.pdq".into());
+        plugin.recording.pd_sidecar_path = Some("missing.json".into());
+        plugin.finish_recording(&mut ControlSink::default());
+        assert!(!plugin.recording_completed_ok);
+        assert!(plugin.message.contains("metadata save failed"));
+    }
+
+    #[test]
+    fn a_skipped_point_leaves_its_reason_on_disk() {
+        let folder = temp_folder("persistent-failure");
+        let (mut plugin, _) = protocol_plugin(&folder, TWO_POINT_PROTOCOL);
+        control_tick(
+            &mut plugin,
+            PluginControlInbox::default(),
+            &mut ControlSink::default(),
+        );
+        let run = plugin.protocol.as_ref().unwrap();
+        let path = folder.join(format!(
+            "{}_progress.jsonl",
+            sanitize_stem(run.lease_id.as_str())
+        ));
+        plugin.fail_protocol_point(
+            &mut ControlSink::default(),
+            "controller refused the requested frequency".into(),
+        );
+        let text = std::fs::read_to_string(path).unwrap();
+        let entries: Vec<Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let failed = entries
+            .iter()
+            .find(|entry| entry["event"] == "point_failed")
+            .unwrap();
+        assert_eq!(failed["point_index"], 1);
+        assert_eq!(
+            failed["detail"],
+            "controller refused the requested frequency"
+        );
     }
 }
