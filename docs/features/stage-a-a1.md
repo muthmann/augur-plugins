@@ -320,9 +320,12 @@ acceptance before high-frequency data is treated as qualified.
   its predecessor would be recorded under parameters the file does not name.
 - **The file's `duration_s` wins** over the panel's, or the survey would not be
   reproducible from the protocol alone.
-- **Validated up front**: ranges, bounds, the `MAX_POINTS = 4096` product limit
-  and the same whole-cycle window check the ladder makes against its lowest
-  frequency — all on the button press, before the drive moves. The point count
+- **Validated up front**: ranges, bounds, the `MAX_POINTS = 4096` product limit,
+  the same whole-cycle window check the ladder makes against its lowest
+  frequency, and — for a measured depth — the placement's dark provenance: a
+  photodiode on the camera or emission path with no lamp-off dark reference
+  fails every quantitative sidecar in the file, so the survey is refused rather
+  than its twelfth point. All on the button press, before the drive moves. The point count
   and expected bench time are reported first, and the bench time still to run
   stays on the protocol's own status line: the opening message is overwritten by
   the first point, so an operator who looked away would otherwise never see it
@@ -330,7 +333,10 @@ acceptance before high-frequency data is treated as qualified.
 - **A refused point is skipped, not fatal**, carrying the modulation owner's own
   wording. Because the per-point message is overwritten within the same tick,
   the reasons are kept on the run and shown in the status pane and the closing
-  summary.
+  summary. A *recording* that fails is the exception: a rejected camera start is
+  retried on the same point after 1, 2 and 4 s, and any recording that still
+  does not complete ends the run there. A survey that skipped on every failure
+  ran to the end of the file with almost no data — see ADR 043.
 
 ### Qualified laboratory protocols
 

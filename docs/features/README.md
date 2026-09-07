@@ -29,4 +29,6 @@ Repository-level feature notes for larger plugin suites, interface migrations, a
 
 A2 production capture modes and synchronization evidence: [ADR 041](../adr/041-stage-a-a2-drive-sync-capture.md).
 
+An A1 protocol retries a rejected camera start, stops on a failed recording and refuses a survey whose sidecars it could not write: [ADR 043](../adr/043-a1-protocol-failure-policy.md).
+
 - [Windows lab watcher](stage-a-lab-watch.md): independent RAW/PDQ progress warnings to an iPhone through ntfy.

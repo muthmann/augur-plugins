@@ -206,6 +206,16 @@ fn frequency_label(hz: f64) -> String {
     format!("{hz:.3} Hz")
 }
 
+/// The detector placement in the words the photodiode plugin's own selector
+/// uses, so a refusal names the setting the operator has to look at.
+fn placement_label(placement: stage_a_plugin_contract::PhotodiodePlacementV1) -> &'static str {
+    match placement {
+        stage_a_plugin_contract::PhotodiodePlacementV1::RejectedPort => "rejected port",
+        stage_a_plugin_contract::PhotodiodePlacementV1::CameraPath => "camera path",
+        stage_a_plugin_contract::PhotodiodePlacementV1::EmissionPath => "emission path",
+    }
+}
+
 /// A stretch of bench time in the largest unit that still reads as a number an
 /// operator can act on: seconds below two minutes, then minutes, then hours.
 fn format_bench_time(seconds: f64) -> String {
@@ -1725,6 +1735,33 @@ impl StageAA1Plugin {
         let reason = self.optical_summary_blocker()?;
         Some(format!(
             "{reason} (or switch \"Depth a source\" to the commanded drive to work open loop)"
+        ))
+    }
+
+    /// Why the selected placement can never anchor a measured `a`, read from
+    /// the photodiode's published placement and dark provenance rather than
+    /// from a live window.
+    ///
+    /// The estimator's other gates need the drive to be running, so they cannot
+    /// be asked before a protocol has commanded its first point. This one can,
+    /// and it is fatal for the whole file rather than for one point: a direct
+    /// placement without a lamp-off dark reference fails every quantitative
+    /// sidecar the survey would write, whatever the drive does afterwards.
+    fn direct_dark_reference_blocker(&self) -> Option<String> {
+        if self.depth_source != DepthSource::Photodiode {
+            return None;
+        }
+        let state = self.photodiode.as_ref()?;
+        if state.placement == stage_a_plugin_contract::PhotodiodePlacementV1::RejectedPort
+            || state.dark_reference.is_some()
+        {
+            return None;
+        }
+        Some(format!(
+            "the photodiode is sampling the {} and has no lamp-off dark reference — block the \
+             light and press Capture lamp-off dark in the photodiode plugin, or enter a manual \
+             value (or switch \"Depth a source\" to the commanded drive to work open loop)",
+            placement_label(state.placement)
         ))
     }
 
@@ -4599,6 +4636,10 @@ impl StageAA1Plugin {
             self.message = blocker;
             return;
         }
+        if let Some(blocker) = self.direct_dark_reference_blocker() {
+            self.message = format!("Protocol refused: {blocker}");
+            return;
+        }
         let text = match std::fs::read_to_string(&path) {
             Ok(text) => text,
             Err(error) => {
@@ -5216,11 +5257,18 @@ impl StageAA1Plugin {
                 return;
             }
         }
-        let message = format!(
-            "Protocol aborted at point {} after {} camera start retries: {reason}",
-            run.index + 1,
-            run.camera_start_retries
-        );
+        let message = if run.camera_start_retries == 0 {
+            // Naming camera retries that never happened sends the operator to
+            // the wrong subsystem: most of these are a refused sidecar or a
+            // photodiode gate, not the camera.
+            format!("Protocol aborted at point {}: {reason}", run.index + 1)
+        } else {
+            format!(
+                "Protocol aborted at point {} after {} camera start retries: {reason}",
+                run.index + 1,
+                run.camera_start_retries
+            )
+        };
         self.finish_protocol(context, message);
     }
 
@@ -11541,6 +11589,39 @@ depth_a = 0.7
         control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
         assert!(plugin.protocol.is_none());
         let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// The bench cost of finding this out at the twelfth point instead of at
+    /// the press: eleven recordings whose sidecar the run then refused to write.
+    #[test]
+    fn protocol_refuses_a_direct_placement_without_a_lamp_off_dark_reference() {
+        let folder = temp_folder("protocol-direct-dark");
+        let (mut plugin, _) = protocol_plugin(&folder, TWO_POINT_PROTOCOL);
+        plugin.photodiode.as_mut().unwrap().placement =
+            stage_a_plugin_contract::PhotodiodePlacementV1::CameraPath;
+        let mut sink = ControlSink::default();
+        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+        assert!(plugin.protocol.is_none(), "{}", plugin.message);
+        assert!(
+            plugin.message.contains("lamp-off dark reference"),
+            "{}",
+            plugin.message
+        );
+        assert!(plugin.message.contains("camera path"), "{}", plugin.message);
+
+        // The same bench with the reference captured runs the file.
+        plugin.protocol_pending = true;
+        plugin.photodiode.as_mut().unwrap().dark_reference =
+            Some(stage_a_plugin_contract::PhotodiodeDarkReferenceV1 {
+                dark_id: "dark-1".into(),
+                source: stage_a_plugin_contract::PhotodiodeDarkSourceV1::MeasuredLampOff,
+                dark_volts: 0.01,
+                captured_at_unix_ms: now_unix_ms(),
+                age_s: 0.5,
+            });
+        control_tick(&mut plugin, PluginControlInbox::default(), &mut sink);
+        assert!(plugin.protocol.is_some(), "{}", plugin.message);
+        let _ = std::fs::remove_dir_all(folder);
     }
 
     #[test]
