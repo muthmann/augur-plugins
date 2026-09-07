@@ -12,6 +12,12 @@ For the full host-side contract, use the upstream authoring guide:
 - `augur-plugins` owns the runtime plugin implementations and the template crate used to start new plugins.
 - Shared domain payloads should live in companion crates when multiple plugins need the same types.
 
+The host remains a standalone general-purpose recorder when every plugin is
+removed. Host contracts therefore expose only generic operations and never
+name plugin IDs, workflows, or scientific gates. A plugin may declare and use a
+generic host capability, but its field restrictions and measurement-validity
+rules stay in this repository.
+
 ## Runtime Packaging
 
 Each installed runtime plugin ships as:
@@ -68,6 +74,9 @@ Key properties:
 - `sensor_height`
 - `acq_time_ms`
 - `event_store_budget_bytes`
+- `record_sensor_telemetry`
+- active ROI and masked pixels
+- event-filter state
 
 New plugins should prefer this shared host contract over duplicating pixel scale or sensor geometry in plugin-local defaults.
 

@@ -5,10 +5,27 @@ free-running PDA1 `SamplesU16` stream the `stage-a-controller` firmware (0.4.0+)
 **second** USB serial port (20 kSa/s default). The port carries no commands, so this plugin is
 read-only by construction; the command port belongs to `stage-a-modulation`.
 
-## Modes
+## Detector placement and modes
+
+Set **Detector placement** to the physical geometry before recording:
+
+- **PBS rejected port** — complementary excitation. This is the legacy mode and
+  uses the learned `I_tot` anchor described below.
+- **camera path (direct)** — direct sample of the path sent to the camera.
+- **emission path (direct fluorescence)** — direct fluorescence after the
+  emission filter. Set **Fraction sent to PD** to the beamsplitter fraction
+  (`0.5` for 50:50), block the beam and press **Capture lamp-off dark**.
+
+The two direct modes compute `a = ln((V_max-D)/(V_min-D))`. They never use
+`I_tot`. The splitter fraction is written as provenance and is not used to
+rescale log contrast. Direct-path `a` is withheld until a lamp-off dark has
+been explicitly captured. The PD artifacts record its value, ID, source,
+capture time, and age. The numeric dark field is only a draft; pressing **Use
+manual dark** activates it with source `manual`. This explicit step prevents UI
+settings replay from replacing a captured lamp-off reference.
 
 - **RAW** — shows the ADC code and its voltage, `V = code · 3.3 / 4095`.
-- **EXCITATION** — the photodiode sits in the excitation path behind the PBS and measures the
+- **EXCITATION** — in rejected-port placement, the photodiode sits behind the PBS and measures the
   light *removed* from the beam: `I_pd = I_tot − I_exc`, so the plugin shows `I_exc = I_tot − I_pd`.
   `I_tot` is **learned, not entered**: it is the brightest smoothed reading the detector has taken
   since the port opened, which on the reject port is where the excitation is extinguished. The
@@ -16,11 +33,42 @@ read-only by construction; the command port belongs to `stage-a-modulation`.
   anchor. There is no dark level either — a DC offset cancels exactly out of the complement.
   See [ADR 024](../../docs/adr/024-stage-a-photodiode-learns-its-own-anchor.md).
 
+RAW/EXCITATION is a display choice. Detector placement is the scientific
+geometry and controls the estimator independently of the chart mode.
+
 ## Views
 
 - a live rolling chart (window length settable, 1–120 s) of the value in the selected mode;
 - a compact status table with the newest code/value, moving average, integrity,
   recording state, and connection state.
+
+## Guided reference recordings
+
+Open **Guided PD references** for raw captures that describe the detector noise
+and the current analogue chain. Choose one reference-set ID and keep it for the
+whole bench configuration. The plugin creates one folder with clearly named
+PDQ and JSON files. It never overwrites an existing reference. The JSON records
+the detector placement, splitter fraction, duration, reference type and PD load
+(470 kOhm for the current setup).
+
+The four steps are:
+
+1. **Electronics dark, 30 s:** block all light before the PD and keep modulation
+   safely off. This measures the ADC, cable and amplified PD background.
+2. **Blocked drive crosstalk, 30 s:** keep the light blocked and run the normal
+   experiment modulation. This separates electrical pickup from optical light.
+3. **Static optical signal, 30 s:** open the path, use a constant drive and do
+   not modulate. This measures noise at the real DC level.
+4. **Optical edges, 100 s:** use the A2 workflow for automatic 1 s steps. The
+   standalone PD button can record an already running sequence, but it does not
+   take hardware ownership from A1 or A2.
+
+Each standalone capture stops automatically and advances the panel to the next
+step. Advanced noise or trigger-error
+analysis is intentionally offline; the raw samples and markers are the source
+of truth. Modulation remains in A1/A2 because those workflows own the command
+port and can restore the hardware safely. Comparator threshold, hysteresis and
+polarity are therefore not duplicated in this general PD panel.
 
 ## Ports
 

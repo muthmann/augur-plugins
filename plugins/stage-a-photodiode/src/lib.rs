@@ -21,6 +21,9 @@
 //! or — for modulated signals — one full period of a user-given frequency,
 //! which makes the mean independent of the modulation phase.
 
+#[cfg(test)]
+mod protocol_validation_tests;
+
 use std::collections::{BTreeMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Write};
@@ -47,7 +50,8 @@ use stage_a_io::{
 use stage_a_plugin_contract::{
     ClientId, ConnectionStateV1, FreshnessV1, LeaseId, LeaseSnapshotV1, OwnerInstanceId,
     PdqFinalizedReceiptV1, PdqReceiptV1, PdqStartSpecV1, PdqStartedReceiptV1, PdqTerminationV1,
-    PhotodiodeCalibrationV1, PhotodiodeCommandV1, PhotodiodeLevelV1, PhotodiodeOpticalSummaryV1,
+    PhotodiodeCalibrationV1, PhotodiodeCommandV1, PhotodiodeDarkReferenceV1,
+    PhotodiodeDarkSourceV1, PhotodiodeLevelV1, PhotodiodeOpticalSummaryV1, PhotodiodePlacementV1,
     PhotodiodeRequestV1, PhotodiodeResponseV1, PhotodiodeStreamV1, PhotodiodeSummaryV1,
     RequestOutcomeV1, ResponseCommonV1, RunId, SampleRangeV1, SemanticRevision, ServiceErrorCodeV1,
     ServiceErrorV1, Sha256V1, StreamIntegrityV1, SynchronizationV1, UnsyncedReasonV1,
@@ -124,6 +128,105 @@ enum Mode {
     Excitation,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReferenceKind {
+    ElectronicsDark,
+    DriveCrosstalk,
+    StaticOptical,
+    OpticalEdges,
+}
+
+impl ReferenceKind {
+    const VARIANTS: [Self; 4] = [
+        Self::ElectronicsDark,
+        Self::DriveCrosstalk,
+        Self::StaticOptical,
+        Self::OpticalEdges,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::ElectronicsDark => "1 - electronics dark",
+            Self::DriveCrosstalk => "2 - blocked drive crosstalk",
+            Self::StaticOptical => "3 - static optical signal",
+            Self::OpticalEdges => "4 - optical edges with comparator",
+        }
+    }
+
+    fn slug(self) -> &'static str {
+        match self {
+            Self::ElectronicsDark => "electronics_dark",
+            Self::DriveCrosstalk => "blocked_drive_crosstalk",
+            Self::StaticOptical => "static_optical",
+            Self::OpticalEdges => "optical_edges",
+        }
+    }
+
+    fn duration_s(self) -> u64 {
+        match self {
+            Self::ElectronicsDark | Self::DriveCrosstalk | Self::StaticOptical => 30,
+            Self::OpticalEdges => 100,
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::ElectronicsDark => Self::DriveCrosstalk,
+            Self::DriveCrosstalk => Self::StaticOptical,
+            Self::StaticOptical => Self::OpticalEdges,
+            Self::OpticalEdges => Self::OpticalEdges,
+        }
+    }
+
+    fn instruction(self) -> &'static str {
+        match self {
+            Self::ElectronicsDark => {
+                "Block all light before the photodiode. The modulation must be safely off."
+            }
+            Self::DriveCrosstalk => {
+                "Keep the light blocked and run the normal A1/A2 modulation. This measures electrical pickup."
+            }
+            Self::StaticOptical => {
+                "Open the optical path and keep the drive constant. Do not modulate during this capture."
+            }
+            Self::OpticalEdges => {
+                "Use the A2 workflow for automatic 1 s optical steps and comparator markers. Standalone mode only records an already running sequence."
+            }
+        }
+    }
+
+    fn from_name(name: &str) -> Option<Self> {
+        Self::VARIANTS.into_iter().find(|kind| kind.name() == name)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ActiveReferenceCapture {
+    kind: ReferenceKind,
+    set_id: String,
+    deadline_unix_ms: u64,
+}
+
+const PHOTODIODE_PLACEMENTS: [PhotodiodePlacementV1; 3] = [
+    PhotodiodePlacementV1::RejectedPort,
+    PhotodiodePlacementV1::CameraPath,
+    PhotodiodePlacementV1::EmissionPath,
+];
+
+fn placement_name(placement: PhotodiodePlacementV1) -> &'static str {
+    match placement {
+        PhotodiodePlacementV1::RejectedPort => "PBS rejected port",
+        PhotodiodePlacementV1::CameraPath => "camera path (direct)",
+        PhotodiodePlacementV1::EmissionPath => "emission path (direct fluorescence)",
+    }
+}
+
+fn placement_from_name(name: &str) -> Option<PhotodiodePlacementV1> {
+    PHOTODIODE_PLACEMENTS
+        .into_iter()
+        .find(|placement| placement_name(*placement) == name)
+}
+
 impl Mode {
     const VARIANTS: [Mode; 2] = [Mode::Raw, Mode::Excitation];
 
@@ -185,6 +288,10 @@ struct SharedState {
     /// `Marker` stream frames. Used for the opt-in trigger overlay and to derive
     /// the modulation frequency.
     markers: VecDeque<u64>,
+    /// A2 optical-comparator crossings (`MarkerPayload::source == 2`). Kept
+    /// separate from A1 phase-0 markers so neither experiment can silently
+    /// derive a frequency from the other experiment's fiducials.
+    comparator_markers: VecDeque<(u64, u8)>,
     /// Newest phase-0 marker index seen, retained or already evicted, and the
     /// spacing to the one before it.
     ///
@@ -256,6 +363,7 @@ impl Default for SharedState {
             samples: VecDeque::new(),
             cells: VecDeque::new(),
             markers: VecDeque::new(),
+            comparator_markers: VecDeque::new(),
             last_marker_index: None,
             marker_period_estimate: None,
             latest: None,
@@ -272,8 +380,44 @@ impl Default for SharedState {
 }
 
 impl SharedState {
+    /// Samples the ring retains: the operator's cache length, or the whole
+    /// modulation cycles the optical estimator needs at the period the drive is
+    /// running — whichever is longer, capped by [`RING_MAX_SAMPLES`].
+    ///
+    /// `a` is only measurable between phase-0 markers, so at low `f` the
+    /// retained window *is* the gate on whether it can be published at all: two
+    /// cycles at 0.075 Hz are 26.7 s, which the 20 s default never covers. Left
+    /// to a setting, that turns into a precondition an operator has to work out
+    /// per file and set by hand before pressing Start — and an A1 survey whose
+    /// lowest rung is sub-hertz otherwise records its full duration and only
+    /// then discovers it has no `a` to write. The markers give the period on the
+    /// same sample clock the ring is indexed by, so size the ring from them and
+    /// the precondition disappears.
+    ///
+    /// Sizing follows the drive both ways: the ring shrinks back on the next
+    /// ingest when the frequency goes up, because eviction re-reads the capacity
+    /// every frame.
     fn ring_capacity(&self, rate_hz: u32) -> usize {
-        ((f64::from(rate_hz.max(1)) * self.cache_seconds) as usize).clamp(2, RING_MAX_SAMPLES)
+        let requested = f64::from(rate_hz.max(1)) * self.cache_seconds;
+        // One cycle beyond the estimator's window, so a whole window still fits
+        // once the oldest marker ages out of it.
+        let needed = self
+            .contrast_period_samples()
+            .map_or(0.0, |period| period * (CONTRAST_WINDOW_CYCLES + 1.0));
+        (requested.max(needed) as usize).clamp(2, RING_MAX_SAMPLES)
+    }
+
+    /// The modulation period in samples the ring sizes itself against.
+    ///
+    /// The newest marker interval first: it moves to the new period on the first
+    /// marker after a retarget, where the mean over the retained markers still
+    /// carries the previous rung and would grow the ring a cycle at a time. It
+    /// also survives eviction, so a period longer than the ring itself — the
+    /// case this exists for — is still known.
+    fn contrast_period_samples(&self) -> Option<f64> {
+        self.marker_period_estimate
+            .filter(|period| *period > 0.0)
+            .or_else(|| self.marker_period_samples())
     }
 
     /// Ingests one `SamplesU16` frame. Any discontinuity — rate change,
@@ -293,6 +437,7 @@ impl SharedState {
             self.samples.clear();
             self.cells.clear();
             self.markers.clear();
+            self.comparator_markers.clear();
             // The sample clock restarts with the segment, so a spacing
             // measured across the discontinuity is meaningless.
             self.last_marker_index = None;
@@ -350,6 +495,13 @@ impl SharedState {
         {
             self.markers.pop_front();
         }
+        while self
+            .comparator_markers
+            .front()
+            .is_some_and(|&(index, _)| index < self.ring_first_index)
+        {
+            self.comparator_markers.pop_front();
+        }
     }
 
     /// Records a phase-0 marker (device sample index) if it sits inside the
@@ -374,6 +526,24 @@ impl SharedState {
         self.markers.push_back(sample_index);
         while self.markers.len() > MAX_MARKERS {
             self.markers.pop_front();
+        }
+        self.last_update_unix_ms = now_unix_ms();
+    }
+
+    fn push_comparator_marker(&mut self, sample_index: u64, level: u8) {
+        if sample_index < self.ring_first_index {
+            return;
+        }
+        if self
+            .comparator_markers
+            .back()
+            .is_some_and(|&(last, _)| last == sample_index)
+        {
+            return;
+        }
+        self.comparator_markers.push_back((sample_index, level));
+        while self.comparator_markers.len() > MAX_MARKERS {
+            self.comparator_markers.pop_front();
         }
         self.last_update_unix_ms = now_unix_ms();
     }
@@ -475,6 +645,7 @@ struct RecordingSink {
     metadata: BTreeMap<String, String>,
     started_slug: String,
     samples_written: u64,
+    marker_counts: stage_a_plugin_contract::PdqMarkerCountsV1,
     write_error: Option<String>,
     /// Integrity counters at recording start, so the sidecar reports deltas
     /// for exactly the recorded span.
@@ -510,7 +681,23 @@ fn record_frame(recording: &SharedRecording, frame: &stage_a_io::Frame, samples:
         return;
     }
     match sink.writer.write_frame(frame) {
-        Ok(()) => sink.samples_written += samples as u64,
+        Ok(()) => {
+            sink.samples_written += samples as u64;
+            if let Some(marker) = frame.marker() {
+                let counts = &mut sink.marker_counts;
+                match (marker.source, marker.level) {
+                    (stage_a_io::wire::MARKER_SOURCE_PHASE0, 1) => counts.phase_zero += 1,
+                    (stage_a_io::wire::MARKER_SOURCE_COMPARATOR, 1) => {
+                        counts.comparator_rising += 1
+                    }
+                    (stage_a_io::wire::MARKER_SOURCE_COMPARATOR, 0) => {
+                        counts.comparator_falling += 1
+                    }
+                    (_, 2..=u8::MAX) => counts.invalid_level += 1,
+                    _ => {}
+                }
+            }
+        }
         Err(err) => sink.write_error = Some(format!("recording write failed: {err}")),
     }
 }
@@ -727,7 +914,15 @@ fn ingest_parse_event(
                 // samples, hence a sample count of 0.
                 record_frame(recording, &frame, 0);
                 if let Ok(mut state) = shared.lock() {
-                    state.push_marker(marker.sample_index);
+                    match marker.source {
+                        stage_a_io::wire::MARKER_SOURCE_PHASE0 => {
+                            state.push_marker(marker.sample_index);
+                        }
+                        stage_a_io::wire::MARKER_SOURCE_COMPARATOR => {
+                            state.push_comparator_marker(marker.sample_index, marker.level);
+                        }
+                        _ => {}
+                    }
                 }
                 return true;
             }
@@ -780,17 +975,40 @@ pub struct StageAPhotodiodePlugin {
     connect_requested: bool,
     port_hint: String,
     mode: Mode,
+    /// Physical detector geometry. This changes the scientific contrast
+    /// transform, unlike `mode`, which is display-only.
+    placement: PhotodiodePlacementV1,
+    /// Fraction of the local beam delivered to the detector. Used only as
+    /// provenance because a fixed factor cancels from log contrast.
+    splitter_fraction: f64,
+    /// Session-local lamp-off reading for direct camera/emission paths. `None`
+    /// is a scientific gate, not an implicit zero-dark calibration.
+    direct_dark_reference: Option<StoredDirectDarkReference>,
+    /// UI-synchronized draft. It becomes a calibration only through the
+    /// explicit `Use manual dark` button, so settings replay cannot overwrite
+    /// a measured reference.
+    direct_dark_manual_volts: f64,
     window_s: f64,
     avg_samples: usize,
     avg_sync_freq_hz: f64,
     time_axis: TimeAxis,
     /// Overlay the phase-0 trigger markers on the chart (opt-in).
     show_markers: bool,
+    /// Overlay A2 comparator state changes independently of phase-0 markers.
+    show_comparator_markers: bool,
     data_dir: String,
+    reference_set_id: String,
+    reference_kind: ReferenceKind,
+    load_ohms: f64,
+    active_reference: Option<ActiveReferenceCapture>,
     // -- momentary-button press forwarding (see PressLatch) --
     press_save_snapshot: PressLatch,
+    press_capture_direct_dark: PressLatch,
+    press_use_manual_direct_dark: PressLatch,
     press_record_start: PressLatch,
     press_record_stop: PressLatch,
+    press_reference_start: PressLatch,
+    press_reference_abort: PressLatch,
 }
 
 /// Forwards momentary button presses across the host's UI-mirror → live-worker
@@ -846,6 +1064,26 @@ struct ControlLease {
     expires_at_unix_ms: u64,
 }
 
+#[derive(Debug, Clone)]
+struct StoredDirectDarkReference {
+    dark_id: String,
+    source: PhotodiodeDarkSourceV1,
+    dark_volts: f64,
+    captured_at_unix_ms: u64,
+}
+
+impl StoredDirectDarkReference {
+    fn published(&self, observed_at_unix_ms: u64) -> PhotodiodeDarkReferenceV1 {
+        PhotodiodeDarkReferenceV1 {
+            dark_id: self.dark_id.clone(),
+            source: self.source,
+            dark_volts: self.dark_volts,
+            captured_at_unix_ms: self.captured_at_unix_ms,
+            age_s: observed_at_unix_ms.saturating_sub(self.captured_at_unix_ms) as f64 / 1_000.0,
+        }
+    }
+}
+
 impl Default for StageAPhotodiodePlugin {
     fn default() -> Self {
         Self {
@@ -873,15 +1111,28 @@ impl Default for StageAPhotodiodePlugin {
             connect_requested: false,
             port_hint: "auto".into(),
             mode: Mode::Raw,
+            placement: PhotodiodePlacementV1::RejectedPort,
+            splitter_fraction: 0.5,
+            direct_dark_reference: None,
+            direct_dark_manual_volts: 0.0,
             window_s: 10.0,
             avg_samples: 4,
             avg_sync_freq_hz: 0.0,
             time_axis: TimeAxis::BeforeNow,
             show_markers: false,
+            show_comparator_markers: false,
             data_dir: String::new(),
+            reference_set_id: String::new(),
+            reference_kind: ReferenceKind::ElectronicsDark,
+            load_ohms: 470_000.0,
+            active_reference: None,
             press_save_snapshot: PressLatch::default(),
+            press_capture_direct_dark: PressLatch::default(),
+            press_use_manual_direct_dark: PressLatch::default(),
             press_record_start: PressLatch::default(),
             press_record_stop: PressLatch::default(),
+            press_reference_start: PressLatch::default(),
+            press_reference_abort: PressLatch::default(),
         }
     }
 }
@@ -907,6 +1158,18 @@ impl StageAPhotodiodePlugin {
             dark_volts: 0.0,
             full_scale_code: ADC_MAX_CODE as u16,
         }
+    }
+
+    fn published_direct_dark(&self) -> Option<PhotodiodeDarkReferenceV1> {
+        self.direct_dark_reference
+            .as_ref()
+            .map(|reference| reference.published(now_unix_ms()))
+    }
+
+    fn direct_dark_volts(&self) -> Option<f64> {
+        self.direct_dark_reference
+            .as_ref()
+            .map(|reference| reference.dark_volts)
     }
 
     /// The learned total-power anchor `I_tot` in volts, if the stream has run
@@ -1169,6 +1432,80 @@ impl StageAPhotodiodePlugin {
         Ok(())
     }
 
+    fn start_reference_capture(&mut self) -> Result<(), String> {
+        if self.runtime_role != PluginRuntimeRole::LiveWorker || !self.effects_allowed {
+            return Err("reference capture is allowed only on the active live worker".into());
+        }
+        if self.lease.is_some() {
+            return Err("the A1/A2 workflow currently owns photodiode recording".into());
+        }
+        if !self.connected() {
+            return Err("connect the photodiode stream first".into());
+        }
+        let kind = self.reference_kind;
+        let set_id = if self.reference_set_id.trim().is_empty() {
+            format!("PDREF-{}", timestamp_slug())
+        } else {
+            self.reference_set_id.trim().to_owned()
+        };
+        if !set_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+        {
+            return Err("reference set ID may contain only letters, numbers, '-' and '_'".into());
+        }
+        let root = self.resolved_data_dir()?.join(&set_id);
+        std::fs::create_dir_all(&root)
+            .map_err(|error| format!("creating {} failed: {error}", root.display()))?;
+        let stem = format!("{}__{}", set_id, kind.slug());
+        let pdq_path = root.join(format!("{stem}.pdq"));
+        let sidecar_path = root.join(format!("{stem}.json"));
+        let mut metadata = BTreeMap::new();
+        metadata.insert("recording_kind".into(), "photodiode_reference".into());
+        metadata.insert("reference_set_id".into(), set_id.clone());
+        metadata.insert("reference_kind".into(), kind.slug().into());
+        metadata.insert("planned_duration_s".into(), kind.duration_s().to_string());
+        metadata.insert("load_ohms".into(), format!("{:.0}", self.load_ohms));
+        metadata.insert("operator_instruction".into(), kind.instruction().into());
+        self.open_recording(
+            RunId::new(format!("{set_id}-{}", kind.slug())),
+            pdq_path.clone(),
+            sidecar_path.clone(),
+            pdq_path.to_string_lossy().into_owned(),
+            sidecar_path.to_string_lossy().into_owned(),
+            metadata,
+            true,
+        )?;
+        self.reference_set_id = set_id.clone();
+        self.active_reference = Some(ActiveReferenceCapture {
+            kind,
+            set_id,
+            deadline_unix_ms: now_unix_ms() + kind.duration_s() * 1_000,
+        });
+        self.last_save_note = Some(format!(
+            "reference {} recording for {} s",
+            kind.slug(),
+            kind.duration_s()
+        ));
+        Ok(())
+    }
+
+    fn finish_reference_capture(&mut self, termination: PdqTerminationV1) -> Result<(), String> {
+        let active = self.active_reference.take();
+        self.finalize_recording(termination)?;
+        if let Some(active) = active {
+            self.last_save_note = Some(format!(
+                "reference saved: {}/{}",
+                active.set_id,
+                active.kind.slug()
+            ));
+            if termination == PdqTerminationV1::Completed {
+                self.reference_kind = active.kind.next();
+            }
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn open_recording(
         &mut self,
@@ -1238,6 +1575,7 @@ impl StageAPhotodiodePlugin {
             metadata,
             started_slug,
             samples_written: 0,
+            marker_counts: stage_a_plugin_contract::PdqMarkerCountsV1::default(),
             write_error: None,
             start_crc_failures: crc,
             start_resync_bytes: resync,
@@ -1253,8 +1591,12 @@ impl StageAPhotodiodePlugin {
     }
 
     fn stop_recording(&mut self) -> Result<(), String> {
-        self.finalize_recording(PdqTerminationV1::OperatorStopped)
-            .map(|_| ())
+        if self.active_reference.is_some() {
+            self.finish_reference_capture(PdqTerminationV1::OperatorStopped)
+        } else {
+            self.finalize_recording(PdqTerminationV1::OperatorStopped)
+                .map(|_| ())
+        }
     }
 
     fn finalize_recording(
@@ -1306,6 +1648,7 @@ impl StageAPhotodiodePlugin {
                 .map_err(|err| format!("invalid recording digest: {err}"))?,
             frames_written: summary.frames_written,
             sample_frames_written: summary.sample_frames_written,
+            marker_counts: Some(sink.marker_counts),
             sample_range: summary.sample_range.map(|range| SampleRangeV1 {
                 first_sample_index: range.first_sample_index,
                 end_sample_index_exclusive: range.end_sample_index_exclusive,
@@ -1315,7 +1658,7 @@ impl StageAPhotodiodePlugin {
             segment_count: summary.sample_segments,
             integrity: contract_integrity,
             termination,
-            valid: summary.valid && write_error.is_none(),
+            valid: summary.valid && write_error.is_none() && samples > 0,
         };
         let sidecar = json!({
             "kind": "recording",
@@ -1327,6 +1670,7 @@ impl StageAPhotodiodePlugin {
             "samples_written": samples,
             "pdq_path": summary.path,
             "pdq_frames": summary.frames_written,
+            "marker_counts": receipt.marker_counts,
             "pdq_bytes": summary.bytes_written,
             "pdq_crc32": summary.file_crc32,
             "pdq_sha256": receipt.sha256.as_str(),
@@ -1334,15 +1678,27 @@ impl StageAPhotodiodePlugin {
             "termination": receipt.termination,
             "adc": { "bits": 12, "full_scale_volts": ADC_FULL_SCALE_VOLTS },
             "display_mode": self.mode.name(),
-            "total_power_volts": self.learned_anchor_volts(),
-            "total_power_source": "observed-peak",
+            "photodiode_placement": self.placement,
+            "splitter_fraction": (self.placement != PhotodiodePlacementV1::RejectedPort)
+                .then_some(self.splitter_fraction),
+            "reference_set_id": Some(self.reference_set_id.trim())
+                .filter(|value| !value.is_empty()),
+            "load_ohms": self.load_ohms,
+            "direct_dark_volts": (self.placement != PhotodiodePlacementV1::RejectedPort)
+                .then(|| self.direct_dark_volts()).flatten(),
+            "direct_dark_reference": (self.placement != PhotodiodePlacementV1::RejectedPort)
+                .then(|| self.published_direct_dark()).flatten(),
+            "total_power_volts": (self.placement == PhotodiodePlacementV1::RejectedPort)
+                .then(|| self.learned_anchor_volts()).flatten(),
+            "total_power_source": (self.placement == PhotodiodePlacementV1::RejectedPort)
+                .then_some("observed-peak"),
             "integrity": {
                 "resync_bytes": summary.integrity.skipped_bytes,
                 "crc_failures": summary.integrity.crc_failures,
                 "segment_restarts": summary.integrity.sequence_gaps,
                 "device_dropped_samples": summary.integrity.dropped_samples,
             },
-            "valid": summary.valid && write_error.is_none(),
+            "valid": summary.valid && write_error.is_none() && samples > 0,
             "write_error": write_error,
         });
         write_json(&sidecar_path, &sidecar)?;
@@ -1599,13 +1955,11 @@ impl StageAPhotodiodePlugin {
 
     /// Live optical log-contrast `a` from a marker-bounded ring window.
     ///
-    /// The detector sits behind the PBS reject port and measures the rejected
-    /// complement `I_pd = I_tot - I_exc` — that is a property of the optical
-    /// bench, settled by construction (knowledge base:
-    /// `setup/optical-path.md`), not of what the operator chose to plot. So the
-    /// geometry is always [`ContrastGeometry::RejectedComplement`] anchored on
-    /// [`SharedState::observed_peak_code`], and `measured_log_contrast` is
-    /// always the *excitation* contrast `a = ln(I_exc,max / I_exc,min)`.
+    /// The physical placement selects the transform. The historical PBS
+    /// rejected port measures a complement and therefore needs its observed
+    /// full-extinction anchor. Camera/emission-path placements measure their
+    /// local beam directly and use the lamp-off dark reference; `I_tot` is not
+    /// defined or consulted in those geometries.
     ///
     /// The display [`Mode`] is presentational only. It must never reach this
     /// function: A1's amplitude sweep settles on this value against a target
@@ -1620,9 +1974,21 @@ impl StageAPhotodiodePlugin {
         &self,
         state: &SharedState,
     ) -> Result<PhotodiodeOpticalSummaryV1, EstimateError> {
-        let total_power_volts = self
-            .total_power_volts(state)
-            .ok_or(EstimateError::MissingTotalPowerAnchor)?;
+        let total_power_volts = match self.placement {
+            PhotodiodePlacementV1::RejectedPort => Some(
+                self.total_power_volts(state)
+                    .ok_or(EstimateError::MissingTotalPowerAnchor)?,
+            ),
+            PhotodiodePlacementV1::CameraPath | PhotodiodePlacementV1::EmissionPath => None,
+        };
+        let direct_dark = match self.placement {
+            PhotodiodePlacementV1::RejectedPort => None,
+            PhotodiodePlacementV1::CameraPath | PhotodiodePlacementV1::EmissionPath => Some(
+                self.direct_dark_reference
+                    .as_ref()
+                    .ok_or(EstimateError::MissingDirectDarkReference)?,
+            ),
+        };
 
         let ring_end = state.ring_first_index + state.samples.len() as u64;
         let markers: Vec<u64> = state
@@ -1652,12 +2018,16 @@ impl StageAPhotodiodePlugin {
         let rate_hz = f64::from(state.rate_hz.max(1));
         let covered_cycles = Some((markers.len() - 1 - start_marker) as f64);
         let window_seconds = end_index.saturating_sub(start_index) as f64 / rate_hz;
-        let calibration = self.adc_calibration();
-        // The anchor and the samples come from the same DC-coupled detector, so
-        // any dark offset appears identically on both sides of the complement
-        // and cancels exactly. Nothing here is dark-corrected, and that is the
-        // physically right answer — see [`Self::adc_calibration`].
-        let geometry = ContrastGeometry::RejectedComplement { total_power_volts };
+        let mut calibration = self.adc_calibration();
+        let geometry = match total_power_volts {
+            Some(total_power_volts) => ContrastGeometry::RejectedComplement { total_power_volts },
+            None => {
+                calibration.dark_volts = direct_dark
+                    .expect("direct placement checked above")
+                    .dark_volts;
+                ContrastGeometry::Direct
+            }
+        };
         let estimate = estimate_contrast(&window, &calibration, geometry)?;
         let run_id = self
             .lease
@@ -1670,13 +2040,23 @@ impl StageAPhotodiodePlugin {
                 adc_calibration_id: "adc-default".into(),
                 // The complement is dark-invariant, so there is no dark level
                 // to name — say that rather than imply an unmeasured zero.
-                dark_id: "dark-cancels".into(),
+                dark_id: match self.placement {
+                    PhotodiodePlacementV1::RejectedPort => "dark-cancels".into(),
+                    _ => direct_dark
+                        .expect("direct placement checked above")
+                        .dark_id
+                        .clone(),
+                },
                 // Provenance for an anchor nobody typed: the detector sample
                 // index the learned peak was still valid at.
-                anchor_id: format!("observed-peak@{ring_end}"),
+                anchor_id: total_power_volts.map(|_| format!("observed-peak@{ring_end}")),
                 dark_volts: calibration.dark_volts,
+                dark_reference: direct_dark.map(|reference| reference.published(now_unix_ms())),
                 total_power_volts,
             },
+            placement: self.placement,
+            splitter_fraction: (self.placement != PhotodiodePlacementV1::RejectedPort)
+                .then_some(self.splitter_fraction),
             measured_log_contrast: estimate.a,
             log_contrast_stddev: None,
             excitation_min_volts: estimate.v_min_volts,
@@ -1831,6 +2211,15 @@ impl StageAPhotodiodePlugin {
             active_recording,
             last_finalized_recording: self.last_finalized_recording.clone(),
             optical_summary,
+            placement: self.placement,
+            splitter_fraction: (self.placement != PhotodiodePlacementV1::RejectedPort)
+                .then_some(self.splitter_fraction),
+            reference_set_id: Some(self.reference_set_id.trim().to_owned())
+                .filter(|value| !value.is_empty()),
+            load_ohms: Some(self.load_ohms),
+            dark_reference: (self.placement != PhotodiodePlacementV1::RejectedPort)
+                .then(|| self.published_direct_dark())
+                .flatten(),
             optical_unavailable,
             synchronization,
             last_response: self.last_response.clone(),
@@ -1870,6 +2259,7 @@ impl StageAPhotodiodePlugin {
             if let Err(error) = self.finalize_recording(PdqTerminationV1::Aborted) {
                 self.last_error = Some(error);
             }
+            self.active_reference = None;
             // Deliberately keep `connect_requested`: it is the operator's
             // *intent*, and this branch is what the UI mirror runs on every
             // control tick. Clearing it there resets the checkbox before the
@@ -1960,8 +2350,17 @@ impl StageAPhotodiodePlugin {
             "csv_path": csv_path,
             "adc": { "bits": 12, "full_scale_volts": ADC_FULL_SCALE_VOLTS },
             "display_mode": self.mode.name(),
-            "total_power_volts": self.learned_anchor_volts(),
-            "total_power_source": "observed-peak",
+            "photodiode_placement": self.placement,
+            "splitter_fraction": (self.placement != PhotodiodePlacementV1::RejectedPort)
+                .then_some(self.splitter_fraction),
+            "direct_dark_volts": (self.placement != PhotodiodePlacementV1::RejectedPort)
+                .then(|| self.direct_dark_volts()).flatten(),
+            "direct_dark_reference": (self.placement != PhotodiodePlacementV1::RejectedPort)
+                .then(|| self.published_direct_dark()).flatten(),
+            "total_power_volts": (self.placement == PhotodiodePlacementV1::RejectedPort)
+                .then(|| self.learned_anchor_volts()).flatten(),
+            "total_power_source": (self.placement == PhotodiodePlacementV1::RejectedPort)
+                .then_some("observed-peak"),
             "time_base": "t_s = sample_index / sample_rate_hz, device clock, segment-relative",
             "integrity": integrity,
         });
@@ -1981,9 +2380,15 @@ impl StageAPhotodiodePlugin {
     /// very first repaint; it shows the raw reading rather than a trace
     /// referenced to a number that does not exist yet.
     fn display_volts(&self, code: f64, anchor_volts: Option<f64>) -> f64 {
-        match (self.mode, anchor_volts) {
-            (Mode::Raw, _) | (Mode::Excitation, None) => code_to_volts(code),
-            (Mode::Excitation, Some(anchor)) => anchor - code_to_volts(code),
+        match (self.mode, self.placement, anchor_volts) {
+            (Mode::Raw, _, _) => code_to_volts(code),
+            (Mode::Excitation, PhotodiodePlacementV1::RejectedPort, Some(anchor)) => {
+                anchor - code_to_volts(code)
+            }
+            (Mode::Excitation, PhotodiodePlacementV1::RejectedPort, None) => code_to_volts(code),
+            (Mode::Excitation, _, _) => self
+                .direct_dark_volts()
+                .map_or(code_to_volts(code), |dark| code_to_volts(code) - dark),
         }
     }
 
@@ -2108,7 +2513,9 @@ impl StageAPhotodiodePlugin {
 
         let avg_window = self.avg_window_samples(state.rate_hz);
         let avg_enabled = avg_window > 1;
-        let anchor = self.total_power_volts(&state);
+        let anchor = (self.placement == PhotodiodePlacementV1::RejectedPort)
+            .then(|| self.total_power_volts(&state))
+            .flatten();
 
         let mut mean_points = Vec::with_capacity(MAX_PLOT_BUCKETS + 1);
         let mut min_points = Vec::with_capacity(if decimating { MAX_PLOT_BUCKETS + 1 } else { 0 });
@@ -2217,6 +2624,42 @@ impl StageAPhotodiodePlugin {
                 }
             }
         }
+        if self.show_comparator_markers && !state.comparator_markers.is_empty() {
+            let first_visible = state.ring_first_index + start as u64;
+            let y_range = lines
+                .iter()
+                .flat_map(|line| line.points.iter())
+                .map(|point| point.y)
+                .fold(None::<(f64, f64)>, |acc, y| {
+                    Some(acc.map_or((y, y), |(lo, hi)| (lo.min(y), hi.max(y))))
+                });
+            if let Some((y_lo, y_hi)) = y_range {
+                let x_for = |index: u64| -> f64 {
+                    let device_t = index as f64 / rate;
+                    match self.time_axis {
+                        TimeAxis::BeforeNow => device_t - latest_x_index as f64 / rate,
+                        TimeAxis::Segment => device_t,
+                    }
+                };
+                let mut points = Vec::with_capacity(state.comparator_markers.len() * 3);
+                for &(index, level) in &state.comparator_markers {
+                    if index < first_visible || index > latest_x_index {
+                        continue;
+                    }
+                    let x = x_for(index);
+                    let marker_top = if level == 0 { y_lo } else { y_hi };
+                    points.push(Series1dPoint { x, y: y_lo });
+                    points.push(Series1dPoint { x, y: marker_top });
+                    points.push(Series1dPoint { x, y: y_lo });
+                }
+                if !points.is_empty() {
+                    lines.push(Series1dLine {
+                        name: "comparator state".into(),
+                        points,
+                    });
+                }
+            }
+        }
         Series1dV1 {
             x_label: x_label.into(),
             y_label: y_label.into(),
@@ -2318,7 +2761,9 @@ impl StageAPhotodiodePlugin {
                     state.device_dropped, state.crc_failures, state.resync_bytes, state.segments
                 ),
                 state.error.clone(),
-                self.total_power_volts(&state),
+                (self.placement == PhotodiodePlacementV1::RejectedPort)
+                    .then(|| self.total_power_volts(&state))
+                    .flatten(),
             ),
             Err(_) => (None, 0, None, String::new(), None, None),
         };
@@ -2664,7 +3109,7 @@ impl Plugin for StageAPhotodiodePlugin {
     }
 
     fn description(&self) -> &'static str {
-        "Live photodiode readout (SMA5/pin 18/A4) from the Teensy PDA1 stream port at the full stream rate: raw values or excitation power I_exc = I_tot − I_pd with a user-set reference."
+        "Live photodiode readout with explicit rejected-port, camera-path or emission-path optical geometry and coordinated PDQ recording."
     }
 
     fn enabled(&self) -> bool {
@@ -2685,6 +3130,7 @@ impl Plugin for StageAPhotodiodePlugin {
             if let Err(err) = self.finalize_recording(termination) {
                 self.last_error = Some(err);
             }
+            self.active_reference = None;
             self.disconnect();
             self.lease = None;
         }
@@ -2696,6 +3142,7 @@ impl Plugin for StageAPhotodiodePlugin {
             if let Err(error) = self.finalize_recording(PdqTerminationV1::Aborted) {
                 self.last_error = Some(error);
             }
+            self.active_reference = None;
             // Demoting to the UI mirror drops the hardware, not the operator's
             // connect intent — see `apply_execution_context`.
             self.disconnect();
@@ -2722,6 +3169,7 @@ impl Plugin for StageAPhotodiodePlugin {
             if let Err(error) = self.finalize_recording(PdqTerminationV1::Aborted) {
                 self.last_error = Some(error);
             }
+            self.active_reference = None;
             // Runs every replayed frame, so it must not clear the intent
             // either — the port stays closed because `connect()` is guarded.
             self.disconnect();
@@ -2732,6 +3180,15 @@ impl Plugin for StageAPhotodiodePlugin {
     fn process_control(&mut self, context: &mut PluginControlContext<'_>) {
         let execution = context.execution();
         self.apply_execution_context(&execution);
+        if self
+            .active_reference
+            .as_ref()
+            .is_some_and(|capture| now_unix_ms() >= capture.deadline_unix_ms)
+        {
+            if let Err(error) = self.finish_reference_capture(PdqTerminationV1::Completed) {
+                self.last_error = Some(error);
+            }
+        }
     }
 
     fn handle_service_request(
@@ -2840,6 +3297,14 @@ impl Plugin for StageAPhotodiodePlugin {
             .iter()
             .position(|m| *m == self.mode)
             .unwrap_or(0);
+        let placement_variants: Vec<String> = PHOTODIODE_PLACEMENTS
+            .iter()
+            .map(|placement| placement_name(*placement).to_owned())
+            .collect();
+        let placement_default = PHOTODIODE_PLACEMENTS
+            .iter()
+            .position(|placement| *placement == self.placement)
+            .unwrap_or(0);
         SettingsSchema {
             sections: vec![
                 SettingsSection {
@@ -2847,12 +3312,10 @@ impl Plugin for StageAPhotodiodePlugin {
                     description: Some(
                         "Reads the photodiode on the Teensy's SECOND serial port. This is what \
                          measures the modulation depth the A1 plugin records against.\n\n\
-                         The detector sits behind the beamsplitter, so it sees the light taken \
-                         *out* of the excitation beam. The total power I_tot is the brightest \
-                         reading it has taken since the port opened — the excitation is fully \
-                         extinguished there, so that reading is I_tot by construction. Nothing \
-                         to enter: the Pockels transfer sweep walks the whole lobe and lands on \
-                         it. EXCITATION mode subtracts the live reading from it."
+                         Set the physical detector placement before recording. The PBS rejected \
+                         port uses the complementary-light I_tot model. Camera and emission paths \
+                         measure the local beam directly, use the lamp-off dark reference, and \
+                         never use I_tot."
                             .into(),
                     ),
                     default_open: true,
@@ -2880,6 +3343,75 @@ impl Plugin for StageAPhotodiodePlugin {
                             ),
                             kind: SettingKind::Bool {
                                 default: self.connect_requested,
+                            },
+                        },
+                        SettingItem {
+                            key: "placement".into(),
+                            label: "Detector placement".into(),
+                            tooltip: Some(
+                                "PBS rejected port: complementary excitation, needs the learned \
+                                 I_tot anchor. Camera path: direct beam towards the camera. \
+                                 Emission path: direct fluorescence after the emission filter."
+                                    .into(),
+                            ),
+                            kind: SettingKind::Enum {
+                                variants: placement_variants,
+                                default: placement_default,
+                            },
+                        },
+                        SettingItem {
+                            key: "splitter_fraction".into(),
+                            label: "Fraction sent to PD".into(),
+                            tooltip: Some(
+                                "0.5 for a 50:50 splitter. Stored as optical provenance; it is \
+                                 not used to rescale log contrast. Ignored for the PBS rejected port."
+                                    .into(),
+                            ),
+                            kind: SettingKind::F64Drag {
+                                min: 0.001,
+                                max: 1.0,
+                                speed: 0.01,
+                                default: self.splitter_fraction,
+                            },
+                        },
+                        SettingItem {
+                            key: "direct_dark_volts".into(),
+                            label: "Lamp-off dark (V)".into(),
+                            tooltip: Some(
+                                "Session-local blocked-light detector reading for camera/emission \
+                                 path contrast. This is only a draft until Use manual dark is \
+                                 pressed. Ignored for the PBS rejected port."
+                                    .into(),
+                            ),
+                            kind: SettingKind::F64Drag {
+                                min: 0.0,
+                                max: ADC_FULL_SCALE_VOLTS,
+                                speed: 0.0001,
+                                default: self.direct_dark_manual_volts,
+                            },
+                        },
+                        SettingItem {
+                            key: "use_manual_direct_dark".into(),
+                            label: "Use manual dark".into(),
+                            tooltip: Some(
+                                "Explicitly activates the typed value and records its source as \
+                                 manual. Prefer Capture lamp-off dark when the detector is available."
+                                    .into(),
+                            ),
+                            kind: SettingKind::Button {
+                                enabled: self.placement != PhotodiodePlacementV1::RejectedPort,
+                            },
+                        },
+                        SettingItem {
+                            key: "capture_direct_dark".into(),
+                            label: "Capture lamp-off dark".into(),
+                            tooltip: Some(
+                                "With the beam physically blocked, freezes the current settled \
+                                 raw detector level as the session dark reference."
+                                    .into(),
+                            ),
+                            kind: SettingKind::Button {
+                                enabled: self.placement != PhotodiodePlacementV1::RejectedPort,
                             },
                         },
                         SettingItem {
@@ -2972,6 +3504,93 @@ impl Plugin for StageAPhotodiodePlugin {
                             ),
                             kind: SettingKind::Bool {
                                 default: self.show_markers,
+                            },
+                        },
+                        SettingItem {
+                            key: "show_comparator_markers".into(),
+                            label: "Show comparator markers".into(),
+                            tooltip: Some(
+                                "Overlay A2 comparator state changes from marker source 2. This is separate from phase-0 timing markers."
+                                    .into(),
+                            ),
+                            kind: SettingKind::Bool {
+                                default: self.show_comparator_markers,
+                            },
+                        },
+                    ],
+                },
+                SettingsSection {
+                    label: "Guided PD references".into(),
+                    description: Some(format!(
+                        "Step: {}\nDuration: {} s\n\n{}\n\nThe capture stops automatically and is saved as a raw PDQ plus JSON. A1/A2 owns automatic modulation; this panel does not change the drive behind an active workflow.",
+                        self.reference_kind.name(),
+                        self.reference_kind.duration_s(),
+                        self.reference_kind.instruction()
+                    )),
+                    default_open: false,
+                    items: vec![
+                        SettingItem {
+                            key: "reference_set_id".into(),
+                            label: "Reference set ID".into(),
+                            tooltip: Some(
+                                "Use the same ID in the A2 protocol. Leave empty to generate PDREF-<time>."
+                                    .into(),
+                            ),
+                            kind: SettingKind::Text {
+                                default: self.reference_set_id.clone(),
+                            },
+                        },
+                        SettingItem {
+                            key: "reference_kind".into(),
+                            label: "Reference step".into(),
+                            tooltip: Some(
+                                "Select the physical condition, follow the instruction above, then start."
+                                    .into(),
+                            ),
+                            kind: SettingKind::Enum {
+                                variants: ReferenceKind::VARIANTS
+                                    .iter()
+                                    .map(|kind| kind.name().to_owned())
+                                    .collect(),
+                                default: ReferenceKind::VARIANTS
+                                    .iter()
+                                    .position(|kind| *kind == self.reference_kind)
+                                    .unwrap_or(0),
+                            },
+                        },
+                        SettingItem {
+                            key: "load_ohms".into(),
+                            label: "PD termination / load".into(),
+                            tooltip: Some(
+                                "Stored as provenance. Current setup: 470000 ohm.".into(),
+                            ),
+                            kind: SettingKind::F64Drag {
+                                min: 1.0,
+                                max: 10_000_000.0,
+                                speed: 1_000.0,
+                                default: self.load_ohms,
+                            },
+                        },
+                        SettingItem {
+                            key: "reference_start".into(),
+                            label: "Start this reference".into(),
+                            tooltip: Some(
+                                "Starts the fixed-length raw capture. Existing files are never overwritten."
+                                    .into(),
+                            ),
+                            kind: SettingKind::Button {
+                                enabled: !self.data_dir.trim().is_empty()
+                                    && !self.recording_active(),
+                            },
+                        },
+                        SettingItem {
+                            key: "reference_abort".into(),
+                            label: "Abort reference".into(),
+                            tooltip: Some(
+                                "Stops the current reference and marks it as aborted.".into(),
+                            ),
+                            kind: SettingKind::Button {
+                                enabled: self.active_reference.is_some(),
                             },
                         },
                     ],
@@ -3072,6 +3691,14 @@ impl Plugin for StageAPhotodiodePlugin {
                 Some(json!(index))
             }
             "connect" => Some(json!(self.connect_requested)),
+            "placement" => Some(json!(PHOTODIODE_PLACEMENTS
+                .iter()
+                .position(|placement| *placement == self.placement)
+                .unwrap_or(0))),
+            "splitter_fraction" => Some(json!(self.splitter_fraction)),
+            "direct_dark_volts" => Some(json!(self.direct_dark_manual_volts)),
+            "use_manual_direct_dark" => Some(self.press_use_manual_direct_dark.value()),
+            "capture_direct_dark" => Some(self.press_capture_direct_dark.value()),
             "mode" => {
                 let index = Mode::VARIANTS
                     .iter()
@@ -3082,6 +3709,7 @@ impl Plugin for StageAPhotodiodePlugin {
             "window_s" => Some(json!(self.window_s)),
             "avg_samples" => Some(json!(self.avg_samples)),
             "show_markers" => Some(json!(self.show_markers)),
+            "show_comparator_markers" => Some(json!(self.show_comparator_markers)),
             "avg_sync_freq_hz" => Some(json!(self.avg_sync_freq_hz)),
             "time_axis" => {
                 let index = TimeAxis::VARIANTS
@@ -3091,6 +3719,14 @@ impl Plugin for StageAPhotodiodePlugin {
                 Some(json!(index))
             }
             "data_dir" => Some(json!(self.data_dir)),
+            "reference_set_id" => Some(json!(self.reference_set_id)),
+            "reference_kind" => Some(json!(ReferenceKind::VARIANTS
+                .iter()
+                .position(|kind| *kind == self.reference_kind)
+                .unwrap_or(0))),
+            "load_ohms" => Some(json!(self.load_ohms)),
+            "reference_start" => Some(self.press_reference_start.value()),
+            "reference_abort" => Some(self.press_reference_abort.value()),
             "cache_s" => Some(json!(self
                 .shared
                 .lock()
@@ -3120,12 +3756,92 @@ impl Plugin for StageAPhotodiodePlugin {
                 self.port_hint = variant_path(&enum_choice(&value, &port_variants())?).to_owned();
                 Ok(())
             }
+            "placement" => {
+                let names: Vec<String> = PHOTODIODE_PLACEMENTS
+                    .iter()
+                    .map(|placement| placement_name(*placement).to_owned())
+                    .collect();
+                let name = enum_choice(&value, &names)?;
+                let placement = placement_from_name(&name)
+                    .ok_or_else(|| format!("unknown photodiode placement: {name}"))?;
+                if placement != self.placement {
+                    self.placement = placement;
+                    self.direct_dark_reference = None;
+                }
+                Ok(())
+            }
+            "splitter_fraction" => {
+                let fraction = value.as_f64().ok_or("splitter_fraction must be a number")?;
+                if !(fraction.is_finite() && 0.0 < fraction && fraction <= 1.0) {
+                    return Err("splitter_fraction must be in (0, 1]".into());
+                }
+                self.splitter_fraction = fraction;
+                Ok(())
+            }
+            "direct_dark_volts" => {
+                let volts = value.as_f64().ok_or("direct_dark_volts must be a number")?;
+                if !volts.is_finite() || !(0.0..ADC_FULL_SCALE_VOLTS).contains(&volts) {
+                    return Err(format!(
+                        "direct_dark_volts must be in [0, {ADC_FULL_SCALE_VOLTS})"
+                    ));
+                }
+                self.direct_dark_manual_volts = volts;
+                Ok(())
+            }
+            "use_manual_direct_dark" => {
+                if self.press_use_manual_direct_dark.accept(&value) {
+                    if self.placement == PhotodiodePlacementV1::RejectedPort {
+                        return Err("lamp-off dark is not used for the PBS rejected port".into());
+                    }
+                    let captured_at_unix_ms = now_unix_ms();
+                    self.direct_dark_reference = Some(StoredDirectDarkReference {
+                        dark_id: format!("manual@{captured_at_unix_ms}"),
+                        source: PhotodiodeDarkSourceV1::Manual,
+                        dark_volts: self.direct_dark_manual_volts,
+                        captured_at_unix_ms,
+                    });
+                    self.last_save_note = Some(format!(
+                        "using manually entered dark: {:.6} V",
+                        self.direct_dark_manual_volts
+                    ));
+                }
+                Ok(())
+            }
+            "capture_direct_dark" => {
+                if self.press_capture_direct_dark.accept(&value) {
+                    if self.placement == PhotodiodePlacementV1::RejectedPort {
+                        return Err("lamp-off dark is not used for the PBS rejected port".into());
+                    }
+                    let level = self
+                        .shared
+                        .lock()
+                        .ok()
+                        .and_then(|state| self.current_level(&state))
+                        .ok_or("no settled photodiode level is available")?;
+                    let volts = level.mean_volts;
+                    let captured_at_unix_ms = now_unix_ms();
+                    self.direct_dark_reference = Some(StoredDirectDarkReference {
+                        dark_id: format!(
+                            "lamp-off@sample-{}@{captured_at_unix_ms}",
+                            level.end_sample_index
+                        ),
+                        source: PhotodiodeDarkSourceV1::MeasuredLampOff,
+                        dark_volts: volts,
+                        captured_at_unix_ms,
+                    });
+                    self.last_save_note = Some(format!("captured lamp-off dark: {volts:.6} V"));
+                }
+                Ok(())
+            }
             "connect" => {
                 let requested = value.as_bool().ok_or("connect must be a boolean")?;
                 self.connect_requested = requested;
                 if requested {
                     self.connect();
                 } else {
+                    if self.active_reference.is_some() {
+                        self.finish_reference_capture(PdqTerminationV1::Aborted)?;
+                    }
                     self.disconnect();
                 }
                 Ok(())
@@ -3140,6 +3856,12 @@ impl Plugin for StageAPhotodiodePlugin {
             }
             "show_markers" => {
                 self.show_markers = value.as_bool().ok_or("show_markers must be a boolean")?;
+                Ok(())
+            }
+            "show_comparator_markers" => {
+                self.show_comparator_markers = value
+                    .as_bool()
+                    .ok_or("show_comparator_markers must be a boolean")?;
                 Ok(())
             }
             "window_s" => {
@@ -3172,6 +3894,52 @@ impl Plugin for StageAPhotodiodePlugin {
                     .as_str()
                     .ok_or("data_dir must be a string")?
                     .to_owned();
+                Ok(())
+            }
+            "reference_set_id" => {
+                self.reference_set_id = value
+                    .as_str()
+                    .ok_or("reference_set_id must be a string")?
+                    .trim()
+                    .to_owned();
+                Ok(())
+            }
+            "reference_kind" => {
+                let names: Vec<String> = ReferenceKind::VARIANTS
+                    .iter()
+                    .map(|kind| kind.name().to_owned())
+                    .collect();
+                let name = enum_choice(&value, &names)?;
+                self.reference_kind = ReferenceKind::from_name(&name)
+                    .ok_or_else(|| format!("unknown reference kind: {name}"))?;
+                Ok(())
+            }
+            "load_ohms" => {
+                let ohms = value.as_f64().ok_or("load_ohms must be a number")?;
+                if !ohms.is_finite() || ohms <= 0.0 {
+                    return Err("load_ohms must be positive".into());
+                }
+                self.load_ohms = ohms;
+                Ok(())
+            }
+            "reference_start" => {
+                if self.press_reference_start.accept(&value) {
+                    match self.start_reference_capture() {
+                        Ok(()) => self.last_error = None,
+                        Err(error) => self.last_error = Some(error),
+                    }
+                    self.generation.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(())
+            }
+            "reference_abort" => {
+                if self.press_reference_abort.accept(&value) && self.active_reference.is_some() {
+                    match self.finish_reference_capture(PdqTerminationV1::Aborted) {
+                        Ok(()) => self.last_error = None,
+                        Err(error) => self.last_error = Some(error),
+                    }
+                    self.generation.fetch_add(1, Ordering::Relaxed);
+                }
                 Ok(())
             }
             "cache_s" => {
@@ -3253,7 +4021,9 @@ impl Plugin for StageAPhotodiodePlugin {
                 state.rate_hz,
                 self.current_average_code(&state),
                 state.error.clone(),
-                self.total_power_volts(&state),
+                (self.placement == PhotodiodePlacementV1::RejectedPort)
+                    .then(|| self.total_power_volts(&state))
+                    .flatten(),
             ),
             Err(_) => (None, 0, None, None, None),
         };
@@ -3265,6 +4035,26 @@ impl Plugin for StageAPhotodiodePlugin {
             }
         } else {
             "Photodiode: disconnected".into()
+        }));
+        entries.push(StatusEntry::Text(match self.placement {
+            PhotodiodePlacementV1::RejectedPort => {
+                "Optics: PBS rejected port (I_tot complement)".into()
+            }
+            placement => match self.published_direct_dark() {
+                Some(dark) => format!(
+                    "Optics: {} (PD fraction {:.1} %, dark {:.4} V, {:?}, age {:.1} s)",
+                    placement_name(placement),
+                    100.0 * self.splitter_fraction,
+                    dark.dark_volts,
+                    dark.source,
+                    dark.age_s
+                ),
+                None => format!(
+                    "Optics: {} (PD fraction {:.1} %, lamp-off dark REQUIRED)",
+                    placement_name(placement),
+                    100.0 * self.splitter_fraction
+                ),
+            },
         }));
         if let Some(sample) = latest {
             match self.mode {
@@ -3297,7 +4087,7 @@ impl Plugin for StageAPhotodiodePlugin {
             // not the display mode.
             Some(Ok(optical)) => {
                 entries.push(StatusEntry::Text(format!(
-                    "a (excitation) = {:.3}  (I {:.4}..{:.4} V)",
+                    "a (local optical signal) = {:.3}  (I {:.4}..{:.4} V)",
                     optical.measured_log_contrast,
                     optical.excitation_min_volts,
                     optical.excitation_max_volts
@@ -3318,6 +4108,24 @@ impl Plugin for StageAPhotodiodePlugin {
                     state.markers.len()
                 )));
             }
+            if !state.comparator_markers.is_empty() {
+                entries.push(StatusEntry::Text(format!(
+                    "Comparator: {} state markers received",
+                    state.comparator_markers.len()
+                )));
+            }
+        }
+        if let Some(reference) = &self.active_reference {
+            let remaining_s = reference
+                .deadline_unix_ms
+                .saturating_sub(now_unix_ms())
+                .div_ceil(1_000);
+            entries.push(StatusEntry::Text(format!(
+                "PD reference: {} ({} s remaining, set {})",
+                reference.kind.slug(),
+                remaining_s,
+                reference.set_id
+            )));
         }
         if self.recording_active() {
             let (samples, path) = self
@@ -3517,16 +4325,44 @@ mod tests {
         state
     }
 
+    /// The bug an A1 survey paid for a recording at a time: a cache length left
+    /// at its default is shorter than one cycle of a sub-hertz rung, so the
+    /// estimator saw no whole cycle, `a` was withheld, and the sidecar was
+    /// refused *after* the recording had already run its full duration. The ring
+    /// grows to the drive now, so the same stream publishes an `a`.
+    #[test]
+    fn a_cache_shorter_than_the_drive_no_longer_starves_the_estimator() {
+        let plugin = live_plugin();
+        // 0.5 Hz at 20 kSa/s = 40 000 samples per cycle, against a cache set to
+        // hold 0.6 of one.
+        let mut state = slow_sine_state(40_000, 24_000, 200_000);
+        anchor_at(&mut state, 3.0);
+        let summary = plugin
+            .optical_summary_result(&state)
+            .expect("the ring sizes itself to the marker period");
+        assert!(
+            summary.covered_cycles.expect("cycles") >= 2.0,
+            "window covers {:?} cycles",
+            summary.covered_cycles
+        );
+    }
+
     #[test]
     fn a_window_shorter_than_one_cycle_withholds_a_instead_of_under_reporting_it() {
         // `a` is peak-to-peak. Below one full cycle the robust extrema see an
         // arc of the sine, so `a` comes out low — and A1's a₀ lock divides by
         // it, inflating its drive against a bias it cannot see. Fail closed.
+        //
+        // A cache too short for the drive is no longer the way to get here —
+        // the ring follows the period. What is left is a drive whose cycles have
+        // not gone by yet: the first phase-0 stamp after a retarget or a segment
+        // restart bounds no whole cycle at all.
         let plugin = live_plugin();
 
-        // 0.5 Hz at 20 kSa/s = 40 000 samples per cycle; retain 0.6 of one.
+        // 0.5 Hz at 20 kSa/s = 40 000 samples per cycle, one marker seen.
         let mut partial = slow_sine_state(40_000, 24_000, 200_000);
         anchor_at(&mut partial, 3.0);
+        partial.markers.drain(1..);
         let error = plugin
             .optical_summary_result(&partial)
             .expect_err("a partial cycle must not publish an a");
@@ -3551,8 +4387,15 @@ mod tests {
             summary.measured_log_contrast
         );
         assert!((summary.measured_frequency_hz.expect("markers") - 0.5).abs() < 0.01);
-        assert!((summary.window_seconds.expect("window") - 4.0).abs() < 0.01);
-        assert!(summary.covered_cycles.expect("cycles") >= 1.0);
+        // The window is whole cycles, and says how many, so a consumer can wait
+        // it out before trusting a re-read.
+        let cycles = summary.covered_cycles.expect("cycles");
+        assert!(cycles >= 2.0, "covered only {cycles} cycles");
+        assert!(
+            (summary.window_seconds.expect("window") - cycles * 2.0).abs() < 0.01,
+            "window {:?} is not {cycles} cycles at 0.5 Hz",
+            summary.window_seconds
+        );
     }
 
     #[test]
@@ -3596,9 +4439,13 @@ mod tests {
         let excitation = plugin.optical_summary(&state).expect("excitation display");
 
         assert_eq!(raw.measured_log_contrast, excitation.measured_log_contrast);
-        assert!(raw.calibration.anchor_id.starts_with("observed-peak@"));
+        assert!(raw
+            .calibration
+            .anchor_id
+            .as_deref()
+            .is_some_and(|anchor| anchor.starts_with("observed-peak@")));
         assert_eq!(raw.calibration.anchor_id, excitation.calibration.anchor_id);
-        assert!((raw.calibration.total_power_volts - 3.0).abs() < 1e-12);
+        assert!((raw.calibration.total_power_volts.expect("I_tot") - 3.0).abs() < 1e-12);
         assert!((raw.measured_frequency_hz.expect("marker frequency") - 39.0625).abs() < 1e-12);
 
         // And it really is the complement contrast, not ln(v_max/v_min) of the
@@ -3609,6 +4456,106 @@ mod tests {
             "published a={} collapsed to the detector-direct contrast",
             raw.measured_log_contrast
         );
+    }
+
+    #[test]
+    fn emission_path_measures_direct_contrast_without_i_tot() {
+        let mut plugin = StageAPhotodiodePlugin {
+            placement: PhotodiodePlacementV1::EmissionPath,
+            splitter_fraction: 0.5,
+            direct_dark_reference: Some(StoredDirectDarkReference {
+                dark_id: "lamp-off@test".into(),
+                source: PhotodiodeDarkSourceV1::MeasuredLampOff,
+                dark_volts: 0.0,
+                captured_at_unix_ms: now_unix_ms(),
+            }),
+            ..StageAPhotodiodePlugin::default()
+        };
+        let state = rejected_port_state(1_600.0, 700.0, 4_096, true);
+        let optical = plugin
+            .optical_summary_result(&state)
+            .expect("direct fluorescence contrast");
+
+        assert_eq!(optical.placement, PhotodiodePlacementV1::EmissionPath);
+        assert_eq!(optical.splitter_fraction, Some(0.5));
+        assert!(optical.measured_log_contrast.is_finite());
+        assert!(optical.measured_log_contrast > 0.0);
+        assert!(optical.calibration.anchor_id.is_none());
+        assert!(optical.calibration.total_power_volts.is_none());
+        assert_eq!(
+            optical
+                .calibration
+                .dark_reference
+                .as_ref()
+                .map(|reference| reference.source),
+            Some(PhotodiodeDarkSourceV1::MeasuredLampOff)
+        );
+
+        // Even a completely empty rejected-port anchor must not gate a direct
+        // path measurement.
+        plugin.shared = Arc::new(Mutex::new(state));
+        let summary = plugin.control_summary();
+        assert_eq!(summary.placement, PhotodiodePlacementV1::EmissionPath);
+        assert_eq!(summary.splitter_fraction, Some(0.5));
+        assert_eq!(summary.reference_set_id, None);
+        assert_eq!(summary.load_ohms, Some(470_000.0));
+        assert!(summary.optical_summary.is_some());
+    }
+
+    #[test]
+    fn direct_path_refuses_contrast_until_dark_is_explicit() {
+        let plugin = StageAPhotodiodePlugin {
+            placement: PhotodiodePlacementV1::EmissionPath,
+            ..StageAPhotodiodePlugin::default()
+        };
+        let state = rejected_port_state(1_600.0, 700.0, 4_096, true);
+
+        assert_eq!(
+            plugin.optical_summary_result(&state),
+            Err(EstimateError::MissingDirectDarkReference)
+        );
+    }
+
+    #[test]
+    fn manual_direct_dark_is_marked_manual() {
+        let mut plugin = StageAPhotodiodePlugin {
+            placement: PhotodiodePlacementV1::EmissionPath,
+            ..StageAPhotodiodePlugin::default()
+        };
+        plugin
+            .set_setting("direct_dark_volts", json!(0.012))
+            .expect("manual dark draft");
+        assert!(plugin.published_direct_dark().is_none());
+        plugin
+            .set_setting("use_manual_direct_dark", json!(true))
+            .expect("activate manual dark");
+
+        let reference = plugin
+            .published_direct_dark()
+            .expect("manual reference published");
+        assert_eq!(reference.source, PhotodiodeDarkSourceV1::Manual);
+        assert!(reference.dark_id.starts_with("manual@"));
+        assert_eq!(reference.dark_volts, 0.012);
+    }
+
+    #[test]
+    fn captured_direct_dark_names_the_measured_sample_window() {
+        let mut plugin = StageAPhotodiodePlugin {
+            placement: PhotodiodePlacementV1::EmissionPath,
+            shared: Arc::new(Mutex::new(rejected_port_state(16.0, 2.0, 4_096, true))),
+            ..StageAPhotodiodePlugin::default()
+        };
+        plugin
+            .set_setting("capture_direct_dark", json!(true))
+            .expect("capture dark");
+
+        let reference = plugin
+            .published_direct_dark()
+            .expect("measured reference published");
+        assert_eq!(reference.source, PhotodiodeDarkSourceV1::MeasuredLampOff);
+        assert!(reference.dark_id.starts_with("lamp-off@sample-4096@"));
+        assert!(reference.captured_at_unix_ms > 0);
+        assert!(reference.age_s >= 0.0);
     }
 
     #[test]
@@ -3966,6 +4913,43 @@ mod tests {
         state.ring_first_index = 60;
         state.push_marker(40); // now below the ring start
         assert_eq!(state.markers.len(), 3);
+    }
+
+    /// The A1 protocols' 0.075 Hz floor at the bench's 500 kSa/s: two whole
+    /// cycles are 26.7 s, and the 20 s default cache cannot hold them. The ring
+    /// has to follow the drive down on its own — a survey that only learns at
+    /// the end of a 267 s recording that no `a` was retained has already spent
+    /// the bench time.
+    #[test]
+    fn ring_follows_the_drive_down_to_sub_hertz() {
+        let rate = 500_000_u32;
+        let mut state = SharedState {
+            rate_hz: rate,
+            ..SharedState::default()
+        };
+        assert_eq!(
+            state.ring_capacity(rate),
+            10_000_000,
+            "with no markers the operator's 20 s default stands"
+        );
+
+        // Two markers 0.075 Hz apart are all it takes to know the period.
+        let period = (f64::from(rate) / 0.075) as u64;
+        state.push_marker(0);
+        state.push_marker(period);
+
+        let capacity = state.ring_capacity(rate);
+        assert_eq!(capacity, RING_MAX_SAMPLES, "sized up to the absolute cap");
+        assert!(
+            capacity as u64 >= 2 * period,
+            "two cycles at 0.075 Hz need {} samples, ring holds {capacity}",
+            2 * period
+        );
+
+        // Back up at 8.7 Hz the ring returns to the operator's cache length.
+        let fast = (f64::from(rate) / 8.7) as u64;
+        state.push_marker(period + fast);
+        assert_eq!(state.ring_capacity(rate), 10_000_000);
     }
 
     #[test]
@@ -4342,7 +5326,7 @@ mod tests {
         payload.extend_from_slice(&sample_index.to_le_bytes());
         payload.extend_from_slice(&0_u32.to_le_bytes()); // tick_us
         payload.push(1); // level
-        payload.push(0); // source
+        payload.push(stage_a_io::wire::MARKER_SOURCE_PHASE0); // source
         payload.extend_from_slice(&[0, 0]); // reserved
         Frame::build(
             FrameHeader {
@@ -4358,6 +5342,26 @@ mod tests {
             },
             payload,
         )
+    }
+
+    #[test]
+    fn comparator_markers_never_enter_the_a1_phase_ring() {
+        let shared = Arc::new(Mutex::new(SharedState::default()));
+        let recording: SharedRecording = Arc::new(Mutex::new(None));
+        {
+            let mut state = shared.lock().unwrap();
+            state.ingest(0, MOCK_RATE_HZ, 0, &[100, 200, 300, 400]);
+        }
+        let mut frame = marker_frame(1, 2);
+        frame.payload[13] = stage_a_io::wire::MARKER_SOURCE_COMPARATOR;
+        assert!(ingest_parse_event(
+            ParseEvent::Frame(frame),
+            &shared,
+            &recording,
+        ));
+        let state = shared.lock().unwrap();
+        assert!(state.markers.is_empty());
+        assert_eq!(state.comparator_markers.back().copied(), Some((2, 1)));
     }
 
     #[test]
@@ -4380,6 +5384,7 @@ mod tests {
             metadata: BTreeMap::new(),
             started_slug: "slug".into(),
             samples_written: 0,
+            marker_counts: stage_a_plugin_contract::PdqMarkerCountsV1::default(),
             write_error: None,
             start_crc_failures: 0,
             start_resync_bytes: 0,
@@ -4423,6 +5428,66 @@ mod tests {
             "the .pdq holds no marker frame: {frame_types:?}"
         );
         assert!(frame_types.contains(&FrameType::SamplesU16));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn comparator_edges_keep_source_level_tick_and_sample_index_through_pdq() {
+        let dir = temp_dir("a2-comparator-record");
+        let mut plugin = live_plugin();
+        plugin.data_dir = dir.to_string_lossy().into_owned();
+        let pdq_path = dir.join("edges.pdq");
+        *plugin.recording.lock().unwrap() = Some(RecordingSink {
+            writer: PdqWriter::create_new(&pdq_path).unwrap(),
+            pdq_path: pdq_path.clone(),
+            sidecar_path: dir.join("edges.json"),
+            pdq_path_label: "edges.pdq".into(),
+            sidecar_path_label: "edges.json".into(),
+            run_id: RunId::new("a2-edges"),
+            opened_at_unix_ms: 0,
+            stream_epoch: 0,
+            first_sample_index: None,
+            metadata: BTreeMap::new(),
+            started_slug: "test".into(),
+            samples_written: 0,
+            marker_counts: Default::default(),
+            write_error: None,
+            start_crc_failures: 0,
+            start_resync_bytes: 0,
+            start_device_dropped: 0,
+            start_segments: 0,
+        });
+        ingest_parse_event(
+            ParseEvent::Frame(mock_sample_frame(0, 100, &[1000; 16])),
+            &plugin.shared,
+            &plugin.recording,
+        );
+        for (seq, index, tick, level) in [(1, 102, 1001_u32, 1), (2, 112, 1021_u32, 0)] {
+            let mut frame = marker_frame(seq, index);
+            frame.payload[8..12].copy_from_slice(&tick.to_le_bytes());
+            frame.payload[12] = level;
+            frame.payload[13] = stage_a_io::wire::MARKER_SOURCE_COMPARATOR;
+            let frame = Frame::build(frame.header, frame.payload);
+            ingest_parse_event(ParseEvent::Frame(frame), &plugin.shared, &plugin.recording);
+        }
+        let receipt = plugin
+            .finalize_recording(PdqTerminationV1::Completed)
+            .unwrap()
+            .unwrap();
+        let counts = receipt.marker_counts.unwrap();
+        assert_eq!(counts.comparator_rising, 1);
+        assert_eq!(counts.comparator_falling, 1);
+        assert_eq!(counts.phase_zero, 0);
+        let mut reader = stage_a_io::PdqReader::open(&pdq_path).unwrap();
+        let mut edges = Vec::new();
+        while let Some(event) = reader.next_event().unwrap() {
+            if let stage_a_io::PdqReadEvent::Frame(frame) = event {
+                if let Some(m) = frame.marker() {
+                    edges.push((m.source, m.level, m.sample_index, m.tick_us));
+                }
+            }
+        }
+        assert_eq!(edges, vec![(2, 1, 102, 1001), (2, 0, 112, 1021)]);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -4515,6 +5580,61 @@ mod tests {
     }
 
     #[test]
+    fn guided_reference_uses_a_fixed_named_capture_and_metadata() {
+        let dir = temp_dir("guided-reference");
+        let mut plugin = StageAPhotodiodePlugin {
+            port_hint: "mock".into(),
+            ..live_plugin()
+        };
+        plugin.connect();
+        plugin
+            .set_setting("data_dir", json!(dir.display().to_string()))
+            .unwrap();
+        plugin
+            .set_setting("reference_set_id", json!("PDREF-bench-01"))
+            .unwrap();
+        plugin.set_setting("reference_kind", json!(1)).unwrap();
+        plugin.set_setting("reference_start", json!(true)).unwrap();
+        assert!(plugin.recording_active());
+        let active = plugin.active_reference.as_ref().expect("active reference");
+        assert_eq!(active.kind, ReferenceKind::DriveCrosstalk);
+        assert!(active.deadline_unix_ms >= now_unix_ms() + 29_000);
+
+        plugin
+            .finish_reference_capture(PdqTerminationV1::Completed)
+            .unwrap();
+        assert_eq!(plugin.reference_kind, ReferenceKind::StaticOptical);
+        let sidecar_path = dir
+            .join("PDREF-bench-01")
+            .join("PDREF-bench-01__blocked_drive_crosstalk.json");
+        let sidecar: Value = serde_json::from_slice(&std::fs::read(sidecar_path).unwrap()).unwrap();
+        assert_eq!(
+            sidecar["metadata"]["recording_kind"],
+            "photodiode_reference"
+        );
+        assert_eq!(sidecar["metadata"]["planned_duration_s"], "30");
+        assert_eq!(sidecar["metadata"]["load_ohms"], "470000");
+        assert_eq!(sidecar["termination"], "completed");
+        plugin.disconnect();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn comparator_overlay_is_separate_from_phase_zero_markers() {
+        let mut plugin = StageAPhotodiodePlugin::default();
+        plugin.show_comparator_markers = true;
+        plugin.avg_samples = 1;
+        {
+            let mut state = plugin.shared.lock().unwrap();
+            state.ingest(0, 1_000, 0, &[100, 101, 102, 103]);
+            state.push_comparator_marker(2, 1);
+        }
+        let series = plugin.series_dataset();
+        let names: Vec<&str> = series.lines.iter().map(|line| line.name.as_str()).collect();
+        assert_eq!(names, ["photodiode", "comparator state"]);
+    }
+
+    #[test]
     fn snapshot_without_data_dir_reports_an_error() {
         let mut plugin = live_plugin();
         plugin.set_setting("save_snapshot", json!(true)).unwrap();
@@ -4560,6 +5680,8 @@ mod tests {
         assert_eq!(sidecar["kind"], "recording");
         assert_eq!(sidecar["samples_written"], 4);
         assert_eq!(sidecar["pdq_frames"], 1);
+        assert_eq!(sidecar["reference_set_id"], Value::Null);
+        assert_eq!(sidecar["load_ohms"], 470_000.0);
         assert_eq!(sidecar["valid"], true);
 
         std::fs::remove_dir_all(dir).unwrap();

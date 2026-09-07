@@ -97,6 +97,9 @@ pub enum EstimateError {
     /// The rejected-complement geometry has no explicitly confirmed,
     /// traceable total-power anchor.
     MissingTotalPowerAnchor,
+    /// A direct camera/emission-path measurement has no explicitly captured
+    /// or manually supplied blocked-light reference.
+    MissingDirectDarkReference,
     /// No marker-bounded window containing at least two complete modulation
     /// cycles fits inside the retained sample budget.
     IncompleteModulationCycles {
@@ -140,6 +143,11 @@ impl std::fmt::Display for EstimateError {
                 "no total power I_tot has been observed yet — let the photodiode stream for a \
                  moment; it learns I_tot from the brightest reading it sees, which the Pockels \
                  transfer sweep produces exactly",
+            ),
+            Self::MissingDirectDarkReference => f.write_str(
+                "no lamp-off dark reference has been captured for the direct photodiode path — \
+                 physically block the light and press Capture lamp-off dark, or explicitly enter \
+                 a manual value",
             ),
             Self::IncompleteModulationCycles {
                 marker_count,

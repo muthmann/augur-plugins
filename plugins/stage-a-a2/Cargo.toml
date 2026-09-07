@@ -1,0 +1,21 @@
+[package]
+name = "augur-plugin-stage-a-a2"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Stage-A A2 optical step-latency protocol runner"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+augur-plugin-api.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+stage-a-plugin-contract = { path = "../../stage-a-plugin-contract" }
+toml = "0.8"
+
+[lints.rust]
+unsafe_code = "forbid"

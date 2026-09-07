@@ -1,7 +1,7 @@
 # Stage-A Photodiode
 
 - **Crate:** `plugins/stage-a-photodiode` (`augur-plugin-stage-a-photodiode`)
-- **Firmware:** `stage-a-controller` 0.4.0+ (`PDSTREAM_PDA1`), Teensy **stream port** (second CDC port)
+- **Firmware:** `stage-a-controller` 0.5.0+ (`PDSTREAM_PDA1`), Teensy **stream port** (second CDC port)
 - **Status:** Active (2026-07-16) — replaces the readout half of `stage-a-monitor`
 - **Design:** [ADR 006](../adr/006-stage-a-two-plugin-split.md) (the split),
   [ADR 012](../adr/012-stage-a-contrast-geometry-is-bench-not-display.md) (the
@@ -15,10 +15,11 @@
 
 ## What it is
 
-A live readout of the photodiode on **board SMA5 → Teensy pin 18 / A4**. Firmware 0.4.0 streams
-PDA1 `SamplesU16` frames free-running at `pd_stream_rate_hz` (20 kSa/s default) on its second USB
+A live readout of the photodiode on **board SMA5 → Teensy pin 18 / A4**. Firmware 0.5.0 streams
+PDA1 `SamplesU16` frames free-running at `pd_stream_rate_hz` (500 kSa/s default) on its second USB
 serial port; a background thread parses them with `stage-a-io`'s `FrameParser` into a bounded raw
-ring (up to 130 s / 4 M samples), and the plugin renders a rolling chart (10 ms – 120 s window)
+ring (**Cache length** 1–130 s, and never more than 16 M samples — 32 s at the bench's 500 kSa/s),
+and the plugin renders a rolling chart (10 ms – 120 s window)
 plus the newest value. During a command-port acquisition the firmware mirrors the acquisition
 blocks here — every rate change or sample-index jump restarts the ring as a new segment, so the
 `index / rate` time base is always consistent.
@@ -34,6 +35,29 @@ source (the camera `EXT_TRIGGER` belongs to A1's camera-clock analysis, not here
   ("phase-0 trigger") on the chart.
 - The **modulation frequency is derived from the marker spacing** (`f = rate / mean marker gap`) and
   shown in the status; the mock emits synthetic markers so the overlay works without hardware.
+- **Show comparator markers** separately overlays A2 comparator state markers
+  (`source=2`). It does not mix them into the phase-0 timing ring.
+
+## Guided PD references
+
+The collapsed **Guided PD references** panel records reusable raw reference data
+without adding analysis controls to the live readout. A reference-set ID groups
+four named captures: 30 s electronics dark, 30 s blocked-drive crosstalk, 30 s
+static optical signal, and 100 s optical edges. Each capture stops
+automatically, uses exclusive file creation, and writes its type, planned
+duration, physical placement, splitter fraction and PD load to the sidecar.
+After a successful capture, the panel advances to the next step. The operator
+can still select a previous step to repeat it with a new reference-set ID.
+
+The panel guides the physical condition but does not duplicate command-port
+ownership. A1 or A2 sets modulated drive states. In particular, A2 owns the
+optical-edge sequence and comparator configuration. This keeps comparator H4,
+H5, threshold, hysteresis and `invert` out of the generic PD UI. The current
+470 kOhm load is a recorded configuration value, not a software filter.
+
+These recordings support later offline noise models and trigger-time uncertainty
+estimates. The plugin does not claim that background subtraction can recover a
+crossing that the comparator never observed.
 
 ## Modes
 
@@ -75,6 +99,16 @@ amplitude sweep settles on this value, so a display toggle must not be able to m
   complete modulation cycles**, ending on phase 0. It no longer estimates
   extrema from an arbitrary trailing sample count; a low-frequency trace that
   does not fit the bounded window is withheld rather than phase biased.
+- **The ring sizes itself to the drive** (ADR 033). Because that window is the
+  gate, the retained ring is the larger of the operator's **Cache length** and
+  nine marker-measured periods, capped at 16 M samples. Two cycles at the A1
+  protocols' 0.075 Hz floor are 26.7 s, which no default cache covers — left to
+  a setting, "raise the cache before starting a sub-hertz file" is a
+  precondition nothing checks and a whole survey fails on, one full-length
+  recording at a time. Two phase-0 markers are enough to know the period, the
+  ring shrinks back when the frequency goes up, and below ~0.06 Hz at 500 kSa/s
+  the cap binds and the estimator refuses — correctly, since nothing retains
+  two cycles there.
 - The estimator is **fail-closed**: it refuses when no anchor has been observed
   yet, on incomplete cycles, on ADC clipping, and when the excitation never dims
   below the brightest the detector has been — where there is no complement left

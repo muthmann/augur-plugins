@@ -312,7 +312,7 @@ impl<T: Transport> MockController<T> {
             "STATUS" => format!(
                 "+{sequence} OK state={} mode={} rate_hz={} block_samples={} raw={} summary={} \
                  sample_index={} dropped=0 marker_drops=0 dac=1.4/3 code={} mod_wave={} \
-                 mod_level={} mod_min={} mod_freq_mhz={}",
+                 mod_level={} mod_min={} mod_freq_mhz={} trigger_source=J24_PHASE0 cmp_armed=0 stream_marker_drops=0 marker_clock=dma_cursor_v1",
                 self.state.name(),
                 self.config.mode,
                 self.config.rate_hz,

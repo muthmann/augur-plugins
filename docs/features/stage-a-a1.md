@@ -31,7 +31,19 @@
   (the sensor readout travels with the measurement, column-wise),
   [ADR 029](../adr/029-stage-a-leases-are-renewed-against-the-granted-deadline.md)
   (a leased run heartbeats against the deadline the owner granted, so a point
-  longer than the owner's TTL cap no longer loses the drive mid-recording)
+  longer than the owner's TTL cap no longer loses the drive mid-recording),
+  [ADR 034](../adr/034-stage-a-a1-sidecar-records-the-recordings-own-light.md)
+  (the sidecar's optical section is latched during the recording, so a large
+  recording no longer loses its metadata to the time its own files took to
+  write, and a refusal quotes the gate that caused it),
+  [ADR 036](../adr/036-stage-a-frequency-bounds-and-a1-sampling-gate.md)
+  (firmware-qualified drive limits remain separate from A1 sample-density),
+  [ADR 037](../adr/037-stage-a-a1-camera-configurations-and-bias-points.md)
+  (protocols apply host camera profiles and per-point biases with readback and
+  restore),
+  [ADR 039](../adr/039-stage-a-a1-sidecar-owns-experiment-provenance.md)
+  (A1 records protocol and optical provenance but does not duplicate the host
+  camera sidecar).
 - **Automation roadmap:** [Stage-A A1 Automation](./stage-a-a1-automation.md)
 - **Second workflow:** [Stage-A A1 Exact Event Count](./stage-a-a1-event-count.md)
   — hold one *measured* depth `a₀` across the frequency sweep
@@ -48,8 +60,14 @@ A1 has two jobs on the Stage-A bench, both deliberately thin:
 2. **Live sanity quicklooks.** The rolling half-period response `S_p(t)` and the
    response probability `q_p`, folded on the modulation period `T`.
 
-A1 owns no hardware and never drives the Teensy. The optical drive is armed in the
-modulation plugin; A1 only *reads* its published settings.
+A1 owns no hardware and never opens the Teensy or camera directly. The optical
+drive remains owned by the modulation plugin and camera settings remain owned
+by the host; A1 retargets them only through declared, generic control
+capabilities.
+
+Runtime requires Augur 2.0.2 or newer. Older installed hosts do not publish the
+camera-session and sensor-monitoring contracts this workflow needs, even when
+the plugin binary is current.
 
 ## The recording workflow
 
@@ -218,16 +236,18 @@ spreadsheet, comes straight out of a script, and each row carries its own
 duration.
 
 ```csv
-label,mean_u,frequency_hz,depth_a,duration_s,settle_s,role
-floor,0.50,10,0.02,20,3,background
-windows,0.50,10,2.00,20,3,pilot
-ladder,0.40,1,0.80,40,4,
-ladder,0.40,200,0.80,10,2,
+camera_profile,label,mean_u,frequency_hz,depth_a,duration_s,settle_s,role,diff_on,diff_off
+A1_low_noise,floor,0.50,10,0.02,20,3,background,12,-7
+A1_low_noise,windows,0.50,10,2.00,20,3,pilot,12,-7
+A1_low_noise,ladder,0.40,200,0.80,10,2,,20,-8
 ```
 
 Required: `mean_u`, `frequency_hz`, `depth_a`. Optional: `duration_s`
 (default 10), `settle_s` (default 2), `role` (`normal`/`pilot`/`background`),
-`label`. Columns are located by header name, `#` comments and blank lines are
+`label`, `camera_profile`, `diff_on`, and `diff_off`. One CSV series may name
+only one profile. The two bias columns are relative factory-trim offsets and
+are applied by A1 through the host; there are no `bias_on`/`bias_off` aliases.
+Columns are located by header name, `#` comments and blank lines are
 skipped, a blank cell falls back to the default, and an error names the file
 line number.
 
@@ -242,9 +262,14 @@ Two capabilities follow from the row form:
 **TOML — blocks and ranges**, kept for a dense regular sweep:
 
 ```toml
+[camera]
+profile = "A1_low_noise"
+
 [defaults]
 duration_s = 10
 settle_s   = 2.0
+diff_on    = 12
+diff_off   = -7
 
 [[block]]
 name         = "frequency-ladder"
@@ -252,11 +277,37 @@ mean_u       = [0.3, 0.6]
 frequency_hz = { min = 1.0, max = 200.0, points = 6, spacing = "log" }
 depth_a      = 0.8
 duration_s   = 20
+diff_on      = 20
 ```
 
 Each axis takes a single value, an explicit list, or a `{ min, max, points }`
 range with `linear` (default) or `log` spacing; a block records the product of
-its three.
+its three. Instead of `profile`, `[camera]` may contain one complete versioned
+`snapshot`. A profile is resolved once by the host and the immutable resolved
+snapshot, profile revision, and hash travel with every recording.
+
+Camera values are applied immediately through the host camera-control path; the
+operator does not click Apply again. A point waits for a fresh sensor readback
+that confirms the requested codes. The confirmed host snapshot is authoritative:
+a profile may enable Sensor reading in the same apply, without waiting for an
+operator action. Missing readback or a confirmed snapshot with Sensor reading
+disabled refuses the run. The active camera backend validates its own bias
+ranges. Completion, Stop, and abort restore the settings that were active before
+the protocol.
+
+### Frequency generation and measurement limit (ADR 036)
+
+Current firmware can generate 0.01 Hz to **2 kHz**. Its sine DAC tick is capped
+at 40 kHz, which leaves 20 updates per cycle at 2 kHz. The Rust UI, service, A1
+protocol parser, and errors share this firmware-qualified bound; values are
+never silently clamped across a service request.
+
+A1 separately requires at least 16 photodiode samples per cycle. It uses the
+fresh sample rate reported by the photodiode owner. At 20 kSa/s the scientific
+measurement limit is 1.25 kHz; at the firmware 0.5.0 default 500 kSa/s it is
+31.25 kHz, above the current 2 kHz generation ceiling. The 500 kSa/s DMA path,
+ADC ENOB, and analog-front-end bandwidth still need the firmware ADR 004 bench
+acceptance before high-frequency data is treated as qualified.
 
 - **`mean_u` is the `I_k` axis** — the normalized cycle-mean lobe point, driven
   by the new `ModulationCommandV1::SetOperatingPoint`. Dimensionless, not
@@ -272,11 +323,50 @@ its three.
 - **Validated up front**: ranges, bounds, the `MAX_POINTS = 4096` product limit
   and the same whole-cycle window check the ladder makes against its lowest
   frequency — all on the button press, before the drive moves. The point count
-  and expected bench time are reported first.
+  and expected bench time are reported first, and the bench time still to run
+  stays on the protocol's own status line: the opening message is overwritten by
+  the first point, so an operator who looked away would otherwise never see it
+  again.
 - **A refused point is skipped, not fatal**, carrying the modulation owner's own
   wording. Because the per-point message is overwritten within the same tick,
   the reasons are kept on the run and shown in the status pane and the closing
   summary.
+
+### Qualified laboratory protocols
+
+The current A1 laboratory set is versioned beside the examples:
+
+- `a1_stufe1_bode_dc.csv` — 73 recordings;
+- `a1_stufe2_bode_u010.csv` — 47 recordings;
+- `a1_stufe2_bode_u045.csv` — 47 recordings; and
+- `a1_stufe2_flussleiter.csv` — 231 recordings.
+
+Their integration tests parse the shipped CSV with A1's production reader,
+quantize every coordinate as the service does, and replay the runtime command
+order `SetOperatingPoint` → `SetDriveFrequency` → `SetOpticalDepth`. Every
+intermediate state is checked with the modulation owner's `PeakLaw`, recorded
+2026-07-30 Pockels lobe, Bessel-normalized log-sine pedestal, inverse warp table
+and DAC ceiling. The files additionally keep their conservative protocol policy
+`u_peak <= 0.90`. When the sibling `Playground/protocols` directory is present,
+the test requires its bench copies to be byte-for-byte identical to the shipped
+fixtures.
+
+The photodiode integration test uses the production ring-capacity calculation.
+With the cache length left at its default, the ring sizes itself to the marker
+period and covers two complete cycles at the files' 0.075 Hz floor (ADR 033);
+every individual recording is also required to span at least two cycles. The
+same test keeps the witness that the 20 s default is far too short on its own —
+that gap used to be an operator precondition, and a survey failed on it one
+full-length recording at a time.
+
+Passing these tests qualifies the declared schedule, not the live apparatus.
+Before starting one of these files, arm the calibrated optical-log-sine drive
+with `a <= 1.70`, select the 2026-07-30-equivalent valid lobe and DAC ceiling,
+and complete the protocol header's anchor, connection, lease, disk-space and
+laser/HV checks. There is no cache length to set. In particular, the
+initial `a <= 1.70` is required because A1 changes `mean_u` before it changes
+`depth_a`; the first operating-point request is therefore validated against the
+operator-armed depth left in the modulation owner.
 
 One lease covers the whole file. `plugins/stage-a-a1/protocols/example.toml` is
 a commented file to copy.
@@ -294,6 +384,7 @@ records what the camera measures about itself, from the host's
 | scene illumination, lux | `illumination_lux` | `sensor_illumination_lux` |
 | staleness of the reading, s | `reading_age_s` | `sensor_reading_age_s` |
 | absolute bias codes | `bias_diff_on/_off/_fo/_hpf/_refr` | — |
+| factory bias codes | `factory_diff_on/_off/_fo/_hpf/_refr` | — |
 
 All three bear directly on `q_p(a, f)`: the dead time caps events per pixel per
 half-cycle, the lux *is* the physical `I_k` axis, and temperature moves the
@@ -303,6 +394,20 @@ sidecar is written at finalize), mirrored even with Live analysis off, and are
 with an offline re-run of the same data. A quantity the sensor cannot report is
 **omitted**, never written as `0`; replay and cameras without a monitoring block
 produce no `[sensor]` section at all.
+
+For a camera-controlled protocol, `[camera_control]` additionally stores the
+resolved versioned snapshot and profile provenance, the point's requested
+`diff_on`/`diff_off`, confirmed offsets, absolute readback, readback age, and
+`status = "confirmed"`. The same profile name/revision/hash and point values are
+sent in recorder metadata, so the RAW, PDQ, and A1 sidecar identify one immutable
+configuration even if the saved profile later changes.
+
+A1 applies the initial configuration and each point through the same generic
+complete-snapshot host command. For a bias point it clones the last confirmed
+snapshot and changes only `diff_on`/`diff_off`; no A1- or bias-specific command
+exists in the recorder. A1 checks its own scientific requirements (sensor
+telemetry on, STC, Trail and ERC explicitly off) and starts recording automatically after the
+host returns a fresh matching sensor readback.
 
 For manual recordings A1 never drives the Teensy: set the drive (high `a` for
 the pilot, `a≈0` for the background) in the modulation plugin, then press the
@@ -383,7 +488,18 @@ the photodiode Data directory no longer have to be kept aligned by hand:
   single-point die temperature / dead time / illumination in `[sensor]` come
   from the context bus and are recorded with every run regardless (ADR 022).
 
-**A1 config sidecar** captures: `measurement_id`, file
+**A1 config sidecar** captures the light **the recording was made under**: the
+optical section is latched from the newest fresh photodiode summary seen while
+the recording ran, not read live when the metadata is written (ADR 034). The
+finalizes and the gather between the last sample and that write block A1's own
+control tick, so a live read is judged against a 2 s freshness budget that has
+been expiring on the recording's own write-out time — the larger the RAW, the
+more certain the refusal. `depth_a` for a photodiode-sourced run comes from the
+same latched window, so the recorded depth and the optical section cannot
+disagree. When there is no summary at all the refusal now quotes the owner's
+published reason instead of naming the `I_tot` anchor whatever the gate was.
+
+It captures: `measurement_id`, file
 stem, role, start/finalize
 timestamps, duration; the sweep `[min_a, max_a]`; modulation settings from the
 acknowledged snapshot (frequency, center/amplitude DAC, waveform, transfer
@@ -548,6 +664,12 @@ sweep-point sidecar fields, the ordered camera → PDQ → PDQ finalize → came
 finalize lifecycle (including envelope identity/revision and save location), the
 selective discontinuity reset, and the `a₀`-lock and frequency-ladder sets listed
 in the [exact-event-count brief](./stage-a-a1-event-count.md).
+
+The qualified laboratory CSVs are covered across the owning crates, not by a
+standalone copy of their formulas. Run
+`cargo test -p augur-plugin-stage-a-a1 -p augur-plugin-stage-a-modulation -p augur-plugin-stage-a-photodiode`:
+A1 owns parsing and service-order behavior, modulation owns the coupled optical
+acceptance calculation, and photodiode owns the retained-window capacity.
 
 Three of them guard the recording defects fixed in ADR 015: a photodiode leg that
 cannot start is refused before any host command is sent; a photodiode failure

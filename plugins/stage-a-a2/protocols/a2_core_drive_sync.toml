@@ -1,0 +1,211 @@
+# Short, prioritized A2 capture. Prepared 2026-09-07.
+# 50 commanded cycles per grid condition; startup/boundary exclusions reduce usable counts.
+# Not a precision-equivalent replacement for the full two-pass matrix.
+# Camera EXT_TRIGGER must receive J24. Optical t50 and contrast are reviewed offline.
+# mean_u is geometric: cycle-mean target / cosh(depth_a/2), rounded to 0.001.
+name = "a2-core-drive-sync-20260907"
+timing_reference = "drive_sync"
+trigger_validation = "offline_review"
+
+[[point]]
+label = "core_floor_pre"
+role = "core_floor_pre_shutter_closed"
+acquisition_mode = "dark"
+duration_s = 30.0
+settle_s = 2.0
+pause_before = true
+
+[[point]]
+label = "blocked_drive_sham"
+role = "blocked_drive_sham"
+acquisition_mode = "stepped"
+mean_u = 0.293
+depth_a = 0.45
+half_period_s = 1.0
+transitions_per_polarity = 15
+settle_s = 3.0
+pause_before = true
+
+[[point]]
+label = "core_cadence_2s"
+role = "commissioning"
+acquisition_mode = "stepped"
+mean_u = 0.293
+depth_a = 0.45
+half_period_s = 2
+transitions_per_polarity = 10
+settle_s = 3.0
+pause_before = true
+
+[[point]]
+label = "core_cadence_1s"
+role = "commissioning"
+acquisition_mode = "stepped"
+mean_u = 0.293
+depth_a = 0.45
+half_period_s = 1.0
+transitions_per_polarity = 10
+settle_s = 3.0
+pause_before = false
+
+[[point]]
+label = "core_cadence_0p5s"
+role = "commissioning"
+acquisition_mode = "stepped"
+mean_u = 0.293
+depth_a = 0.45
+half_period_s = 0.5
+transitions_per_polarity = 10
+settle_s = 3.0
+pause_before = false
+
+[[point]]
+label = "core_reference_open"
+role = "reference"
+acquisition_mode = "stepped"
+mean_u = 0.293
+depth_a = 0.45
+half_period_s = 1.0
+transitions_per_polarity = 10
+settle_s = 3.0
+pause_before = false
+
+[[point]]
+label = "core_flux300_a0280"
+role = "identification_core"
+acquisition_mode = "stepped"
+mean_u = 0.297
+depth_a = 0.28
+half_period_s = 1.0
+transitions_per_polarity = 50
+settle_s = 3.0
+pause_before = false
+
+[[point]]
+label = "core_flux300_a0450"
+role = "identification_core"
+acquisition_mode = "stepped"
+mean_u = 0.293
+depth_a = 0.45
+half_period_s = 1.0
+transitions_per_polarity = 50
+settle_s = 3.0
+pause_before = false
+
+[[point]]
+label = "core_flux300_a0800"
+role = "identification_core"
+acquisition_mode = "stepped"
+mean_u = 0.278
+depth_a = 0.8
+half_period_s = 1.0
+transitions_per_polarity = 50
+settle_s = 3.0
+pause_before = false
+
+[[point]]
+label = "core_reference_after_300"
+role = "reference"
+acquisition_mode = "stepped"
+mean_u = 0.293
+depth_a = 0.45
+half_period_s = 1.0
+transitions_per_polarity = 10
+settle_s = 3.0
+pause_before = false
+
+[[point]]
+label = "core_flux150_a0800"
+role = "identification_core"
+acquisition_mode = "stepped"
+mean_u = 0.139
+depth_a = 0.8
+half_period_s = 1.0
+transitions_per_polarity = 50
+settle_s = 3.0
+pause_before = false
+
+[[point]]
+label = "core_flux150_a0450"
+role = "identification_core"
+acquisition_mode = "stepped"
+mean_u = 0.146
+depth_a = 0.45
+half_period_s = 1.0
+transitions_per_polarity = 50
+settle_s = 3.0
+pause_before = false
+
+[[point]]
+label = "core_flux150_a0280"
+role = "identification_core"
+acquisition_mode = "stepped"
+mean_u = 0.149
+depth_a = 0.28
+half_period_s = 1.0
+transitions_per_polarity = 50
+settle_s = 3.0
+pause_before = false
+
+[[point]]
+label = "core_reference_after_150"
+role = "reference"
+acquisition_mode = "stepped"
+mean_u = 0.293
+depth_a = 0.45
+half_period_s = 1.0
+transitions_per_polarity = 10
+settle_s = 3.0
+pause_before = false
+
+[[point]]
+label = "core_flux450_a0280"
+role = "identification_core"
+acquisition_mode = "stepped"
+mean_u = 0.446
+depth_a = 0.28
+half_period_s = 1.0
+transitions_per_polarity = 50
+settle_s = 3.0
+pause_before = false
+
+[[point]]
+label = "core_flux450_a0450"
+role = "identification_core"
+acquisition_mode = "stepped"
+mean_u = 0.439
+depth_a = 0.45
+half_period_s = 1.0
+transitions_per_polarity = 50
+settle_s = 3.0
+pause_before = false
+
+[[point]]
+label = "core_flux450_a0800"
+role = "identification_core"
+acquisition_mode = "stepped"
+mean_u = 0.416
+depth_a = 0.8
+half_period_s = 1.0
+transitions_per_polarity = 50
+settle_s = 3.0
+pause_before = false
+
+[[point]]
+label = "core_reference_after_450"
+role = "reference"
+acquisition_mode = "stepped"
+mean_u = 0.293
+depth_a = 0.45
+half_period_s = 1.0
+transitions_per_polarity = 10
+settle_s = 3.0
+pause_before = false
+
+[[point]]
+label = "core_floor_post"
+role = "core_floor_post_shutter_closed"
+acquisition_mode = "dark"
+duration_s = 30.0
+settle_s = 2.0
+pause_before = true

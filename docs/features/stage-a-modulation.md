@@ -92,6 +92,10 @@ did enumerate.
   longer have to infer these from DAC endpoints. `v_peak_dac` replaced the
   earlier `v_pi_dac`, and carries the absolute peak code rather than the span
   (ADR 016, ADR 025).
+- `ModulationStateV1.optical_lobe` publishes the applied measured calibration
+  independently of the currently armed mode and point. Protocol runners such as
+  A2 use this field to command their own `mean_u` and `depth_a`; the operator
+  does not prepare those points in the modulation UI.
 - `mock` port runs the firmware-faithful `MockController` in-process for hardware-free tests.
 - The workflow-owner service and `WaveformV1` automation path remain exact-waveform contracts and
   do not use the UI Drive method.

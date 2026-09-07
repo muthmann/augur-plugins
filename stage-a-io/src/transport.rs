@@ -258,7 +258,10 @@ mod tests {
     #[test]
     fn unix_keeps_the_linux_cdc_acm_node() {
         let ports = vec![port("/dev/ttyACM0", true), port("/dev/ttyS0", false)];
-        assert_eq!(names(narrow_to_candidates(ports, false)), vec!["/dev/ttyACM0"]);
+        assert_eq!(
+            names(narrow_to_candidates(ports, false)),
+            vec!["/dev/ttyACM0"]
+        );
     }
 
     #[test]
@@ -266,7 +269,10 @@ mod tests {
         // The bug: COMn matches neither `cu.usbmodem` nor `ttyACM`, so the
         // Teensy's two ports were filtered out before any probe could run.
         let ports = vec![port("COM3", true), port("COM4", true)];
-        assert_eq!(names(narrow_to_candidates(ports, true)), vec!["COM3", "COM4"]);
+        assert_eq!(
+            names(narrow_to_candidates(ports, true)),
+            vec!["COM3", "COM4"]
+        );
     }
 
     #[test]
@@ -278,7 +284,10 @@ mod tests {
     #[test]
     fn windows_probes_everything_when_the_os_classifies_nothing() {
         let ports = vec![port("COM1", false), port("COM3", false)];
-        assert_eq!(names(narrow_to_candidates(ports, true)), vec!["COM1", "COM3"]);
+        assert_eq!(
+            names(narrow_to_candidates(ports, true)),
+            vec!["COM1", "COM3"]
+        );
     }
 
     #[test]

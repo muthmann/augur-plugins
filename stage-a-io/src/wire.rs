@@ -218,6 +218,8 @@ pub struct MarkerPayload {
 
 /// `source` value the firmware stamps on a modulation phase-0 marker.
 pub const MARKER_SOURCE_PHASE0: u8 = 1;
+/// `source` value the firmware stamps on an A2 optical comparator crossing.
+pub const MARKER_SOURCE_COMPARATOR: u8 = 2;
 
 impl MarkerPayload {
     pub fn encode(&self) -> Vec<u8> {
