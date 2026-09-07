@@ -109,6 +109,13 @@ amplitude sweep settles on this value, so a display toggle must not be able to m
   ring shrinks back when the frequency goes up, and below ~0.06 Hz at 500 kSa/s
   the cap binds and the estimator refuses — correctly, since nothing retains
   two cycles there.
+- **A refusal names its own gate** (ADR 045). Four benches have no whole-cycle
+  window and only one of them is the window length: a controller outside
+  `mode=A1` stamps no phase-0 marker at all, a marker clock that disagrees with
+  the sample clock stamps markers the ring can never hold, a stream that keeps
+  restarting clears the samples and their markers together, and a slow drive
+  really can outgrow the window. The refusal says which, in seconds of stream
+  rather than sample counts, and only the last one mentions the cache length.
 - The estimator is **fail-closed**: it refuses when no anchor has been observed
   yet, on incomplete cycles, on ADC clipping, and when the excitation never dims
   below the brightest the detector has been — where there is no complement left
@@ -163,6 +170,13 @@ but a chart setting.
 - **Start recording** / **Stop recording** buttons tee every incoming sample
   frame to `pd_rec_<timestamp>.pdq`; stopping writes the JSON sidecar. Both
   buttons (and the snapshot) are disabled until a data directory is selected.
+- The file is written on a thread of its own, fed by a bounded queue of 1024
+  frames (~8 s of stream at 500 kSa/s). The reader thread owns the serial port
+  and the firmware buffers only two DMA blocks, so a reader that waits for
+  storage makes the device drop whole blocks and the `.pdq` lose its contiguous
+  sample range — which is what A1/A2 reject a point for. A queue that runs full
+  therefore fails the recording with a named `write_error` instead of waiting
+  (ADR 042).
 - All three are momentary buttons whose presses are forwarded from the UI
   mirror to the live worker as monotonic press counters (`PressLatch`, ADR 010)
   and act only on a press **edge**. The previous unguarded `save_snapshot`

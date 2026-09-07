@@ -29,6 +29,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -302,6 +303,15 @@ struct SharedState {
     /// past instead of trying to recover it from what survived eviction.
     last_marker_index: Option<u64>,
     marker_period_estimate: Option<f64>,
+    /// Phase-0 markers stamped before the retained window since the current
+    /// segment began. A trigger that never lands inside the ring is not a
+    /// trigger that is missing: it is one whose sample index does not belong
+    /// to this stream, and the two need different words.
+    markers_outside_window: u64,
+    /// When the ring last restarted, host clock. A restart clears the samples
+    /// and their markers together, so a window that is short because of one is
+    /// not a window that needs a longer cache.
+    last_segment_restart_unix_ms: Option<u64>,
     latest: Option<u16>,
     /// Cumulative firmware-side drop counter (latest header value).
     device_dropped: u32,
@@ -366,6 +376,8 @@ impl Default for SharedState {
             comparator_markers: VecDeque::new(),
             last_marker_index: None,
             marker_period_estimate: None,
+            markers_outside_window: 0,
+            last_segment_restart_unix_ms: None,
             latest: None,
             device_dropped: 0,
             crc_failures: 0,
@@ -433,6 +445,7 @@ impl SharedState {
         if !continuous {
             if !self.samples.is_empty() {
                 self.segments += 1;
+                self.last_segment_restart_unix_ms = Some(now_unix_ms());
             }
             self.samples.clear();
             self.cells.clear();
@@ -442,6 +455,7 @@ impl SharedState {
             // measured across the discontinuity is meaningless.
             self.last_marker_index = None;
             self.marker_period_estimate = None;
+            self.markers_outside_window = 0;
             self.ring_first_index = first_index;
             self.rate_hz = rate_hz;
         }
@@ -508,6 +522,7 @@ impl SharedState {
     /// current ring window. Bounded so a marker storm cannot grow unbounded.
     fn push_marker(&mut self, sample_index: u64) {
         if sample_index < self.ring_first_index {
+            self.markers_outside_window += 1;
             return;
         }
         if self
@@ -582,6 +597,34 @@ impl SharedState {
         (period > 0.0).then_some(period)
     }
 
+    /// The refusal for a window that bounds no two whole modulation cycles,
+    /// told apart by *why* it does not.
+    ///
+    /// The three benches need three different actions, and only one of them is
+    /// the cache length: a stream that keeps restarting drops samples, a
+    /// controller outside `mode=A1` stamps no phase-0 marker at all, and a
+    /// marker clock that disagrees with the sample clock stamps markers the
+    /// ring can never hold. Naming the window length for all three sent the
+    /// operator to raise a cache that was never the gate.
+    fn incomplete_cycles(&self, marker_count: usize) -> EstimateError {
+        let rate = f64::from(self.rate_hz.max(1));
+        let retained_seconds = self.samples.len() as f64 / rate;
+        // Only a restart the ring has not had time to refill after explains a
+        // short window; an older one is history the operator cannot act on.
+        let capacity_seconds = self.ring_capacity(self.rate_hz) as f64 / rate;
+        let now = now_unix_ms();
+        let restarted_seconds_ago = self
+            .last_segment_restart_unix_ms
+            .map(|at| now.saturating_sub(at) as f64 / 1_000.0)
+            .filter(|elapsed| *elapsed < capacity_seconds);
+        EstimateError::IncompleteModulationCycles {
+            marker_count,
+            retained_seconds,
+            restarted_seconds_ago,
+            markers_outside_window: self.markers_outside_window,
+        }
+    }
+
     /// min/max/sum over deque offsets `[start, end)`, combining whole
     /// summary cells with raw samples at the edges: O(range/64 + 128)
     /// instead of O(range).
@@ -632,8 +675,9 @@ impl SharedState {
 
 /// One active disk recording: every clean `SamplesU16` frame is appended
 /// verbatim to a `.pdq` file; `stop` writes the JSON sidecar next to it.
+/// The file itself is written by [`RecordingWriter`] on its own thread.
 struct RecordingSink {
-    writer: PdqWriter,
+    writer: RecordingWriter,
     pdq_path: PathBuf,
     sidecar_path: PathBuf,
     pdq_path_label: String,
@@ -670,6 +714,79 @@ impl RecordingSink {
 
 type SharedRecording = Arc<Mutex<Option<RecordingSink>>>;
 
+/// Depth of the hand-off queue between the stream reader and the disk writer,
+/// in wire frames. One frame is 2048 samples — about 4 ms at 500 kSa/s — so
+/// this absorbs roughly eight seconds of storage latency at 4 MB of memory.
+const WRITER_QUEUE_FRAMES: usize = 1_024;
+
+/// The `.pdq` writer, running on its own thread.
+///
+/// The reader thread must never wait for the file system. It owns the serial
+/// port, and the firmware keeps only two DMA blocks (~8 ms at 500 kSa/s):
+/// every millisecond the reader spends inside a write is a millisecond in
+/// which the device can overrun and discard whole blocks. A recording written
+/// to a network share stalled the reader for 50-280 ms at a time, which broke
+/// the `.pdq` into several sample segments and cost A1/A2 the point. Frames
+/// are therefore handed over through a bounded queue and written here.
+struct RecordingWriter {
+    /// `None` once the queue is closed, which ends the writer thread.
+    frames: Option<SyncSender<stage_a_io::Frame>>,
+    join: Option<JoinHandle<(PdqWriter, Option<String>)>>,
+}
+
+impl RecordingWriter {
+    fn spawn(mut writer: PdqWriter) -> Self {
+        let (frames, receiver) = sync_channel::<stage_a_io::Frame>(WRITER_QUEUE_FRAMES);
+        let join = std::thread::Builder::new()
+            .name("stage-a-pdq-writer".into())
+            .spawn(move || {
+                let mut error: Option<String> = None;
+                for frame in receiver {
+                    // After a failure the queue is still drained: the reader
+                    // must not start blocking because this thread stopped.
+                    if error.is_some() {
+                        continue;
+                    }
+                    if let Err(err) = writer.write_frame(&frame) {
+                        error = Some(format!("recording write failed: {err}"));
+                    }
+                }
+                (writer, error)
+            })
+            .expect("spawning the photodiode recording writer thread must succeed");
+        Self {
+            frames: Some(frames),
+            join: Some(join),
+        }
+    }
+
+    /// Hands one frame to the writer thread without ever blocking. `false`
+    /// means the queue is full — storage is seconds behind the stream, and
+    /// the recording cannot be completed.
+    fn enqueue(&self, frame: &stage_a_io::Frame) -> bool {
+        self.frames
+            .as_ref()
+            .is_some_and(|frames| frames.try_send(frame.clone()).is_ok())
+    }
+
+    /// Closes the queue, waits for the queued frames to reach the file and
+    /// finalizes it. Returns the summary together with the first write error
+    /// the writer thread saw, if any.
+    fn finish(
+        mut self,
+        integrity: StreamIntegrity,
+    ) -> std::io::Result<(stage_a_io::PdqSummary, Option<String>)> {
+        self.frames = None; // Closing the queue ends the writer loop.
+        let Some(join) = self.join.take() else {
+            return Err(std::io::Error::other("recording writer thread is gone"));
+        };
+        let (writer, error) = join
+            .join()
+            .map_err(|_| std::io::Error::other("the recording writer thread panicked"))?;
+        writer.finish(integrity).map(|summary| (summary, error))
+    }
+}
+
 fn record_frame(recording: &SharedRecording, frame: &stage_a_io::Frame, samples: usize) {
     let Ok(mut slot) = recording.lock() else {
         return;
@@ -680,25 +797,24 @@ fn record_frame(recording: &SharedRecording, frame: &stage_a_io::Frame, samples:
     if sink.write_error.is_some() {
         return;
     }
-    match sink.writer.write_frame(frame) {
-        Ok(()) => {
-            sink.samples_written += samples as u64;
-            if let Some(marker) = frame.marker() {
-                let counts = &mut sink.marker_counts;
-                match (marker.source, marker.level) {
-                    (stage_a_io::wire::MARKER_SOURCE_PHASE0, 1) => counts.phase_zero += 1,
-                    (stage_a_io::wire::MARKER_SOURCE_COMPARATOR, 1) => {
-                        counts.comparator_rising += 1
-                    }
-                    (stage_a_io::wire::MARKER_SOURCE_COMPARATOR, 0) => {
-                        counts.comparator_falling += 1
-                    }
-                    (_, 2..=u8::MAX) => counts.invalid_level += 1,
-                    _ => {}
-                }
-            }
+    if !sink.writer.enqueue(frame) {
+        sink.write_error = Some(format!(
+            "recording queue overflow after {} samples: the storage target cannot keep up \
+             with the stream",
+            sink.samples_written
+        ));
+        return;
+    }
+    sink.samples_written += samples as u64;
+    if let Some(marker) = frame.marker() {
+        let counts = &mut sink.marker_counts;
+        match (marker.source, marker.level) {
+            (stage_a_io::wire::MARKER_SOURCE_PHASE0, 1) => counts.phase_zero += 1,
+            (stage_a_io::wire::MARKER_SOURCE_COMPARATOR, 1) => counts.comparator_rising += 1,
+            (stage_a_io::wire::MARKER_SOURCE_COMPARATOR, 0) => counts.comparator_falling += 1,
+            (_, 2..=u8::MAX) => counts.invalid_level += 1,
+            _ => {}
         }
-        Err(err) => sink.write_error = Some(format!("recording write failed: {err}")),
     }
 }
 
@@ -1563,7 +1679,7 @@ impl StageAPhotodiodePlugin {
             }
         }
         let sink = RecordingSink {
-            writer,
+            writer: RecordingWriter::spawn(writer),
             pdq_path: pdq_path.clone(),
             sidecar_path,
             pdq_path_label,
@@ -1622,7 +1738,7 @@ impl StageAPhotodiodePlugin {
             sequence_gaps: segments.saturating_sub(sink.start_segments),
             dropped_samples: u64::from(dropped.saturating_sub(sink.start_device_dropped)),
         };
-        let write_error = sink.write_error.clone();
+        let enqueue_error = sink.write_error.clone();
         let started = sink.started_slug.clone();
         let samples = sink.samples_written;
         let pdq_path = sink.pdq_path.clone();
@@ -1632,10 +1748,11 @@ impl StageAPhotodiodePlugin {
         let pdq_path_label = sink.pdq_path_label.clone();
         let sidecar_path_label = sink.sidecar_path_label.clone();
         let metadata = sink.metadata.clone();
-        let summary = sink
+        let (summary, writer_error) = sink
             .writer
             .finish(integrity)
             .map_err(|err| format!("finishing recording failed: {err}"))?;
+        let write_error = enqueue_error.or(writer_error);
         let contract_integrity = contract_integrity(summary.integrity, summary.sample_segments);
         let receipt = PdqFinalizedReceiptV1 {
             run_id: run_id.clone(),
@@ -1998,10 +2115,7 @@ impl StageAPhotodiodePlugin {
             .filter(|index| *index >= state.ring_first_index && *index <= ring_end)
             .collect();
         if markers.len() < 3 {
-            return Err(EstimateError::IncompleteModulationCycles {
-                marker_count: markers.len(),
-                max_samples: state.samples.len(),
-            });
+            return Err(state.incomplete_cycles(markers.len()));
         }
 
         // End on the newest complete phase-0 boundary. Start at least two
@@ -4575,9 +4689,66 @@ mod tests {
             plugin.optical_summary_result(&state),
             Err(EstimateError::IncompleteModulationCycles {
                 marker_count: 2,
-                max_samples: 4_096,
+                ..
             })
         ));
+    }
+
+    #[test]
+    fn a_refused_window_names_which_of_the_three_gates_holds_it() {
+        // Every one of these used to read "lower the frequency, or raise the
+        // photodiode cache length". Two of them cannot be fixed that way, and
+        // an A1 survey that hits one loses every point to it, so the reason
+        // has to separate them.
+        let plugin = live_plugin();
+
+        // 1. No phase-0 marker at all: the controller is not in mode=A1.
+        let mut silent = rejected_port_state(1_600.0, 700.0, 4_096, false);
+        anchor_at(&mut silent, 3.0);
+        let reason = plugin
+            .optical_summary_result(&silent)
+            .expect_err("no trigger, no a")
+            .to_string();
+        assert!(reason.contains("mode=A1"), "{reason}");
+        assert!(
+            !reason.contains("cache length"),
+            "a missing trigger is not a short cache: {reason}"
+        );
+
+        // 2. Markers arrive, but stamped on indices the ring never reaches.
+        let mut mistimed = rejected_port_state(1_600.0, 700.0, 4_096, false);
+        anchor_at(&mut mistimed, 3.0);
+        mistimed.ring_first_index = 10_000;
+        for cycle in 0..4 {
+            mistimed.push_marker(cycle * 512);
+        }
+        assert!(mistimed.markers.is_empty());
+        let reason = plugin
+            .optical_summary_result(&mistimed)
+            .expect_err("markers outside the window bound nothing")
+            .to_string();
+        assert!(reason.contains("marker clock"), "{reason}");
+
+        // 3. The stream restarted, which cleared samples and markers together.
+        let mut restarted = rejected_port_state(1_600.0, 700.0, 4_096, false);
+        anchor_at(&mut restarted, 3.0);
+        restarted.last_segment_restart_unix_ms = Some(now_unix_ms());
+        let reason = plugin
+            .optical_summary_result(&restarted)
+            .expect_err("a restarted stream has no window yet")
+            .to_string();
+        assert!(reason.contains("restarted"), "{reason}");
+        assert!(reason.contains("dropping samples"), "{reason}");
+
+        // 4. What is left really is the window length.
+        let mut short = rejected_port_state(1_600.0, 700.0, 4_096, true);
+        anchor_at(&mut short, 3.0);
+        short.markers.drain(2..);
+        let reason = plugin
+            .optical_summary_result(&short)
+            .expect_err("two markers bound one cycle")
+            .to_string();
+        assert!(reason.contains("cache length"), "{reason}");
     }
 
     #[test]
@@ -5372,7 +5543,7 @@ mod tests {
         let pdq_path = dir.join("run.pdq");
         let shared = Arc::new(Mutex::new(SharedState::default()));
         let recording: SharedRecording = Arc::new(Mutex::new(Some(RecordingSink {
-            writer: PdqWriter::create(&pdq_path).expect("create pdq"),
+            writer: RecordingWriter::spawn(PdqWriter::create(&pdq_path).expect("create pdq")),
             pdq_path: pdq_path.clone(),
             sidecar_path: dir.join("run.json"),
             pdq_path_label: "run.pdq".into(),
@@ -5432,13 +5603,65 @@ mod tests {
     }
 
     #[test]
+    fn a_full_writer_queue_fails_the_recording_instead_of_blocking_the_reader() {
+        // The reader thread owns the serial port: if it ever waited for the
+        // file system, the device would overrun its two DMA blocks and the
+        // .pdq would lose whole sample segments. A queue that stays full is
+        // therefore a failed recording, not a reason to wait.
+        let dir = temp_dir("writer-queue-full");
+        let pdq_path = dir.join("full.pdq");
+        let (frames, _receiver) = sync_channel::<stage_a_io::Frame>(1);
+        let shared = Arc::new(Mutex::new(SharedState::default()));
+        let recording: SharedRecording = Arc::new(Mutex::new(Some(RecordingSink {
+            // No writer thread drains this queue, so it stays full.
+            writer: RecordingWriter {
+                frames: Some(frames),
+                join: None,
+            },
+            pdq_path,
+            sidecar_path: dir.join("full.json"),
+            pdq_path_label: "full.pdq".into(),
+            sidecar_path_label: "full.json".into(),
+            run_id: RunId::from("test"),
+            opened_at_unix_ms: 0,
+            stream_epoch: 0,
+            first_sample_index: None,
+            metadata: BTreeMap::new(),
+            started_slug: "slug".into(),
+            samples_written: 0,
+            marker_counts: stage_a_plugin_contract::PdqMarkerCountsV1::default(),
+            write_error: None,
+            start_crc_failures: 0,
+            start_resync_bytes: 0,
+            start_device_dropped: 0,
+            start_segments: 0,
+        })));
+
+        let codes = [100_u16, 200, 300, 400];
+        for sequence in 0..3 {
+            ingest_parse_event(
+                ParseEvent::Frame(mock_sample_frame(sequence, u64::from(sequence) * 4, &codes)),
+                &shared,
+                &recording,
+            );
+        }
+
+        let sink = recording.lock().unwrap().take().expect("sink");
+        // One frame fit into the queue; the next one had nowhere to go.
+        assert_eq!(sink.samples_written, codes.len() as u64);
+        let error = sink.write_error.expect("the overflow must be reported");
+        assert!(error.contains("queue overflow"), "{error}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn comparator_edges_keep_source_level_tick_and_sample_index_through_pdq() {
         let dir = temp_dir("a2-comparator-record");
         let mut plugin = live_plugin();
         plugin.data_dir = dir.to_string_lossy().into_owned();
         let pdq_path = dir.join("edges.pdq");
         *plugin.recording.lock().unwrap() = Some(RecordingSink {
-            writer: PdqWriter::create_new(&pdq_path).unwrap(),
+            writer: RecordingWriter::spawn(PdqWriter::create_new(&pdq_path).unwrap()),
             pdq_path: pdq_path.clone(),
             sidecar_path: dir.join("edges.json"),
             pdq_path_label: "edges.pdq".into(),
@@ -5621,9 +5844,11 @@ mod tests {
 
     #[test]
     fn comparator_overlay_is_separate_from_phase_zero_markers() {
-        let mut plugin = StageAPhotodiodePlugin::default();
-        plugin.show_comparator_markers = true;
-        plugin.avg_samples = 1;
+        let plugin = StageAPhotodiodePlugin {
+            show_comparator_markers: true,
+            avg_samples: 1,
+            ..StageAPhotodiodePlugin::default()
+        };
         {
             let mut state = plugin.shared.lock().unwrap();
             state.ingest(0, 1_000, 0, &[100, 101, 102, 103]);

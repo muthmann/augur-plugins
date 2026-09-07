@@ -15,6 +15,10 @@ use crate::sha256::{Sha256, Sha256Digest};
 use crate::wire::{Crc32, Frame, FrameParser, FrameType, ParseEvent};
 
 const READ_BUFFER_BYTES: usize = 64 * 1024;
+/// Write buffer of the evidence writer. One second of the 500 kSa/s stream
+/// fits in it, so a recording reaches the file system in few large writes
+/// instead of one per two wire frames — decisive on a network share.
+const WRITE_BUFFER_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PdqSampleRange {
@@ -82,7 +86,7 @@ impl PdqWriter {
             .truncate(!exclusive)
             .open(&path)?;
         Ok(Self {
-            file: BufWriter::new(file),
+            file: BufWriter::with_capacity(WRITE_BUFFER_BYTES, file),
             path,
             frames_written: 0,
             bytes_written: 0,
