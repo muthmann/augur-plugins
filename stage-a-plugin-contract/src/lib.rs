@@ -11,6 +11,7 @@
 #![forbid(unsafe_code)]
 
 pub mod csv;
+pub mod protocol;
 pub mod telemetry;
 
 use serde::{Deserialize, Serialize};

@@ -61,8 +61,8 @@ pub const MAX_POINTS: usize = 4_096;
 const DEPTH_A_RANGE: (f64, f64) = (0.01, 6.0);
 const MEAN_U_RANGE: (f64, f64) = (0.01, 1.0);
 const FREQUENCY_RANGE: (f64, f64) = (
-    stage_a_plugin_contract::DRIVE_FREQUENCY_MIN_MILLIHZ as f64 / 1_000.0,
-    stage_a_plugin_contract::DRIVE_FREQUENCY_MAX_MILLIHZ as f64 / 1_000.0,
+    crate::DRIVE_FREQUENCY_MIN_MILLIHZ as f64 / 1_000.0,
+    crate::DRIVE_FREQUENCY_MAX_MILLIHZ as f64 / 1_000.0,
 );
 const DURATION_RANGE: (i64, i64) = (1, 3_600);
 const SETTLE_RANGE: (f64, f64) = (0.0, 60.0);
@@ -1253,7 +1253,7 @@ mod example_file_tests {
     /// the format moves — a stale example is worse than none.
     #[test]
     fn the_shipped_example_csv_parses_and_exercises_every_column() {
-        let text = include_str!("../protocols/example.csv");
+        let text = include_str!("../../plugins/stage-a-a1/protocols/example.csv");
         let protocol = parse_csv(text).expect("the shipped CSV example must parse");
         assert!(protocol.points.len() > 10);
         assert!(protocol
@@ -1278,7 +1278,7 @@ mod example_file_tests {
 
     #[test]
     fn the_shipped_example_protocol_parses() {
-        let text = include_str!("../protocols/example.toml");
+        let text = include_str!("../../plugins/stage-a-a1/protocols/example.toml");
         let protocol = parse(text).expect("the shipped example must parse");
         assert_eq!(protocol.name, "a1-example-survey");
         // 1×1×7 + 2×6×1 + 1×3×4 + 4×1×1

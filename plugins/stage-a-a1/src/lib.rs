@@ -5,16 +5,19 @@
 //! photodiode plugins; this code only validates and analyses immutable inputs.
 
 pub mod phase;
-pub mod protocol;
 pub mod rates;
 pub mod response_curve;
 mod runtime;
 pub mod types;
 
-/// Host sensor-telemetry compaction. Shared with A4 through the contract
-/// crate, because both workflows gather the same host-written CSV and a second
-/// copy would drift the moment the host adds a column.
-pub use stage_a_plugin_contract::{csv, telemetry as sensor};
+/// Host sensor-telemetry compaction, the CSV splitter and the declarative
+/// recording protocol. All three live in the contract crate: A4 gathers the
+/// same host-written CSV, and the modulation and photodiode owners validate
+/// the shipped protocols against their own limits. A plugin crate must never
+/// depend on another plugin crate — every one of them exports
+/// `augur_plugin_vtable`, and two of those in one binary do not link on
+/// Windows or Linux (ADR 031).
+pub use stage_a_plugin_contract::{csv, protocol, telemetry as sensor};
 
 pub use runtime::StageAA1Plugin;
 pub use types::{CameraEvent, Polarity};

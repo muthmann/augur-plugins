@@ -1,7 +1,7 @@
 //! Verifies that the A1 protocol minima fit the production photodiode ring at
 //! the 500 kSa/s bench rate, with the cache length left at its default.
 
-use augur_plugin_stage_a_a1::protocol::parse_csv;
+use stage_a_plugin_contract::protocol::parse_csv;
 
 use super::{SharedState, DEFAULT_CACHE_SECONDS, RING_MAX_SAMPLES};
 

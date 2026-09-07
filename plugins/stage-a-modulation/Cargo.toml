@@ -16,5 +16,3 @@ stage-a-io = { path = "../../stage-a-io" }
 stage-a-plugin-contract = { path = "../../stage-a-plugin-contract" }
 toml = "0.8"
 
-[dev-dependencies]
-augur-plugin-stage-a-a1 = { path = "../stage-a-a1" }

@@ -7,7 +7,9 @@ authors = ["Mika Uthmann <muthmann@physik.uni-bielefeld.de>"]
 description = "Serde-only inter-plugin control and status contract for the Stage-A device-owner plugins"
 
 [dependencies]
+augur-plugin-api.workspace = true
 serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 
 [dev-dependencies]
 serde_json = "1"

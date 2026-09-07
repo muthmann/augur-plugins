@@ -69,6 +69,21 @@ Each plugin keeps re-exporting the shared names it used to own, so downstream
   smaller than the cost of a platform-specific link failure that only shows up
   on a machine nobody builds on.
 
+## The rule covers dev-dependencies (2026-09-07)
+
+A `[dev-dependencies]` edge onto a plugin crate links that plugin's vtable into
+the *test* binary, and it fails exactly the same way. The modulation and
+photodiode owners each had one onto the A1 plugin, to validate the shipped A1
+protocols against their own limits. Nothing caught it because the workflow only
+built `cdylib`s; the first job that compiled a test target on Linux and Windows
+failed to link.
+
+The A1 recording protocol parser therefore lives in `stage-a-plugin-contract`
+(`protocol`), re-exported by the A1 crate so `crate::protocol::…` and
+`augur_plugin_stage_a_a1::protocol::…` both keep working. The build workflow
+now runs the Stage-A tests on every platform, so the next such edge fails in CI
+rather than on the bench.
+
 ## Alternatives considered
 
 **Feature-gate `export_plugin!` and have dependents disable it.** Would keep the

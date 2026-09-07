@@ -7,8 +7,8 @@ use augur_plugin_api::{
     ExecutionContext, ExecutionMode, Plugin, PluginRuntimeRole, PluginServiceOutcome,
     PluginServiceRequest,
 };
-use augur_plugin_stage_a_a1::protocol::{parse_csv, ProtocolPoint};
 use serde_json::Value;
+use stage_a_plugin_contract::protocol::{parse_csv, ProtocolPoint};
 use stage_a_plugin_contract::{
     ClientId, LeaseId, ModulationCommandV1, ModulationRequestV1, RunId,
     PLUGIN_ID_STAGE_A_MODULATION, SERVICE_STAGE_A_MODULATION_CONTROL_V1,
