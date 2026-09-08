@@ -1812,13 +1812,15 @@ impl StageAA2Plugin {
                     _ => None,
                 });
             if let Some(receipt) = receipt {
+                let pdq_path = self.resolve_owner_path(&receipt.pdq_path);
+                let sidecar_path = self.resolve_owner_path(&receipt.sidecar_path);
                 let error = self
-                    .check_recording_directory(&receipt.pdq_path)
+                    .check_recording_directory(&pdq_path)
                     .err()
-                    .or_else(|| self.check_recording_directory(&receipt.sidecar_path).err());
+                    .or_else(|| self.check_recording_directory(&sidecar_path).err());
                 let run = self.run.as_mut().unwrap();
-                run.evidence.pdq_path = Some(receipt.pdq_path);
-                run.evidence.pd_sidecar_path = Some(receipt.sidecar_path);
+                run.evidence.pdq_path = Some(pdq_path);
+                run.evidence.pd_sidecar_path = Some(sidecar_path);
                 if let Some(error) = error {
                     self.fail(control, format!("photodiode output path mismatch: {error}"));
                     return;
@@ -2018,6 +2020,12 @@ impl StageAA2Plugin {
                         _ => None,
                     });
                 let requested_seconds = self.point().unwrap().acquisition_seconds();
+                let paths = finalized.as_ref().map(|receipt| {
+                    (
+                        self.resolve_owner_path(&receipt.pdq_path),
+                        self.resolve_owner_path(&receipt.sidecar_path),
+                    )
+                });
                 let e = &mut self.run.as_mut().unwrap().evidence;
                 if let Some(receipt) = finalized {
                     let seconds = receipt
@@ -2029,8 +2037,10 @@ impl StageAA2Plugin {
                         e.failure.get_or_insert(format!("PDQ does not cover the requested {:.3} s: sampled duration={seconds:?} s", requested_seconds));
                     }
                     e.pdq_marker_counts = receipt.marker_counts;
-                    e.pdq_path = Some(receipt.pdq_path);
-                    e.pd_sidecar_path = Some(receipt.sidecar_path);
+                    if let Some((pdq_path, sidecar_path)) = paths {
+                        e.pdq_path = Some(pdq_path);
+                        e.pd_sidecar_path = Some(sidecar_path);
+                    }
                     e.pdq_sha256 = Some(receipt.sha256.to_string());
                     if !receipt.valid
                         || !receipt.integrity.is_clean()
@@ -2349,6 +2359,24 @@ impl StageAA2Plugin {
         } else if phase == Phase::StopCamera {
             self.finish_point(control, &outcome)
         }
+    }
+
+    /// Anchor an owner-reported recording path to the run's output root.
+    ///
+    /// The photodiode owner echoes a workflow path exactly as the request
+    /// named it: relative to the `root_dir` it was given. Resolving it here
+    /// keeps every later check and every recorded artefact path absolute.
+    /// The components are pushed one by one because the request separates
+    /// them with `/`, which a Windows verbatim root (`\\?\C:\...`, what
+    /// `canonicalize` returns) does not read as a separator.
+    fn resolve_owner_path(&self, reported: &str) -> String {
+        let path = Path::new(reported);
+        if path.is_absolute() {
+            return reported.to_owned();
+        }
+        let mut resolved = self.run.as_ref().unwrap().output_root.clone();
+        resolved.extend(path.components());
+        resolved.to_string_lossy().into_owned()
     }
 
     fn check_recording_directory(&self, raw: &str) -> Result<(), String> {
@@ -3594,6 +3622,34 @@ settle_s=0
             readback: augur_plugin_api::SensorBiasReadbackV1::default(),
             readback_age_s: 0.1,
         }
+    }
+
+    fn started_pd_payload(request_id: u64, run_id: &str, pdq: &str, sidecar: &str) -> Value {
+        use stage_a_plugin_contract::{
+            OwnerInstanceId, PdqStartedReceiptV1, ResponseCommonV1, CONTRACT_VERSION_V1,
+        };
+        serde_json::to_value(PhotodiodeResponseV1 {
+            common: ResponseCommonV1 {
+                contract_version: CONTRACT_VERSION_V1,
+                request_id: RequestId(request_id),
+                owner_instance: OwnerInstanceId::new("pd-test"),
+                run_id: Some(RunId::new(run_id.split("_r").next().unwrap())),
+                requested_revision: None,
+                acknowledged_revision: None,
+                outcome: RequestOutcomeV1::Applied,
+                completed_at_unix_ms: Some(now_ms()),
+                error: None,
+            },
+            receipt: Some(PdqReceiptV1::Started(PdqStartedReceiptV1 {
+                run_id: RunId::new(run_id),
+                pdq_path: pdq.into(),
+                sidecar_path: sidecar.into(),
+                opened_at_unix_ms: now_ms(),
+                stream_epoch: 1,
+                first_sample_index: Some(0),
+            })),
+        })
+        .unwrap()
     }
 
     fn finalized_pd_payload(request_id: u64, run_id: &str) -> Value {
@@ -5042,6 +5098,72 @@ comparator_threshold_dac=500
             raw.to_string_lossy().as_ref()
         );
         assert_eq!(value["evidence"]["acquisition_complete"], false);
+    }
+
+    #[test]
+    fn photodiode_paths_reported_relative_to_the_root_are_anchored_to_it() {
+        let (mut plugin, mut control) = waiting_camera("relative-pd-paths");
+        let HostCommand::StartRecording {
+            root_dir: Some(root),
+            base_path,
+            ..
+        } = control.hosts.last().unwrap().command.clone()
+        else {
+            panic!("missing explicit root")
+        };
+        let raw = Path::new(&root).join(&base_path);
+        let id = control.hosts.last().unwrap().request_id;
+        plugin.host_reply(
+            &mut control,
+            id,
+            HostCommandOutcome::RecordingStarted {
+                actual_raw_path: raw.to_string_lossy().into_owned(),
+                started_at: "now".into(),
+            },
+        );
+        let request: PhotodiodeRequestV1 =
+            serde_json::from_value(control.services.last().unwrap().payload.clone()).unwrap();
+        let PhotodiodeCommandV1::BeginRecording { specification } = request.command else {
+            panic!("not a PD start")
+        };
+        // The owner echoes the requested paths, which are relative to the root.
+        let pd_id = plugin.run.as_ref().unwrap().pending.unwrap().1;
+        let run_id = plugin.run.as_ref().unwrap().run_id.clone();
+        plugin.accepted(
+            &mut control,
+            PendingKind::Pd,
+            &started_pd_payload(
+                pd_id,
+                &run_id,
+                &specification.pdq_path,
+                &specification.sidecar_path,
+            ),
+        );
+        let run = plugin.run.as_ref().unwrap();
+        assert!(!run.stop, "{:?}", run.abort_reason);
+        assert_eq!(run.abort_reason, None);
+        let measurement_dir = run
+            .output_root
+            .join(&run.measurement_id)
+            .canonicalize()
+            .unwrap();
+        for (recorded, requested) in [
+            (&run.evidence.pdq_path, &specification.pdq_path),
+            (&run.evidence.pd_sidecar_path, &specification.sidecar_path),
+        ] {
+            let recorded = Path::new(recorded.as_deref().expect("path recorded"));
+            assert!(recorded.is_absolute(), "{}", recorded.display());
+            assert_eq!(
+                recorded.parent().unwrap().canonicalize().unwrap(),
+                measurement_dir
+            );
+            assert_eq!(
+                recorded.file_name(),
+                Path::new(requested).file_name(),
+                "{}",
+                recorded.display()
+            );
+        }
     }
 
     #[test]
