@@ -15,7 +15,7 @@ on:
       augur_rs_ref:
         description: "augur-rs ref to build against (branch, tag or SHA)"
         required: false
-        default: v2.1.1
+        default: 142ccb3877151a172979c2cec6a5efee599831d0
 
 concurrency:
   group: build-plugins-${{ github.ref }}
@@ -26,9 +26,9 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # The paired camera-session changes are part of augur-rs main. Keep manual
-  # runs overridable so older or diagnostic host revisions remain testable.
-  AUGUR_RS_REF: ${{ inputs.augur_rs_ref || 'main' }}
+  # The recording root API requires the paired host fix in augur-rs PR #53.
+  # Pin its tested commit for matching, reproducible host and plugin bundles.
+  AUGUR_RS_REF: ${{ inputs.augur_rs_ref || '142ccb3877151a172979c2cec6a5efee599831d0' }}
 
 jobs:
   build:

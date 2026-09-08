@@ -28,3 +28,22 @@ reuse, mean-level conventions, firmware installation and remaining hardware chec
 For the time-limited first laboratory block, load `protocols/a2_core_drive_sync.toml`
 (19 points, 19 min 55 s plus overhead). This retains the essential capture controls
 but has fewer repeats and does not replace offline timing qualification.
+
+### Measurement control
+
+Like A1, select a **Measurement id** (or **New id**), load the protocol, then use
+**Run protocol**, **Continue** at a requested pause, and **Stop** when needed.
+The id names the folder; subsequent runs use unique filenames. The status shows
+completed points and remaining acquisition/settling time, excluding manual pauses,
+controller setup and file finalization. All files go below the data folder chosen
+in the photodiode plugin.
+
+This workflow requires the matching Augur host with `StartRecording.root_dir`
+support. A2 checks the actual output directory and refuses a split camera/PD run.
+After updating, close/reopen the Windows host and verify one short saved pair
+before the long protocol. Do not mix the new DLL with an older executable.
+
+Reuse the same measurement ID and exact protocol to continue only missing rows.
+The runner requires explicit completion metadata and the four nonempty recording
+files in that ID folder. Older records without completion evidence are not skipped.
+The status separates reused/new rows and estimates remaining acquisition time.

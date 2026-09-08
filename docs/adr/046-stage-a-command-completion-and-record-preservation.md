@@ -72,3 +72,19 @@ Check finalized RAW/PDQ and sidecars, PDQ sample and marker continuity, expected
 camera trigger edges and the saved quality diagnostics. Repeat a few points to
 exercise file finalization and reacquisition. No local mock test proves USB,
 camera timing, signal quality or the installed firmware version.
+
+## Recording-root and workflow completion, 2026-09-08
+
+The host's default recording folder and the photodiode folder can differ. Add the
+optional host `StartRecording.root_dir` contract (augur-rs ADR 028) and have A1/A2
+pass their resolved workflow root explicitly. A2 freezes it, verifies opened-file
+parents, and records actual paths before stimulus start. It does not move large
+files between volumes at the end of each point. Older host behavior is detected
+before PD acquisition. A1 retains its existing file-gather fallback.
+
+A2 now preserves a user measurement id across uniquely named runs, presents timed
+remaining duration, and journals acquisition progress independently of scientific
+qualification. Atomic point JSON replacement preserves previous metadata if an
+update fails. Retained modulation responses are queried with the original request
+identity; host preview resets cannot discard an active run. These changes keep
+the A1/A2 controls consistent without moving experiment logic into the host.

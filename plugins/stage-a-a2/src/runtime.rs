@@ -1,5 +1,5 @@
-use std::collections::BTreeMap;
-use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use augur_plugin_api::{
@@ -161,6 +161,7 @@ struct PointEvidence {
     camera_configuration_sidecar_path: Option<String>,
     sensor_monitoring_path: Option<String>,
     pdq_path: Option<String>,
+    pd_sidecar_path: Option<String>,
     pdq_sha256: Option<String>,
     pdq_marker_counts: Option<stage_a_plugin_contract::PdqMarkerCountsV1>,
     marker_diagnostics_before: Option<stage_a_plugin_contract::A2MarkerDiagnosticsV1>,
@@ -174,6 +175,7 @@ struct PointEvidence {
     /// point of the same pedestal, and recorded on each of them so a single
     /// sidecar is self-contained.
     threshold_measurement: Option<MeasuredThreshold>,
+    acquisition_complete: bool,
     valid: bool,
     /// Quality concerns do not imply file corruption. Strict protocols stop;
     /// diagnostic protocols retain these captures for explicit offline review.
@@ -314,6 +316,13 @@ struct Run {
     protocol_sha256: String,
     protocol_archive_path: String,
     measurement_id: String,
+    output_root: PathBuf,
+    attempt_id: String,
+    completed_points: usize,
+    resumed_points: BTreeSet<usize>,
+    resume_pause: bool,
+    pending_mod_request: Option<PluginServiceRequest>,
+    last_mod_poll_ms: u64,
     index: usize,
     phase: Phase,
     pending: Option<(PendingKind, u64, u64)>,
@@ -352,6 +361,8 @@ pub struct StageAA2Plugin {
     output_folder: String,
     measurement_id: String,
     protocol_path: String,
+    protocol_preview: Option<Protocol>,
+    new_id: Press,
     start: Press,
     stop: Press,
     continue_press: Press,
@@ -376,6 +387,8 @@ impl Default for StageAA2Plugin {
             output_folder: String::new(),
             measurement_id: String::new(),
             protocol_path: String::new(),
+            protocol_preview: None,
+            new_id: Press::default(),
             start: Press::default(),
             stop: Press::default(),
             continue_press: Press::default(),
@@ -487,8 +500,8 @@ impl StageAA2Plugin {
     }
 
     fn begin(&mut self, control: &mut impl Control) {
-        if let Some(blocker) = self.blocker() {
-            self.message = format!("A2 refused: {blocker}");
+        if self.run.is_some() {
+            self.message = "A2 refused: an A2 protocol is already running".into();
             return;
         }
         let text = match std::fs::read_to_string(self.protocol_path.trim()) {
@@ -505,6 +518,62 @@ impl StageAA2Plugin {
                 return;
             }
         };
+        if let Some(folder) = self.photodiode.as_ref().and_then(|pd| pd.data_dir.as_ref()) {
+            self.output_folder = folder.clone();
+        }
+        let measurement_id = if self.measurement_id.trim().is_empty() {
+            format!("A2-{}", compact_time())
+        } else {
+            self.measurement_id.trim().to_owned()
+        };
+        if !valid_measurement_id(&measurement_id) {
+            self.message = "A2 refused: measurement id must use 1–100 letters, digits, '-' or '_' and must not be a reserved Windows filename".into();
+            return;
+        }
+        let output_root = match resolve_output_root(&self.output_folder) {
+            Ok(root) => root,
+            Err(error) => {
+                self.message = format!("A2 refused: {error}");
+                return;
+            }
+        };
+        self.output_folder = output_root.to_string_lossy().into_owned();
+        self.protocol_preview = Some(plan.clone());
+        self.measurement_id = measurement_id.clone();
+        let hash = hex_hash(text.as_bytes());
+        let resumed_points = match crate::resume::completed(
+            &output_root.join(&measurement_id),
+            &measurement_id,
+            &hash,
+            &plan,
+        ) {
+            Ok(points) => points,
+            Err(error) => {
+                self.message = format!("A2 refused: cannot inspect existing measurement: {error}");
+                return;
+            }
+        };
+        let Some(index) = (0..plan.points.len()).find(|i| !resumed_points.contains(i)) else {
+            self.message = format!(
+                "A2 {}: all {} protocol points already complete; nothing to record",
+                measurement_id,
+                plan.points.len()
+            );
+            return;
+        };
+        let attempt_id = compact_time();
+        let journal = output_root
+            .join(&measurement_id)
+            .join(format!("{attempt_id}_progress.jsonl"));
+        if journal.exists() {
+            self.message =
+                "A2 refused: this run already exists; start again to create a new run".into();
+            return;
+        }
+        if let Some(blocker) = self.blocker() {
+            self.message = format!("A2 refused: {blocker}");
+            return;
+        }
         // Everything below happens before the camera configuration is applied and
         // before either owner lease is acquired: an unresolvable lobe, an
         // unresolvable step floor or an unreachable plateau must refuse while
@@ -518,11 +587,6 @@ impl StageAA2Plugin {
                 .as_ref()
                 .expect("blocker confirmed the photodiode owner"),
         );
-        self.output_folder = self
-            .photodiode
-            .as_ref()
-            .and_then(|summary| summary.data_dir.clone())
-            .expect("blocker confirmed the photodiode data folder");
         let resolved = match resolve_controller(&controller, self.modulation.as_ref(), self.sensor)
         {
             Ok(resolved) => resolved,
@@ -542,9 +606,6 @@ impl StageAA2Plugin {
                 return;
             }
         };
-        let measurement_id = format!("A2-{}", compact_time());
-        self.measurement_id = measurement_id.clone();
-        let hash = hex_hash(text.as_bytes());
         let protocol_archive_path =
             match archive_protocol(&self.output_folder, &measurement_id, &hash, text.as_bytes()) {
                 Ok(path) => path,
@@ -566,7 +627,14 @@ impl StageAA2Plugin {
             protocol_sha256: hash,
             protocol_archive_path,
             measurement_id: measurement_id.clone(),
-            index: 0,
+            output_root,
+            attempt_id,
+            completed_points: 0,
+            resume_pause: !resumed_points.is_empty(),
+            resumed_points,
+            pending_mod_request: None,
+            last_mod_poll_ms: 0,
+            index,
             phase: Phase::ApplyCamera,
             pending: None,
             lease: LeaseId::new(format!("a2-{}", now_ms())),
@@ -595,6 +663,11 @@ impl StageAA2Plugin {
             cleanup_failures: Vec::new(),
             pd_progress: None,
         });
+        if let Err(error) = self.append_progress("run_started") {
+            self.message = format!("A2 refused: cannot save run progress: {error}");
+            self.run = None;
+            return;
+        }
         self.send_host(
             control,
             HostCommand::ApplyCameraConfiguration {
@@ -639,14 +712,18 @@ impl StageAA2Plugin {
         if revision {
             e.requested_revision = Some(self.next_revision());
         }
-        control.service(&PluginServiceRequest {
+        let request = PluginServiceRequest {
             request_id,
             source_plugin_id: ID.into(),
             target_plugin_id: MOD_ID.into(),
             service: SERVICE_STAGE_A_MODULATION_CONTROL_V1.into(),
             payload: serde_json::to_value(e).unwrap(),
-        });
-        self.run.as_mut().unwrap().pending = Some((pending_kind, request_id, now_ms()));
+        };
+        control.service(&request);
+        let run = self.run.as_mut().unwrap();
+        run.pending_mod_request = Some(request);
+        run.last_mod_poll_ms = now_ms();
+        run.pending = Some((pending_kind, request_id, now_ms()));
     }
 
     fn send_pd(
@@ -704,21 +781,26 @@ impl StageAA2Plugin {
         let run = self.run.as_mut().unwrap();
         run.phase = Phase::Prepare;
         run.run_id = format!(
-            "{}_r{:03}_{}",
+            "{}_r{:03}_{}_{}",
             run.measurement_id,
             run.index + 1,
-            safe(&p.label)
+            safe(&p.label),
+            run.attempt_id
         );
         run.evidence = PointEvidence::default();
         run.last_event_bin_us = None;
         run.last_event_bin_count = 0;
         run.camera_stop_attempts = 0;
         run.probe = None;
-        if should_pause(&p, self.run.as_ref().unwrap().pause_acknowledged) {
+        if should_pause(&p, self.run.as_ref().unwrap().pause_acknowledged)
+            || (self.run.as_ref().unwrap().resume_pause
+                && !self.run.as_ref().unwrap().pause_acknowledged)
+        {
             self.run.as_mut().unwrap().phase = Phase::Paused;
             self.message = pause_message(&p);
             return;
         }
+        self.run.as_mut().unwrap().resume_pause = false;
         match p.acquisition {
             Acquisition::Dark { .. } => self.send_mod(
                 control,
@@ -1270,9 +1352,19 @@ impl StageAA2Plugin {
     fn advance(&mut self, control: &mut impl Control) {
         let done = {
             let r = self.run.as_mut().unwrap();
-            r.index += 1;
+            r.completed_points += 1;
             r.pause_acknowledged = false;
-            r.index >= r.protocol.points.len() || r.stop
+            let next =
+                (r.index + 1..r.protocol.points.len()).find(|i| !r.resumed_points.contains(i));
+            if !r.stop {
+                if let Some(next) = next {
+                    r.resume_pause = r.protocol.points[r.index + 1..next]
+                        .iter()
+                        .any(|p| p.pause_before);
+                    r.index = next;
+                }
+            }
+            next.is_none() || r.stop
         };
         if done {
             self.release_next(control);
@@ -1345,11 +1437,6 @@ impl StageAA2Plugin {
     }
 
     fn finish_run(&mut self) {
-        if let Some(run) = self.run.as_mut() {
-            if run.index >= run.protocol.points.len() {
-                run.index = run.protocol.points.len() - 1;
-            }
-        }
         if self.run.as_ref().is_some_and(|r| !r.run_id.is_empty()) {
             if let Err(error) = self.write_sidecar() {
                 self.run
@@ -1359,6 +1446,12 @@ impl StageAA2Plugin {
                     .get_or_insert(format!("cannot save final A2 sidecar: {error}"));
             }
         }
+        if let Err(error) = self.append_progress("run_finished") {
+            if let Some(run) = self.run.as_mut() {
+                run.abort_reason
+                    .get_or_insert(format!("cannot save final progress: {error}"));
+            }
+        }
         if let Some(run) = self.run.take() {
             self.message = if let Some(reason) = run.abort_reason {
                 format!(
@@ -1366,8 +1459,8 @@ impl StageAA2Plugin {
                     self.output_folder, run.measurement_id
                 )
             } else if run.review_points > 0 {
-                format!("A2 capture finished; {} point(s) require offline timing review. This is not a passed latency measurement. Files: {}/{}",
-                    run.review_points, self.output_folder, run.measurement_id)
+                format!("A2 capture finished: {}/{} points recorded; {} point(s) require offline timing review. Files: {}/{}",
+                    run.completed_points + run.resumed_points.len(), run.protocol.points.len(), run.review_points, self.output_folder, run.measurement_id)
             } else {
                 format!("A2 acquisition checks passed; H4/H5 and offline first-event analysis remain required. Files: {}/{}",
                     self.output_folder, run.measurement_id)
@@ -1617,6 +1710,14 @@ impl StageAA2Plugin {
                     HostCommand::StartRecording {
                         run_id,
                         base_path: base,
+                        root_dir: Some(
+                            self.run
+                                .as_ref()
+                                .unwrap()
+                                .output_root
+                                .to_string_lossy()
+                                .into_owned(),
+                        ),
                         metadata: meta,
                     },
                 );
@@ -1703,6 +1804,40 @@ impl StageAA2Plugin {
                 }
             }
         }
+        if kind == PendingKind::Pd && phase == Phase::StartPd {
+            let receipt = serde_json::from_value::<PhotodiodeResponseV1>(payload.clone())
+                .ok()
+                .and_then(|r| match r.receipt {
+                    Some(PdqReceiptV1::Started(r)) => Some(r),
+                    _ => None,
+                });
+            if let Some(receipt) = receipt {
+                let error = self
+                    .check_recording_directory(&receipt.pdq_path)
+                    .err()
+                    .or_else(|| self.check_recording_directory(&receipt.sidecar_path).err());
+                let run = self.run.as_mut().unwrap();
+                run.evidence.pdq_path = Some(receipt.pdq_path);
+                run.evidence.pd_sidecar_path = Some(receipt.sidecar_path);
+                if let Some(error) = error {
+                    self.fail(control, format!("photodiode output path mismatch: {error}"));
+                    return;
+                }
+                if let Err(error) = self.write_sidecar() {
+                    self.fail(
+                        control,
+                        format!("cannot save opened photodiode paths: {error}"),
+                    );
+                    return;
+                }
+            } else if !cfg!(test) || !payload.is_null() {
+                self.fail(
+                    control,
+                    "photodiode owner returned no opened-file receipt".into(),
+                );
+                return;
+            }
+        }
         if kind == PendingKind::RenewMod {
             self.run.as_mut().unwrap().pending = None;
             self.send_pd(
@@ -1729,6 +1864,28 @@ impl StageAA2Plugin {
                 if phase == Phase::StopMod {
                     evidence.marker_diagnostics_after = response.marker_diagnostics;
                 }
+            }
+        }
+        if self.stop_pending || self.run.as_ref().unwrap().stop {
+            self.stop_pending = false;
+            let run = self.run.as_mut().unwrap();
+            if kind == PendingKind::Mod && phase == Phase::AcquireMod {
+                run.mod_leased = true;
+            }
+            if kind == PendingKind::Pd && phase == Phase::AcquirePd {
+                run.pd_leased = true;
+            }
+            if !matches!(
+                phase,
+                Phase::StopMod
+                    | Phase::FinalizePd
+                    | Phase::StopCamera
+                    | Phase::ReleasePd
+                    | Phase::ReleaseMod
+                    | Phase::RestoreCamera
+            ) {
+                self.fail(control, "operator stopped A2".into());
+                return;
             }
         }
         match (kind, phase) {
@@ -1785,7 +1942,7 @@ impl StageAA2Plugin {
                     expected_sample_rate_hz: Some(r.controller.sample_rate_hz),
                     expected_stream_epoch: self.photodiode.as_ref().map(|p| p.stream.stream_epoch),
                     metadata: self.metadata(),
-                    root_dir: Some(self.output_folder.clone()),
+                    root_dir: Some(r.output_root.to_string_lossy().into_owned()),
                 };
                 let run = self.run.as_mut().unwrap();
                 run.phase = Phase::StartPd;
@@ -1826,6 +1983,9 @@ impl StageAA2Plugin {
                     r.index + 1,
                     r.protocol.points[r.index].label
                 );
+                if let Err(error) = self.append_progress("point_started") {
+                    self.fail(control, format!("cannot save point progress: {error}"));
+                }
             }
             (PendingKind::Mod, Phase::StopMod) => {
                 let run = self.run.as_mut().unwrap();
@@ -1870,6 +2030,7 @@ impl StageAA2Plugin {
                     }
                     e.pdq_marker_counts = receipt.marker_counts;
                     e.pdq_path = Some(receipt.pdq_path);
+                    e.pd_sidecar_path = Some(receipt.sidecar_path);
                     e.pdq_sha256 = Some(receipt.sha256.to_string());
                     if !receipt.valid
                         || !receipt.integrity.is_clean()
@@ -1951,25 +2112,44 @@ impl StageAA2Plugin {
     }
 
     fn finish_async_mod(&mut self, control: &mut impl Control) {
-        let Some((kind @ (PendingKind::Mod | PendingKind::RenewMod), request_id, _)) =
+        let Some((kind @ (PendingKind::Mod | PendingKind::RenewMod), request_id, sent)) =
             self.run.as_ref().and_then(|r| r.pending)
         else {
             return;
         };
-        let Some(response) = self
+        if let Some(response) = self
             .modulation
             .as_ref()
             .and_then(|s| s.last_response.as_ref())
-        else {
-            return;
-        };
-        if response.common.request_id.0 != request_id
-            || response.common.outcome == RequestOutcomeV1::InProgress
         {
-            return;
+            let run = self.run.as_ref().unwrap();
+            if response.common.request_id.0 == request_id
+                && response.common.owner_instance.as_str() == run.resolved.modulation_owner_instance
+                && response
+                    .common
+                    .run_id
+                    .as_ref()
+                    .is_some_and(|id| id.as_str() == run.lease_run_id)
+                && response.common.outcome != RequestOutcomeV1::InProgress
+            {
+                let payload = serde_json::to_value(response).unwrap_or(Value::Null);
+                self.accepted(control, kind, &payload);
+                return;
+            }
         }
-        let payload = serde_json::to_value(response).unwrap_or(Value::Null);
-        self.accepted(control, kind, &payload);
+        let now = now_ms();
+        let run = self.run.as_mut().unwrap();
+        if now.saturating_sub(sent) <= TIMEOUT_MS && now.saturating_sub(run.last_mod_poll_ms) >= 200
+        {
+            if let Some(request) = run
+                .pending_mod_request
+                .as_ref()
+                .filter(|r| r.request_id == request_id)
+            {
+                control.service(request);
+                run.last_mod_poll_ms = now;
+            }
+        }
     }
 
     fn finish_point(&mut self, control: &mut impl Control, outcome: &HostCommandOutcome) {
@@ -2059,7 +2239,14 @@ impl StageAA2Plugin {
                 ));
             }
         }
-        if let Err(error) = self.write_sidecar() {
+        {
+            let run = self.run.as_mut().unwrap();
+            run.evidence.acquisition_complete = run.evidence.failure.is_none() && !run.stop;
+        }
+        if let Err(error) = self
+            .write_sidecar()
+            .and_then(|()| self.append_progress("point_finished"))
+        {
             let run = self.run.as_mut().unwrap();
             run.stop = true;
             run.evidence.valid = false;
@@ -2143,23 +2330,77 @@ impl StageAA2Plugin {
                         Some(camera_sidecar_path(&actual_raw_path));
                     evidence.sensor_monitoring_path =
                         Some(sensor_monitoring_path(&actual_raw_path));
-                    evidence.raw_path = Some(actual_raw_path);
+                    evidence.raw_path = Some(actual_raw_path.clone());
+                    if let Err(error) = self.check_recording_directory(&actual_raw_path) {
+                        self.fail(control, error);
+                        return;
+                    }
+                    if let Err(error) = self.write_sidecar() {
+                        self.fail(control, format!("cannot save opened camera path: {error}"));
+                        return;
+                    }
                     self.accepted(control, PendingKind::Host, &Value::Null)
                 }
-                outcome => self.fail(control, format!("camera start failed: {outcome:?}")),
+                outcome => {
+                    self.run.as_mut().unwrap().camera_recording = false;
+                    self.fail(control, format!("camera start failed: {outcome:?}"));
+                }
             }
         } else if phase == Phase::StopCamera {
             self.finish_point(control, &outcome)
         }
     }
 
+    fn check_recording_directory(&self, raw: &str) -> Result<(), String> {
+        let run = self.run.as_ref().unwrap();
+        let expected = run.output_root.join(&run.measurement_id);
+        let parent = Path::new(raw)
+            .parent()
+            .ok_or("recorder returned no parent directory")?;
+        let actual = parent
+            .canonicalize()
+            .map_err(|e| format!("cannot verify recording output directory: {e}"))?;
+        if actual != expected.canonicalize().map_err(|e| e.to_string())? {
+            return Err(format!("recorder saved outside the measurement folder: {raw}; expected {}. Install the matching host with workflow recording-root support", expected.display()));
+        }
+        Ok(())
+    }
+
+    fn append_progress(&self, event: &str) -> Result<(), String> {
+        use std::io::Write;
+        let Some(run) = self.run.as_ref() else {
+            return Ok(());
+        };
+        let path = run
+            .output_root
+            .join(&run.measurement_id)
+            .join(format!("{}_progress.jsonl", run.attempt_id));
+        let entry = json!({"schema":"stage-a.a2.progress.v1", "event":event,
+            "at_unix_ms":now_ms(), "measurement_id":run.measurement_id, "run_id":run.run_id,
+            "protocol_sha256":run.protocol_sha256, "point_index":run.index+1,
+            "point_total":run.protocol.points.len(), "completed_points":run.completed_points,
+            "resumed_rows":run.resumed_points.iter().map(|i| i + 1).collect::<Vec<_>>(),
+            "phase":format!("{:?}",run.phase), "evidence":run.evidence,
+            "abort_reason":run.abort_reason, "cleanup_failures":run.cleanup_failures});
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(|e| e.to_string())?;
+        writeln!(file, "{entry}").map_err(|e| e.to_string())?;
+        file.sync_data().map_err(|e| e.to_string())
+    }
+
     fn write_sidecar(&self) -> Result<(), String> {
         let r = self.run.as_ref().unwrap();
-        let dir = Path::new(&self.output_folder).join(&r.measurement_id);
+        let dir = r.output_root.join(&r.measurement_id);
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         #[derive(Serialize)]
         struct Side<'a> {
             schema_version: u32,
+            measurement_id: &'a str,
+            attempt_id: &'a str,
+            output_root: &'a Path,
             trigger_validation: TriggerValidation,
             cleanup_failures: &'a [String],
             experiment: &'static str,
@@ -2191,6 +2432,9 @@ impl StageAA2Plugin {
         }
         let s = Side {
             schema_version: 2,
+            measurement_id: &r.measurement_id,
+            attempt_id: &r.attempt_id,
+            output_root: &r.output_root,
             trigger_validation: r.protocol.trigger_validation,
             cleanup_failures: &r.cleanup_failures,
             experiment: "A2",
@@ -2217,7 +2461,13 @@ impl StageAA2Plugin {
             }),
         };
         let bytes = serde_json::to_vec_pretty(&s).map_err(|e| e.to_string())?;
-        std::fs::write(dir.join(format!("{}.a2.json", r.run_id)), bytes).map_err(|e| e.to_string())
+        use std::io::Write;
+        let mut file = tempfile::NamedTempFile::new_in(&dir).map_err(|e| e.to_string())?;
+        file.write_all(&bytes).map_err(|e| e.to_string())?;
+        file.as_file().sync_all().map_err(|e| e.to_string())?;
+        file.persist(dir.join(format!("{}.a2.json", r.run_id)))
+            .map_err(|e| e.to_string())?;
+        Ok(())
     }
 }
 
@@ -2238,7 +2488,11 @@ impl Plugin for StageAA2Plugin {
         self.role = r
     }
     fn reset(&mut self) {
-        self.run = None;
+        // Host recording boundaries reset preview state, not the acquisition.
+        if let Some(run) = self.run.as_mut() {
+            run.last_event_bin_us = None;
+            run.last_event_bin_count = 0;
+        }
     }
     fn on_discontinuity(&mut self, _: PluginDiscontinuity) {}
     fn input_kind(&self) -> PluginInput {
@@ -2340,16 +2594,18 @@ impl Plugin for StageAA2Plugin {
                     ),
                     default_open: true,
                     items: vec![
+                        SettingItem { key: "measurement_id".into(), label: "Measurement id".into(), tooltip: Some("Names the folder and every file. Leave blank to generate an id; repeated runs keep distinct filenames.".into()), kind: SettingKind::Text { default: self.measurement_id.clone() } },
+                        SettingItem { key: "new_id".into(), label: "New id".into(), tooltip: None, kind: SettingKind::Button { enabled: self.run.is_none() } },
                         SettingItem { key: "protocol_path".into(), label: "Protocol".into(), tooltip: None, kind: SettingKind::Path { dialog: PathDialogKind::OpenFile, default: self.protocol_path.clone() } },
-                        SettingItem { key: "run_protocol".into(), label: "Run protocol".into(), tooltip: None, kind: SettingKind::Button { enabled: true } },
-                        SettingItem { key: "continue_run".into(), label: "Continue".into(), tooltip: None, kind: SettingKind::Button { enabled: true } },
-                        SettingItem { key: "stop_protocol".into(), label: "Stop".into(), tooltip: None, kind: SettingKind::Button { enabled: true } },
+                        SettingItem { key: "run_protocol".into(), label: "Run protocol".into(), tooltip: None, kind: SettingKind::Button { enabled: self.run.is_none() } },
+                        SettingItem { key: "continue_run".into(), label: "Continue".into(), tooltip: None, kind: SettingKind::Button { enabled: self.run.as_ref().is_some_and(|r| r.phase == Phase::Paused) } },
+                        SettingItem { key: "stop_protocol".into(), label: "Stop".into(), tooltip: None, kind: SettingKind::Button { enabled: self.run.is_some() } },
                     ],
                 },
                 SettingsSection {
                     label: "Before the first A2 run".into(),
                     description: Some(
-                        "1. Record the generic dark, crosstalk and static-light data in Guided PD references. A2 reads the selected reference set automatically.\n\n2. Keep H4 loopback and H5 polarity/invert as comparator-specific A2 evidence.\n\n3. Run the optical-edge points. A2 sets LOG_SQUARE, measures both plateaus, selects V50, records camera RAW plus PDQ, and restores the camera configuration.\n\nDo not infer invert from the drawing. H5 fixes whether a physical rising optical edge is reported as rising or falling."
+                        "Choose the data folder and references in the photodiode plugin. Apply the optical calibration in modulation. A2 sets each protocol point automatically and saves all files in the measurement folder.\n\nDrive-sync protocols use J24 common markers and determine optical ON/OFF timing offline. Comparator protocols retain their separate threshold and polarity checks."
                             .into(),
                     ),
                     default_open: false,
@@ -2363,6 +2619,7 @@ impl Plugin for StageAA2Plugin {
             "output_folder" => Some(json!(self.output_folder)),
             "measurement_id" => Some(json!(self.measurement_id)),
             "protocol_path" => Some(json!(self.protocol_path)),
+            "new_id" => Some(json!(self.new_id.value)),
             "run_protocol" => Some(json!(self.start.value)),
             "continue_run" => Some(json!(self.continue_press.value)),
             "stop_protocol" => Some(json!(self.stop.value)),
@@ -2370,10 +2627,30 @@ impl Plugin for StageAA2Plugin {
         }
     }
     fn set_setting(&mut self, k: &str, v: Value) -> Result<(), String> {
+        if self.run.is_some()
+            && matches!(
+                k,
+                "output_folder" | "measurement_id" | "protocol_path" | "new_id"
+            )
+        {
+            return Err(
+                "Stop the current protocol before changing its measurement settings".into(),
+            );
+        }
         match k {
             "output_folder" => self.output_folder = v.as_str().ok_or("string required")?.into(),
             "measurement_id" => self.measurement_id = v.as_str().ok_or("string required")?.into(),
-            "protocol_path" => self.protocol_path = v.as_str().ok_or("string required")?.into(),
+            "protocol_path" => {
+                self.protocol_path = v.as_str().ok_or("string required")?.into();
+                self.protocol_preview = std::fs::read_to_string(self.protocol_path.trim())
+                    .ok()
+                    .and_then(|s| protocol::parse(&s).ok());
+            }
+            "new_id" => {
+                if self.new_id.accept(&v) {
+                    self.measurement_id = format!("A2-{}", compact_time());
+                }
+            }
             "run_protocol" => {
                 if self.start.accept(&v) {
                     self.start_pending = true
@@ -2403,10 +2680,101 @@ impl Plugin for StageAA2Plugin {
                 r.protocol.points.len(),
                 r.phase
             )));
-        } else if let Some(b) = self.blocker() {
-            v.push(StatusEntry::Text(format!("Not ready: {b}")));
+            v.push(StatusEntry::Text(format!(
+                "{} reused, {} newly recorded; about {} remaining, plus file finalization and manual pauses",
+                r.resumed_points.len(), r.completed_points,
+                format_bench_time(remaining_seconds(r, now_ms()))
+            )));
+            if r.phase == Phase::Paused {
+                v.push(StatusEntry::Text(
+                    "Waiting for Continue; manual pause time is not included".into(),
+                ));
+            }
+            v.push(StatusEntry::Text(format!(
+                "Files: {}",
+                r.output_root.join(&r.measurement_id).display()
+            )));
+        } else {
+            if let Some(plan) = &self.protocol_preview {
+                let seconds: f64 = plan.points.iter().map(point_seconds).sum();
+                let pauses = plan.points.iter().filter(|p| p.pause_before).count();
+                v.push(StatusEntry::Text(format!(
+                    "{} points; about {} plus file finalization and {pauses} manual pauses",
+                    plan.points.len(),
+                    format_bench_time(seconds)
+                )));
+            }
+            if let Some(b) = self.blocker() {
+                v.push(StatusEntry::Text(format!("Not ready: {b}")));
+            }
         }
         v
+    }
+}
+
+fn valid_measurement_id(id: &str) -> bool {
+    let upper = id.to_ascii_uppercase();
+    !id.is_empty()
+        && id.len() <= 100
+        && id
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+        && !matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        && !(upper.len() == 4
+            && (upper.starts_with("COM") || upper.starts_with("LPT"))
+            && matches!(upper.as_bytes()[3], b'1'..=b'9'))
+}
+
+fn resolve_output_root(folder: &str) -> Result<PathBuf, String> {
+    let root = Path::new(folder.trim());
+    if !root.is_absolute() {
+        return Err("choose an absolute data folder in the photodiode plugin".into());
+    }
+    std::fs::create_dir_all(root).map_err(|e| format!("cannot create data folder: {e}"))?;
+    root.canonicalize()
+        .map_err(|e| format!("cannot resolve data folder: {e}"))
+}
+
+fn point_seconds(point: &Point) -> f64 {
+    point.acquisition_seconds() + point.settle_s.max(0.25)
+}
+
+fn remaining_seconds(run: &Run, now: u64) -> f64 {
+    let later: f64 = run
+        .protocol
+        .points
+        .iter()
+        .enumerate()
+        .skip(run.index + 1)
+        .filter(|(i, _)| !run.resumed_points.contains(i))
+        .map(|(_, p)| point_seconds(p))
+        .sum();
+    let point = &run.protocol.points[run.index];
+    let current = match run.phase {
+        Phase::Settle => {
+            run.deadline_ms.saturating_sub(now) as f64 / 1000.0 + point.acquisition_seconds()
+        }
+        Phase::StartCamera | Phase::StartPd | Phase::StartStimulus => point.acquisition_seconds(),
+        Phase::Recording => run.deadline_ms.saturating_sub(now) as f64 / 1000.0,
+        Phase::StopMod | Phase::FinalizePd | Phase::StopCamera => 0.0,
+        Phase::ReleasePd | Phase::ReleaseMod | Phase::RestoreCamera => return 0.0,
+        _ => point_seconds(point),
+    };
+    if run.stop {
+        0.0
+    } else {
+        later + current
+    }
+}
+
+fn format_bench_time(seconds: f64) -> String {
+    let seconds = seconds.ceil() as u64;
+    if seconds >= 3600 {
+        format!("{} h {:02} min", seconds / 3600, seconds % 3600 / 60)
+    } else if seconds >= 60 {
+        format!("{} min {:02} s", seconds / 60, seconds % 60)
+    } else {
+        format!("{seconds} s")
     }
 }
 
@@ -2448,6 +2816,9 @@ fn archive_protocol(
     bytes: &[u8],
 ) -> Result<String, String> {
     let directory = Path::new(output_folder).join(measurement_id);
+    if std::fs::symlink_metadata(&directory).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err("measurement folder must not be a symlink; choose a new measurement id".into());
+    }
     std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
     let path = directory.join(format!("protocol-{sha256}.toml"));
     if path.exists() {
@@ -3398,7 +3769,7 @@ settle_s=0
     }
 
     #[test]
-    fn a2_ui_does_not_ask_for_owner_data_or_manual_ids() {
+    fn a2_ui_reads_owner_settings_but_offers_a_measurement_id() {
         let plugin = StageAA2Plugin::default();
         let keys = plugin
             .settings_schema()
@@ -3408,7 +3779,7 @@ settle_s=0
             .map(|item| item.key)
             .collect::<Vec<_>>();
         assert!(!keys.iter().any(|key| key == "output_folder"));
-        assert!(!keys.iter().any(|key| key == "measurement_id"));
+        assert!(keys.iter().any(|key| key == "measurement_id"));
         assert!(keys.iter().any(|key| key == "protocol_path"));
     }
 
@@ -3441,7 +3812,10 @@ settle_s=0
             .unwrap();
         let mut control = MockControl::default();
         plugin.begin(&mut control);
-        assert_eq!(plugin.output_folder, expected_output_folder);
+        assert_eq!(
+            Path::new(&plugin.output_folder),
+            Path::new(&expected_output_folder).canonicalize().unwrap()
+        );
         assert!(plugin.measurement_id.starts_with("A2-"));
         let measurement_id = plugin.measurement_id.clone();
         assert!(matches!(
@@ -3482,7 +3856,11 @@ settle_s=0
             &mut control,
             camera_start,
             HostCommandOutcome::RecordingStarted {
-                actual_raw_path: "/tmp/a2-dark.raw".into(),
+                actual_raw_path: Path::new(&expected_output_folder)
+                    .join(&measurement_id)
+                    .join("dark.raw")
+                    .to_string_lossy()
+                    .into_owned(),
                 started_at: "now".into(),
             },
         );
@@ -3504,7 +3882,11 @@ settle_s=0
             &mut control,
             stop_camera_id,
             HostCommandOutcome::RecordingFinalized {
-                actual_raw_path: "/tmp/a2-dark.raw".into(),
+                actual_raw_path: Path::new(&expected_output_folder)
+                    .join(&measurement_id)
+                    .join("dark.raw")
+                    .to_string_lossy()
+                    .into_owned(),
                 size: 1,
                 sha256: "ef".repeat(32),
                 duration_us: 1_000,
@@ -3542,7 +3924,11 @@ settle_s=0
             &mut control,
             camera_start,
             HostCommandOutcome::RecordingStarted {
-                actual_raw_path: "/tmp/a2-step.raw".into(),
+                actual_raw_path: Path::new(&expected_output_folder)
+                    .join(&measurement_id)
+                    .join("step.raw")
+                    .to_string_lossy()
+                    .into_owned(),
                 started_at: "now".into(),
             },
         );
@@ -3583,7 +3969,11 @@ settle_s=0
             &mut control,
             stop_camera_id,
             HostCommandOutcome::RecordingFinalized {
-                actual_raw_path: "/tmp/a2-step.raw".into(),
+                actual_raw_path: Path::new(&expected_output_folder)
+                    .join(&measurement_id)
+                    .join("step.raw")
+                    .to_string_lossy()
+                    .into_owned(),
                 size: 1,
                 sha256: "12".repeat(32),
                 duration_us: 4_000,
@@ -4424,7 +4814,7 @@ comparator_threshold_dac=500
             plugin_at_finalization("sidecar-io", TriggerValidation::OfflineReview);
         let blocked = Path::new(&plugin.output_folder).join("not-a-directory");
         std::fs::write(&blocked, b"blocked").unwrap();
-        plugin.output_folder = blocked.display().to_string();
+        plugin.run.as_mut().unwrap().output_root = blocked;
         plugin.finish_point(&mut control, &raw_finalized());
         assert!(plugin
             .run
@@ -4598,6 +4988,463 @@ comparator_threshold_dac=500
             path.is_file(),
             "point evidence must exist before acquisition"
         );
+    }
+    fn waiting_camera(label: &str) -> (StageAA2Plugin, MockControl) {
+        let (mut plugin, mut control) =
+            plugin_at_finalization(label, TriggerValidation::OfflineReview);
+        let run = plugin.run.as_mut().unwrap();
+        run.phase = Phase::Settle;
+        run.pending = None;
+        run.deadline_ms = 0;
+        run.next_renew_ms = u64::MAX;
+        plugin.drive(&mut control);
+        (plugin, control)
+    }
+
+    #[test]
+    fn camera_and_pd_use_the_same_frozen_root_even_if_the_owner_folder_changes() {
+        let (mut plugin, mut control) = waiting_camera("frozen-root");
+        let HostCommand::StartRecording {
+            root_dir: Some(root),
+            base_path,
+            ..
+        } = control.hosts.last().unwrap().command.clone()
+        else {
+            panic!("missing explicit root")
+        };
+        assert!(Path::new(&root).is_absolute());
+        let raw = Path::new(&root).join(&base_path);
+        plugin.photodiode.as_mut().unwrap().data_dir = Some("/different/owner/folder".into());
+        let id = control.hosts.last().unwrap().request_id;
+        plugin.host_reply(
+            &mut control,
+            id,
+            HostCommandOutcome::RecordingStarted {
+                actual_raw_path: raw.to_string_lossy().into_owned(),
+                started_at: "now".into(),
+            },
+        );
+        let request: PhotodiodeRequestV1 =
+            serde_json::from_value(control.services.last().unwrap().payload.clone()).unwrap();
+        let PhotodiodeCommandV1::BeginRecording { specification } = request.command else {
+            panic!("not a PD start")
+        };
+        assert_eq!(specification.root_dir.as_deref(), Some(root.as_str()));
+        assert_eq!(
+            Path::new(&root).join(&specification.pdq_path).parent(),
+            raw.parent()
+        );
+        let sidecar = raw.with_extension("a2.json");
+        let value: Value = serde_json::from_slice(&std::fs::read(sidecar).unwrap()).unwrap();
+        assert_eq!(
+            value["evidence"]["raw_path"],
+            raw.to_string_lossy().as_ref()
+        );
+        assert_eq!(value["evidence"]["acquisition_complete"], false);
+    }
+
+    #[test]
+    fn an_old_host_ignoring_the_root_is_stopped_before_pd_start() {
+        let (mut plugin, mut control) = waiting_camera("wrong-host-root");
+        let id = control.hosts.last().unwrap().request_id;
+        let wrong = test_folder("wrong-raw-location");
+        std::fs::create_dir_all(&wrong).unwrap();
+        plugin.host_reply(
+            &mut control,
+            id,
+            HostCommandOutcome::RecordingStarted {
+                actual_raw_path: wrong.join("recording.raw").to_string_lossy().into_owned(),
+                started_at: "now".into(),
+            },
+        );
+        assert!(plugin.run.as_ref().unwrap().stop);
+        assert!(plugin
+            .run
+            .as_ref()
+            .unwrap()
+            .abort_reason
+            .as_ref()
+            .unwrap()
+            .contains("outside the measurement folder"));
+        assert!(matches!(
+            control.hosts.last().unwrap().command,
+            HostCommand::StopRecording
+        ));
+        assert!(!control
+            .services
+            .iter()
+            .any(
+                |r| serde_json::from_value::<PhotodiodeRequestV1>(r.payload.clone())
+                    .is_ok_and(|r| matches!(r.command, PhotodiodeCommandV1::BeginRecording { .. }))
+            ));
+    }
+
+    #[test]
+    fn rejected_camera_start_does_not_stop_an_unrelated_recording() {
+        let (mut plugin, mut control) = waiting_camera("camera-busy");
+        let id = control.hosts.last().unwrap().request_id;
+        let host_count = control.hosts.len();
+        plugin.host_reply(
+            &mut control,
+            id,
+            HostCommandOutcome::Rejected {
+                code: "recording_busy".into(),
+                message: "another recording is active".into(),
+            },
+        );
+        assert!(!plugin.run.as_ref().unwrap().camera_recording);
+        assert!(!control.hosts[host_count..]
+            .iter()
+            .any(|r| matches!(r.command, HostCommand::StopRecording)));
+    }
+
+    #[test]
+    fn measurement_id_is_preserved_and_repeated_runs_do_not_overwrite() {
+        let mut plugin = ready_plugin("repeat-id");
+        plugin
+            .set_setting("measurement_id", json!("A2-Atto647-test"))
+            .unwrap();
+        let mut control = MockControl::default();
+        plugin.begin(&mut control);
+        plugin.prepare(&mut control);
+        let first = plugin.run.as_ref().unwrap().run_id.clone();
+        plugin.write_sidecar().unwrap();
+        let path = plugin
+            .run
+            .as_ref()
+            .unwrap()
+            .output_root
+            .join(&plugin.measurement_id)
+            .join(format!("{first}.a2.json"));
+        plugin.finish_run();
+        let before = std::fs::read(&path).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        plugin.begin(&mut control);
+        plugin.prepare(&mut control);
+        plugin.write_sidecar().unwrap();
+        assert_eq!(plugin.measurement_id, "A2-Atto647-test");
+        assert_ne!(plugin.run.as_ref().unwrap().run_id, first);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn unsafe_or_reserved_measurement_ids_refuse_before_hardware() {
+        for (i, id) in ["../escape", "a/b", "C:\\data", "CON", "LPT1", "nul"]
+            .iter()
+            .enumerate()
+        {
+            let mut plugin = ready_plugin(&format!("id-validation-{i}"));
+            plugin.measurement_id = (*id).into();
+            let mut control = MockControl::default();
+            plugin.begin(&mut control);
+            assert!(plugin.run.is_none(), "accepted {id}");
+            assert!(control.hosts.is_empty() && control.services.is_empty());
+        }
+    }
+
+    #[test]
+    fn active_measurement_settings_are_frozen() {
+        let (mut plugin, _) = waiting_camera("settings-frozen");
+        for key in ["measurement_id", "output_folder", "protocol_path", "new_id"] {
+            assert!(plugin.set_setting(key, json!("replacement")).is_err());
+        }
+        let id = plugin.run.as_ref().unwrap().run_id.clone();
+        plugin.reset();
+        assert_eq!(
+            plugin.run.as_ref().unwrap().run_id,
+            id,
+            "host reset lost active acquisition"
+        );
+    }
+
+    #[test]
+    fn rest_time_counts_down_only_timed_phases_and_excludes_pauses() {
+        let mut plugin = ready_plugin("eta");
+        let mut control = MockControl::default();
+        plugin.begin(&mut control);
+        let run = plugin.run.as_mut().unwrap();
+        let expected: f64 = run.protocol.points.iter().map(point_seconds).sum();
+        run.phase = Phase::Paused;
+        assert_eq!(remaining_seconds(run, 0), expected);
+        assert_eq!(remaining_seconds(run, 1_000_000), expected);
+        run.phase = Phase::Recording;
+        run.deadline_ms = 500;
+        let later = point_seconds(&run.protocol.points[1]);
+        assert!((remaining_seconds(run, 100) - (0.4 + later)).abs() < 1e-9);
+        assert!((remaining_seconds(run, 400) - (0.1 + later)).abs() < 1e-9);
+        run.phase = Phase::RestoreCamera;
+        assert_eq!(remaining_seconds(run, 0), 0.0);
+    }
+
+    #[test]
+    fn loading_a_protocol_shows_its_duration_before_start() {
+        let mut plugin = ready_plugin("preview-estimate");
+        plugin
+            .set_setting("protocol_path", json!(plugin.protocol_path))
+            .unwrap();
+        let status = format!("{:?}", plugin.status_entries());
+        assert!(
+            status.contains("2 points") && status.contains("manual pauses"),
+            "{status}"
+        );
+        assert!(plugin.run.is_none());
+    }
+
+    #[test]
+    fn pending_modulation_is_polled_with_unchanged_identity_and_timeout() {
+        let mut plugin = ready_plugin("poll-command");
+        let mut control = MockControl::default();
+        plugin.begin(&mut control);
+        let id = control.hosts.last().unwrap().request_id;
+        plugin.host_reply(&mut control, id, applied_camera_outcome());
+        let original = control.services.last().unwrap().clone();
+        let pending = plugin.run.as_ref().unwrap().pending;
+        plugin.run.as_mut().unwrap().last_mod_poll_ms = 0;
+        plugin.finish_async_mod(&mut control);
+        let poll = control.services.last().unwrap();
+        assert_eq!(poll.request_id, original.request_id);
+        assert_eq!(poll.payload, original.payload);
+        assert_eq!(plugin.run.as_ref().unwrap().pending, pending);
+        let count = control.services.len();
+        plugin.finish_async_mod(&mut control);
+        assert_eq!(control.services.len(), count, "poll must be throttled");
+    }
+
+    #[test]
+    fn another_clients_snapshot_cannot_abort_a_pending_command() {
+        use stage_a_plugin_contract::{
+            ControllerStateV1, OwnerInstanceId, ResponseCommonV1, CONTRACT_VERSION_V1,
+        };
+        let mut plugin = ready_plugin("snapshot-collision");
+        let mut control = MockControl::default();
+        plugin.begin(&mut control);
+        let id = control.hosts.last().unwrap().request_id;
+        plugin.host_reply(&mut control, id, applied_camera_outcome());
+        let pending = plugin.run.as_ref().unwrap().pending;
+        let response = ModulationResponseV1 {
+            common: ResponseCommonV1 {
+                contract_version: CONTRACT_VERSION_V1,
+                request_id: RequestId(pending.unwrap().1),
+                owner_instance: OwnerInstanceId::new(
+                    plugin
+                        .run
+                        .as_ref()
+                        .unwrap()
+                        .resolved
+                        .modulation_owner_instance
+                        .clone(),
+                ),
+                run_id: Some(RunId::new("different-workflow")),
+                requested_revision: None,
+                acknowledged_revision: None,
+                outcome: RequestOutcomeV1::Applied,
+                completed_at_unix_ms: Some(now_ms()),
+                error: None,
+            },
+            controller_state: ControllerStateV1::Running,
+            acknowledged_target: None,
+            marker_diagnostics: None,
+        };
+        plugin.modulation.as_mut().unwrap().last_response = Some(response);
+        plugin.finish_async_mod(&mut control);
+        assert_eq!(plugin.run.as_ref().unwrap().pending, pending);
+        assert!(!plugin.run.as_ref().unwrap().stop);
+        let response = plugin
+            .modulation
+            .as_mut()
+            .unwrap()
+            .last_response
+            .as_mut()
+            .unwrap();
+        response.common.run_id = Some(RunId::new(
+            plugin.run.as_ref().unwrap().lease_run_id.clone(),
+        ));
+        plugin.finish_async_mod(&mut control);
+        assert_eq!(plugin.run.as_ref().unwrap().phase, Phase::AcquirePd);
+    }
+
+    #[test]
+    fn completed_capture_and_progress_survive_cleanup() {
+        let (mut plugin, mut control) =
+            plugin_at_finalization("progress-capture", TriggerValidation::OfflineReview);
+        plugin.finish_point(&mut control, &raw_finalized());
+        let run = plugin.run.as_ref().unwrap();
+        let sidecar = run
+            .output_root
+            .join(&run.measurement_id)
+            .join(format!("{}.a2.json", run.run_id));
+        let journal = run
+            .output_root
+            .join(&run.measurement_id)
+            .join(format!("{}_progress.jsonl", run.attempt_id));
+        assert_eq!(run.completed_points, 1);
+        plugin.finish_run();
+        let value: Value = serde_json::from_slice(&std::fs::read(sidecar).unwrap()).unwrap();
+        assert_eq!(value["evidence"]["acquisition_complete"], true);
+        assert_eq!(value["protocol_row"], 2);
+        let events: Vec<Value> = std::fs::read_to_string(journal)
+            .unwrap()
+            .lines()
+            .map(|s| serde_json::from_str(s).unwrap())
+            .collect();
+        assert!(events.iter().any(|v| v["event"] == "point_finished"));
+        assert_eq!(events.last().unwrap()["event"], "run_finished");
+        assert_eq!(events.last().unwrap()["completed_points"], 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_measurement_directory_refuses_before_hardware() {
+        let mut plugin = ready_plugin("symlink-directory");
+        let outside = test_folder("outside-directory");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(
+            &outside,
+            Path::new(&plugin.output_folder).join(&plugin.measurement_id),
+        )
+        .unwrap();
+        let mut control = MockControl::default();
+        plugin.begin(&mut control);
+        assert!(plugin.run.is_none());
+        assert!(control.hosts.is_empty());
+        assert_eq!(std::fs::read_dir(outside).unwrap().count(), 0);
+    }
+    fn save_completed_row(plugin: &mut StageAA2Plugin, index: usize) {
+        let run = plugin.run.as_mut().unwrap();
+        run.index = index;
+        run.run_id = format!("{}_r{:03}_saved", run.measurement_id, index + 1);
+        let dir = run.output_root.join(&run.measurement_id);
+        let mut paths = Vec::new();
+        for suffix in ["raw", "toml", "pdq", "pd.json"] {
+            let name = format!("{}.{}", run.run_id, suffix);
+            std::fs::write(dir.join(&name), b"recorded").unwrap();
+            paths.push(format!(r"C:\old\{name}"));
+        }
+        run.evidence.raw_path = Some(paths[0].clone());
+        run.evidence.camera_configuration_sidecar_path = Some(paths[1].clone());
+        run.evidence.pdq_path = Some(paths[2].clone());
+        run.evidence.pd_sidecar_path = Some(paths[3].clone());
+        run.evidence.acquisition_complete = true;
+        plugin.write_sidecar().unwrap();
+    }
+
+    #[test]
+    fn resume_requires_same_protocol_and_complete_local_artifacts() {
+        let mut plugin = ready_plugin("resume-evidence");
+        plugin.begin(&mut MockControl::default());
+        save_completed_row(&mut plugin, 1);
+        let run = plugin.run.as_ref().unwrap();
+        let dir = run.output_root.join(&run.measurement_id);
+        let scan = || {
+            crate::resume::completed(
+                &dir,
+                &run.measurement_id,
+                &run.protocol_sha256,
+                &run.protocol,
+            )
+            .unwrap()
+        };
+        assert_eq!(scan(), BTreeSet::from([1]));
+        assert!(
+            crate::resume::completed(&dir, &run.measurement_id, "changed", &run.protocol)
+                .unwrap()
+                .is_empty()
+        );
+        let pd = dir.join(format!("{}.pdq", run.run_id));
+        std::fs::write(&pd, b"").unwrap();
+        assert!(scan().is_empty());
+        std::fs::remove_file(pd).unwrap();
+        assert!(scan().is_empty());
+    }
+
+    #[test]
+    fn resume_skips_gaps_without_renumbering_and_all_complete_needs_no_hardware() {
+        let mut plugin = ready_plugin("resume-gaps");
+        plugin.begin(&mut MockControl::default());
+        save_completed_row(&mut plugin, 1);
+        // Remove the current journal so this test can restart within the same millisecond.
+        let run = plugin.run.take().unwrap();
+        std::fs::remove_file(
+            run.output_root
+                .join(&run.measurement_id)
+                .join(format!("{}_progress.jsonl", run.attempt_id)),
+        )
+        .unwrap();
+        let mut control = MockControl::default();
+        plugin.begin(&mut control);
+        let run = plugin.run.as_ref().unwrap();
+        assert_eq!(run.index, 0);
+        assert_eq!(run.resumed_points, BTreeSet::from([1]));
+        assert_eq!(
+            remaining_seconds(run, 0),
+            point_seconds(&run.protocol.points[0])
+        );
+        assert!(run.resume_pause);
+        save_completed_row(&mut plugin, 0);
+        let run = plugin.run.take().unwrap();
+        std::fs::remove_file(
+            run.output_root
+                .join(&run.measurement_id)
+                .join(format!("{}_progress.jsonl", run.attempt_id)),
+        )
+        .unwrap();
+        plugin.modulation = None;
+        plugin.sensor = None;
+        let mut control = MockControl::default();
+        plugin.begin(&mut control);
+        assert!(plugin.run.is_none(), "{}", plugin.message);
+        assert!(
+            plugin.message.contains("already complete"),
+            "{}",
+            plugin.message
+        );
+        assert!(control.hosts.is_empty() && control.services.is_empty());
+    }
+
+    #[test]
+    fn stop_during_camera_start_does_not_start_photodiode() {
+        let (mut plugin, mut control) = waiting_camera("stop-opening");
+        plugin.stop_pending = true;
+        let run = plugin.run.as_ref().unwrap();
+        let path = run
+            .output_root
+            .join(&run.measurement_id)
+            .join(format!("{}.raw", run.run_id));
+        let id = control.hosts.last().unwrap().request_id;
+        let services_before = control.services.len();
+        plugin.host_reply(
+            &mut control,
+            id,
+            HostCommandOutcome::RecordingStarted {
+                actual_raw_path: path.to_string_lossy().into_owned(),
+                started_at: "now".into(),
+            },
+        );
+        assert_eq!(control.services.len(), services_before);
+        assert!(matches!(
+            control.hosts.last().unwrap().command,
+            HostCommand::StopRecording
+        ));
+        assert!(!plugin.run.as_ref().unwrap().evidence.acquisition_complete);
+    }
+    #[test]
+    fn advancing_skips_completed_rows_and_keeps_crossed_manual_pause() {
+        let mut plugin = ready_plugin("resume-advance");
+        let mut control = MockControl::default();
+        plugin.begin(&mut control);
+        let run = plugin.run.as_mut().unwrap();
+        run.protocol.points.push(run.protocol.points[1].clone());
+        run.protocol.points[1].pause_before = true;
+        run.protocol.points[2].pause_before = false;
+        run.resumed_points = BTreeSet::from([1]);
+        run.index = 0;
+        run.pending = None;
+        plugin.advance(&mut control);
+        let run = plugin.run.as_ref().unwrap();
+        assert_eq!(run.index, 2);
+        assert_eq!(run.completed_points, 1);
+        assert_eq!(run.phase, Phase::Paused);
+        assert!(run.run_id.contains("_r003_"));
     }
 }
 

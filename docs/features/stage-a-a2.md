@@ -56,10 +56,10 @@ clock/edge ordinal alone.
 
 ## Acquisition contract
 
-The panel asks for the protocol. The runner creates the measurement ID, uses the
-PD owner's data folder and archives the exact TOML by SHA-256. The host may put RAW
-in its own output folder; the A2 sidecar stores the returned absolute path and
-links camera-configuration and sensor-monitoring companions. Keep both folders.
+The panel accepts a protocol and a measurement ID. It uses the PD owner's data
+folder and archives the exact TOML by SHA-256. Camera RAW, camera configuration,
+PDQ and both acquisition sidecars must remain together under `<data folder>/<ID>`.
+The host receives this explicit root; A2 checks the returned paths before continuing.
 
 Applied optical lobe/calibration, PD placement (`emission_path`), splitter fraction
 (0.5), gain/load and selected reference ID come from the owners (ADR 040). No manual
@@ -146,3 +146,66 @@ See [ADR 041](../adr/041-stage-a-a2-drive-sync-capture.md) for the compatibility
 A2 uses the shared queued controller service and retains its existing completion, integrity and cleanup checks. Initial point metadata is now written before camera start. A write failure ends preparation through normal cleanup. Return to A1 restores running ADC acquisition even when A2 drive-sync left the controller in A1 mode but stopped.
 
 See [ADR 046](../adr/046-stage-a-command-completion-and-record-preservation.md) for the contract and Windows bench verification.
+
+## Consistent recording workflow (2026-09-08)
+
+A2 now follows the A1 interaction pattern: Measurement id, New id, Protocol,
+Run protocol, Continue and Stop. A blank id is generated at start. A supplied id
+names the subfolder and is retained for subsequent runs. Each run adds its own
+timestamp to point filenames and a separate progress journal, so repeating a
+protocol under one measurement id does not overwrite the earlier run.
+Ids accept up to 100 ASCII letters/digits, hyphens and underscores; Windows device
+names are refused before hardware commands. Measurement settings cannot change
+while a run is active. Continue is offered only at a manual pause.
+
+The photodiode's chosen data folder is resolved once to an absolute root. Camera
+StartRecording and PD BeginRecording receive that same root. A2 verifies the
+actual camera/PD parent directories before starting the stimulus and stores the
+opened paths immediately. A host that ignores the root is stopped before PD
+acquisition instead of silently splitting the files. The required generic host
+change is documented in augur-rs ADR 028. **Install a matching host and plugin
+build; this fix cannot be deployed by replacing the A2 DLL alone.** A1 also passes
+its selected root and retains its historical post-finalization collection fallback.
+
+Loading a valid protocol shows its acquisition-plus-settling duration. During a
+run the status shows point count, completed recordings, output folder and remaining
+timed duration. The current recording/settle timer counts down. Manual pause time,
+controller acknowledgement/auto-comparator qualification and disk finalization
+are not predicted; they are explicitly additional time. Zero remaining timed
+seconds during cleanup does not mean the files have finished closing.
+
+Modulation requests that report InProgress are polled with the same request id and
+revision, at most five times per second, against the owner's retained completion
+history. The original deadline is retained. A status response for another run is
+ignored. A host preview reset does not erase an active acquisition. Explicit camera
+start rejection does not send StopRecording for a different recording.
+
+Each invocation writes `<timestamp>_progress.jsonl` in its measurement folder.
+It retains run start, point start/final result, run completion, paths and failure
+or cleanup details. Point JSON is replaced atomically after syncing a temporary
+file, so a failed update preserves the last complete version. The evidence field
+`acquisition_complete` is separate from `valid` and offline scientific status:
+preview timing warnings do not turn an intact offline capture into a failed file.
+Hardware/recording failures remain visible and stop the run through cleanup.
+
+Tests cover full dark/step completion, root disagreement, changed owner settings,
+metadata preservation, repeated ids, asynchronous completion identity, reset,
+manual pauses, timing countdown and cleanup evidence. Windows USB/camera timing
+still requires a short saved RAW/PDQ pair on the laboratory computer.
+
+## Automatic continuation
+
+Run with the same measurement ID and unchanged protocol to resume. A2 checks the
+existing folder before acquiring hardware. It skips only original row numbers with
+matching protocol SHA-256, matching point data, explicit `acquisition_complete`
+and all four nonempty local artifacts (RAW, camera TOML, PDQ, PD JSON). Repeated
+conditions remain separate protocol rows. Missing, partial or legacy records without
+explicit completion are acquired again; existing files are kept with unique attempt
+names. Offline timing warnings do not by themselves require a repeat.
+
+The display counts reused and newly acquired rows and estimates the remaining
+acquisition and settling time. A completed protocol makes no hardware requests.
+On resume, confirm the optical path for the first missing point; pauses crossed by
+skipped rows are retained at the next acquired point. This prevents a saved dark or
+blocked-drive reference from silently leaving the next measurement in the wrong
+physical state. Resume verifies file presence, not a full offline integrity analysis.

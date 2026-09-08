@@ -890,6 +890,7 @@ struct ProtocolRun {
     source_path: String,
     source_sha256: String,
     source_text: String,
+    reused: std::collections::BTreeSet<usize>,
     phase: ProtocolPhase,
     index: usize,
     lease_id: LeaseId,
@@ -939,6 +940,16 @@ struct ProtocolRun {
 }
 
 impl ProtocolRun {
+    fn remaining_seconds(&self) -> f64 {
+        self.plan
+            .points
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index >= self.index && !self.reused.contains(index))
+            .map(|(_, point)| point.duration_s as f64 + point.settle_s)
+            .sum()
+    }
+
     fn point(&self) -> Option<&protocol::ProtocolPoint> {
         self.plan.points.get(self.index)
     }
@@ -2548,6 +2559,7 @@ impl StageAA1Plugin {
             command: HostCommand::StartRecording {
                 run_id: stem.clone(),
                 base_path: format!("{subdir}/{stem}.raw"),
+                root_dir: Some(self.recording.folder.clone()),
                 metadata,
             },
         });
@@ -2747,13 +2759,9 @@ impl StageAA1Plugin {
 
     /// Collects the finalized artifacts into `<output folder>/<measurement id>/`.
     ///
-    /// The camera RAW and the PDQ are written by two other owners against their
-    /// own roots — the host resolves plugin recording paths below *its* output
-    /// directory and rejects absolute ones, and the photodiode resolves PDQ
-    /// paths below *its* data directory. Left alone, one measurement scatters
-    /// across up to three unrelated folders. Both files are closed and hashed
-    /// by the time their receipts arrive, so moving them here is safe and makes
-    /// this plugin's output folder authoritative for the whole measurement.
+    /// Both owners receive the chosen recording root. Older hosts can ignore
+    /// that optional field and use their own directory, so retain the existing
+    /// collection step as a fallback after both files are closed and hashed.
     fn gather_into_measurement_folder(&mut self) {
         let dir = PathBuf::from(&self.recording.folder).join(&self.recording.id);
         if std::fs::create_dir_all(&dir).is_err() {
@@ -4687,19 +4695,6 @@ impl StageAA1Plugin {
             self.message = "Choose a protocol file first".into();
             return;
         }
-        if !self.modulation_connected() {
-            self.message =
-                "The modulation plugin is not connected — connect it to drive the protocol".into();
-            return;
-        }
-        if let Some(blocker) = self.photodiode_blocker() {
-            self.message = blocker;
-            return;
-        }
-        if let Some(blocker) = self.direct_dark_reference_blocker() {
-            self.message = format!("Protocol refused: {blocker}");
-            return;
-        }
         let text = match std::fs::read_to_string(&path) {
             Ok(text) => text,
             Err(error) => {
@@ -4715,6 +4710,41 @@ impl StageAA1Plugin {
             }
         };
         let source_sha256 = format!("{:x}", Sha256::digest(text.as_bytes()));
+        let id = self.ensure_measurement_id();
+        let folder = Path::new(self.output_folder.trim()).join(&id);
+        let reused = match completed_protocol_rows(&folder, &id, &source_sha256, plan.points.len())
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                self.message = format!("Cannot inspect measurement folder: {error}");
+                return;
+            }
+        };
+        let remaining = plan.points.len() - reused.len();
+        if remaining == 0 {
+            self.message = format!(
+                "Protocol '{}': all {} points already complete; {} reused, 0 new, 0 missing",
+                plan.name,
+                plan.points.len(),
+                reused.len()
+            );
+            return;
+        }
+        self.loaded_key = None;
+        self.scan_measurement_folder();
+        if !self.modulation_connected() {
+            self.message =
+                "The modulation plugin is not connected — connect it to drive the protocol".into();
+            return;
+        }
+        if let Some(blocker) = self.photodiode_blocker() {
+            self.message = blocker;
+            return;
+        }
+        if let Some(blocker) = self.direct_dark_reference_blocker() {
+            self.message = format!("Protocol refused: {blocker}");
+            return;
+        }
         // A fixed protocol records commanded points for offline analysis. A
         // live window from the previous frequency cannot qualify the next one.
         let highest = plan
@@ -4756,9 +4786,20 @@ impl StageAA1Plugin {
 
         let (means, frequencies, depths) = plan.axis_counts();
         let total = plan.points.len();
-        let bench_time = format_bench_time(plan.total_seconds());
+        let bench_time = format_bench_time(
+            plan.points
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| !reused.contains(index))
+                .map(|(_, point)| point.duration_s as f64 + point.settle_s)
+                .sum(),
+        );
+        let first_missing = (0..total)
+            .find(|index| !reused.contains(index))
+            .unwrap_or(total);
+        let reused_count = reused.len();
         self.message = format!(
-            "Protocol '{}': {total} recordings ({means} × ū, {frequencies} × f, {depths} × a), \
+            "Protocol '{}': {total} points, {reused_count} reused, 0 new, {remaining} missing ({means} × ū, {frequencies} × f, {depths} × a), \
              about {bench_time} of bench time — preparing the camera and modulation lease…",
             plan.name
         );
@@ -4767,8 +4808,9 @@ impl StageAA1Plugin {
             source_path: path,
             source_sha256,
             source_text: text,
+            reused,
             phase,
-            index: 0,
+            index: first_missing,
             lease_id,
             lease_granted: false,
             lease_req: 0,
@@ -5081,6 +5123,9 @@ impl StageAA1Plugin {
             return;
         };
         run.index += 1;
+        while run.reused.contains(&run.index) {
+            run.index += 1;
+        }
         run.point_retries = 0;
         run.last_activity_ms = now_unix_ms();
         if run.index < run.plan.points.len() && !run.stop_requested {
@@ -5093,9 +5138,11 @@ impl StageAA1Plugin {
             run.failed.clone(),
             run.plan.points.len(),
         );
+        let reused = run.reused.len();
+        let missing = total.saturating_sub(reused + recorded);
         let stopped = run.stop_requested;
         let mut message = format!(
-            "Protocol '{name}' {}: {recorded}/{total} recorded",
+            "Protocol '{name}' {}: {recorded}/{total} recorded, {reused} reused, {recorded} new, {missing} missing",
             if stopped { "stopped" } else { "finished" }
         );
         if !failed.is_empty() {
@@ -6845,6 +6892,99 @@ fn sibling_toml(raw_path: &str) -> Option<String> {
     Some(parent.join(format!("{stem}.toml")).display().to_string())
 }
 
+/// Find explicitly completed original rows with their artifacts in the selected folder.
+fn completed_protocol_rows(
+    folder: &Path,
+    id: &str,
+    sha256: &str,
+    total: usize,
+) -> Result<std::collections::BTreeSet<usize>, String> {
+    let mut rows = std::collections::BTreeSet::new();
+    if std::fs::symlink_metadata(folder).is_ok_and(|m| !m.is_dir()) {
+        return Err("measurement folder must be a real directory".into());
+    }
+    let entries = match std::fs::read_dir(folder) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(rows),
+        Err(error) => return Err(error.to_string()),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.ends_with("_config.toml")
+            || !entry.file_type().map_err(|e| e.to_string())?.is_file()
+        {
+            continue;
+        }
+        let Some(doc) = std::fs::read_to_string(entry.path())
+            .ok()
+            .and_then(|text| toml::from_str::<toml::Value>(&text).ok())
+        else {
+            continue;
+        };
+        if doc
+            .get("acquisition_complete")
+            .and_then(toml::Value::as_bool)
+            != Some(true)
+            || doc.get("acquisition_failure").is_some()
+            || doc.get("schema").and_then(toml::Value::as_str) != Some("stage-a.a1.sidecar.v2")
+            || doc.get("measurement_id").and_then(toml::Value::as_str) != Some(id)
+            || doc.get("file_stem").and_then(toml::Value::as_str)
+                != name.strip_suffix("_config.toml")
+        {
+            continue;
+        }
+        let Some(protocol) = doc.get("protocol") else {
+            continue;
+        };
+        if protocol.get("source_sha256").and_then(toml::Value::as_str) != Some(sha256)
+            || protocol
+                .get("point_total")
+                .and_then(toml::Value::as_integer)
+                != Some(total as i64)
+        {
+            continue;
+        }
+        let Some(index) = protocol
+            .get("point_index")
+            .and_then(toml::Value::as_integer)
+            .filter(|index| *index > 0 && *index <= total as i64)
+        else {
+            continue;
+        };
+        let Some(files) = doc.get("files") else {
+            continue;
+        };
+        // Copied Windows datasets retain their original absolute paths. Only
+        // evidence inside the selected folder counts, never the old location.
+        let complete = [
+            "camera_raw",
+            "camera_config_sidecar",
+            "photodiode_pdq",
+            "photodiode_sidecar",
+        ]
+        .iter()
+        .all(|key| {
+            let Some(path) = files.get(*key).and_then(toml::Value::as_str) else {
+                return false;
+            };
+            let Some(name) = path
+                .rsplit(['/', '\\'])
+                .next()
+                .filter(|name| !name.is_empty() && *name != "." && *name != "..")
+            else {
+                return false;
+            };
+            std::fs::symlink_metadata(folder.join(name))
+                .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
+        });
+        if complete {
+            rows.insert(index as usize - 1);
+        }
+    }
+    Ok(rows)
+}
+
 /// Parses the newest config sidecar in `folder` for measurement `id` whose stem
 /// carries `role_tag` (e.g. `_pilot`). Filenames embed a sortable timestamp, so
 /// the lexicographically largest matching name is the most recent.
@@ -8033,13 +8173,15 @@ impl Plugin for StageAA1Plugin {
             // by the first point's own line, so an operator who looked away had
             // no way to see how long the survey still runs.
             entries.push(StatusEntry::Text(format!(
-                "Protocol '{}': point {}/{} — {} recorded, {} skipped, about {} of bench time left",
+                "Protocol '{}': point {}/{} — {} reused, {} new, {} missing, {} skipped, about {} of bench time left",
                 run.plan.name,
                 (run.index + 1).min(run.plan.points.len()),
                 run.plan.points.len(),
+                run.reused.len(),
                 run.recorded,
+                run.plan.points.len().saturating_sub(run.reused.len() + run.recorded),
                 run.failed.len(),
-                format_bench_time(run.plan.remaining_seconds(run.index)),
+                format_bench_time(run.remaining_seconds()),
             )));
             // The per-point message is overwritten within the tick that skips a
             // point, so the most recent reason lives here instead of scrolling
@@ -11235,6 +11377,124 @@ mean_u = [0.4, 0.6]
 frequency_hz = 25.0
 depth_a = 0.7
 "#;
+
+    fn saved_protocol_row(folder: &Path, source: &str, index: usize, total: usize) -> PathBuf {
+        let folder = folder.join("A1-proto");
+        std::fs::create_dir_all(&folder).unwrap();
+        let stem = format!("A1-proto_row{index}");
+        let mut files = toml::map::Map::new();
+        for (key, extension) in [
+            ("camera_raw", "raw"),
+            ("camera_config_sidecar", "toml"),
+            ("photodiode_pdq", "pdq"),
+            ("photodiode_sidecar", "json"),
+        ] {
+            let name = format!("{stem}.{extension}");
+            std::fs::write(folder.join(&name), b"saved artifact").unwrap();
+            files.insert(key.into(), toml::Value::String(format!(r"C:\old\{name}")));
+        }
+        let path = folder.join(format!("{stem}_config.toml"));
+        let hash = format!("{:x}", Sha256::digest(source.as_bytes()));
+        let doc = toml::toml! {
+            schema = "stage-a.a1.sidecar.v2"
+            acquisition_complete = true
+            measurement_id = "A1-proto"
+            file_stem = stem
+            [protocol]
+            source_sha256 = hash
+            point_index = index
+            point_total = total
+        };
+        let mut doc = toml::Value::Table(doc);
+        doc.as_table_mut()
+            .unwrap()
+            .insert("files".into(), toml::Value::Table(files));
+        std::fs::write(&path, toml::to_string(&doc).unwrap()).unwrap();
+        path
+    }
+
+    #[test]
+    fn protocol_resume_keeps_gaps_and_original_indices() {
+        let folder = temp_folder("resume-gaps");
+        let source = THREE_POINT_PROTOCOL.replace("[0.4, 0.6, 0.8]", "[0.4, 0.4, 0.4, 0.4]");
+        let (mut plugin, _) = protocol_plugin(&folder, &source);
+        saved_protocol_row(&folder, &source, 1, 4);
+        saved_protocol_row(&folder, &source, 3, 4);
+        let mut sink = ControlSink::default();
+        plugin.begin_protocol(&mut sink);
+        let run = plugin.protocol.as_ref().unwrap();
+        assert_eq!(run.index, 1);
+        assert_eq!(run.remaining_seconds(), 6.0);
+        assert_eq!(run.reused.iter().copied().collect::<Vec<_>>(), vec![0, 2]);
+        plugin.advance_protocol(&mut sink);
+        assert_eq!(plugin.protocol.as_ref().unwrap().index, 3);
+        assert!(sink.services.iter().any(|request| matches!(
+            modulation_command(request),
+            Some(ModulationCommandV1::SetOperatingPoint { .. })
+        )));
+        let _ = std::fs::remove_dir_all(folder);
+    }
+
+    #[test]
+    fn protocol_resume_all_done_needs_no_hardware() {
+        let folder = temp_folder("resume-done");
+        let (mut plugin, _) = protocol_plugin(&folder, TWO_POINT_PROTOCOL);
+        for index in 1..=2 {
+            saved_protocol_row(&folder, TWO_POINT_PROTOCOL, index, 2);
+        }
+        plugin.modulation = None;
+        plugin.photodiode = None;
+        let mut sink = ControlSink::default();
+        plugin.begin_protocol(&mut sink);
+        assert!(plugin.protocol.is_none());
+        assert!(
+            plugin.message.contains("2 reused, 0 new, 0 missing"),
+            "{}",
+            plugin.message
+        );
+        assert!(sink.hosts.is_empty() && sink.services.is_empty());
+        let _ = std::fs::remove_dir_all(folder);
+    }
+
+    #[test]
+    fn protocol_resume_requires_exact_protocol_and_complete_local_evidence() {
+        let folder = temp_folder("resume-evidence");
+        let path = saved_protocol_row(&folder, TWO_POINT_PROTOCOL, 1, 2);
+        let original = std::fs::read_to_string(&path).unwrap();
+        let hash = format!("{:x}", Sha256::digest(TWO_POINT_PROTOCOL.as_bytes()));
+        let scan =
+            || completed_protocol_rows(&folder.join("A1-proto"), "A1-proto", &hash, 2).unwrap();
+        assert_eq!(scan().len(), 1);
+        assert!(
+            completed_protocol_rows(&folder.join("A1-proto"), "A1-proto", "changed", 2)
+                .unwrap()
+                .is_empty()
+        );
+        for replacement in [
+            "acquisition_complete = false",
+            "",
+            "acquisition_complete = true\nacquisition_failure = \"interrupted\"",
+        ] {
+            std::fs::write(
+                &path,
+                original.replace("acquisition_complete = true", replacement),
+            )
+            .unwrap();
+            assert!(scan().is_empty());
+        }
+        std::fs::write(&path, "malformed [").unwrap();
+        assert!(scan().is_empty());
+        std::fs::write(&path, &original).unwrap();
+        for extension in ["raw", "toml", "pdq", "json"] {
+            let artifact = folder.join(format!("A1-proto/A1-proto_row1.{extension}"));
+            std::fs::write(&artifact, b"").unwrap();
+            assert!(scan().is_empty());
+            std::fs::remove_file(&artifact).unwrap();
+            assert!(scan().is_empty());
+            std::fs::write(&artifact, b"saved artifact").unwrap();
+        }
+        let _ = std::fs::remove_dir_all(folder);
+    }
 
     #[test]
     fn protocol_identity_and_exact_source_are_archived_with_each_point() {

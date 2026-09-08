@@ -5,6 +5,7 @@
 //! Scientific latency fits remain offline.
 
 pub mod protocol;
+mod resume;
 mod runtime;
 
 pub use runtime::StageAA2Plugin;

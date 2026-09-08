@@ -4,7 +4,7 @@ Repository-level feature notes for larger plugin suites, interface migrations, a
 
 ## Available Briefs
 
-- [Stage-A command completion and record preservation](../adr/046-stage-a-command-completion-and-record-preservation.md) — confirmed commands, automatic A1 acquisition restart, durable metadata and Windows validation.
+- [Stage-A command completion and record preservation](../adr/046-stage-a-command-completion-and-record-preservation.md) — confirmed commands, common recording roots, consistent A1/A2 controls, durable metadata and Windows validation.
 
 - [Stage-A Bench Stack](./stage-a.md) — Teensy-driven Stage-A bench: two serial ports, two minimal plugins, and the shared `stage-a-io` library.
 - [Stage-A Modulation](./stage-a-modulation.md) — orthogonal Manual/Calibrated drive methods and five waveform modes under one hard DAC ceiling, applied immediately on the command port. The coupled `ū`/`a` controls **clamp into the achievable range instead of refusing**, so a leftover depth can no longer make an optical mode unselectable, and both live bounds are shown in the control labels (ADR 025). `V_peak` is the one operator-facing name for the lobe maximum; the half-wave span is derived and never entered. The undocumented TOML `MOD`-step protocol runner was removed — declarative recording protocols belong to A1 (ADR 027). Port discovery is platform-aware and shared with the photodiode plugin, so `auto` finds the Teensy on Windows' nameless `COMn` ports too (ADR 032).

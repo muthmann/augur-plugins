@@ -229,6 +229,24 @@ succeed.
 
 ### Protocol — a survey from a file (ADR 027)
 
+Starting a protocol inspects the selected output folder and measurement ID first.
+A point is reused only when its canonical `_config.toml` explicitly records
+`acquisition_complete = true`, no acquisition failure, the same exact protocol
+SHA-256, and its original one-based row and total. All four referenced artifacts
+(RAW, camera TOML, PDQ, and PD sidecar) must be nonempty regular files in that
+measurement folder. Copied Windows paths resolve by basename inside this folder;
+external files and symlinks do not qualify. Older metadata without explicit
+completion, malformed metadata, and incomplete recordings remain pending.
+
+Completed rows are skipped, including rows after gaps. Repeated identical rows
+remain distinct. The original protocol and row numbers stay unchanged. Status
+shows reused, newly recorded, and missing points; remaining time excludes reused
+points. If every point is complete, starting issues no hardware commands. Missing
+or unreadable measurement-folder listings stop the scan, except that a folder
+which does not yet exist starts a new acquisition. Acquisition completion is not
+scientific acceptance: reused data still require offline review.
+
+
 The four sweep buttons each move one axis and leave the others wherever they
 are. That is right for exploring and wrong for a survey: `I_k` could not be
 swept at all, and what a block recorded lived in the panel rather than in

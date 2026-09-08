@@ -614,6 +614,7 @@ impl StageAA4Plugin {
             command: HostCommand::StartRecording {
                 run_id: stem.clone(),
                 base_path: format!("{id}/{stem}.raw"),
+                root_dir: None,
                 metadata,
             },
         });
