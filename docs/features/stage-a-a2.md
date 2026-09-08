@@ -209,3 +209,8 @@ On resume, confirm the optical path for the first missing point; pauses crossed 
 skipped rows are retained at the next acquired point. This prevents a saved dark or
 blocked-drive reference from silently leaving the next measurement in the wrong
 physical state. Resume verifies file presence, not a full offline integrity analysis.
+
+The UI mirror does not own the active run. Continue and Stop therefore stay
+accessible in the panel; the live worker accepts Continue only at a manual pause
+and treats Stop with no active run as a no-op. An early Continue click is consumed
+and cannot acknowledge a later pause.

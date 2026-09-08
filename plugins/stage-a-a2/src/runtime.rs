@@ -2598,8 +2598,9 @@ impl Plugin for StageAA2Plugin {
                         SettingItem { key: "new_id".into(), label: "New id".into(), tooltip: None, kind: SettingKind::Button { enabled: self.run.is_none() } },
                         SettingItem { key: "protocol_path".into(), label: "Protocol".into(), tooltip: None, kind: SettingKind::Path { dialog: PathDialogKind::OpenFile, default: self.protocol_path.clone() } },
                         SettingItem { key: "run_protocol".into(), label: "Run protocol".into(), tooltip: None, kind: SettingKind::Button { enabled: self.run.is_none() } },
-                        SettingItem { key: "continue_run".into(), label: "Continue".into(), tooltip: None, kind: SettingKind::Button { enabled: self.run.as_ref().is_some_and(|r| r.phase == Phase::Paused) } },
-                        SettingItem { key: "stop_protocol".into(), label: "Stop".into(), tooltip: None, kind: SettingKind::Button { enabled: self.run.is_some() } },
+                        // The UI mirror has no Run. The live worker validates these actions.
+                        SettingItem { key: "continue_run".into(), label: "Continue".into(), tooltip: Some("Continue the current manual pause. Ignored when no pause is waiting.".into()), kind: SettingKind::Button { enabled: true } },
+                        SettingItem { key: "stop_protocol".into(), label: "Stop".into(), tooltip: None, kind: SettingKind::Button { enabled: true } },
                     ],
                 },
                 SettingsSection {
@@ -5445,6 +5446,45 @@ comparator_threshold_dac=500
         assert_eq!(run.completed_points, 1);
         assert_eq!(run.phase, Phase::Paused);
         assert!(run.run_id.contains("_r003_"));
+    }
+    #[test]
+    fn ui_mirror_keeps_continue_and_stop_accessible_without_worker_run_state() {
+        let mut mirror = StageAA2Plugin::default();
+        mirror.set_runtime_role(PluginRuntimeRole::UiMirror);
+        assert!(mirror.run.is_none());
+        let schema = mirror.settings_schema();
+        for key in ["continue_run", "stop_protocol"] {
+            let item = schema
+                .sections
+                .iter()
+                .flat_map(|s| &s.items)
+                .find(|item| item.key == key)
+                .unwrap();
+            assert!(
+                matches!(item.kind, SettingKind::Button { enabled: true }),
+                "{key} must be accessible in the UI mirror"
+            );
+        }
+    }
+
+    #[test]
+    fn continue_click_outside_a_pause_cannot_acknowledge_a_later_pause() {
+        let mut plugin = ready_plugin("continue-interlock");
+        let mut control = MockControl::default();
+        plugin.set_setting("continue_run", json!(1)).unwrap();
+        plugin.drive(&mut control);
+        assert!(!plugin.continue_pending);
+        assert!(control.hosts.is_empty() && control.services.is_empty());
+        plugin.begin(&mut control);
+        let run = plugin.run.as_mut().unwrap();
+        run.pending = None;
+        run.next_renew_ms = u64::MAX;
+        plugin.prepare(&mut control);
+        assert_eq!(plugin.run.as_ref().unwrap().phase, Phase::Paused);
+        plugin.set_setting("continue_run", json!(2)).unwrap();
+        plugin.drive(&mut control);
+        assert_ne!(plugin.run.as_ref().unwrap().phase, Phase::Paused);
+        assert!(plugin.run.as_ref().unwrap().pause_acknowledged);
     }
 }
 
