@@ -157,3 +157,9 @@ Overlays remain useful for supplemental 2D annotations, but the host now treats 
 - Keep each plugin focused on one analysis concern.
 - Reuse standard payloads where possible.
 - Document context keys, host views, and any calibration assumptions in the plugin README.
+
+## A1/A3 acquisition library
+
+`stage-a-sine-acquisition` owns the shared coordinator and A1 analysis helpers.
+The `stage-a-a1` and `stage-a-a3` crates only export their respective runtime entry
+points; neither links another runtime plugin. See [ADR 047](adr/047-shared-a1-a3-acquisition.md).

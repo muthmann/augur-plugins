@@ -310,3 +310,9 @@ for why an `a₀` gate refused and how Live analysis is distinguished from a
 missing trigger, and
 [docs/features/stage-a-a1-automation.md](../../docs/features/stage-a-a1-automation.md) for the
 planned amplitude-sweep automation on top of this.
+
+## Shared implementation
+
+The coordinator and pure analysis modules now live in `stage-a-sine-acquisition`;
+this crate preserves their public re-exports and the A1 runtime entry point. A3
+uses the same lifecycle with a separate identity and reduced protocol UI.

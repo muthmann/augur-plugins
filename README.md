@@ -61,6 +61,7 @@ The plugin crates under `plugins/` are under active development and not yet read
 | `stage-a-modulation` | control service | Sole owner of the Stage-A Teensy command port and ACKed modulation state |
 | `stage-a-photodiode` | control service | Sole owner of the Stage-A stream port, PDA1 ingestion, and PDQ persistence |
 | `stage-a-a1` | `RawEvents` + orchestration | A1 protocol/schedule validation, raw phase quicklooks, analysis core, and a safety-gated commissioning run through the two owner services |
+| `stage-a-a3` | `RawEvents` + orchestration | Shared A1 recorder with A3 identity, simple protocol controls and offline threshold metadata |
 
 `plugin-template/` is the starting point for new plugin crates.
 

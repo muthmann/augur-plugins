@@ -1,0 +1,35 @@
+schema = "stage-a.a3.sidecar.v2"
+acquisition_complete = false
+acquisition_failure = "Stopped before the planned duration; partial recording retained for offline review"
+scientific_status = "requires_offline_review"
+optical_unavailable = "the photodiode plugin is not reporting status — enable it and connect the detector"
+measurement_id = ""
+file_stem = ""
+role = "point"
+recorded_at_utc = "2026-09-08T20:35:47Z"
+finalized_at_utc = "2026-09-08T20:35:47Z"
+duration_s = 60
+
+[a3]
+experiment = "A3"
+analysis_mode = "offline_threshold"
+cutoff_qualified = false
+duration_complete = false
+
+[depth]
+analysis_source = "modulation_commanded"
+
+[sweep]
+min_a = 0.0
+max_a = 2.0
+
+[modulation]
+frequency_source = "modulation"
+
+[photodiode]
+
+[trigger]
+marker_anchored = false
+marker_count = 0
+
+[files]

@@ -44,17 +44,16 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use augur_plugin_api::{
-    export_plugin, CameraBiasOffsetsV1, CameraConfigurationProvenanceV1,
-    CameraConfigurationSnapshotV1, CameraConfigurationSourceV1, EventStoreHandle, FfiCdEvent,
-    GlobalSettings, HostCommand, HostCommandOutcome, HostCommandReply, HostCommandRequest,
-    HostContext, HostDatasetDescriptor, HostDatasetKind, HostOutput, HostViewDescriptor,
-    HostViewKind, HostViewPlacement, HostViewRegistry, PathDialogKind, Plugin, PluginCapabilities,
-    PluginControlContext, PluginControlInbox, PluginDiscontinuity, PluginFrame, PluginInput,
-    PluginRuntimeRole, PluginServiceOutcome, PluginServiceReply, PluginServiceRequest, RoiV1,
-    SensorBiasReadbackV1, SensorMonitoringV1, Series1dLine, Series1dPoint, Series1dV1, SettingItem,
-    SettingKind, SettingsSchema, SettingsSection, StatusEntry, TableColumn, TableColumnData,
-    TableColumnValues, TableDatasetV1, TableSchema, TableValueType, CTX_GLOBAL_SETTINGS,
-    CTX_SENSOR_MONITORING,
+    CameraBiasOffsetsV1, CameraConfigurationProvenanceV1, CameraConfigurationSnapshotV1,
+    CameraConfigurationSourceV1, EventStoreHandle, FfiCdEvent, GlobalSettings, HostCommand,
+    HostCommandOutcome, HostCommandReply, HostCommandRequest, HostContext, HostDatasetDescriptor,
+    HostDatasetKind, HostOutput, HostViewDescriptor, HostViewKind, HostViewPlacement,
+    HostViewRegistry, PathDialogKind, Plugin, PluginCapabilities, PluginControlContext,
+    PluginControlInbox, PluginDiscontinuity, PluginFrame, PluginInput, PluginRuntimeRole,
+    PluginServiceOutcome, PluginServiceReply, PluginServiceRequest, RoiV1, SensorBiasReadbackV1,
+    SensorMonitoringV1, Series1dLine, Series1dPoint, Series1dV1, SettingItem, SettingKind,
+    SettingsSchema, SettingsSection, StatusEntry, TableColumn, TableColumnData, TableColumnValues,
+    TableDatasetV1, TableSchema, TableValueType, CTX_GLOBAL_SETTINGS, CTX_SENSOR_MONITORING,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -77,16 +76,6 @@ use crate::types::{CameraEvent, Polarity};
 
 const MODULATION_PLUGIN_ID: &str = "stage-a.modulation";
 const PHOTODIODE_PLUGIN_ID: &str = "stage-a.photodiode";
-const A1_PLUGIN_ID: &str = "stage-a.a1";
-
-const STATUS_DATASET_ID: &str = "stage-a-a1.status";
-const STATUS_VIEW_ID: &str = "stage-a-a1.status.view";
-const ROLLING_DATASET_ID: &str = "stage-a-a1.rolling-response";
-const ROLLING_VIEW_ID: &str = "stage-a-a1.rolling-response.view";
-const RESPONSE_CURVE_DATASET_ID: &str = "stage-a-a1.response-curve";
-const RESPONSE_CURVE_VIEW_ID: &str = "stage-a-a1.response-curve.view";
-const A0_LOCK_DATASET_ID: &str = "stage-a-a1.a0-locks";
-const A0_LOCK_VIEW_ID: &str = "stage-a-a1.a0-locks.view";
 
 /// Camera events retained for the live fold. At the bench event rates this is a
 /// few seconds of history and keeps the fold cost bounded.
@@ -976,7 +965,11 @@ struct A0LockTable {
     locks: Vec<A0LockPoint>,
 }
 
-pub struct StageAA1Plugin {
+pub type StageAA1Plugin = SineAcquisition<false>;
+pub type StageAA3Plugin = SineAcquisition<true>;
+
+/// Shared recorder with experiment-specific identity and operator controls.
+pub struct SineAcquisition<const A3: bool> {
     enabled: bool,
     runtime_role: PluginRuntimeRole,
     /// While true, camera events are folded into the live quicklooks. This does
@@ -1139,7 +1132,7 @@ pub struct StageAA1Plugin {
     press_clear_a0: PressLatch,
 }
 
-impl Default for StageAA1Plugin {
+impl<const A3: bool> Default for SineAcquisition<A3> {
     fn default() -> Self {
         Self {
             enabled: false,
@@ -1164,8 +1157,12 @@ impl Default for StageAA1Plugin {
             pilot_windows: None,
             background_floor: None,
             output_folder: String::new(),
-            measurement_id: generate_measurement_id(),
-            depth_source: DepthSource::Photodiode,
+            measurement_id: Self::new_measurement_id(),
+            depth_source: if A3 {
+                DepthSource::Commanded
+            } else {
+                DepthSource::Photodiode
+            },
             min_a: 0.0,
             max_a: 2.0,
             duration_s: 10,
@@ -1315,7 +1312,85 @@ struct FoldKey {
     masked_count: usize,
 }
 
-impl StageAA1Plugin {
+impl<const A3: bool> SineAcquisition<A3> {
+    const PLUGIN_ID: &'static str = if A3 { "stage-a.a3" } else { "stage-a.a1" };
+    const STATUS_DATASET_ID: &'static str = if A3 {
+        "stage-a-a3.status"
+    } else {
+        "stage-a-a1.status"
+    };
+    const STATUS_VIEW_ID: &'static str = if A3 {
+        "stage-a-a3.status.view"
+    } else {
+        "stage-a-a1.status.view"
+    };
+    const ROLLING_DATASET_ID: &'static str = if A3 {
+        "stage-a-a3.rolling-response"
+    } else {
+        "stage-a-a1.rolling-response"
+    };
+    const ROLLING_VIEW_ID: &'static str = if A3 {
+        "stage-a-a3.rolling-response.view"
+    } else {
+        "stage-a-a1.rolling-response.view"
+    };
+    const RESPONSE_CURVE_DATASET_ID: &'static str = if A3 {
+        "stage-a-a3.response-curve"
+    } else {
+        "stage-a-a1.response-curve"
+    };
+    const RESPONSE_CURVE_VIEW_ID: &'static str = if A3 {
+        "stage-a-a3.response-curve.view"
+    } else {
+        "stage-a-a1.response-curve.view"
+    };
+    const A0_LOCK_DATASET_ID: &'static str = if A3 {
+        "stage-a-a3.a0-locks"
+    } else {
+        "stage-a-a1.a0-locks"
+    };
+    const A0_LOCK_VIEW_ID: &'static str = if A3 {
+        "stage-a-a3.a0-locks.view"
+    } else {
+        "stage-a-a1.a0-locks.view"
+    };
+    const EXPERIMENT: &'static str = if A3 { "A3" } else { "A1" };
+    const SIDECAR_SCHEMA: &'static str = if A3 {
+        "stage-a.a3.sidecar.v2"
+    } else {
+        "stage-a.a1.sidecar.v2"
+    };
+    const PROGRESS_SCHEMA: &'static str = if A3 {
+        "stage-a.a3.progress.v1"
+    } else {
+        "stage-a.a1.progress.v1"
+    };
+    fn new_measurement_id() -> String {
+        generate_measurement_id(Self::EXPERIMENT)
+    }
+
+    fn a3_settings_schema(&self) -> SettingsSchema {
+        let button = |key: &str, label: &str| SettingItem {
+            key: key.into(),
+            label: label.into(),
+            tooltip: None,
+            kind: SettingKind::Button { enabled: true },
+        };
+        SettingsSchema { sections: vec![SettingsSection {
+            label: "A3 protocol recording".into(),
+            description: Some("Choose an output folder and CSV/TOML protocol, then Run. Each point records camera RAW, photodiode PDQ and metadata in the measurement folder. Run again with the same ID and unchanged protocol to record missing points; use New ID for a fresh repeat. Cutoff, measured contrast and thresholds are checked offline. Keep the emission-PD dark reference and calibrated optical drive applied.".into()),
+            default_open: true,
+            items: vec![
+                SettingItem { key: "output_folder".into(), label: "Output folder".into(), tooltip: None, kind: SettingKind::Path { dialog: PathDialogKind::Directory, default: self.output_folder.clone() } },
+                SettingItem { key: "measurement_id".into(), label: "Measurement ID".into(), tooltip: None, kind: SettingKind::Text { default: self.measurement_id.clone() } },
+                button("new_id", "New ID"),
+                SettingItem { key: "protocol_path".into(), label: "Protocol file (.csv / .toml)".into(), tooltip: None, kind: SettingKind::Path { dialog: PathDialogKind::OpenFile, default: self.protocol_path.clone() } },
+                button("run_protocol", "Run / resume protocol"),
+                button("stop_recording", "Stop and save"),
+            ],
+        }] }
+    }
+
     fn bump(&mut self) {
         self.dataset_generation = self.dataset_generation.wrapping_add(1);
     }
@@ -1431,7 +1506,7 @@ impl StageAA1Plugin {
     /// after the owner had already dropped it.
     fn owner_holds(lease: Option<&LeaseSnapshotV1>, held: &LeaseId) -> Option<u64> {
         let lease = lease?;
-        (&lease.lease_id == held && lease.holder.as_str() == A1_PLUGIN_ID)
+        (&lease.lease_id == held && lease.holder.as_str() == Self::PLUGIN_ID)
             .then_some(lease.expires_at_unix_ms)
     }
 
@@ -2168,8 +2243,11 @@ impl StageAA1Plugin {
                 | PhotodiodeCommandV1::FinalizeRecording { .. }
                 | PhotodiodeCommandV1::AbortRecording { .. }
         );
-        let mut envelope =
-            PhotodiodeRequestV1::new(RequestId(request_id), ClientId::new(A1_PLUGIN_ID), command);
+        let mut envelope = PhotodiodeRequestV1::new(
+            RequestId(request_id),
+            ClientId::new(Self::PLUGIN_ID),
+            command,
+        );
         envelope.lease_id = Some(self.recording.lease_id.clone());
         if !self.recording.stem.is_empty() {
             envelope.run_id = Some(RunId::new(self.recording.stem.clone()));
@@ -2201,7 +2279,7 @@ impl StageAA1Plugin {
         envelope.issued_at_unix_ms = now_unix_ms();
         PluginServiceRequest {
             request_id,
-            source_plugin_id: A1_PLUGIN_ID.into(),
+            source_plugin_id: Self::PLUGIN_ID.into(),
             target_plugin_id: PHOTODIODE_PLUGIN_ID.into(),
             service: SERVICE_STAGE_A_PHOTODIODE_CONTROL_V1.into(),
             payload: serde_json::to_value(&envelope).unwrap_or(Value::Null),
@@ -2210,7 +2288,7 @@ impl StageAA1Plugin {
 
     /// String metadata embedded in both recorders' own sidecars.
     fn recording_metadata(&self) -> BTreeMap<String, String> {
-        let mut meta = BTreeMap::new();
+        let mut meta: BTreeMap<String, String> = BTreeMap::new();
         meta.insert("a1_measurement_id".into(), self.recording.id.clone());
         meta.insert("a1_stem".into(), self.recording.stem.clone());
         meta.insert("a1_role".into(), self.recording.role.label().into());
@@ -2328,6 +2406,21 @@ impl StageAA1Plugin {
                 format!("{:.3}", sensor.age_s),
             );
         }
+        if A3 {
+            meta = meta
+                .into_iter()
+                .map(|(key, value)| {
+                    (
+                        key.strip_prefix("a1_")
+                            .map(|suffix| format!("a3_{suffix}"))
+                            .unwrap_or(key),
+                        value,
+                    )
+                })
+                .collect();
+            meta.insert("experiment".into(), "A3".into());
+            meta.insert("analysis_mode".into(), "offline_threshold".into());
+        }
         meta
     }
 
@@ -2352,7 +2445,7 @@ impl StageAA1Plugin {
     /// silently share one folder called `A1`.
     fn ensure_measurement_id(&mut self) -> String {
         if self.measurement_id.trim().is_empty() {
-            self.measurement_id = generate_measurement_id();
+            self.measurement_id = Self::new_measurement_id();
             self.bump();
         }
         sanitize_stem(self.measurement_id.trim())
@@ -2378,7 +2471,7 @@ impl StageAA1Plugin {
         //
         // A lease held by anyone else means the PDQ is already committed.
         if let Some(lease) = photodiode.lease.as_ref() {
-            if lease.holder.as_str() != A1_PLUGIN_ID {
+            if lease.holder.as_str() != Self::PLUGIN_ID {
                 return Some(format!(
                     "The photodiode is leased by {} — release it before recording",
                     lease.holder.as_str()
@@ -2480,12 +2573,17 @@ impl StageAA1Plugin {
                 }
             })
             .unwrap_or_default();
-        let stem = format!(
-            "{id}_{}{}{sweep_tag}",
-            format_compact_utc(now_ms / 1_000),
-            role.suffix()
-        );
-        let lease_id = LeaseId::new(format!("a1-{stem}"));
+        let time_tag = if A3 {
+            format!(
+                "{}-{:03}",
+                format_compact_utc(now_ms / 1_000),
+                now_ms % 1_000
+            )
+        } else {
+            format_compact_utc(now_ms / 1_000)
+        };
+        let stem = format!("{id}_{}{}{sweep_tag}", time_tag, role.suffix());
+        let lease_id = LeaseId::new(format!("{}-{stem}", Self::EXPERIMENT.to_ascii_lowercase()));
         self.recording_completed_ok = false;
         let mut recording = Recording::idle();
         recording.role = role;
@@ -2635,6 +2733,14 @@ impl StageAA1Plugin {
     /// Atomically close the PDQ and release its lease while the camera
     /// pipeline is still live.
     fn stop_photodiode(&mut self, context: &mut impl RecordingControl) {
+        if A3
+            && self.recording.stop_requested
+            && (self.recording.start_unix_ms == 0
+                || now_unix_ms().saturating_sub(self.recording.start_unix_ms)
+                    < self.recording.duration_s.saturating_mul(1_000))
+        {
+            self.note_failure("Stopped before the planned duration; partial recording retained for offline review");
+        }
         if self.recording.lease_granted {
             let pd_request = self.photodiode_request(PhotodiodeCommandV1::ReleaseLease {
                 finalize_recording: true,
@@ -2727,7 +2833,8 @@ impl StageAA1Plugin {
     }
 
     fn finish_recording(&mut self, context: &mut impl RecordingControl) {
-        let clean = self.recording.cam_complete
+        let clean = (!A3 || self.recording.failure.is_none())
+            && self.recording.cam_complete
             && self.recording.pd_finalized
             && self.recording.pd_valid
             && self.recording.pd_pdq_path.is_some()
@@ -2829,7 +2936,15 @@ impl StageAA1Plugin {
             return None;
         }
         let destination = dir.join(format!("{}.sensor.json", self.recording.stem));
-        let json = readout.to_json(sensor::SCHEMA_A1, &self.recording.id, &self.recording.stem);
+        let json = readout.to_json(
+            if A3 {
+                "stage-a.a3.sensor.v1"
+            } else {
+                sensor::SCHEMA_A1
+            },
+            &self.recording.id,
+            &self.recording.stem,
+        );
         if std::fs::write(&destination, json).is_err() {
             return None;
         }
@@ -2883,8 +2998,11 @@ impl StageAA1Plugin {
         lease_id: &LeaseId,
     ) -> PluginServiceRequest {
         let request_id = self.next_request_id();
-        let mut envelope =
-            ModulationRequestV1::new(RequestId(request_id), ClientId::new(A1_PLUGIN_ID), command);
+        let mut envelope = ModulationRequestV1::new(
+            RequestId(request_id),
+            ClientId::new(Self::PLUGIN_ID),
+            command,
+        );
         envelope.lease_id = Some(lease_id.clone());
         envelope.target_owner_instance = self
             .modulation
@@ -2899,7 +3017,7 @@ impl StageAA1Plugin {
         ));
         let request = PluginServiceRequest {
             request_id,
-            source_plugin_id: A1_PLUGIN_ID.into(),
+            source_plugin_id: Self::PLUGIN_ID.into(),
             target_plugin_id: MODULATION_PLUGIN_ID.into(),
             service: SERVICE_STAGE_A_MODULATION_CONTROL_V1.into(),
             payload: serde_json::to_value(&envelope).unwrap_or(Value::Null),
@@ -4690,6 +4808,15 @@ impl StageAA1Plugin {
             self.message = "Pick an output folder first — that is where the files go".into();
             return;
         }
+        if A3
+            && !self.measurement_id.trim().is_empty()
+            && (self.measurement_id.trim() == "."
+                || self.measurement_id.trim() == ".."
+                || sanitize_stem(self.measurement_id.trim()) != self.measurement_id.trim())
+        {
+            self.message = "A3 measurement ID must contain only letters, digits, dots, underscores or hyphens, and cannot be . or ..".into();
+            return;
+        }
         let path = self.protocol_path.trim().to_owned();
         if path.is_empty() {
             self.message = "Choose a protocol file first".into();
@@ -4709,11 +4836,27 @@ impl StageAA1Plugin {
                 return;
             }
         };
+        if A3 {
+            if let Some((index, point)) = plan
+                .points
+                .iter()
+                .enumerate()
+                .find(|(_, p)| p.duration_s as f64 * p.frequency_hz < 5.0)
+            {
+                self.message = format!("A3 row {} ({}) records fewer than 5 cycles; increase duration_s or frequency_hz", index + 1, point.block);
+                return;
+            }
+        }
         let source_sha256 = format!("{:x}", Sha256::digest(text.as_bytes()));
         let id = self.ensure_measurement_id();
         let folder = Path::new(self.output_folder.trim()).join(&id);
-        let reused = match completed_protocol_rows(&folder, &id, &source_sha256, plan.points.len())
-        {
+        let reused = match completed_protocol_rows(
+            &folder,
+            &id,
+            &source_sha256,
+            plan.points.len(),
+            Self::SIDECAR_SCHEMA,
+        ) {
             Ok(rows) => rows,
             Err(error) => {
                 self.message = format!("Cannot inspect measurement folder: {error}");
@@ -4774,7 +4917,8 @@ impl StageAA1Plugin {
 
         let now_ms = now_unix_ms();
         let lease_id = LeaseId::new(format!(
-            "a1-protocol-{}",
+            "{}-protocol-{}",
+            Self::EXPERIMENT.to_ascii_lowercase(),
             format_compact_utc(now_ms / 1_000)
         ));
         let camera_selection = plan.camera.clone();
@@ -4889,15 +5033,23 @@ impl StageAA1Plugin {
         let Some(run) = self.protocol.as_ref() else {
             return Ok(());
         };
-        let folder = Path::new(self.output_folder.trim());
-        std::fs::create_dir_all(folder).map_err(|error| error.to_string())?;
-        let path = folder.join(format!(
-            "{}_progress.jsonl",
-            sanitize_stem(run.lease_id.as_str())
-        ));
+        let folder = if A3 {
+            PathBuf::from(self.output_folder.trim()).join(sanitize_stem(self.measurement_id.trim()))
+        } else {
+            PathBuf::from(self.output_folder.trim())
+        };
+        std::fs::create_dir_all(&folder).map_err(|error| error.to_string())?;
+        let path = if A3 {
+            folder.join("progress.jsonl")
+        } else {
+            folder.join(format!(
+                "{}_progress.jsonl",
+                sanitize_stem(run.lease_id.as_str())
+            ))
+        };
         let point = run.point();
         let entry = json!({
-            "schema": "stage-a.a1.progress.v1", "event": event, "detail": detail,
+            "schema": Self::PROGRESS_SCHEMA, "event": event, "detail": detail,
             "at_unix_ms": now_unix_ms(), "protocol_sha256": run.source_sha256,
             "protocol_path": run.source_path, "point_index": run.index + 1,
             "point_total": run.plan.points.len(), "recorded": run.recorded,
@@ -6323,7 +6475,10 @@ impl StageAA1Plugin {
                     .and_then(|extension| extension.to_str())
                     .unwrap_or("txt");
                 let short_hash = &run.source_sha256[..12.min(run.source_sha256.len())];
-                let archive_name = format!("a1_protocol_{short_hash}.{extension}");
+                let archive_name = format!(
+                    "{}_protocol_{short_hash}.{extension}",
+                    Self::EXPERIMENT.to_ascii_lowercase()
+                );
                 let archive_path = dir.join(&archive_name);
                 if !archive_path.exists() {
                     std::fs::write(&archive_path, &run.source_text)
@@ -6367,8 +6522,22 @@ impl StageAA1Plugin {
             });
 
         let doc = SidecarDoc {
-            schema: "stage-a.a1.sidecar.v2".into(),
-            acquisition_complete: self.recording.cam_complete
+            a3: A3.then_some(A3Sidecar {
+                experiment: "A3",
+                analysis_mode: "offline_threshold",
+                cutoff_qualified: false,
+                planned_cycles: self
+                    .protocol
+                    .as_ref()
+                    .and_then(|run| run.point())
+                    .map(|point| point.frequency_hz * point.duration_s as f64),
+                duration_complete: self.recording.failure.is_none()
+                    && self.recording.cam_complete
+                    && self.recording.pd_finalized,
+            }),
+            schema: Self::SIDECAR_SCHEMA.into(),
+            acquisition_complete: (!A3 || self.recording.failure.is_none())
+                && self.recording.cam_complete
                 && self.recording.pd_finalized
                 && self.recording.pd_valid
                 && self.recording.pd_pdq_path.is_some()
@@ -6534,7 +6703,18 @@ impl StageAA1Plugin {
 // ---- sidecar document ------------------------------------------------------
 
 #[derive(Serialize)]
+struct A3Sidecar {
+    experiment: &'static str,
+    analysis_mode: &'static str,
+    cutoff_qualified: bool,
+    planned_cycles: Option<f64>,
+    duration_complete: bool,
+}
+
+#[derive(Serialize)]
 struct SidecarDoc {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    a3: Option<A3Sidecar>,
     schema: String,
     acquisition_complete: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -6898,6 +7078,7 @@ fn completed_protocol_rows(
     id: &str,
     sha256: &str,
     total: usize,
+    schema: &str,
 ) -> Result<std::collections::BTreeSet<usize>, String> {
     let mut rows = std::collections::BTreeSet::new();
     if std::fs::symlink_metadata(folder).is_ok_and(|m| !m.is_dir()) {
@@ -6927,7 +7108,7 @@ fn completed_protocol_rows(
             .and_then(toml::Value::as_bool)
             != Some(true)
             || doc.get("acquisition_failure").is_some()
-            || doc.get("schema").and_then(toml::Value::as_str) != Some("stage-a.a1.sidecar.v2")
+            || doc.get("schema").and_then(toml::Value::as_str) != Some(schema)
             || doc.get("measurement_id").and_then(toml::Value::as_str) != Some(id)
             || doc.get("file_stem").and_then(toml::Value::as_str)
                 != name.strip_suffix("_config.toml")
@@ -7042,10 +7223,13 @@ fn sanitize_stem(input: &str) -> String {
     }
 }
 
-fn generate_measurement_id() -> String {
+fn generate_measurement_id(experiment: &str) -> String {
     let ms = now_unix_ms();
+    if experiment == "A3" {
+        return format!("A3-{}-{ms:x}", format_compact_date(ms / 1_000));
+    }
     format!(
-        "A1-{}-{:04x}",
+        "{experiment}-{}-{:04x}",
         format_compact_date(ms / 1_000),
         (ms & 0xffff)
     )
@@ -7095,12 +7279,19 @@ fn format_iso_utc(unix_secs: u64) -> String {
     format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
 }
 
-impl Plugin for StageAA1Plugin {
+impl<const A3: bool> Plugin for SineAcquisition<A3> {
     fn name(&self) -> &'static str {
-        "Stage-A A1 Analysis"
+        if A3 {
+            "Stage-A A3 Threshold"
+        } else {
+            "Stage-A A1 Analysis"
+        }
     }
 
     fn description(&self) -> &'static str {
+        if A3 {
+            return "Protocol-driven slow contrast sweeps; synchronized RAW and PDQ for offline threshold analysis.";
+        }
         "Stage-A A1 recording coordinator: one-button synchronized camera RAW + photodiode PDQ recording with a config sidecar, plus live rolling-response and response-probability quicklooks."
     }
 
@@ -7171,7 +7362,7 @@ impl Plugin for StageAA1Plugin {
         // Request retained event history so the analysis window comes exactly
         // from the EventStore rather than best-effort preview frames.
         PluginCapabilities {
-            retained_event_history: true,
+            retained_event_history: !A3,
         }
     }
 
@@ -7290,7 +7481,7 @@ impl Plugin for StageAA1Plugin {
         }
         // Reuse the pilot/background captured for this measurement when idle: when
         // the folder or id changes, look them up in the folder.
-        if !self.recording.is_active() {
+        if !A3 && !self.recording.is_active() {
             self.scan_measurement_folder();
             self.load_a0_locks();
         }
@@ -7312,6 +7503,9 @@ impl Plugin for StageAA1Plugin {
     }
 
     fn settings_schema(&self) -> SettingsSchema {
+        if A3 {
+            return self.a3_settings_schema();
+        }
         // The record buttons stay disabled until the recording has a
         // destination, instead of failing with a status message after a click.
         let can_record = !self.output_folder.trim().is_empty();
@@ -7959,6 +8153,31 @@ impl Plugin for StageAA1Plugin {
     }
 
     fn set_setting(&mut self, key: &str, value: Value) -> Result<(), String> {
+        if A3
+            && !matches!(
+                key,
+                "output_folder"
+                    | "measurement_id"
+                    | "new_id"
+                    | "protocol_path"
+                    | "run_protocol"
+                    | "stop_recording"
+            )
+        {
+            return Err(format!("A3 has no setting '{key}'"));
+        }
+        if A3
+            && self.automation_active()
+            && matches!(
+                key,
+                "output_folder" | "measurement_id" | "protocol_path" | "new_id"
+            )
+        {
+            let unchanged = key != "new_id" && self.get_setting(key).as_ref() == Some(&value);
+            if !unchanged {
+                return Err("Stop the protocol before changing its folder, ID or source".into());
+            }
+        }
         match key {
             "output_folder" => {
                 self.output_folder = value
@@ -7973,7 +8192,7 @@ impl Plugin for StageAA1Plugin {
                     .to_string();
             }
             "new_id" if value.as_bool() == Some(true) => {
-                self.measurement_id = generate_measurement_id();
+                self.measurement_id = Self::new_measurement_id();
             }
             "depth_source" => {
                 self.depth_source =
@@ -8269,6 +8488,10 @@ impl Plugin for StageAA1Plugin {
         if !self.message.is_empty() {
             entries.push(StatusEntry::Text(self.message.clone()));
         }
+        if A3 {
+            entries.push(StatusEntry::Text("Thresholds and measured contrast: offline review. No low-frequency plateau is assumed.".into()));
+            return entries;
+        }
         // Each fact appears once. The panel used to state a missing frequency on
         // three separate lines — the transient message, this line, and the a₀
         // readiness line — which reads as three problems instead of one.
@@ -8448,6 +8671,9 @@ impl Plugin for StageAA1Plugin {
     }
 
     fn host_views(&self) -> HostViewRegistry {
+        if A3 {
+            return HostViewRegistry::default();
+        }
         fn column(id: &str, title: &str) -> TableColumn {
             TableColumn {
                 id: id.into(),
@@ -8458,7 +8684,7 @@ impl Plugin for StageAA1Plugin {
         HostViewRegistry {
             datasets: vec![
                 HostDatasetDescriptor {
-                    id: STATUS_DATASET_ID.into(),
+                    id: Self::STATUS_DATASET_ID.into(),
                     title: "A1 status".into(),
                     kind: HostDatasetKind::TableV1(TableSchema {
                         columns: vec![
@@ -8479,7 +8705,7 @@ impl Plugin for StageAA1Plugin {
                     relations: Vec::new(),
                 },
                 HostDatasetDescriptor {
-                    id: ROLLING_DATASET_ID.into(),
+                    id: Self::ROLLING_DATASET_ID.into(),
                     title: "A1 rolling response S_p(t) — live sanity check".into(),
                     kind: HostDatasetKind::Series1dV1,
                     empty_message: "Enable Live analysis; waiting for events and a period".into(),
@@ -8487,7 +8713,7 @@ impl Plugin for StageAA1Plugin {
                     relations: Vec::new(),
                 },
                 HostDatasetDescriptor {
-                    id: RESPONSE_CURVE_DATASET_ID.into(),
+                    id: Self::RESPONSE_CURVE_DATASET_ID.into(),
                     title: "A1 response probability q_p(a) — live quicklook".into(),
                     kind: HostDatasetKind::Series1dV1,
                     empty_message: "Capture a pilot, then record points per amplitude".into(),
@@ -8495,7 +8721,7 @@ impl Plugin for StageAA1Plugin {
                     relations: Vec::new(),
                 },
                 HostDatasetDescriptor {
-                    id: A0_LOCK_DATASET_ID.into(),
+                    id: Self::A0_LOCK_DATASET_ID.into(),
                     title: "A1 a₀ locks — commanded depth per frequency".into(),
                     kind: HostDatasetKind::TableV1(TableSchema {
                         columns: vec![
@@ -8517,30 +8743,30 @@ impl Plugin for StageAA1Plugin {
             ],
             views: vec![
                 HostViewDescriptor {
-                    id: STATUS_VIEW_ID.into(),
+                    id: Self::STATUS_VIEW_ID.into(),
                     title: "A1 status".into(),
-                    dataset_id: STATUS_DATASET_ID.into(),
+                    dataset_id: Self::STATUS_DATASET_ID.into(),
                     placement: HostViewPlacement::AnalysisPanel,
                     kind: HostViewKind::CompactTable,
                 },
                 HostViewDescriptor {
-                    id: ROLLING_VIEW_ID.into(),
+                    id: Self::ROLLING_VIEW_ID.into(),
                     title: "A1 rolling response S_p (ON/OFF)".into(),
-                    dataset_id: ROLLING_DATASET_ID.into(),
+                    dataset_id: Self::ROLLING_DATASET_ID.into(),
                     placement: HostViewPlacement::Window,
                     kind: HostViewKind::LineSeriesWindow,
                 },
                 HostViewDescriptor {
-                    id: RESPONSE_CURVE_VIEW_ID.into(),
+                    id: Self::RESPONSE_CURVE_VIEW_ID.into(),
                     title: "A1 response probability q_p (ON/OFF)".into(),
-                    dataset_id: RESPONSE_CURVE_DATASET_ID.into(),
+                    dataset_id: Self::RESPONSE_CURVE_DATASET_ID.into(),
                     placement: HostViewPlacement::Window,
                     kind: HostViewKind::LineSeriesWindow,
                 },
                 HostViewDescriptor {
-                    id: A0_LOCK_VIEW_ID.into(),
+                    id: Self::A0_LOCK_VIEW_ID.into(),
                     title: "A1 a₀ locks (commanded depth per frequency)".into(),
-                    dataset_id: A0_LOCK_DATASET_ID.into(),
+                    dataset_id: Self::A0_LOCK_DATASET_ID.into(),
                     placement: HostViewPlacement::Window,
                     kind: HostViewKind::TableWindow,
                 },
@@ -8551,21 +8777,33 @@ impl Plugin for StageAA1Plugin {
 
     fn host_view_dataset(&self, dataset_id: &str) -> Option<Vec<u8>> {
         match dataset_id {
-            STATUS_DATASET_ID => serde_json::to_vec(&self.status_dataset()).ok(),
-            ROLLING_DATASET_ID => serde_json::to_vec(&self.rolling_dataset()).ok(),
-            RESPONSE_CURVE_DATASET_ID => serde_json::to_vec(&self.response_curve_dataset()).ok(),
-            A0_LOCK_DATASET_ID => serde_json::to_vec(&self.a0_locks_dataset()).ok(),
+            id if id == Self::STATUS_DATASET_ID => serde_json::to_vec(&self.status_dataset()).ok(),
+            id if id == Self::ROLLING_DATASET_ID => {
+                serde_json::to_vec(&self.rolling_dataset()).ok()
+            }
+            id if id == Self::RESPONSE_CURVE_DATASET_ID => {
+                serde_json::to_vec(&self.response_curve_dataset()).ok()
+            }
+            id if id == Self::A0_LOCK_DATASET_ID => {
+                serde_json::to_vec(&self.a0_locks_dataset()).ok()
+            }
             _ => None,
         }
     }
 
     fn host_view_dataset_generation(&self, dataset_id: &str) -> u64 {
-        matches!(
-            dataset_id,
-            STATUS_DATASET_ID | ROLLING_DATASET_ID | RESPONSE_CURVE_DATASET_ID | A0_LOCK_DATASET_ID
-        )
-        .then_some(self.dataset_generation)
-        .unwrap_or(0)
+        if [
+            Self::STATUS_DATASET_ID,
+            Self::ROLLING_DATASET_ID,
+            Self::RESPONSE_CURVE_DATASET_ID,
+            Self::A0_LOCK_DATASET_ID,
+        ]
+        .contains(&dataset_id)
+        {
+            self.dataset_generation
+        } else {
+            0
+        }
     }
 }
 
@@ -8577,8 +8815,6 @@ fn connection_label(connection: &ConnectionStateV1) -> &'static str {
         ConnectionStateV1::Faulted { .. } => "faulted",
     }
 }
-
-export_plugin!(StageAA1Plugin);
 
 #[cfg(test)]
 mod tests {
@@ -8618,8 +8854,8 @@ mod tests {
     }
 
     /// Mirrors the ordering of [`StageAA1Plugin::process_control`].
-    fn control_tick(
-        plugin: &mut StageAA1Plugin,
+    fn control_tick<const A3: bool>(
+        plugin: &mut SineAcquisition<A3>,
         inbox: PluginControlInbox,
         sink: &mut ControlSink,
     ) {
@@ -8644,7 +8880,7 @@ mod tests {
     fn accepted(request_id: u64) -> PluginServiceReply {
         PluginServiceReply {
             request_id,
-            source_plugin_id: A1_PLUGIN_ID.into(),
+            source_plugin_id: StageAA1Plugin::PLUGIN_ID.into(),
             target_plugin_id: MODULATION_PLUGIN_ID.into(),
             service: SERVICE_STAGE_A_MODULATION_CONTROL_V1.into(),
             outcome: PluginServiceOutcome::Accepted {
@@ -8671,7 +8907,7 @@ mod tests {
     fn rejected(request_id: u64, message: &str) -> PluginServiceReply {
         PluginServiceReply {
             request_id,
-            source_plugin_id: A1_PLUGIN_ID.into(),
+            source_plugin_id: StageAA1Plugin::PLUGIN_ID.into(),
             target_plugin_id: MODULATION_PLUGIN_ID.into(),
             service: SERVICE_STAGE_A_MODULATION_CONTROL_V1.into(),
             outcome: PluginServiceOutcome::Rejected {
@@ -9503,7 +9739,7 @@ mod tests {
         };
         PluginServiceReply {
             request_id,
-            source_plugin_id: A1_PLUGIN_ID.into(),
+            source_plugin_id: StageAA1Plugin::PLUGIN_ID.into(),
             target_plugin_id: PHOTODIODE_PLUGIN_ID.into(),
             service: SERVICE_STAGE_A_PHOTODIODE_CONTROL_V1.into(),
             outcome: PluginServiceOutcome::Accepted {
@@ -9877,14 +10113,21 @@ mod tests {
 
     #[test]
     fn recording_orders_camera_then_pdq_and_saves_inside_the_measurement_folder() {
-        let folder = std::env::temp_dir().join(format!("a1-lifecycle-{}", now_unix_ms()));
-        let mut plugin = StageAA1Plugin {
+        check_recording_lifecycle::<false>();
+    }
+    #[test]
+    fn a3_recording_orders_camera_then_pdq_and_finalizes_its_own_sidecar() {
+        check_recording_lifecycle::<true>();
+    }
+    fn check_recording_lifecycle<const A3: bool>() {
+        let folder = std::env::temp_dir().join(format!("lifecycle-{A3}-{}", now_unix_ms()));
+        let mut plugin = SineAcquisition::<A3> {
             output_folder: folder.display().to_string(),
             measurement_id: "A1-row".into(),
             photodiode: Some(fresh_photodiode_summary()),
             duration_s: 1,
             pending_role: Some(RecRole::Normal),
-            ..StageAA1Plugin::default()
+            ..SineAcquisition::<A3>::default()
         };
         let mut sink = ControlSink::default();
 
@@ -10051,6 +10294,19 @@ mod tests {
             .is_some_and(|name| name.to_string_lossy().ends_with("_config.toml")));
         assert!(plugin.message.starts_with("Saved recording A1-row"));
 
+        let doc: toml::Value =
+            toml::from_str(&std::fs::read_to_string(&sidecars[0]).unwrap()).unwrap();
+        assert_eq!(
+            doc["schema"].as_str(),
+            Some(SineAcquisition::<A3>::SIDECAR_SCHEMA)
+        );
+        assert_eq!(
+            doc["scientific_status"].as_str(),
+            Some("requires_offline_review")
+        );
+        for request in &sink.services {
+            assert_eq!(request.source_plugin_id, SineAcquisition::<A3>::PLUGIN_ID);
+        }
         std::fs::remove_dir_all(folder).expect("cleanup");
     }
 
@@ -11151,7 +11407,7 @@ mod tests {
 
     #[test]
     fn measurement_id_generation_is_file_safe_and_prefixed() {
-        let id = generate_measurement_id();
+        let id = generate_measurement_id("A1");
         assert!(id.starts_with("A1-"));
         assert_eq!(sanitize_stem(&id), id);
         assert_eq!(sanitize_stem("I_k 3 / f=10Hz"), "I_k_3_f_10Hz");
@@ -11462,14 +11718,26 @@ depth_a = 0.7
         let path = saved_protocol_row(&folder, TWO_POINT_PROTOCOL, 1, 2);
         let original = std::fs::read_to_string(&path).unwrap();
         let hash = format!("{:x}", Sha256::digest(TWO_POINT_PROTOCOL.as_bytes()));
-        let scan =
-            || completed_protocol_rows(&folder.join("A1-proto"), "A1-proto", &hash, 2).unwrap();
+        let scan = || {
+            completed_protocol_rows(
+                &folder.join("A1-proto"),
+                "A1-proto",
+                &hash,
+                2,
+                StageAA1Plugin::SIDECAR_SCHEMA,
+            )
+            .unwrap()
+        };
         assert_eq!(scan().len(), 1);
-        assert!(
-            completed_protocol_rows(&folder.join("A1-proto"), "A1-proto", "changed", 2)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(completed_protocol_rows(
+            &folder.join("A1-proto"),
+            "A1-proto",
+            "changed",
+            2,
+            StageAA1Plugin::SIDECAR_SCHEMA
+        )
+        .unwrap()
+        .is_empty());
         for replacement in [
             "acquisition_complete = false",
             "",
@@ -12650,7 +12918,7 @@ depth_a = 99.0
         if let Some(state) = plugin.modulation.as_mut() {
             state.lease = Some(LeaseSnapshotV1 {
                 lease_id: lease_id.clone(),
-                holder: ClientId::new(A1_PLUGIN_ID),
+                holder: ClientId::new(StageAA1Plugin::PLUGIN_ID),
                 expires_at_unix_ms: now_ms + LEASE_RENEW_MARGIN_MS / 2,
                 run_id: None,
             });
@@ -12696,7 +12964,7 @@ depth_a = 99.0
         if let Some(state) = plugin.modulation.as_mut() {
             state.lease = Some(LeaseSnapshotV1 {
                 lease_id,
-                holder: ClientId::new(A1_PLUGIN_ID),
+                holder: ClientId::new(StageAA1Plugin::PLUGIN_ID),
                 expires_at_unix_ms: now_unix_ms() + LEASE_RENEW_MARGIN_MS * 4,
                 run_id: None,
             });
@@ -13044,7 +13312,7 @@ bias_refr_code,status,error\n\
     fn pd_rejection(request_id: u64, code: &str, message: &str) -> PluginServiceReply {
         PluginServiceReply {
             request_id,
-            source_plugin_id: A1_PLUGIN_ID.into(),
+            source_plugin_id: StageAA1Plugin::PLUGIN_ID.into(),
             target_plugin_id: PHOTODIODE_PLUGIN_ID.into(),
             service: SERVICE_STAGE_A_PHOTODIODE_CONTROL_V1.into(),
             outcome: PluginServiceOutcome::Rejected {
@@ -13795,5 +14063,158 @@ bias_refr_code,status,error\n\
             failed["detail"],
             "controller refused the requested frequency"
         );
+    }
+    fn a3_protocol_plugin(folder: &Path, body: &str) -> StageAA3Plugin {
+        std::fs::create_dir_all(folder).unwrap();
+        let path = folder.join("protocol.toml");
+        std::fs::write(&path, body).unwrap();
+        StageAA3Plugin {
+            output_folder: folder.display().to_string(),
+            protocol_path: path.display().to_string(),
+            measurement_id: "A3-test".into(),
+            modulation: Some(connected_modulation()),
+            photodiode: Some(ready_photodiode()),
+            record_sensor_telemetry: true,
+            ..StageAA3Plugin::default()
+        }
+    }
+
+    #[test]
+    fn a3_ui_keeps_run_and_stop_accessible_and_forwards_each_click_once() {
+        let mut worker = StageAA3Plugin::default();
+        assert!(worker.measurement_id.starts_with("A3-"));
+        assert!(!worker.live && !worker.capabilities().retained_event_history);
+        assert_eq!(worker.depth_source, DepthSource::Commanded);
+        let schema = worker.settings_schema();
+        let keys: Vec<_> = schema
+            .sections
+            .iter()
+            .flat_map(|s| &s.items)
+            .map(|i| i.key.as_str())
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "output_folder",
+                "measurement_id",
+                "new_id",
+                "protocol_path",
+                "run_protocol",
+                "stop_recording"
+            ]
+        );
+        worker.set_setting("run_protocol", json!(0)).unwrap();
+        worker.set_setting("run_protocol", json!(1)).unwrap();
+        assert!(worker.protocol_pending);
+        worker.protocol_pending = false;
+        worker.set_setting("run_protocol", json!(1)).unwrap();
+        assert!(!worker.protocol_pending);
+        worker.set_setting("stop_recording", json!(0)).unwrap();
+        worker.set_setting("stop_recording", json!(1)).unwrap();
+        assert!(!worker.protocol_pending);
+        assert!(worker.set_setting("live", json!(true)).is_err());
+    }
+
+    #[test]
+    fn a3_protocol_starts_without_online_events_and_owns_its_progress() {
+        let folder = temp_folder("a3-offline");
+        let mut plugin = a3_protocol_plugin(&folder, TWO_POINT_PROTOCOL);
+        let mut sink = ControlSink::default();
+        plugin.begin_protocol(&mut sink);
+        assert!(plugin.protocol.is_some(), "{}", plugin.message);
+        assert!(plugin.camera_events.is_empty() && !plugin.live);
+        assert!(plugin
+            .protocol
+            .as_ref()
+            .unwrap()
+            .lease_id
+            .as_str()
+            .starts_with("a3-protocol-"));
+        assert!(plugin
+            .set_setting("measurement_id", json!("another"))
+            .is_err());
+        assert!(plugin
+            .set_setting("output_folder", json!(plugin.output_folder))
+            .is_ok());
+        plugin.append_protocol_event("test", "offline").unwrap();
+        let progress =
+            std::fs::read_to_string(folder.join("A3-test").join("progress.jsonl")).unwrap();
+        assert!(progress.contains("stage-a.a3.progress.v1"));
+        let meta = plugin.recording_metadata();
+        assert_eq!(meta.get("experiment").map(String::as_str), Some("A3"));
+        assert!(meta.keys().all(|key| !key.starts_with("a1_")));
+        plugin.request_stop();
+        plugin.drive_protocol(&mut sink);
+        assert!(plugin.protocol.is_none());
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn a3_refuses_too_few_cycles_before_touching_hardware() {
+        let folder = temp_folder("a3-short");
+        let mut plugin = a3_protocol_plugin(
+            &folder,
+            &TWO_POINT_PROTOCOL.replace("frequency_hz = 25.0", "frequency_hz = 0.2"),
+        );
+        let mut sink = ControlSink::default();
+        plugin.begin_protocol(&mut sink);
+        assert!(
+            plugin.message.contains("fewer than 5 cycles"),
+            "{}",
+            plugin.message
+        );
+        assert!(sink.hosts.is_empty() && sink.services.is_empty());
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn a3_resume_never_reuses_a1_schema_or_incomplete_evidence() {
+        let folder = temp_folder("a3-resume");
+        let path = saved_protocol_row(&folder, TWO_POINT_PROTOCOL, 1, 2);
+        let hash = format!("{:x}", Sha256::digest(TWO_POINT_PROTOCOL.as_bytes()));
+        let scan = || {
+            completed_protocol_rows(
+                &folder.join("A1-proto"),
+                "A1-proto",
+                &hash,
+                2,
+                StageAA3Plugin::SIDECAR_SCHEMA,
+            )
+            .unwrap()
+        };
+        assert!(scan().is_empty());
+        let text = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("stage-a.a1.sidecar.v2", "stage-a.a3.sidecar.v2");
+        std::fs::write(&path, &text).unwrap();
+        assert_eq!(scan().into_iter().collect::<Vec<_>>(), vec![0]);
+        std::fs::write(
+            &path,
+            text.replace(
+                "acquisition_complete = true",
+                "acquisition_complete = false",
+            ),
+        )
+        .unwrap();
+        assert!(scan().is_empty());
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+    #[test]
+    fn a3_manual_stop_preserves_partial_data_but_cannot_mark_a_row_complete() {
+        let mut plugin = StageAA3Plugin::default();
+        plugin.recording.phase = RecPhase::Running;
+        plugin.recording.start_unix_ms = now_unix_ms();
+        plugin.recording.duration_s = 60;
+        plugin.recording.lease_granted = true;
+        plugin.recording.stop_requested = true;
+        let mut sink = ControlSink::default();
+        plugin.drive_recording(&mut sink);
+        assert!(plugin
+            .recording
+            .failure
+            .as_deref()
+            .unwrap()
+            .contains("partial recording retained"));
+        assert_ne!(plugin.recording.phase, RecPhase::Running);
     }
 }

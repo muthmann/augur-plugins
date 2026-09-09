@@ -1,0 +1,17 @@
+# A3 technical smoke: three frequencies, two depths, repeated low-frequency point.
+# Current emission PD, dark reference applied; calibrated optical log-sine and J24.
+# Keep sample, ROI, mask, bias-v1 and PD gain/load fixed. No online cutoff is required.
+# All depths are commanded; derive true log contrast from saved PDQ offline.
+# Compare counts/cycle across frequencies before estimating C. No plateau is assumed.
+# low_depth_control rows use a=0.01; they are NOT constant-light backgrounds.
+# 9 recordings; 164 s recording + settling; allow about 11 s extra per file plus operation/recovery.
+camera_profile,label,mean_u,frequency_hz,depth_a,duration_s,settle_s,role
+A1-bias-v1-monitoring,low_depth_control_start,0.3,2,0.01,10,4,
+A1-bias-v1-monitoring,smoke_f0.5_a0.3,0.3,0.5,0.3,20,8,
+A1-bias-v1-monitoring,smoke_f0.5_a0.9,0.3,0.5,0.9,20,8,
+A1-bias-v1-monitoring,smoke_f2_a0.3,0.3,2,0.3,10,4,
+A1-bias-v1-monitoring,smoke_f2_a0.9,0.3,2,0.9,10,4,
+A1-bias-v1-monitoring,smoke_f8_a0.3,0.3,8,0.3,10,2,
+A1-bias-v1-monitoring,smoke_f8_a0.9,0.3,8,0.9,10,2,
+A1-bias-v1-monitoring,repeat_low_frequency,0.3,0.5,0.9,20,8,
+A1-bias-v1-monitoring,low_depth_control_end,0.3,2,0.01,10,4,

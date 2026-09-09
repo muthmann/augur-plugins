@@ -1,10 +1,10 @@
 [package]
-name = "augur-plugin-stage-a-a1"
+name = "augur-plugin-stage-a-a3"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Stage-A A1 workflow orchestrator and pure minimum-depth analysis core"
+description = "Stage-A A3 automated threshold acquisition"
 
 [lib]
 crate-type = ["cdylib", "rlib"]

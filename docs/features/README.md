@@ -40,3 +40,5 @@ An A1 run states the controller's experiment mode instead of inheriting it: [ADR
 A withheld photodiode `a` names which of the four gates holds it, and A1 renders a controller left outside `mode=A1`: [ADR 045](../adr/045-a-refused-a-names-which-gate-holds-it.md).
 
 - [Windows lab watcher](stage-a-lab-watch.md): independent RAW/PDQ progress warnings to an iPhone through ntfy.
+
+- [Stage-A A3 Threshold](./stage-a-a3.md) — CSV/TOML sine protocols, A3 measurement folders, offline thresholds and full frequency/depth/bias fixtures.
