@@ -6,7 +6,9 @@ import io
 
 ROOT = Path(__file__).resolve().parents[1] / "plugins/stage-a-a3/protocols"
 PROFILE = "A1-bias-v1-monitoring"
-FREQUENCIES = [2, 0.5, 8, 0.2, 32]
+FREQUENCIES = [2, 8, 32]
+LOW_FREQUENCY = 0.5
+LOW_DEPTHS = [0.20, 1.0]
 DEPTHS = [0.06, 0.08, 0.11, 0.15, 0.20, 0.27, 0.36, 0.48, 0.63, 0.80, 1.0, 1.3]
 # Offsets from the per-sensor factory trims, not absolute register codes.
 BIASES = [(10, 0), (-10, 0), (0, 5), (0, -5)]
@@ -38,9 +40,11 @@ def full_baseline():
             for f in frequencies:
                 for index, a in enumerate(depths):
                     rows.append(point(f"{tag}_f{f}_a{a}", mean, f, a))
-                    # At 0.2 Hz a depth ladder is long; bracket short sub-blocks.
+                    # Retain the existing short reference brackets.
                     if (index + 1) % 3 == 0:
                         rows.append(reference(f"{tag}_ref_after_f{f}_d{index+1}", mean))
+            for a in LOW_DEPTHS if repeat == 1 else LOW_DEPTHS[::-1]:
+                rows.append(point(f"{tag}_slow_check_a{a}", mean, LOW_FREQUENCY, a))
             rows.append(low_depth_control(tag + "_low_depth_control_end", mean))
     return rows
 
@@ -59,6 +63,8 @@ def full_bias():
                     rows.append(point(f"{tag}_f{f}_a{a}", .30, f, a, on, off))
                     if (index + 1) % 3 == 0:
                         rows.append(reference(f"{tag}_anchor_after_f{f}_d{index+1}", .30))
+            for a in LOW_DEPTHS if repeat == 1 else LOW_DEPTHS[::-1]:
+                rows.append(point(f"{tag}_slow_check_a{a}", .30, LOW_FREQUENCY, a, on, off))
             rows += [point(tag + "_bias_low_depth_control_end", .30, 2, .01, on, off, "", 40), reference(tag + "_anchor_end", .30)]
     return rows
 
@@ -77,6 +83,7 @@ def write(name, rows, scope):
 # Profile {PROFILE}; confirm this saved profile contains bias-v1 and filters OFF.
 # diff_on/off are offsets; host readback must confirm each requested bias and restoration.
 # a is commanded log excursion. Compute actual dark-corrected contrast from saved PDQ offline.
+# Main ladders: 2/8/32 Hz. Sparse 0.5 Hz checks; no 0.2 Hz points.
 # All frequencies are candidates; test frequency independence at each flux AND bias offline.
 # low_depth_control rows use a=0.01; they are NOT constant-light backgrounds.
 # mean_u is a relative operating point, not calibrated photon flux. Retain registered frame references.
@@ -90,9 +97,24 @@ def write(name, rows, scope):
 
 def main():
     ROOT.mkdir(parents=True, exist_ok=True)
+    smoke = [point("low_depth_control_start", .30, 2, .01)]
+    for f in FREQUENCIES:
+        for a in [.30, .90]: smoke.append(point(f"smoke_f{f}_a{a}", .30, f, a))
+    for a in [.30, .90]: smoke.append(point(f"slow_check_a{a}", .30, LOW_FREQUENCY, a))
+    smoke += [point("repeat_f2_a0.9", .30, 2, .90), point("low_depth_control_end", .30, 2, .01)]
+    write("a3_smoke.csv", smoke, "A3 technical smoke: 2/8/32 Hz, two depths, sparse 0.5 Hz checks and repeated reference.")
+    core = [low_depth_control("low_depth_control_start", .30), reference("reference_start", .30)]
+    for f in FREQUENCIES:
+        for a in [.4, .12, .9, .18, 1.3, .27, .6, .08]:
+            row = point(f"grid_f{f}_a{a}", .30, f, a); row[5] = 20
+            core.append(row)
+        core.append(reference(f"reference_after_{f}", .30))
+    for a in [.18, .9]: core.append(point(f"slow_check_a{a}", .30, LOW_FREQUENCY, a, cycles=20))
+    core.append(low_depth_control("low_depth_control_end", .30))
+    write("a3_frequency_depth_core.csv", core, "A3 one-flux core: 2/8/32 Hz, eight depths, sparse 0.5 Hz checks and references.")
     baseline, bias = full_baseline(), full_bias()
-    write("a3_full_baseline.csv", baseline, "A3 full baseline: 3 fluxes x 5 frequencies x 12 depths x 2 passes, with references.")
-    write("a3_full_bias_map.csv", bias, "A3 bias extension: one flux, four single-polarity offset variants x 5 frequencies x 6 depths x 2 passes.")
+    write("a3_full_baseline.csv", baseline, "A3 full baseline: 3 fluxes x 3 main frequencies x 12 depths x 2 passes, with references and sparse 0.5 Hz checks.")
+    write("a3_full_bias_map.csv", bias, "A3 bias extension: one flux, four single-polarity offset variants x 3 main frequencies x 6 depths x 2 passes and sparse 0.5 Hz checks.")
     write("a3_full_scientific.csv", baseline + bias, "A3 complete planned acquisition: full baseline followed by the bias extension.")
 
 

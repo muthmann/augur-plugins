@@ -35,27 +35,27 @@ fn fixtures() -> [Fixture; 13] {
         Fixture {
             name: "a3_full_baseline.csv",
             csv: include_str!("../../stage-a-a3/protocols/a3_full_baseline.csv"),
-            expected_points: 498,
+            expected_points: 318,
         },
         Fixture {
             name: "a3_full_bias_map.csv",
             csv: include_str!("../../stage-a-a3/protocols/a3_full_bias_map.csv"),
-            expected_points: 360,
+            expected_points: 248,
         },
         Fixture {
             name: "a3_full_scientific.csv",
             csv: include_str!("../../stage-a-a3/protocols/a3_full_scientific.csv"),
-            expected_points: 858,
+            expected_points: 566,
         },
         Fixture {
             name: "a3_smoke.csv",
             csv: include_str!("../../stage-a-a3/protocols/a3_smoke.csv"),
-            expected_points: 9,
+            expected_points: 11,
         },
         Fixture {
             name: "a3_frequency_depth_core.csv",
             csv: include_str!("../../stage-a-a3/protocols/a3_frequency_depth_core.csv"),
-            expected_points: 48,
+            expected_points: 32,
         },
         Fixture {
             name: "a1_lux_dark_offset.csv",

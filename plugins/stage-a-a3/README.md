@@ -36,15 +36,23 @@ readbacks, setup, manual optical references, retries and file I/O can take longe
 
 | File | Scope | Recordings | Estimated duration |
 |---|---|---:|---:|
-| `a3_smoke.csv` | One flux; 0.5/2/8 Hz; two depths; low-depth controls and repeated low-frequency point | 9 | 4.4 min |
-| `a3_frequency_depth_core.csv` | One flux; 0.2/0.5/2/8/32 Hz; eight depths; references | 48 | 43.5 min |
-| `a3_full_baseline.csv` | Three relative flux settings; five frequencies; 12 depths; two opposite-order passes; frequent references | 498 | 4 h 46 min |
-| `a3_full_bias_map.csv` | One flux; four single-polarity bias variants; five frequencies; six depths; two passes; anchor/bias low-depth controls | 360 | 3 h 26 min |
-| `a3_full_scientific.csv` | Exact concatenation of baseline and bias extension | 858 | 8 h 12 min |
+| `a3_smoke.csv` | One flux; 2/8/32 Hz; two depths; sparse 0.5 Hz checks and repeated reference | 11 | 4.6 min |
+| `a3_frequency_depth_core.csv` | One flux; 2/8/32 Hz; eight depths; two 0.5 Hz checks and references | 32 | 18.3 min |
+| `a3_full_baseline.csv` | Three flux settings; three main frequencies; 12 depths; two opposite-order passes; sparse 0.5 Hz checks and references | 318 | 2 h 19 min |
+| `a3_full_bias_map.csv` | One flux; four bias variants; three main frequencies; six depths; two passes; sparse 0.5 Hz checks and controls | 248 | 1 h 53 min |
+| `a3_full_scientific.csv` | Exact concatenation of baseline and bias extension | 566 | 4 h 12 min |
 
 Use either the combined file **or** the two separate full files. The short core is
 an alternative for limited bench time, not a required extra before the full run.
-The full files are generated deterministically by `scripts/build_a3_protocols.py`.
+All five files are generated deterministically by `scripts/build_a3_protocols.py`.
+
+As of 2026-09-09, main depth ladders use **2, 8 and 32 Hz**. The full files add
+**0.5 Hz at a=0.20 and 1.0 for every flux/bias state and pass**, matching depths
+in the main ladders. The core uses a=0.18/0.9 and the smoke a=0.3/0.9 for its
+slow checks. No 0.2 Hz recordings remain. Depth/flux/bias coverage, both full
+passes and the main reference cadence are retained; the full low-frequency
+ladders have been removed. The saved protocol hash changes: use a new measurement
+ID instead of treating the revised file as a resume of the old schedule.
 
 The baseline uses `mean_u = 0.15, 0.30, 0.45` and commanded depths
 `0.06, 0.08, 0.11, 0.15, 0.20, 0.27, 0.36, 0.48, 0.63, 0.80, 1.0, 1.3`.
@@ -107,7 +115,7 @@ Before fitting:
   unsaturated dark-corrected emission. Retain constant-light noise controls.
 - At each flux and bias compare ON/OFF counts per cycle against **measured**
   contrast across frequencies. Select a frequency-independent region offline;
-  even 0.2 Hz is not guaranteed to be below an unknown cutoff.
+  even 0.5 Hz is not guaranteed to be below an unknown cutoff.
 - Check local contrast, registered local flux, drift/bleaching and reference
   changes. A global PD does not qualify every pixel. A static multiplicative
   intensity factor cancels in an ideal log ratio; background and flux-dependent
