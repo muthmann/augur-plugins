@@ -354,7 +354,10 @@ fn assert_production_service_accepts_protocol(fixture: &str, points: &[ProtocolP
 
     for (index, point) in points.iter().enumerate() {
         let context = format!("{fixture} point {}", index + 1);
+        // Long fixtures can exceed one lease on slower CI runners. Renew as
+        // the acquisition coordinator does instead of extending the safety TTL.
         for command in [
+            ModulationCommandV1::RenewLease { ttl_ms: 60_000 },
             ModulationCommandV1::SetOperatingPoint {
                 mean_u_milli: (point.mean_u * 1_000.0).round() as u32,
             },
