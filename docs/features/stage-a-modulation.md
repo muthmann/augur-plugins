@@ -141,3 +141,14 @@ behavior.
 Automation commands use a bounded FIFO separate from the replaceable slider slot. Applied means the controller replied successfully, not that a command was queued. Completed replies remain queryable by requester and request ID. PrepareA1 always restates the A1 configuration (STOP, CONFIG, START, STATUS) and verifies running ADC acquisition and the phase-marker source, because A2's drive-synchronized capture also configures A1 mode. Safe-off clears queued work and does not restore an armed waveform during lease cleanup.
 
 See [ADR 046](../adr/046-stage-a-command-completion-and-record-preservation.md) for the contract and Windows bench verification.
+
+### Completion queries through the host cache
+
+`QueryRequest { request_id }` reads the original operation result without issuing
+another device command. Each query has a fresh transport ID because the host
+caches each transport reply, including an accepted `InProgress` response. The
+returned common request ID identifies the original operation. Results are scoped
+to requester, run and owner instance; an unknown or evicted operation is rejected.
+A1/A3 use this path for preparation and drive confirmations. Update the modulation
+owner and acquisition plugins together. A2 additionally consumes its sequential
+operation completion from the owner's published snapshot.

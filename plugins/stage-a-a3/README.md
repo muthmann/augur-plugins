@@ -141,3 +141,18 @@ fixtures are checked against the modulation owner's real drive calculations.
 A local macOS build does not validate Windows DLL loading, USB acquisition or the
 physical optical waveform. Complete the short Windows smoke before using A3 for
 an unattended bench run.
+
+## Controller confirmation troubleshooting
+
+A1/A3 polls queued controller operations through read-only `QueryRequest`
+requests with fresh transport IDs. AugurRS caches the first reply for each
+transport ID; replaying that ID cannot retrieve a later completion. Preparation
+and each mean/frequency/depth command must still receive their terminal result
+before recording. Queries never re-execute the hardware operation.
+
+Install the matching A1/A3 and modulation plugins from the same bundle and fully
+restart AugurRS. Older modulation plugins do not understand the query command.
+A confirmation timeout identifies the remaining controller commands separately
+from the camera-bias readback. A successful software test does not establish the
+installed firmware or physical acquisition: first run `a3_smoke.csv` and verify
+finalized RAW/PDQ files and the saved effective sample rate before a full run.

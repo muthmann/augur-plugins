@@ -311,6 +311,13 @@ pub struct A2AcquisitionConfigV1 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ModulationCommandV1 {
+    /// Read a retained operation result without executing the operation again.
+    /// Each poll uses a fresh transport request ID and names the original
+    /// operation here. Results are scoped to requester, owner instance and run;
+    /// the response's common request ID remains the original operation ID.
+    QueryRequest {
+        request_id: RequestId,
+    },
     Connect,
     Disconnect {
         safe_off: bool,

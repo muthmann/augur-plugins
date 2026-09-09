@@ -1038,6 +1038,7 @@ pub struct SineAcquisition<const A3: bool> {
     request_seq: u64,
     modulation_requests: Vec<(PluginServiceRequest, u64)>,
     modulation_poll_ms: u64,
+    modulation_queries: Vec<(u64, u64)>,
     pd_revision_seq: u64,
     /// Role latched by the Start/Pilot/Background buttons, consumed next tick.
     pending_role: Option<RecRole>,
@@ -1171,6 +1172,7 @@ impl<const A3: bool> Default for SineAcquisition<A3> {
             request_seq: 0,
             modulation_requests: Vec::new(),
             modulation_poll_ms: 0,
+            modulation_queries: Vec::new(),
             pd_revision_seq: 0,
             pending_role: None,
             loaded_key: None,
@@ -5484,7 +5486,9 @@ impl<const A3: bool> SineAcquisition<A3> {
                     if now_ms.saturating_sub(last_activity) > REPLY_TIMEOUT_MS {
                         self.fail_protocol_point(
                             context,
-                            "the requested drive or camera biases were not confirmed".into(),
+                            format!(
+                                "confirmation timeout: {retargets_left} controller command(s) pending; camera bias confirmation pending: {bias_pending}"
+                            ),
                         );
                     }
                     return;
@@ -6212,12 +6216,80 @@ impl<const A3: bool> SineAcquisition<A3> {
         self.modulation_poll_ms = now;
         self.modulation_requests
             .retain(|(_, sent)| now.saturating_sub(*sent) <= REPLY_TIMEOUT_MS);
-        for (request, _) in &self.modulation_requests {
-            context.request_service(request);
+        self.modulation_queries.retain(|(_, original)| {
+            self.modulation_requests
+                .iter()
+                .any(|(request, _)| request.request_id == *original)
+        });
+        // The host caches transport replies, including InProgress. Poll with
+        // a fresh read-only request instead of resending the hardware command.
+        for (original, _) in self.modulation_requests.clone() {
+            let Ok(mut envelope) =
+                serde_json::from_value::<ModulationRequestV1>(original.payload.clone())
+            else {
+                continue;
+            };
+            let query_id = self.next_request_id();
+            envelope.command = ModulationCommandV1::QueryRequest {
+                request_id: envelope.request_id,
+            };
+            envelope.request_id = RequestId(query_id);
+            envelope.issued_at_unix_ms = now;
+            let query = PluginServiceRequest {
+                request_id: query_id,
+                payload: serde_json::to_value(envelope).expect("modulation query serializes"),
+                ..original.clone()
+            };
+            self.modulation_queries
+                .push((query_id, original.request_id));
+            context.request_service(&query);
         }
     }
 
     fn on_service_reply(&mut self, reply: &PluginServiceReply) {
+        let mut correlated = reply.clone();
+        if let Some(index) = self
+            .modulation_queries
+            .iter()
+            .position(|(query, _)| *query == reply.request_id)
+        {
+            let (_, original) = self.modulation_queries.remove(index);
+            if !self.modulation_requests.iter().any(|(request, _)| {
+                request.request_id == original
+                    && request.target_plugin_id == reply.target_plugin_id
+                    && request.source_plugin_id == reply.source_plugin_id
+                    && request.service == reply.service
+            }) {
+                return;
+            }
+            correlated.request_id = original;
+            if let PluginServiceOutcome::Accepted { payload } = &reply.outcome {
+                let valid = serde_json::from_value::<ModulationResponseV1>(payload.clone())
+                    .is_ok_and(|response| {
+                        response.common.request_id.0 == original
+                            && self.modulation_requests.iter().any(|(request, _)| {
+                                request.request_id == original
+                                    && serde_json::from_value::<ModulationRequestV1>(
+                                        request.payload.clone(),
+                                    )
+                                    .is_ok_and(|envelope| {
+                                        envelope.run_id == response.common.run_id
+                                            && envelope.target_owner_instance.as_ref().is_none_or(
+                                                |owner| *owner == response.common.owner_instance,
+                                            )
+                                    })
+                            })
+                    });
+                if !valid {
+                    correlated.outcome = PluginServiceOutcome::Rejected {
+                        code: "invalid_completion".into(),
+                        message: "controller result did not match the original request and owner"
+                            .into(),
+                    };
+                }
+            }
+        }
+        let reply = &correlated;
         let mut terminal = reply.clone();
         if self
             .modulation_requests
@@ -14004,13 +14076,18 @@ bias_refr_code,status,error\n\
             .pending_reqs
             .contains(&request_id));
         plugin.poll_modulation_requests(&mut sink);
-        assert!(
-            sink.services
-                .iter()
-                .filter(|r| r.request_id == request_id)
-                .count()
-                >= 2
-        );
+        assert!(sink.services.iter().any(|request| {
+            request.request_id != request_id
+                && serde_json::from_value::<ModulationRequestV1>(request.payload.clone()).is_ok_and(
+                    |envelope| {
+                        matches!(
+                            envelope.command,
+                            ModulationCommandV1::QueryRequest { request_id: original }
+                                if original.0 == request_id
+                        )
+                    },
+                )
+        }));
     }
     #[test]
     fn metadata_write_failure_cannot_count_as_a_completed_point() {
@@ -14077,6 +14154,78 @@ bias_refr_code,status,error\n\
             record_sensor_telemetry: true,
             ..StageAA3Plugin::default()
         }
+    }
+
+    #[test]
+    fn a3_queries_complete_preparation_and_all_three_drive_commands() {
+        let folder = temp_folder("a3-query-completion");
+        let mut plugin = a3_protocol_plugin(&folder, TWO_POINT_PROTOCOL);
+        let mut sink = ControlSink::default();
+        plugin.begin_protocol(&mut sink);
+        let lease = plugin.protocol.as_ref().unwrap().lease_id.clone();
+        let prepare = plugin.modulation_request(ModulationCommandV1::PrepareA1, &lease);
+        plugin.protocol.as_mut().unwrap().prepare_req = Some(prepare.request_id);
+        let mut originals = vec![prepare];
+        for command in [
+            ModulationCommandV1::SetOperatingPoint { mean_u_milli: 300 },
+            ModulationCommandV1::SetDriveFrequency {
+                frequency_millihz: 2000,
+            },
+            ModulationCommandV1::SetOpticalDepth { depth_a_milli: 300 },
+        ] {
+            let request = plugin.modulation_request(command, &lease);
+            plugin
+                .protocol
+                .as_mut()
+                .unwrap()
+                .pending_reqs
+                .push(request.request_id);
+            originals.push(request);
+        }
+        // Ignore setup requests: each poll must be a fresh read-only query.
+        sink.services.clear();
+        plugin.modulation_poll_ms = 0;
+        plugin.poll_modulation_requests(&mut sink);
+        for original in &originals {
+            let query = sink.services.iter().find(|q| {
+                matches!(modulation_command(q), Some(ModulationCommandV1::QueryRequest { request_id })
+                    if request_id.0 == original.request_id)
+            }).unwrap();
+            assert_ne!(query.request_id, original.request_id);
+            let mut reply = accepted(query.request_id);
+            reply.source_plugin_id = StageAA3Plugin::PLUGIN_ID.into();
+            let envelope: ModulationRequestV1 =
+                serde_json::from_value(original.payload.clone()).unwrap();
+            reply.outcome = PluginServiceOutcome::Accepted {
+                payload: serde_json::to_value(ModulationResponseV1 {
+                    marker_diagnostics: None,
+                    common: ResponseCommonV1 {
+                        contract_version: CONTRACT_VERSION_V1,
+                        request_id: envelope.request_id,
+                        owner_instance: envelope.target_owner_instance.unwrap(),
+                        run_id: envelope.run_id,
+                        requested_revision: envelope.requested_revision,
+                        acknowledged_revision: envelope.requested_revision,
+                        outcome: RequestOutcomeV1::Applied,
+                        completed_at_unix_ms: Some(now_unix_ms()),
+                        error: None,
+                    },
+                    controller_state: stage_a_plugin_contract::ControllerStateV1::Running,
+                    acknowledged_target: None,
+                })
+                .unwrap(),
+            };
+            plugin.on_service_reply(&reply);
+        }
+        let run = plugin.protocol.as_ref().unwrap();
+        assert!(run.prepare_req.is_none());
+        assert!(run.pending_reqs.is_empty());
+        assert!(!run.stop_requested);
+        assert!(originals.iter().all(|original| !plugin
+            .modulation_requests
+            .iter()
+            .any(|(pending, _)| pending.request_id == original.request_id)));
+        let _ = std::fs::remove_dir_all(folder);
     }
 
     #[test]

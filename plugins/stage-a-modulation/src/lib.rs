@@ -2036,11 +2036,66 @@ impl StageAModulationPlugin {
         })
     }
 
+    fn query_request_result(
+        &self,
+        query: &ModulationRequestV1,
+        original_id: stage_a_plugin_contract::RequestId,
+    ) -> Result<ModulationResponseV1, ServiceErrorV1> {
+        // The owner instance check is also applied to the query envelope. A
+        // retained completion can outlive its original request-cache entry.
+        if let Some(response) = self.shared.completions.lock().ok().and_then(|responses| {
+            responses.iter().rev().find_map(|(client, response)| {
+                (client == &query.requester
+                    && response.common.request_id == original_id
+                    && response.common.run_id == query.run_id
+                    && response.common.owner_instance == self.owner_instance)
+                    .then(|| response.clone())
+            })
+        }) {
+            return Ok(response);
+        }
+        let cached = self.request_cache.iter().find(|(envelope, _)| {
+            envelope.source_plugin_id == query.requester.as_str()
+                && envelope.request_id == original_id.0
+                && serde_json::from_value::<ModulationRequestV1>(envelope.payload.clone())
+                    .is_ok_and(|original| {
+                        original.run_id == query.run_id
+                            && !matches!(original.command, ModulationCommandV1::QueryRequest { .. })
+                    })
+        });
+        if let Some((_, reply)) = cached {
+            return match &reply.outcome {
+                PluginServiceOutcome::Accepted { payload } => {
+                    serde_json::from_value::<ModulationResponseV1>(payload.clone()).map_err(|_| {
+                        service_error(
+                            ServiceErrorCodeV1::Internal,
+                            "invalid retained response",
+                            false,
+                        )
+                    })
+                }
+                PluginServiceOutcome::Rejected { code, message } => Err(service_error(
+                    ServiceErrorCodeV1::DeviceRejected,
+                    format!("original request rejected ({code}): {message}"),
+                    false,
+                )),
+            };
+        }
+        Err(service_error(
+            ServiceErrorCodeV1::InvalidCommand,
+            "operation result is unknown or no longer retained for this requester and run",
+            false,
+        ))
+    }
+
     fn handle_modulation_command(
         &mut self,
         request: &ModulationRequestV1,
     ) -> Result<ModulationResponseV1, ServiceErrorV1> {
         match &request.command {
+            ModulationCommandV1::QueryRequest { request_id } => {
+                self.query_request_result(request, *request_id)
+            }
             ModulationCommandV1::Connect => {
                 if self.lease.is_some() {
                     return Err(service_error(
@@ -5678,6 +5733,268 @@ mod tests {
                 .outcome,
             PluginServiceOutcome::Rejected { .. }
         ));
+    }
+
+    #[test]
+    fn query_request_retrieves_completion_through_immutable_host_cache() {
+        fn route(
+            owner: &mut StageAModulationPlugin,
+            cache: &mut std::collections::HashMap<(String, u64), PluginServiceReply>,
+            request: &PluginServiceRequest,
+        ) -> PluginServiceReply {
+            cache
+                .entry((request.source_plugin_id.clone(), request.request_id))
+                .or_insert_with(|| owner.handle_service_request(request, &live_execution()))
+                .clone()
+        }
+        fn response(reply: PluginServiceReply) -> ModulationResponseV1 {
+            let PluginServiceOutcome::Accepted { payload } = reply.outcome else {
+                panic!("expected accepted response: {reply:?}");
+            };
+            serde_json::from_value(payload).unwrap()
+        }
+        let mut owner = live_plugin();
+        owner.port_hint = "mock".into();
+        owner.connect_requested = true;
+        owner.connect();
+        wait_until(&owner, Duration::from_secs(2), |owner| {
+            owner.device_connected()
+        });
+        owner.method = DriveMethod::Calibrated;
+        owner.mode = Mode::OpticalLogSine;
+        owner.calibration_id = Some("test-lobe".into());
+        let mut cache = std::collections::HashMap::new();
+        let acquire = service_request(
+            &owner,
+            900,
+            "workflow-a",
+            ModulationCommandV1::AcquireLease { ttl_ms: 10_000 },
+            None,
+        );
+        route(&mut owner, &mut cache, &acquire);
+        {
+            let mut state = owner.shared.state.lock().unwrap();
+            state.controller_rate_hz = Some(20_000);
+            state.controller_block_samples = Some(256);
+        }
+        let prepare = service_request(
+            &owner,
+            901,
+            "workflow-a",
+            ModulationCommandV1::PrepareA1,
+            Some(1),
+        );
+        assert_eq!(
+            response(route(&mut owner, &mut cache, &prepare))
+                .common
+                .outcome,
+            RequestOutcomeV1::InProgress
+        );
+        wait_until(&owner, Duration::from_secs(2), |owner| {
+            owner
+                .shared
+                .completions
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, response)| response.common.request_id.0 == 901)
+        });
+        // Repeating the mutation is trapped behind the host's first reply.
+        assert_eq!(
+            response(route(&mut owner, &mut cache, &prepare))
+                .common
+                .outcome,
+            RequestOutcomeV1::InProgress
+        );
+        // A pending query is cached too; each subsequent poll needs a fresh ID.
+        let retained = std::mem::take(&mut *owner.shared.completions.lock().unwrap());
+        let pending_query = service_request(
+            &owner,
+            907,
+            "workflow-a",
+            ModulationCommandV1::QueryRequest {
+                request_id: stage_a_plugin_contract::RequestId(901),
+            },
+            None,
+        );
+        assert_eq!(
+            response(route(&mut owner, &mut cache, &pending_query))
+                .common
+                .outcome,
+            RequestOutcomeV1::InProgress
+        );
+        *owner.shared.completions.lock().unwrap() = retained;
+        assert_eq!(
+            response(route(&mut owner, &mut cache, &pending_query))
+                .common
+                .outcome,
+            RequestOutcomeV1::InProgress
+        );
+        let query = service_request(
+            &owner,
+            902,
+            "workflow-a",
+            ModulationCommandV1::QueryRequest {
+                request_id: stage_a_plugin_contract::RequestId(901),
+            },
+            None,
+        );
+        let terminal = response(route(&mut owner, &mut cache, &query));
+        assert_eq!(terminal.common.request_id.0, 901);
+        assert_eq!(terminal.common.outcome, RequestOutcomeV1::Applied);
+        assert_eq!(
+            terminal.common.acknowledged_revision,
+            Some(SemanticRevision(1))
+        );
+        assert_eq!(owner.shared.completions.lock().unwrap().len(), 1);
+
+        let other_client = service_request(
+            &owner,
+            903,
+            "workflow-b",
+            ModulationCommandV1::QueryRequest {
+                request_id: stage_a_plugin_contract::RequestId(901),
+            },
+            None,
+        );
+        assert!(matches!(
+            route(&mut owner, &mut cache, &other_client).outcome,
+            PluginServiceOutcome::Rejected { .. }
+        ));
+        let mut other_run = service_request(
+            &owner,
+            904,
+            "workflow-a",
+            ModulationCommandV1::QueryRequest {
+                request_id: stage_a_plugin_contract::RequestId(901),
+            },
+            None,
+        );
+        other_run.payload["run_id"] = serde_json::json!("run-b");
+        assert!(matches!(
+            route(&mut owner, &mut cache, &other_run).outcome,
+            PluginServiceOutcome::Rejected { .. }
+        ));
+        let unknown = service_request(
+            &owner,
+            908,
+            "workflow-a",
+            ModulationCommandV1::QueryRequest {
+                request_id: stage_a_plugin_contract::RequestId(999),
+            },
+            None,
+        );
+        assert!(matches!(
+            route(&mut owner, &mut cache, &unknown).outcome,
+            PluginServiceOutcome::Rejected { .. }
+        ));
+        let mut other_owner = service_request(
+            &owner,
+            909,
+            "workflow-a",
+            ModulationCommandV1::QueryRequest {
+                request_id: stage_a_plugin_contract::RequestId(901),
+            },
+            None,
+        );
+        other_owner.payload["target_owner_instance"] = serde_json::json!("other-owner");
+        assert!(matches!(
+            route(&mut owner, &mut cache, &other_owner).outcome,
+            PluginServiceOutcome::Rejected { .. }
+        ));
+        let mut conflicting = query.clone();
+        conflicting.payload["command"]["request_id"] = serde_json::json!(999);
+        assert!(matches!(
+            owner
+                .handle_service_request(&conflicting, &live_execution())
+                .outcome,
+            PluginServiceOutcome::Rejected { .. }
+        ));
+
+        for (index, command) in [
+            ModulationCommandV1::SetOperatingPoint { mean_u_milli: 300 },
+            ModulationCommandV1::SetDriveFrequency {
+                frequency_millihz: 8_000,
+            },
+            ModulationCommandV1::SetOpticalDepth { depth_a_milli: 300 },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = 920 + index as u64 * 2;
+            let mutation = service_request(&owner, id, "workflow-a", command, None);
+            assert_eq!(
+                response(route(&mut owner, &mut cache, &mutation))
+                    .common
+                    .outcome,
+                RequestOutcomeV1::InProgress
+            );
+            wait_until(&owner, Duration::from_secs(2), |owner| {
+                owner
+                    .shared
+                    .completions
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(_, result)| result.common.request_id.0 == id)
+            });
+            assert_eq!(
+                response(route(&mut owner, &mut cache, &mutation))
+                    .common
+                    .outcome,
+                RequestOutcomeV1::InProgress
+            );
+            let poll = service_request(
+                &owner,
+                id + 1,
+                "workflow-a",
+                ModulationCommandV1::QueryRequest {
+                    request_id: stage_a_plugin_contract::RequestId(id),
+                },
+                None,
+            );
+            let result = response(route(&mut owner, &mut cache, &poll));
+            assert_eq!(result.common.request_id.0, id);
+            assert_eq!(
+                result.common.outcome,
+                RequestOutcomeV1::Applied,
+                "{:?}",
+                result.common.error
+            );
+        }
+        assert_eq!(owner.shared.completions.lock().unwrap().len(), 4);
+
+        // A device rejection remains a rejection when read through a query.
+        let mut rejected = terminal;
+        rejected.common.request_id = stage_a_plugin_contract::RequestId(905);
+        rejected.common.outcome = RequestOutcomeV1::Rejected;
+        rejected.common.error = Some(service_error(
+            ServiceErrorCodeV1::DeviceRejected,
+            "controller rejected test operation",
+            false,
+        ));
+        owner
+            .shared
+            .completions
+            .lock()
+            .unwrap()
+            .push_back((ClientId::from("workflow-a"), rejected));
+        let query_rejected = service_request(
+            &owner,
+            906,
+            "workflow-a",
+            ModulationCommandV1::QueryRequest {
+                request_id: stage_a_plugin_contract::RequestId(905),
+            },
+            None,
+        );
+        let rejected = response(route(&mut owner, &mut cache, &query_rejected));
+        assert_eq!(rejected.common.outcome, RequestOutcomeV1::Rejected);
+        assert_eq!(
+            rejected.common.error.unwrap().message,
+            "controller rejected test operation"
+        );
+        owner.disconnect();
     }
 
     #[test]
