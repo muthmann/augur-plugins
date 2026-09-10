@@ -6,11 +6,6 @@ experiment = "A1"
 name = "frequency-response"
 protocol = "a1_existing_protocol"
  [block.camera]
- diff_on = -15
- diff_off = -2
- fo = 55
- hpf = 0
- refr = 235
  filters_off = true
 [[block.points]]
 label = "A1_current_optical_state"
@@ -23,11 +18,6 @@ experiment = "A2"
 name = "step-latency"
 protocol = "a2_existing_protocol"
  [block.camera]
- diff_on = -15
- diff_off = -2
- fo = 55
- hpf = 0
- refr = 235
  filters_off = true
 [[block.points]]
 label = "A2_current_optical_state"
@@ -57,11 +47,6 @@ experiment = "A4"
 name = "background-threshold-survey"
 protocol = "a4_bright_reference"
  [block.camera]
- diff_on = 0
- diff_off = 0
- fo = 55
- hpf = 0
- refr = 235
  filters_off = true
 [[block.points]]
 label = "A4_threshold_survey"
@@ -75,42 +60,34 @@ name = "refractory-and-load"
 protocol = "a5_complete_scientific"
 pause_before = true
  [block.camera]
- diff_on = -15
- diff_off = -2
- fo = 55
- hpf = 0
- refr = 235
  filters_off = true
 [[block.points]]
-label = "A5_small_roi_log_slew"
+label = "A5_log_slew_reference"
 role = "slew_rate"
 duration_s = 120
 settle_s = 10
 repeats = 1
-roi = "small"
 flux_id = "CAMERA_LUX_CURRENT"
 frequency_hz = 32
 depth_a = 0.5
 transitions_per_polarity = 100
 pause_before = true
 [[block.points]]
-label = "A5_medium_roi_log_slew"
+label = "A5_global_load_low"
 role = "global_load_diagnostic"
 duration_s = 120
 settle_s = 10
 repeats = 1
-roi = "medium"
 flux_id = "CAMERA_LUX_CURRENT"
 frequency_hz = 32
 depth_a = 0.5
 transitions_per_polarity = 100
 [[block.points]]
-label = "A5_large_roi_log_slew"
+label = "A5_global_load_high"
 role = "global_load_diagnostic"
 duration_s = 120
 settle_s = 10
 repeats = 1
-roi = "large"
 flux_id = "CAMERA_LUX_CURRENT"
 frequency_hz = 32
 depth_a = 0.5
@@ -121,7 +98,6 @@ role = "polarity_check"
 duration_s = 120
 settle_s = 10
 repeats = 2
-roi = "small"
 flux_id = "CAMERA_LUX_CURRENT"
 frequency_hz = 32
 depth_a = 0.5

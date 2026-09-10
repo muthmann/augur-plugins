@@ -72,11 +72,15 @@ impl StageAUniversalRunnerPlugin {
     }
 
     fn start(&mut self, context: &mut PluginControlContext<'_>) {
-        let text = match std::fs::read_to_string(self.protocol_path.trim()) {
-            Ok(text) => text,
-            Err(error) => {
-                self.message = format!("Cannot read universal protocol: {error}");
-                return;
+        let text = if self.protocol_path.trim().is_empty() {
+            include_str!("../../../stage-a-universal-runner/protocols/stage-a-all.toml").to_owned()
+        } else {
+            match std::fs::read_to_string(self.protocol_path.trim()) {
+                Ok(text) => text,
+                Err(error) => {
+                    self.message = format!("Cannot read universal protocol: {error}");
+                    return;
+                }
             }
         };
         let plan = match parse(&text) {
@@ -103,20 +107,17 @@ impl StageAUniversalRunnerPlugin {
     }
 
     fn dispatch_next(&mut self, context: &mut PluginControlContext<'_>) {
-        let Some(run) = self.run.as_ref() else { return };
-        let Some(block) = run.plan.blocks.get(run.block_index) else {
-            self.message = "Universal Stage-A run complete".into();
-            self.run = None;
-            return;
+        let (experiment, block_name, protocol, camera, plan_name, measurement_sequence) = {
+            let Some(run) = self.run.as_ref() else { return };
+            let Some(block) = run.plan.blocks.get(run.block_index) else {
+                self.message = "Universal Stage-A run complete".into();
+                self.run = None;
+                return;
+            };
+            (block.experiment, block.name.clone(), block.protocol.clone(), block.camera.clone(), run.plan.name.clone(), run.measurement_sequence)
         };
-        let experiment = block.experiment;
-        let block_name = block.name.clone();
-        let protocol = block.protocol.clone();
-        let plan_name = run.plan.name.clone();
-        let measurement_sequence = run.measurement_sequence;
         let id = self.next_request_id();
         let measurement_id = self.measurement_id(experiment, measurement_sequence);
-        let camera = block.camera.clone();
         let payload = ExecuteBlockRequest {
             plan_name,
             block_name: block_name.clone(),
@@ -189,7 +190,7 @@ impl Plugin for StageAUniversalRunnerPlugin {
     }
     fn settings_schema(&self) -> SettingsSchema {
         SettingsSchema { sections: vec![SettingsSection { label: "Universal Stage-A".into(), description: Some("Sequence existing A1-A6 experiment owners from one protocol.".into()), default_open: true, items: vec![
-            SettingItem { key: "protocol_path".into(), label: "Protocol file".into(), tooltip: None, kind: SettingKind::Path { dialog: augur_plugin_api::PathDialogKind::OpenFile, default: self.protocol_path.clone() } },
+            SettingItem { key: "protocol_path".into(), label: "Protocol file (blank = built-in A1-A5)".into(), tooltip: None, kind: SettingKind::Path { dialog: augur_plugin_api::PathDialogKind::OpenFile, default: self.protocol_path.clone() } },
             SettingItem { key: "measurement_prefix".into(), label: "Measurement prefix".into(), tooltip: None, kind: SettingKind::Text { default: self.measurement_prefix.clone() } },
             SettingItem { key: "start".into(), label: "Run universal protocol".into(), tooltip: None, kind: SettingKind::Button { enabled: true } },
         ] }] }
