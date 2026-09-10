@@ -7397,7 +7397,9 @@ impl<const A3: bool> Plugin for SineAcquisition<A3> {
         } else {
             match serde_json::from_value::<stage_a_universal_runner::ExecuteBlockRequest>(request.payload.clone()) {
                 Ok(command) if command.experiment == experiment => {
-                    self.protocol_path = command.protocol;
+                    if !command.protocol.trim().is_empty() {
+                        self.protocol_path = command.protocol;
+                    }
                     self.measurement_id = command.measurement_id.clone();
                     self.protocol_pending = true;
                     PluginServiceOutcome::Accepted { payload: json!({"measurement_id": command.measurement_id}) }

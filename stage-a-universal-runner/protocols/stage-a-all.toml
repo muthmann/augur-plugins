@@ -4,7 +4,8 @@ overhead_s_per_point = 8.0
 [[block]]
 experiment = "A1"
 name = "frequency-response"
-protocol = "a1_existing_protocol"
+# Empty means: use the A1 protocol already selected in the A1 plugin.
+protocol = ""
  [block.camera]
  filters_off = true
 [[block.points]]
@@ -16,7 +17,8 @@ repeats = 1
 [[block]]
 experiment = "A2"
 name = "step-latency"
-protocol = "a2_existing_protocol"
+# Empty means: use the A2 protocol already selected in the A2 plugin.
+protocol = ""
  [block.camera]
  filters_off = true
 [[block.points]]
@@ -28,7 +30,8 @@ repeats = 1
 [[block]]
 experiment = "A3"
 name = "threshold-map"
-protocol = "a3_existing_protocol"
+# Empty means: use the A3 protocol already selected in the A3 plugin.
+protocol = ""
  [block.camera]
  diff_on = -15
  diff_off = -2

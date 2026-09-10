@@ -2537,7 +2537,9 @@ impl Plugin for StageAA2Plugin {
         } else {
             match serde_json::from_value::<stage_a_universal_runner::ExecuteBlockRequest>(request.payload.clone()) {
                 Ok(command) if command.experiment == stage_a_universal_runner::Experiment::A2 => {
-                    self.protocol_path = command.protocol;
+                    if !command.protocol.trim().is_empty() {
+                        self.protocol_path = command.protocol;
+                    }
                     self.measurement_id = command.measurement_id.clone();
                     self.start_pending = true;
                     PluginServiceOutcome::Accepted { payload: json!({"measurement_id": command.measurement_id}) }
