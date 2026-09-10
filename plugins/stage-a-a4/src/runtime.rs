@@ -3822,8 +3822,8 @@ mod tests {
             p.message,
             p.run.as_ref().map(|r| r.phase)
         );
-        assert_eq!(starts, 3);
-        assert!(p.message.contains("3/3 recorded"), "{}", p.message);
+        assert_eq!(starts, 15);
+        assert!(p.message.contains("15/15 recorded"), "{}", p.message);
         for snapshot in sink.applied_snapshots() {
             assert_eq!(snapshot, baseline_snapshot());
         }
@@ -3836,21 +3836,21 @@ mod tests {
                 .iter()
                 .filter(|p| p.extension().is_some_and(|e| e == "raw"))
                 .count(),
-            3
+            15
         );
         assert_eq!(
             files
                 .iter()
                 .filter(|p| p.extension().is_some_and(|e| e == "pdq"))
                 .count(),
-            3
+            15
         );
         assert_eq!(
             files
                 .iter()
                 .filter(|p| p.to_string_lossy().ends_with(".devices.json"))
                 .count(),
-            3
+            15
         );
         assert!(p.devices.released());
     }

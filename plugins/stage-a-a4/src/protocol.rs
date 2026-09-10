@@ -241,20 +241,36 @@ pub fn parse_file(path: &str, text: &str) -> Result<Protocol, ProtocolError> {
         if value.get("mode").and_then(toml::Value::as_str) == Some("current_reference") {
             #[derive(Deserialize)]
             #[serde(deny_unknown_fields)]
+            struct Threshold {
+                diff_on: i64,
+                diff_off: i64,
+            }
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
             struct Reference {
                 mode: String,
                 name: String,
                 duration_s: i64,
                 settle_s: f64,
                 repeats: i64,
+                #[serde(default)]
+                threshold: Vec<Threshold>,
             }
             let reference: Reference =
                 toml::from_str(text).map_err(|e| ProtocolError::Toml(e.to_string()))?;
             let _ = reference.mode;
-            let csv = format!(
-                "diff_on,diff_off,duration_s,settle_s,repeats\n0,0,{},{},{}\n",
-                reference.duration_s, reference.settle_s, reference.repeats
-            );
+            let rows = if reference.threshold.is_empty() {
+                vec![(0, 0)]
+            } else {
+                reference.threshold.iter().map(|p| (p.diff_on, p.diff_off)).collect()
+            };
+            let csv = std::iter::once("diff_on,diff_off,duration_s,settle_s,repeats".to_owned())
+                .chain(rows.into_iter().map(|(diff_on, diff_off)| format!(
+                    "{diff_on},{diff_off},{},{},{}",
+                    reference.duration_s, reference.settle_s, reference.repeats
+                )))
+                .collect::<Vec<_>>()
+                .join("\n");
             let mut plan = parse_csv(&csv)?;
             plan.name = reference.name;
             plan.preserve_current = true;
@@ -1049,8 +1065,8 @@ mod reference_tests {
         )
         .unwrap();
         assert!(p.preserve_current);
-        assert_eq!(p.points.len(), 3);
-        assert_eq!(p.total_seconds(), 390.0);
+        assert_eq!(p.points.len(), 15);
+        assert_eq!(p.total_seconds(), 1950.0);
         assert!(p.points.iter().all(|p| !p.pause_before));
     }
 }
