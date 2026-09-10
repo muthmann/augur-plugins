@@ -114,22 +114,21 @@ if [[ ${#packages[@]} -eq 0 ]]; then
     exit 1
 fi
 
-cmd=(cargo build --manifest-path "${repo_root}/Cargo.toml")
+echo "Building ${#packages[@]} runtime plugin(s) with profile ${profile}:"
+printf '  %s\n' "${packages[@]}"
+common_args=(--manifest-path "${repo_root}/Cargo.toml")
 if [[ "${profile}" == "release" ]]; then
-    cmd+=(--release)
+    common_args+=(--release)
 else
-    cmd+=(--profile "${profile}")
+    common_args+=(--profile "${profile}")
 fi
 if [[ ${locked} -eq 1 ]]; then
-    cmd+=(--locked)
+    common_args+=(--locked)
 fi
-for package in "${packages[@]}"; do
-    cmd+=(-p "${package}")
-done
 
 if local_augur_rs_repo="$(find_local_augur_rs_repo)"; then
     local_augur_rs_url="file://${local_augur_rs_repo}"
-    cmd+=(
+    common_args+=(
         --config
         "patch.\"https://github.com/muthmann/augur-rs.git\".augur-core.git=\"${local_augur_rs_url}\""
         --config
@@ -137,17 +136,18 @@ if local_augur_rs_repo="$(find_local_augur_rs_repo)"; then
     )
 fi
 
-if [[ ${#cargo_args[@]} -gt 0 ]]; then
-    cmd+=("${cargo_args[@]}")
-fi
-
-echo "Building ${#packages[@]} runtime plugin(s) with profile ${profile}:"
-printf '  %s\n' "${packages[@]}"
 if [[ -n "${local_augur_rs_repo:-}" ]]; then
     echo "Using local AugurRS checkout: ${local_augur_rs_repo}"
 fi
 echo
-"${cmd[@]}"
+for package in "${packages[@]}"; do
+    cmd=(cargo build "${common_args[@]}" -p "${package}")
+    if [[ ${#cargo_args[@]} -gt 0 ]]; then
+        cmd+=("${cargo_args[@]}")
+    fi
+    echo "Building ${package}"
+    "${cmd[@]}"
+done
 echo
 echo "Built ${#packages[@]} runtime plugin(s)"
 echo "Skipped ${skipped_not_runtime} non-runtime plugin(s)"
