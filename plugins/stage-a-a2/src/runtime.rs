@@ -3,11 +3,12 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use augur_plugin_api::{
-    export_plugin, CameraConfigurationProvenanceV1, CameraConfigurationSnapshotV1,
+    export_plugin, CameraConfigurationProvenanceV1, CameraConfigurationSnapshotV1, ExecutionContext,
     CameraConfigurationSourceV1, EventStoreHandle, GlobalSettings, HostCommand, HostCommandOutcome,
     HostCommandRequest, HostContext, HostOutput, PathDialogKind, Plugin, PluginCapabilities,
     PluginControlContext, PluginControlInbox, PluginDiscontinuity, PluginFrame, PluginInput,
-    PluginRuntimeRole, PluginServiceOutcome, PluginServiceRequest, SensorMonitoringV1, SettingItem,
+    PluginRuntimeRole, PluginServiceOutcome, PluginServiceReply, PluginServiceRequest,
+    SensorMonitoringV1, SettingItem,
     SettingKind, SettingsSchema, SettingsSection, StatusEntry, CTX_GLOBAL_SETTINGS,
     CTX_SENSOR_MONITORING,
 };
@@ -2521,6 +2522,30 @@ impl Plugin for StageAA2Plugin {
             run.last_event_bin_us = None;
             run.last_event_bin_count = 0;
         }
+    }
+
+    fn handle_service_request(
+        &mut self,
+        request: &PluginServiceRequest,
+        execution: &ExecutionContext,
+    ) -> PluginServiceReply {
+        let outcome = if request.service != stage_a_universal_runner::SERVICE_EXECUTE_BLOCK_V1 {
+            PluginServiceOutcome::Rejected { code: "unsupported_service".into(), message: "A2 does not support this service".into() }
+        } else if !execution.hardware_effects_allowed() {
+            PluginServiceOutcome::Rejected { code: "effects_not_allowed".into(), message: "A2 block execution requires the live worker".into() }
+        } else {
+            match serde_json::from_value::<stage_a_universal_runner::ExecuteBlockRequest>(request.payload.clone()) {
+                Ok(command) if command.experiment == stage_a_universal_runner::Experiment::A2 => {
+                    self.protocol_path = command.protocol;
+                    self.measurement_id = command.measurement_id.clone();
+                    self.start_pending = true;
+                    PluginServiceOutcome::Accepted { payload: json!({"measurement_id": command.measurement_id}) }
+                }
+                Ok(command) => PluginServiceOutcome::Rejected { code: "wrong_target".into(), message: format!("A2 cannot execute {:?}", command.experiment) },
+                Err(error) => PluginServiceOutcome::Rejected { code: "invalid_payload".into(), message: error.to_string() },
+            }
+        };
+        PluginServiceReply { request_id: request.request_id, source_plugin_id: request.source_plugin_id.clone(), target_plugin_id: request.target_plugin_id.clone(), service: request.service.clone(), outcome }
     }
     fn on_discontinuity(&mut self, _: PluginDiscontinuity) {}
     fn input_kind(&self) -> PluginInput {
