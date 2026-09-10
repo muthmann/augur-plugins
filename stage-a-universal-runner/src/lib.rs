@@ -83,6 +83,14 @@ pub struct Point {
     pub roi: Option<String>,
     #[serde(default)]
     pub flux_id: Option<String>,
+    #[serde(default)]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub frequency_hz: Option<f64>,
+    #[serde(default)]
+    pub depth_a: Option<f64>,
+    #[serde(default)]
+    pub transitions_per_polarity: Option<u32>,
 }
 
 fn one() -> u32 { 1 }

@@ -83,33 +83,49 @@ pause_before = true
  filters_off = true
 [[block.points]]
 label = "A5_small_roi_log_slew"
+role = "slew_rate"
 duration_s = 120
 settle_s = 10
 repeats = 1
 roi = "small"
 flux_id = "CAMERA_LUX_CURRENT"
+frequency_hz = 32
+depth_a = 0.5
+transitions_per_polarity = 100
 pause_before = true
 [[block.points]]
 label = "A5_medium_roi_log_slew"
+role = "global_load_diagnostic"
 duration_s = 120
 settle_s = 10
 repeats = 1
 roi = "medium"
 flux_id = "CAMERA_LUX_CURRENT"
+frequency_hz = 32
+depth_a = 0.5
+transitions_per_polarity = 100
 [[block.points]]
 label = "A5_large_roi_log_slew"
+role = "global_load_diagnostic"
 duration_s = 120
 settle_s = 10
 repeats = 1
 roi = "large"
 flux_id = "CAMERA_LUX_CURRENT"
+frequency_hz = 32
+depth_a = 0.5
+transitions_per_polarity = 100
 [[block.points]]
 label = "A5_polarity_reference"
+role = "polarity_check"
 duration_s = 120
 settle_s = 10
 repeats = 2
 roi = "small"
 flux_id = "CAMERA_LUX_CURRENT"
+frequency_hz = 32
+depth_a = 0.5
+transitions_per_polarity = 100
 
 [[block]]
 experiment = "A6"
