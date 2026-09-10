@@ -169,6 +169,14 @@ mod tests {
     }
 
     #[test]
+    fn smoke_plan_covers_all_runtime_stages() {
+        let plan = parse(include_str!("../protocols/stage-a-smoke-test.toml")).expect("fixture parses");
+        assert_eq!(plan.blocks.len(), 5);
+        assert_eq!(plan.total_points(), 5);
+        assert!(plan.blocks.iter().all(|block| block.camera.refr == Some(235)));
+    }
+
+    #[test]
     fn block_handoff_is_versioned_and_keeps_experiment_ownership() {
         let request = ExecuteBlockRequest {
             plan_name: "day".into(),

@@ -1,0 +1,92 @@
+# Short operator smoke test for the universal runner.
+# This validates dispatch, camera-state handoff, AOD confirmation metadata,
+# explicit block completion and resume identity. It is not scientific data.
+name = "stage-a-smoke-test"
+overhead_s_per_point = 1.0
+
+[[block]]
+experiment = "A1"
+name = "a1-dispatch"
+protocol = ""
+ [block.camera]
+ diff_on = -15
+ diff_off = -2
+ fo = 55
+ hpf = 0
+ refr = 235
+ filters_off = true
+[[block.points]]
+label = "A1_smoke"
+duration_s = 2
+settle_s = 1
+repeats = 1
+
+[[block]]
+experiment = "A2"
+name = "a2-dispatch"
+protocol = ""
+ [block.camera]
+ diff_on = -15
+ diff_off = -2
+ fo = 55
+ hpf = 0
+ refr = 235
+ filters_off = true
+[[block.points]]
+label = "A2_smoke"
+duration_s = 2
+settle_s = 1
+repeats = 1
+
+[[block]]
+experiment = "A3"
+name = "a3-dispatch"
+protocol = ""
+ [block.camera]
+ diff_on = -15
+ diff_off = -2
+ fo = 55
+ hpf = 0
+ refr = 235
+ filters_off = true
+[[block.points]]
+label = "A3_smoke"
+duration_s = 2
+settle_s = 1
+repeats = 1
+
+[[block]]
+experiment = "A4"
+name = "a4-dispatch"
+protocol = "a4_bright_reference"
+pause_before = true
+ [block.camera]
+ diff_on = -15
+ diff_off = -2
+ fo = 55
+ hpf = 0
+ refr = 235
+ filters_off = true
+[[block.points]]
+label = "A4_smoke"
+duration_s = 2
+settle_s = 1
+repeats = 1
+
+[[block]]
+experiment = "A5"
+name = "a5-dispatch"
+protocol = "a5_complete_scientific"
+pause_before = true
+ [block.camera]
+ diff_on = -15
+ diff_off = -2
+ fo = 55
+ hpf = 0
+ refr = 235
+ filters_off = true
+[[block.points]]
+label = "A5_smoke"
+duration_s = 2
+settle_s = 1
+repeats = 1
