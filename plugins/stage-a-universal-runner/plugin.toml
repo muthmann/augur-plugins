@@ -1,0 +1,8 @@
+id = "stage-a.universal-runner"
+name = "Stage-A Universal Runner"
+version = "0.2.0"
+description = "Sequences A1-A6 while experiment plugins retain camera, modulation and photodiode ownership."
+domain = "stage-a"
+library = "augur_plugin_stage_a_universal_runner"
+phase = "raw_events"
+min_augur_version = "2.2.0"
