@@ -45,7 +45,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use augur_plugin_api::{
     CameraBiasOffsetsV1, CameraConfigurationProvenanceV1, CameraConfigurationSnapshotV1,
-    CameraConfigurationSourceV1, EventStoreHandle, FfiCdEvent, GlobalSettings, HostCommand,
+    CameraConfigurationSourceV1, EventStoreHandle, ExecutionContext, FfiCdEvent, GlobalSettings, HostCommand,
     HostCommandOutcome, HostCommandReply, HostCommandRequest, HostContext, HostDatasetDescriptor,
     HostDatasetKind, HostOutput, HostViewDescriptor, HostViewKind, HostViewPlacement,
     HostViewRegistry, PathDialogKind, Plugin, PluginCapabilities, PluginControlContext,
@@ -7377,6 +7377,35 @@ impl<const A3: bool> Plugin for SineAcquisition<A3> {
 
     fn set_runtime_role(&mut self, role: PluginRuntimeRole) {
         self.runtime_role = role;
+    }
+
+    fn handle_service_request(
+        &mut self,
+        request: &PluginServiceRequest,
+        execution: &ExecutionContext,
+    ) -> PluginServiceReply {
+        let experiment = if A3 {
+            stage_a_universal_runner::Experiment::A3
+        } else {
+            stage_a_universal_runner::Experiment::A1
+        };
+        let outcome = if request.service != stage_a_universal_runner::SERVICE_EXECUTE_BLOCK_V1 {
+            PluginServiceOutcome::Rejected { code: "unsupported_service".into(), message: "A1/A3 does not support this service".into() }
+        } else if !execution.hardware_effects_allowed() {
+            PluginServiceOutcome::Rejected { code: "effects_not_allowed".into(), message: "A1/A3 block execution requires the live worker".into() }
+        } else {
+            match serde_json::from_value::<stage_a_universal_runner::ExecuteBlockRequest>(request.payload.clone()) {
+                Ok(command) if command.experiment == experiment => {
+                    self.protocol_path = command.protocol;
+                    self.measurement_id = command.measurement_id.clone();
+                    self.protocol_pending = true;
+                    PluginServiceOutcome::Accepted { payload: json!({"measurement_id": command.measurement_id}) }
+                }
+                Ok(command) => PluginServiceOutcome::Rejected { code: "wrong_target".into(), message: format!("this runner cannot execute {:?}", command.experiment) },
+                Err(error) => PluginServiceOutcome::Rejected { code: "invalid_payload".into(), message: error.to_string() },
+            }
+        };
+        PluginServiceReply { request_id: request.request_id, source_plugin_id: request.source_plugin_id.clone(), target_plugin_id: request.target_plugin_id.clone(), service: request.service.clone(), outcome }
     }
 
     fn reset(&mut self) {
