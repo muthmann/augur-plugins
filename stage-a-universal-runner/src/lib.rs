@@ -125,6 +125,7 @@ pub struct ExecuteBlockRequest {
     pub experiment: Experiment,
     pub protocol: String,
     pub measurement_id: String,
+    pub camera: CameraSettings,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -163,6 +164,7 @@ mod tests {
             experiment: Experiment::A5,
             protocol: "a5_complete_scientific".into(),
             measurement_id: "A5-20260910-01".into(),
+            camera: CameraSettings::default(),
         };
         let encoded = toml::to_string(&request).expect("request serializes");
         assert!(encoded.contains("experiment = \"a5\""));

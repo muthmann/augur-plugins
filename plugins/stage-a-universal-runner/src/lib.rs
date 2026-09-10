@@ -116,12 +116,14 @@ impl StageAUniversalRunnerPlugin {
         let measurement_sequence = run.measurement_sequence;
         let id = self.next_request_id();
         let measurement_id = self.measurement_id(experiment, measurement_sequence);
+        let camera = block.camera.clone();
         let payload = ExecuteBlockRequest {
             plan_name,
             block_name: block_name.clone(),
             experiment,
             protocol,
             measurement_id,
+            camera,
         };
         let waiting_measurement_id = payload.measurement_id.clone();
         let _ = context.request_service(&PluginServiceRequest {

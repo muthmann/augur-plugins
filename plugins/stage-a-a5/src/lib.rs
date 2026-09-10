@@ -47,6 +47,9 @@ impl Plugin for StageAA5Plugin {
         } else {
             match serde_json::from_value::<ExecuteBlockRequest>(request.payload.clone()) {
                 Ok(command) if command.experiment == Experiment::A5 => {
+                    if command.camera.roi.is_some() {
+                        return PluginServiceReply { request_id: request.request_id, source_plugin_id: request.source_plugin_id.clone(), target_plugin_id: request.target_plugin_id.clone(), service: request.service.clone(), outcome: PluginServiceOutcome::Rejected { code: "camera_roi_not_supported".into(), message: "A5 adapter requires a preselected qualified ROI; ROI switching is not yet supported by the delegated engine".into() } };
+                    }
                     if let Err(error) = self.inner.set_setting("protocol_path", json!(command.protocol)) {
                         PluginServiceOutcome::Rejected { code: "invalid_protocol".into(), message: error }
                     } else if let Err(error) = self.inner.set_setting("measurement_id", json!(command.measurement_id)) {
