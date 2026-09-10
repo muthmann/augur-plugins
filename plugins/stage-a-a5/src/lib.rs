@@ -50,7 +50,18 @@ impl Plugin for StageAA5Plugin {
                     if command.camera.roi.is_some() {
                         return PluginServiceReply { request_id: request.request_id, source_plugin_id: request.source_plugin_id.clone(), target_plugin_id: request.target_plugin_id.clone(), service: request.service.clone(), outcome: PluginServiceOutcome::Rejected { code: "camera_roi_not_supported".into(), message: "A5 adapter requires a preselected qualified ROI; ROI switching is not yet supported by the delegated engine".into() } };
                     }
-                    if let Err(error) = self.inner.set_setting("protocol_path", json!(command.protocol)) {
+                    let protocol_path = if command.protocol == "a5_complete_scientific" {
+                        let path = std::env::temp_dir().join("stage-a-a5_complete_scientific.toml");
+                        std::fs::write(&path, include_str!("../protocols/a5_complete_scientific.toml"))
+                            .map(|_| path.to_string_lossy().into_owned())
+                            .map_err(|error| error.to_string())
+                    } else {
+                        Ok(command.protocol)
+                    };
+                    let Ok(protocol_path) = protocol_path else {
+                        return PluginServiceReply { request_id: request.request_id, source_plugin_id: request.source_plugin_id.clone(), target_plugin_id: request.target_plugin_id.clone(), service: request.service.clone(), outcome: PluginServiceOutcome::Rejected { code: "protocol_materialization_failed".into(), message: "could not materialize the built-in A5 protocol".into() } };
+                    };
+                    if let Err(error) = self.inner.set_setting("protocol_path", json!(protocol_path)) {
                         PluginServiceOutcome::Rejected { code: "invalid_protocol".into(), message: error }
                     } else if let Err(error) = self.inner.set_setting("measurement_id", json!(command.measurement_id)) {
                         PluginServiceOutcome::Rejected { code: "invalid_measurement_id".into(), message: error }
