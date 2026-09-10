@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use augur_plugin_api::{
-    export_plugin, CameraConfigurationProvenanceV1, CameraConfigurationSnapshotV1, ExecutionContext,
+    CameraConfigurationProvenanceV1, CameraConfigurationSnapshotV1, ExecutionContext,
     CameraConfigurationSourceV1, EventStoreHandle, GlobalSettings, HostCommand, HostCommandOutcome,
     HostCommandRequest, HostContext, HostOutput, PathDialogKind, Plugin, PluginCapabilities,
     PluginControlContext, PluginControlInbox, PluginDiscontinuity, PluginFrame, PluginInput,
@@ -5654,4 +5654,5 @@ comparator_threshold_dac=500
     }
 }
 
-export_plugin!(StageAA2Plugin);
+#[cfg(feature = "plugin-entrypoint")]
+augur_plugin_api::export_plugin!(StageAA2Plugin);

@@ -6,6 +6,10 @@ license.workspace = true
 authors.workspace = true
 description = "Stage-A A2 optical step-latency protocol runner"
 
+[features]
+default = ["plugin-entrypoint"]
+plugin-entrypoint = []
+
 [lib]
 crate-type = ["cdylib", "rlib"]
 
