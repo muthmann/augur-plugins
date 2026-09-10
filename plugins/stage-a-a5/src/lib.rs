@@ -6,7 +6,7 @@
 
 use augur_plugin_api::{
     export_plugin, EventStoreHandle, ExecutionContext, HostContext, HostOutput, Plugin,
-    PluginControlContext, PluginDiscontinuity, PluginFrame, PluginInput, PluginRuntimeRole,
+    PluginControlContext, PluginControlSnapshot, PluginDiscontinuity, PluginFrame, PluginInput, PluginRuntimeRole,
     PluginServiceOutcome, PluginServiceReply, PluginServiceRequest, SettingsSchema, StatusEntry,
 };
 use serde_json::{json, Value};
@@ -32,6 +32,13 @@ impl Plugin for StageAA5Plugin {
     fn input_kind(&self) -> PluginInput { self.inner.input_kind() }
     fn process_frame(&mut self, frame: &PluginFrame<'_>, output: &mut HostOutput<'_>, context: &mut HostContext<'_>, store: &EventStoreHandle<'_>) { self.inner.process_frame(frame, output, context, store); }
     fn process_control(&mut self, context: &mut PluginControlContext<'_>) { self.inner.process_control(context); }
+    fn control_snapshots(&self) -> Vec<PluginControlSnapshot> {
+        self.inner.control_snapshots().into_iter().map(|mut snapshot| {
+            snapshot.plugin_id = "stage-a.a5".into();
+            snapshot.payload["experiment"] = json!("A5");
+            snapshot
+        }).collect()
+    }
     fn handle_service_request(&mut self, request: &PluginServiceRequest, execution: &ExecutionContext) -> PluginServiceReply {
         let outcome = if request.service != SERVICE_EXECUTE_BLOCK_V1 {
             PluginServiceOutcome::Rejected { code: "unsupported_service".into(), message: "A5 does not support this service".into() }
