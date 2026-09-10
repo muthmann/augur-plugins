@@ -50,7 +50,8 @@ use augur_plugin_api::{
     HostDatasetKind, HostOutput, HostViewDescriptor, HostViewKind, HostViewPlacement,
     HostViewRegistry, PathDialogKind, Plugin, PluginCapabilities, PluginControlContext,
     PluginControlInbox, PluginDiscontinuity, PluginFrame, PluginInput, PluginRuntimeRole,
-    PluginServiceOutcome, PluginServiceReply, PluginServiceRequest, RoiV1, SensorBiasReadbackV1,
+    PluginServiceOutcome, PluginServiceReply, PluginServiceRequest, PluginControlSnapshot,
+    RoiV1, SensorBiasReadbackV1,
     SensorMonitoringV1, Series1dLine, Series1dPoint, Series1dV1, SettingItem, SettingKind,
     SettingsSchema, SettingsSection, StatusEntry, TableColumn, TableColumnData, TableColumnValues,
     TableDatasetV1, TableSchema, TableValueType, CTX_GLOBAL_SETTINGS, CTX_SENSOR_MONITORING,
@@ -7601,6 +7602,21 @@ impl<const A3: bool> Plugin for SineAcquisition<A3> {
         self.drive_recording(context);
         // The fold reflects live snapshots (T, a) even between frames.
         self.bump();
+    }
+
+    fn control_snapshots(&self) -> Vec<PluginControlSnapshot> {
+        let experiment = if A3 { "A3" } else { "A1" };
+        let completed = self.protocol.is_none() && self.recording_completed_ok;
+        vec![PluginControlSnapshot {
+            plugin_id: Self::PLUGIN_ID.into(),
+            topic: "stage-a.universal.block".into(),
+            revision: self.dataset_generation,
+            payload: json!({
+                "state": if completed { "completed" } else if self.protocol.is_some() { "running" } else { "idle" },
+                "experiment": experiment,
+                "measurement_id": self.measurement_id,
+            }),
+        }]
     }
 
     fn settings_schema(&self) -> SettingsSchema {

@@ -8,6 +8,7 @@ use augur_plugin_api::{
     HostCommandRequest, HostContext, HostOutput, PathDialogKind, Plugin, PluginCapabilities,
     PluginControlContext, PluginControlInbox, PluginDiscontinuity, PluginFrame, PluginInput,
     PluginRuntimeRole, PluginServiceOutcome, PluginServiceReply, PluginServiceRequest,
+    PluginControlSnapshot,
     SensorMonitoringV1, SettingItem,
     SettingKind, SettingsSchema, SettingsSection, StatusEntry, CTX_GLOBAL_SETTINGS,
     CTX_SENSOR_MONITORING,
@@ -2636,6 +2637,22 @@ impl Plugin for StageAA2Plugin {
         }
         self.drive(c);
     }
+
+    fn control_snapshots(&self) -> Vec<PluginControlSnapshot> {
+        let completed = self.run.is_none()
+            && (self.message.starts_with("A2 capture finished")
+                || self.message.starts_with("A2 acquisition checks passed"));
+        vec![PluginControlSnapshot {
+            plugin_id: "stage-a.a2".into(),
+            topic: "stage-a.universal.block".into(),
+            revision: self.revision,
+            payload: json!({
+                "state": if completed { "completed" } else if self.run.is_some() { "running" } else { "idle" },
+                "measurement_id": self.measurement_id,
+            }),
+        }]
+    }
+
     fn settings_schema(&self) -> SettingsSchema {
         SettingsSchema {
             sections: vec![
