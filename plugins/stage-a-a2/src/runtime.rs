@@ -358,6 +358,7 @@ struct Run {
 }
 
 pub struct StageAA2Plugin {
+    requester_plugin_id: String,
     enabled: bool,
     role: PluginRuntimeRole,
     output_folder: String,
@@ -384,6 +385,7 @@ pub struct StageAA2Plugin {
 impl Default for StageAA2Plugin {
     fn default() -> Self {
         Self {
+            requester_plugin_id: ID.into(),
             enabled: true,
             role: PluginRuntimeRole::LiveWorker,
             output_folder: String::new(),
@@ -423,6 +425,12 @@ impl Control for PluginControlContext<'_> {
 }
 
 impl StageAA2Plugin {
+    /// Override the requester identity when this recorder is embedded by a
+    /// protocol adapter such as A5. Hardware owners validate this identity.
+    pub fn set_requester_plugin_id(&mut self, plugin_id: impl Into<String>) {
+        self.requester_plugin_id = plugin_id.into();
+    }
+
     fn next_id(&mut self) -> u64 {
         self.request += 1;
         self.request
@@ -706,7 +714,11 @@ impl StageAA2Plugin {
                 self.modulation.as_ref().map(|s| s.owner_instance.clone()),
             )
         };
-        let mut e = ModulationRequestV1::new(RequestId(request_id), ClientId::new(ID), command);
+        let mut e = ModulationRequestV1::new(
+            RequestId(request_id),
+            ClientId::new(self.requester_plugin_id.clone()),
+            command,
+        );
         e.lease_id = Some(lease);
         e.target_owner_instance = owner;
         e.issued_at_unix_ms = now_ms();
@@ -716,7 +728,7 @@ impl StageAA2Plugin {
         }
         let request = PluginServiceRequest {
             request_id,
-            source_plugin_id: ID.into(),
+            source_plugin_id: self.requester_plugin_id.clone(),
             target_plugin_id: MOD_ID.into(),
             service: SERVICE_STAGE_A_MODULATION_CONTROL_V1.into(),
             payload: serde_json::to_value(e).unwrap(),
@@ -748,7 +760,11 @@ impl StageAA2Plugin {
                 self.photodiode.as_ref().map(|s| s.owner_instance.clone()),
             )
         };
-        let mut e = PhotodiodeRequestV1::new(RequestId(request_id), ClientId::new(ID), command);
+        let mut e = PhotodiodeRequestV1::new(
+            RequestId(request_id),
+            ClientId::new(self.requester_plugin_id.clone()),
+            command,
+        );
         e.lease_id = Some(lease);
         e.target_owner_instance = owner;
         e.issued_at_unix_ms = now_ms();
@@ -758,7 +774,7 @@ impl StageAA2Plugin {
         }
         control.service(&PluginServiceRequest {
             request_id,
-            source_plugin_id: ID.into(),
+            source_plugin_id: self.requester_plugin_id.clone(),
             target_plugin_id: PD_ID.into(),
             service: SERVICE_STAGE_A_PHOTODIODE_CONTROL_V1.into(),
             payload: serde_json::to_value(e).unwrap(),

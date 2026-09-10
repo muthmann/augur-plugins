@@ -18,7 +18,11 @@ pub struct StageAA5Plugin {
 }
 
 impl Default for StageAA5Plugin {
-    fn default() -> Self { Self { inner: StageAA2Plugin::default() } }
+    fn default() -> Self {
+        let mut inner = StageAA2Plugin::default();
+        inner.set_requester_plugin_id("stage-a.a5");
+        Self { inner }
+    }
 }
 
 impl Plugin for StageAA5Plugin {
