@@ -1,0 +1,9 @@
+id = "stage-a.a5"
+name = "Stage-A A5 Refractory and Load"
+version = "0.2.0"
+description = "Runs A5 rate, polarity and array-load protocols using the existing coordinated camera/PD/modulation acquisition engine."
+domain = "stage-a"
+library = "augur_plugin_stage_a_a5"
+phase = "raw_events"
+min_augur_version = "2.2.0"
+host_commands = ["start_recording", "stop_recording", "apply_camera_configuration", "restore_camera_configuration"]
