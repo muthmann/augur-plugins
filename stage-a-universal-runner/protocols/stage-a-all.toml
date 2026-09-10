@@ -1,0 +1,125 @@
+name = "stage-a-complete-repetition"
+overhead_s_per_point = 8.0
+
+[[block]]
+experiment = "A1"
+name = "frequency-response"
+protocol = "a1_existing_protocol"
+ [block.camera]
+ diff_on = -15
+ diff_off = -2
+ fo = 55
+ hpf = 0
+ refr = 235
+ filters_off = true
+[[block.points]]
+label = "A1_current_optical_state"
+duration_s = 60
+settle_s = 10
+repeats = 1
+
+[[block]]
+experiment = "A2"
+name = "step-latency"
+protocol = "a2_existing_protocol"
+ [block.camera]
+ diff_on = -15
+ diff_off = -2
+ fo = 55
+ hpf = 0
+ refr = 235
+ filters_off = true
+[[block.points]]
+label = "A2_current_optical_state"
+duration_s = 120
+settle_s = 10
+repeats = 1
+
+[[block]]
+experiment = "A3"
+name = "threshold-map"
+protocol = "a3_existing_protocol"
+ [block.camera]
+ diff_on = -15
+ diff_off = -2
+ fo = 55
+ hpf = 0
+ refr = 235
+ filters_off = true
+[[block.points]]
+label = "A3_current_optical_state"
+duration_s = 60
+settle_s = 10
+repeats = 1
+
+[[block]]
+experiment = "A4"
+name = "background-threshold-survey"
+protocol = "a4_bright_reference"
+ [block.camera]
+ diff_on = 0
+ diff_off = 0
+ fo = 55
+ hpf = 0
+ refr = 235
+ filters_off = true
+[[block.points]]
+label = "A4_threshold_survey"
+duration_s = 120
+settle_s = 10
+repeats = 15
+
+[[block]]
+experiment = "A5"
+name = "refractory-and-load"
+protocol = "a5_complete_scientific"
+pause_before = true
+ [block.camera]
+ diff_on = -15
+ diff_off = -2
+ fo = 55
+ hpf = 0
+ refr = 235
+ filters_off = true
+[[block.points]]
+label = "A5_small_roi_log_slew"
+duration_s = 120
+settle_s = 10
+repeats = 1
+roi = "small"
+flux_id = "CAMERA_LUX_CURRENT"
+pause_before = true
+[[block.points]]
+label = "A5_medium_roi_log_slew"
+duration_s = 120
+settle_s = 10
+repeats = 1
+roi = "medium"
+flux_id = "CAMERA_LUX_CURRENT"
+[[block.points]]
+label = "A5_large_roi_log_slew"
+duration_s = 120
+settle_s = 10
+repeats = 1
+roi = "large"
+flux_id = "CAMERA_LUX_CURRENT"
+[[block.points]]
+label = "A5_polarity_reference"
+duration_s = 120
+settle_s = 10
+repeats = 2
+roi = "small"
+flux_id = "CAMERA_LUX_CURRENT"
+
+[[block]]
+experiment = "A6"
+name = "camera-lux-reference"
+protocol = "camera_lux_reference"
+ [block.camera]
+ filters_off = true
+[[block.points]]
+label = "A6_current_camera_lux"
+duration_s = 30
+settle_s = 10
+repeats = 1
+flux_id = "CAMERA_LUX"
