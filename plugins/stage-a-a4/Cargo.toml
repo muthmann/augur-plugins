@@ -17,6 +17,7 @@ serde_json.workspace = true
 # a hash that means the same thing as every other hash in the folder.
 sha2 = "0.10"
 stage-a-plugin-contract = { path = "../../stage-a-plugin-contract" }
+stage-a-universal-runner = { path = "../../stage-a-universal-runner" }
 toml = "0.8"
 
 [lints.rust]

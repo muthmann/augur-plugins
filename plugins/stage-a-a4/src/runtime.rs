@@ -43,11 +43,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use augur_plugin_api::{
     export_plugin, CameraConfigurationSnapshotV1, CameraConfigurationSourceV1, EventFiltersV1,
-    EventStoreHandle, GlobalSettings, HostCommand, HostCommandOutcome, HostCommandReply,
+    EventStoreHandle, ExecutionContext, GlobalSettings, HostCommand, HostCommandOutcome, HostCommandReply,
     HostCommandRequest, HostContext, HostDatasetDescriptor, HostDatasetKind, HostOutput,
     HostViewDescriptor, HostViewKind, HostViewPlacement, HostViewRegistry, PathDialogKind, Plugin,
     PluginCapabilities, PluginControlContext, PluginControlInbox, PluginDiscontinuity, PluginFrame,
-    PluginInput, PluginRuntimeRole, PluginServiceRequest, RoiV1, SensorBiasReadbackV1,
+    PluginInput, PluginRuntimeRole, PluginServiceOutcome, PluginServiceReply, PluginServiceRequest,
+    RoiV1, SensorBiasReadbackV1,
     SensorMonitoringV1, SettingItem, SettingKind, SettingsSchema, SettingsSection, StatusEntry,
     TableColumn, TableColumnData, TableColumnValues, TableDatasetV1, TableSchema, TableValueType,
     CTX_GLOBAL_SETTINGS, CTX_SENSOR_MONITORING,
@@ -2253,6 +2254,52 @@ impl Plugin for StageAA4Plugin {
 
     fn reset(&mut self) {
         self.bump();
+    }
+
+    fn handle_service_request(
+        &mut self,
+        request: &PluginServiceRequest,
+        execution: &ExecutionContext,
+    ) -> PluginServiceReply {
+        let outcome = if request.service != stage_a_universal_runner::SERVICE_EXECUTE_BLOCK_V1 {
+            PluginServiceOutcome::Rejected {
+                code: "unsupported_service".into(),
+                message: format!("service '{}' is not supported by A4", request.service),
+            }
+        } else if !execution.hardware_effects_allowed() {
+            PluginServiceOutcome::Rejected {
+                code: "effects_not_allowed".into(),
+                message: "A4 block execution requires the live worker".into(),
+            }
+        } else {
+            match serde_json::from_value::<stage_a_universal_runner::ExecuteBlockRequest>(
+                request.payload.clone(),
+            ) {
+                Ok(command) if command.experiment == stage_a_universal_runner::Experiment::A4 => {
+                    self.protocol_path = command.protocol;
+                    self.measurement_id = command.measurement_id.clone();
+                    self.start_pending = true;
+                    PluginServiceOutcome::Accepted {
+                        payload: serde_json::json!({"measurement_id": command.measurement_id}),
+                    }
+                }
+                Ok(command) => PluginServiceOutcome::Rejected {
+                    code: "wrong_target".into(),
+                    message: format!("A4 cannot execute {:?}", command.experiment),
+                },
+                Err(error) => PluginServiceOutcome::Rejected {
+                    code: "invalid_payload".into(),
+                    message: error.to_string(),
+                },
+            }
+        };
+        PluginServiceReply {
+            request_id: request.request_id,
+            source_plugin_id: request.source_plugin_id.clone(),
+            target_plugin_id: request.target_plugin_id.clone(),
+            service: request.service.clone(),
+            outcome,
+        }
     }
 
     fn on_discontinuity(&mut self, reason: PluginDiscontinuity) {
