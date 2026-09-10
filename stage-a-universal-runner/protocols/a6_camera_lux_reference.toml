@@ -1,0 +1,15 @@
+name = "a6-camera-lux-reference"
+overhead_s_per_point = 8.0
+
+[[block]]
+experiment = "A6"
+name = "camera-lux-reference"
+protocol = "camera_lux_reference"
+ [block.camera]
+ filters_off = true
+[[block.points]]
+label = "A6_current_camera_lux"
+duration_s = 30
+settle_s = 10
+repeats = 1
+flux_id = "CAMERA_LUX"

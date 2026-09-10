@@ -127,15 +127,6 @@ frequency_hz = 32
 depth_a = 0.5
 transitions_per_polarity = 100
 
-[[block]]
-experiment = "A6"
-name = "camera-lux-reference"
-protocol = "camera_lux_reference"
- [block.camera]
- filters_off = true
-[[block.points]]
-label = "A6_current_camera_lux"
-duration_s = 30
-settle_s = 10
-repeats = 1
-flux_id = "CAMERA_LUX"
+# A6 is optional and intentionally not part of this A1-A5 run. Use the
+# separate camera-lux reference plan when a dedicated calibration observation
+# is desired; camera Lux is the operational axis, not an absolute radiometer.

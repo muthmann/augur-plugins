@@ -141,15 +141,15 @@ mod tests {
     #[test]
     fn complete_plan_counts_repeats_and_overhead() {
         let plan = parse(include_str!("../protocols/stage-a-all.toml")).expect("fixture parses");
-        assert_eq!(plan.blocks.len(), 6);
-        assert_eq!(plan.total_points(), 24);
+        assert_eq!(plan.blocks.len(), 5);
+        assert_eq!(plan.total_points(), 23);
         assert_eq!(Plan::measurement_prefix(Experiment::A5), "A5");
         assert!(plan.total_seconds() > 1_000.0);
     }
 
     #[test]
     fn a6_is_explicitly_a_camera_lux_reference() {
-        let plan = parse(include_str!("../protocols/stage-a-all.toml")).expect("fixture parses");
+        let plan = parse(include_str!("../protocols/a6_camera_lux_reference.toml")).expect("fixture parses");
         let a6 = plan.blocks.iter().find(|b| b.experiment == Experiment::A6).expect("A6");
         assert_eq!(a6.protocol, "camera_lux_reference");
         assert!(a6.points.iter().all(|p| p.flux_id.as_deref() == Some("CAMERA_LUX")));
