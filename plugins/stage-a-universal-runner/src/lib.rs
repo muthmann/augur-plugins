@@ -10,7 +10,7 @@ use augur_plugin_api::{
     SettingItem, SettingKind, SettingsSchema, SettingsSection, StatusEntry,
 };
 use serde_json::{json, Value};
-use stage_a_universal_runner::{parse, ExecuteBlockRequest, Experiment, Plan, SERVICE_EXECUTE_BLOCK_V1};
+use stage_a_universal_runner::{parse, ExecuteBlockRequest, Experiment, OpticalStateConfirmation, Plan, SERVICE_EXECUTE_BLOCK_V1};
 
 const ID: &str = "stage-a.universal-runner";
 
@@ -33,6 +33,10 @@ pub struct StageAUniversalRunnerPlugin {
     request_sequence: u64,
     run: Option<ActiveRun>,
     message: String,
+    aod_setting: String,
+    camera_lux: String,
+    photodiode_level: String,
+    confirmed_optical_state: Option<OpticalStateConfirmation>,
 }
 
 impl Default for StageAUniversalRunnerPlugin {
@@ -46,6 +50,10 @@ impl Default for StageAUniversalRunnerPlugin {
             request_sequence: 0,
             run: None,
             message: "Select a universal Stage-A protocol".into(),
+            aod_setting: String::new(),
+            camera_lux: String::new(),
+            photodiode_level: String::new(),
+            confirmed_optical_state: None,
         }
     }
 }
@@ -72,6 +80,10 @@ impl StageAUniversalRunnerPlugin {
     }
 
     fn start(&mut self, context: &mut PluginControlContext<'_>) {
+        if self.confirmed_optical_state.is_none() {
+            self.message = "Enter AOD, camera lux and photodiode level, then Continue".into();
+            return;
+        }
         let text = if self.protocol_path.trim().is_empty() {
             include_str!("../../../stage-a-universal-runner/protocols/stage-a-all.toml").to_owned()
         } else {
@@ -125,6 +137,7 @@ impl StageAUniversalRunnerPlugin {
             protocol,
             measurement_id,
             camera,
+            optical_state: self.confirmed_optical_state.clone(),
         };
         let waiting_measurement_id = payload.measurement_id.clone();
         let _ = context.request_service(&PluginServiceRequest {
@@ -192,14 +205,26 @@ impl Plugin for StageAUniversalRunnerPlugin {
         SettingsSchema { sections: vec![SettingsSection { label: "Universal Stage-A".into(), description: Some("Sequence existing A1-A6 experiment owners from one protocol.".into()), default_open: true, items: vec![
             SettingItem { key: "protocol_path".into(), label: "Protocol file (blank = built-in A1-A5)".into(), tooltip: None, kind: SettingKind::Path { dialog: augur_plugin_api::PathDialogKind::OpenFile, default: self.protocol_path.clone() } },
             SettingItem { key: "measurement_prefix".into(), label: "Measurement prefix".into(), tooltip: None, kind: SettingKind::Text { default: self.measurement_prefix.clone() } },
+            SettingItem { key: "aod_setting".into(), label: "AOD setting".into(), tooltip: Some("Control value only; not a flux measurement.".into()), kind: SettingKind::Text { default: self.aod_setting.clone() } },
+            SettingItem { key: "camera_lux".into(), label: "Camera lux (readback)".into(), tooltip: None, kind: SettingKind::Text { default: self.camera_lux.clone() } },
+            SettingItem { key: "photodiode_level".into(), label: "Photodiode level (readback)".into(), tooltip: None, kind: SettingKind::Text { default: self.photodiode_level.clone() } },
+            SettingItem { key: "confirm_optical_state".into(), label: "Continue: confirm optical state".into(), tooltip: Some("Required after every AOD change.".into()), kind: SettingKind::Button { enabled: true } },
             SettingItem { key: "start".into(), label: "Run universal protocol".into(), tooltip: None, kind: SettingKind::Button { enabled: true } },
         ] }] }
     }
-    fn get_setting(&self, key: &str) -> Option<Value> { match key { "protocol_path" => Some(json!(self.protocol_path)), "measurement_prefix" => Some(json!(self.measurement_prefix)), "start" => Some(json!(self.start_counter)), _ => None } }
+    fn get_setting(&self, key: &str) -> Option<Value> { match key { "protocol_path" => Some(json!(self.protocol_path)), "measurement_prefix" => Some(json!(self.measurement_prefix)), "aod_setting" => Some(json!(self.aod_setting)), "camera_lux" => Some(json!(self.camera_lux)), "photodiode_level" => Some(json!(self.photodiode_level)), "confirm_optical_state" => Some(json!(0)), "start" => Some(json!(self.start_counter)), _ => None } }
     fn set_setting(&mut self, key: &str, value: Value) -> Result<(), String> {
         match key {
             "protocol_path" => { self.protocol_path = value.as_str().ok_or("protocol_path must be a string")?.into(); Ok(()) }
             "measurement_prefix" => { self.measurement_prefix = value.as_str().ok_or("measurement_prefix must be a string")?.into(); Ok(()) }
+            "aod_setting" => { self.aod_setting = value.as_str().ok_or("aod_setting must be text")?.into(); self.confirmed_optical_state = None; Ok(()) }
+            "camera_lux" => { self.camera_lux = value.as_str().ok_or("camera_lux must be text")?.into(); self.confirmed_optical_state = None; Ok(()) }
+            "photodiode_level" => { self.photodiode_level = value.as_str().ok_or("photodiode_level must be text")?.into(); self.confirmed_optical_state = None; Ok(()) }
+            "confirm_optical_state" => {
+                if self.aod_setting.trim().is_empty() || self.camera_lux.trim().is_empty() || self.photodiode_level.trim().is_empty() { return Err("enter AOD, camera lux and photodiode level before Continue".into()); }
+                self.confirmed_optical_state = Some(OpticalStateConfirmation { aod_setting: self.aod_setting.clone(), camera_lux: self.camera_lux.clone(), photodiode_level: self.photodiode_level.clone(), confirmed_at_utc: format!("{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|_| "system clock before epoch")?.as_secs()) });
+                self.message = "Optical state confirmed; press Run universal protocol".into(); Ok(())
+            }
             "start" => { if let Some(counter) = value.as_u64() { self.start_counter = counter; } else if value.as_bool() == Some(true) { self.start_counter = self.start_counter.wrapping_add(1); } else { return Err("start must be a button counter".into()); } Ok(()) }
             _ => Err(format!("unknown setting: {key}")),
         }

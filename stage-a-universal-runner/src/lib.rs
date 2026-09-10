@@ -126,6 +126,18 @@ pub struct ExecuteBlockRequest {
     pub protocol: String,
     pub measurement_id: String,
     pub camera: CameraSettings,
+    #[serde(default)]
+    pub optical_state: Option<OpticalStateConfirmation>,
+}
+
+/// Operator-confirmed optical state. AOD is a control value; camera lux and
+/// photodiode level are recorded observations, not calibration constants.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OpticalStateConfirmation {
+    pub aod_setting: String,
+    pub camera_lux: String,
+    pub photodiode_level: String,
+    pub confirmed_at_utc: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -165,6 +177,7 @@ mod tests {
             protocol: "a5_complete_scientific".into(),
             measurement_id: "A5-20260910-01".into(),
             camera: CameraSettings::default(),
+            optical_state: None,
         };
         let encoded = toml::to_string(&request).expect("request serializes");
         assert!(encoded.contains("experiment = \"a5\""));
