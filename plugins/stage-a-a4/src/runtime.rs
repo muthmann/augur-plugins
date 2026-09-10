@@ -2276,7 +2276,11 @@ impl Plugin for StageAA4Plugin {
                 request.payload.clone(),
             ) {
                 Ok(command) if command.experiment == stage_a_universal_runner::Experiment::A4 => {
-                    self.protocol_path = command.protocol;
+                    self.protocol_path = if command.protocol == "a4_bright_reference" {
+                        String::new()
+                    } else {
+                        command.protocol
+                    };
                     self.measurement_id = command.measurement_id.clone();
                     self.start_pending = true;
                     PluginServiceOutcome::Accepted {
