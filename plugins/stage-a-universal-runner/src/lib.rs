@@ -20,6 +20,8 @@ struct ActiveRun {
     block_index: usize,
     measurement_sequence: u32,
     pending_request_id: Option<u64>,
+    waiting_for_completion: bool,
+    waiting_measurement_id: Option<String>,
 }
 
 pub struct StageAUniversalRunnerPlugin {
@@ -93,6 +95,8 @@ impl StageAUniversalRunnerPlugin {
             block_index: 0,
             measurement_sequence: 1,
             pending_request_id: None,
+            waiting_for_completion: false,
+            waiting_measurement_id: None,
         });
         self.message = "Universal Stage-A run started".into();
         self.dispatch_next(context);
@@ -119,6 +123,7 @@ impl StageAUniversalRunnerPlugin {
             protocol,
             measurement_id,
         };
+        let waiting_measurement_id = payload.measurement_id.clone();
         let _ = context.request_service(&PluginServiceRequest {
             request_id: id,
             source_plugin_id: ID.into(),
@@ -126,20 +131,19 @@ impl StageAUniversalRunnerPlugin {
             service: SERVICE_EXECUTE_BLOCK_V1.into(),
             payload: serde_json::to_value(payload).expect("request is serializable"),
         });
-        if let Some(run) = self.run.as_mut() { run.pending_request_id = Some(id); }
+        if let Some(run) = self.run.as_mut() {
+            run.pending_request_id = Some(id);
+            run.waiting_for_completion = true;
+            run.waiting_measurement_id = Some(waiting_measurement_id);
+        }
         self.message = format!("Waiting for {} block '{}'", Plan::measurement_prefix(experiment), block_name);
     }
 
-    fn service_reply(&mut self, context: &mut PluginControlContext<'_>, reply: PluginServiceReply) {
+    fn service_reply(&mut self, _context: &mut PluginControlContext<'_>, reply: PluginServiceReply) {
         let Some(run) = self.run.as_mut() else { return };
         if run.pending_request_id != Some(reply.request_id) { return; }
         match reply.outcome {
-            PluginServiceOutcome::Accepted { .. } => {
-                run.block_index += 1;
-                run.measurement_sequence += 1;
-                run.pending_request_id = None;
-                self.dispatch_next(context);
-            }
+            PluginServiceOutcome::Accepted { .. } => self.message = "Block accepted; waiting for explicit completion".into(),
             PluginServiceOutcome::Rejected { code, message } => {
                 self.message = format!("Block refused ({code}): {message}");
                 run.pending_request_id = None;
@@ -158,6 +162,24 @@ impl Plugin for StageAUniversalRunnerPlugin {
     fn process_frame(&mut self, _frame: &PluginFrame<'_>, _output: &mut HostOutput<'_>, _context: &mut HostContext<'_>, _event_store: &EventStoreHandle<'_>) {}
     fn process_control(&mut self, context: &mut PluginControlContext<'_>) {
         for reply in context.inbox().service_replies.clone() { self.service_reply(context, reply); }
+        let completed = context.inbox().snapshots.iter().any(|snapshot| {
+            snapshot.topic == "stage-a.universal.block"
+                && snapshot.payload.get("state").and_then(Value::as_str) == Some("completed")
+                && self.run.as_ref().and_then(|run| run.waiting_measurement_id.as_deref())
+                    == snapshot.payload.get("measurement_id").and_then(Value::as_str)
+        });
+        if completed {
+            if let Some(run) = self.run.as_mut() {
+                if run.waiting_for_completion {
+                    run.block_index += 1;
+                    run.measurement_sequence += 1;
+                    run.pending_request_id = None;
+                    run.waiting_for_completion = false;
+                    run.waiting_measurement_id = None;
+                    self.dispatch_next(context);
+                }
+            }
+        }
         if self.start_counter != self.seen_start_counter.unwrap_or(self.start_counter) {
             self.seen_start_counter = Some(self.start_counter);
             if self.run.is_none() { self.start(context); }

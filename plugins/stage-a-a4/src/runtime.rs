@@ -48,6 +48,7 @@ use augur_plugin_api::{
     HostViewDescriptor, HostViewKind, HostViewPlacement, HostViewRegistry, PathDialogKind, Plugin,
     PluginCapabilities, PluginControlContext, PluginControlInbox, PluginDiscontinuity, PluginFrame,
     PluginInput, PluginRuntimeRole, PluginServiceOutcome, PluginServiceReply, PluginServiceRequest,
+    PluginControlSnapshot,
     RoiV1, SensorBiasReadbackV1,
     SensorMonitoringV1, SettingItem, SettingKind, SettingsSchema, SettingsSection, StatusEntry,
     TableColumn, TableColumnData, TableColumnValues, TableDatasetV1, TableSchema, TableValueType,
@@ -308,6 +309,7 @@ pub struct StageAA4Plugin {
     last_original: Option<BiasOffsets>,
     /// A standalone restore, outside a run, and the request it is waiting on.
     restore_request: Option<u64>,
+    last_completed_measurement_id: Option<String>,
 }
 
 impl Default for StageAA4Plugin {
@@ -341,6 +343,7 @@ impl Default for StageAA4Plugin {
                     .into(),
             last_original: None,
             restore_request: None,
+            last_completed_measurement_id: None,
         }
     }
 }
@@ -978,6 +981,7 @@ impl StageAA4Plugin {
         let Some(run) = self.run.take() else {
             return;
         };
+        self.last_completed_measurement_id = Some(run.measurement_id.clone());
         let recorded = run
             .records
             .iter()
@@ -2422,6 +2426,16 @@ impl Plugin for StageAA4Plugin {
         }
         self.drive(context);
         self.bump();
+    }
+
+    fn control_snapshots(&self) -> Vec<PluginControlSnapshot> {
+        let state = if self.run.is_some() { "running" } else if self.last_completed_measurement_id.is_some() { "completed" } else { "idle" };
+        vec![PluginControlSnapshot {
+            plugin_id: "stage-a.a4".into(),
+            topic: "stage-a.universal.block".into(),
+            revision: self.generation,
+            payload: json!({"state": state, "measurement_id": self.last_completed_measurement_id}),
+        }]
     }
 
     fn settings_schema(&self) -> SettingsSchema {
