@@ -1,16 +1,11 @@
-//! Stage-A A4: reproducible contrast-threshold measurements on the IMX636.
+//! A4 constant-light background references and legacy threshold surveys.
 //!
-//! At one fixed optical condition, A4 walks a protocol of `diff_on`/`diff_off`
-//! bias pairs, confirms each against the sensor's own readback before it
-//! records, and writes a RAW file per point with the provenance needed to read
-//! an event rate against a threshold setting months later.
-//!
-//! This crate owns no hardware. Biases are changed through the host's generic
-//! camera-configuration session (augur-rs ADR 037), the only way a plugin can
-//! touch the sensor. That session carries a whole configuration, so keeping the
-//! survey to two registers is A4's own job: it clones the configuration the
-//! host confirmed when the run opened, and changes exactly two fields.
+//! The bright reference preserves the confirmed camera configuration and uses
+//! the existing modulation and photodiode owners for paired RAW/PDQ capture.
+//! Legacy surveys clone that configuration and vary only threshold offsets.
+//! Camera commands always use the host-owned configuration session.
 
+mod devices;
 pub mod protocol;
 pub mod qc;
 mod runtime;

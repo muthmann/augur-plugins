@@ -156,6 +156,7 @@ fn signed_tag(value: i64) -> String {
 /// A parsed protocol: what to record, in order.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Protocol {
+    pub preserve_current: bool,
     pub name: String,
     pub points: Vec<A4Point>,
 }
@@ -235,7 +236,37 @@ pub fn parse_file(path: &str, text: &str) -> Result<Protocol, ProtocolError> {
     if is_csv {
         parse_csv(text)
     } else {
-        parse_toml(text)
+        let value: toml::Value =
+            toml::from_str(text).map_err(|e| ProtocolError::Toml(e.to_string()))?;
+        if value.get("mode").and_then(toml::Value::as_str) == Some("current_reference") {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Reference {
+                mode: String,
+                name: String,
+                duration_s: i64,
+                settle_s: f64,
+                repeats: i64,
+            }
+            let reference: Reference =
+                toml::from_str(text).map_err(|e| ProtocolError::Toml(e.to_string()))?;
+            let _ = reference.mode;
+            let csv = format!(
+                "diff_on,diff_off,duration_s,settle_s,repeats\n0,0,{},{},{}\n",
+                reference.duration_s, reference.settle_s, reference.repeats
+            );
+            let mut plan = parse_csv(&csv)?;
+            plan.name = reference.name;
+            plan.preserve_current = true;
+            for point in &mut plan.points {
+                point.label = "bright-reference".into();
+                point.optical_state = "constant light; unchanged A1-A3 attenuation".into();
+                point.flux_id = "BRIGHT_REFERENCE".into();
+            }
+            Ok(plan)
+        } else {
+            parse_toml(text)
+        }
     }
 }
 
@@ -383,6 +414,7 @@ pub fn parse_csv(text: &str) -> Result<Protocol, ProtocolError> {
         return Err(ProtocolError::Empty);
     }
     Ok(Protocol {
+        preserve_current: false,
         name: "protocol".to_owned(),
         points,
     })
@@ -659,6 +691,7 @@ pub fn parse_toml(text: &str) -> Result<Protocol, ProtocolError> {
         return Err(ProtocolError::Empty);
     }
     Ok(Protocol {
+        preserve_current: false,
         name: doc
             .name
             .filter(|name| !name.trim().is_empty())
@@ -1002,5 +1035,22 @@ mod shipped_protocol_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod reference_tests {
+    use super::*;
+    #[test]
+    fn matched_reference_preserves_camera_and_takes_six_minutes_plus_settling() {
+        let p = parse_file(
+            "reference.toml",
+            include_str!("../protocols/a4_bright_reference.toml"),
+        )
+        .unwrap();
+        assert!(p.preserve_current);
+        assert_eq!(p.points.len(), 3);
+        assert_eq!(p.total_seconds(), 390.0);
+        assert!(p.points.iter().all(|p| !p.pause_before));
     }
 }

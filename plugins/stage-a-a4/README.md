@@ -1,74 +1,65 @@
-# Stage-A A4 — contrast-threshold survey
+# Stage-A A4 — bright background reference
 
-Reproducible `diff_on`/`diff_off` threshold measurements on the IMX636. At one
-fixed optical condition, A4 walks a protocol of bias pairs and records a RAW
-file at each, with enough provenance to read an event rate against a threshold
-setting months later.
+Version 0.2.1 adds the matched reference for the completed A1–A3 recordings.
+Source and local tests are available. A matching Windows DLL and an installed-build
+smoke must be verified before using the new mode on the laboratory PC.
 
-- **Crate:** `augur-plugin-stage-a-a4` · **id:** `stage-a.a4` · **phase:** `raw_events`
-- **Host commands:** `start_recording`, `stop_recording`,
-  `apply_camera_configuration`, `restore_camera_configuration`
-- **Requires:** augur-rs with the generic camera-configuration session
-  (augur-rs ADR 037)
+## Laboratory operation
 
-## What it changes, and what it does not
+1. Keep the A1–A3 AOD and laser settings. Connect the existing modulation and
+   photodiode plugins and retain the applied optical transfer calibration.
+2. Open **Stage-A A4 Background**. Leave **Optional custom protocol** empty and
+   press **Run protocol**. The PD output folder is reused if A4 has no override.
+3. Wait for **3/3 recorded** and **Biases restored**. Keep the complete measurement
+   directory, including RAW, PDQ, monitoring CSV and sidecars.
 
-A4 changes **two registers**: `diff_on` and `diff_off`. The host offers one
-generic verb that carries a whole configuration — there is no A4-specific
-command — so the freeze on `fo`, `hpf`, `refr`, the ROI and the pixel mask is
-kept by A4 itself: it opens the run by asking the host to confirm the
-configuration the bench is on, and every point is that confirmed snapshot with
-exactly two fields changed. A test asserts the equality field by field.
+No camera profile, bias, ROI, PD Start/Stop or per-point filename selection is
+needed. A new measurement ID is generated if the previous ID already has data.
+A4 checks filters off and fresh readback before capture; it does not silently
+change a filter or mask to make the run pass.
 
-They are recorded with every point exactly as A4 found them.
+The program preserves all five biases, ROI, mask and camera settings from the
+confirmed session baseline. It sets **constant optical mean_u=0.30** through the
+measured Pockels lobe. The AOD/laser attenuation remains a physical setting.
+This matches the central illumination reference of the preceding modulated runs;
+it is a constant-light background measurement, not another modulation recording.
+The camera's actual reported lux is saved; 8 lux is only the operator's approximate
+preceding value, never an automatic acceptance target.
 
-The optical condition is yours. A4 never drives the Teensy and never touches a
-filter; a row that needs one says `pause_before` and waits for a button.
+**Duration:** 3 × 120 s recording + 3 × 10 s settling = **6 min 30 s**;
+allow roughly **7–8 min** including controller/camera/file handshakes. Retries add
+time. The nominal schedule is exact; the overhead estimate is not bench-measured.
 
-## Per point
+The same program is available as [a4_bright_reference.toml](protocols/a4_bright_reference.toml).
+For the first matching Windows installation, use [a4_bright_smoke.toml](protocols/a4_bright_smoke.toml)
+once (10 s capture + 3 s settling), verify RAW/PDQ/monitoring and restoration,
+then clear the custom-protocol field to use the full built-in reference.
 
-1. Clone the configuration the session confirmed, set its `diff_on`/`diff_off`,
-   and send it back as `ApplyCameraConfiguration`.
-2. **Confirm against the sensor's own readback** that the absolute codes on the
-   die are `factory_default + offset`. A point whose codes disagree, or whose
-   confirming reading is missing or older than the change, is skipped — it is
-   not measuring what the protocol says it measures.
-3. Settle for `settle_s`, *and* wait for a monitoring sample newer than the
-   settle. A settle that produced no fresh telemetry is not a settle.
-4. Record for `duration_s`, counting ON/OFF events.
-5. Check the receipt — size, hash, duration, clean finalization — and write the
-   sidecar. A partial or truncated file is never counted as recorded.
+## Failure handling and evidence
 
-On completion, on Stop, and on any abort, the configuration the bench was on
-before the survey is put back — the host preserved it when the session opened,
-so `RestoreCameraConfiguration` returns the whole state, not only the two
-biases. The run does not close until that restore is answered.
+Camera attempts with confirmed idle state are retried twice at the same point.
+After three failures, Continue retries that point; Stop ends the run. Unconfirmed
+camera stops and failed restoration retain recovery state. Device/PD integrity
+failures stop acquisition at the current point and retain available files; they
+are not interpreted as valid background data. Failed cleanup can be retried with
+Continue. A device failure does not start later points.
 
-## Refusals vs flags
+RAW is opened directly under the common absolute measurement root. Every attempt
+has a distinct filename. The original monitoring CSV is retained; compact JSON
+is an additional view. `attempts.jsonl` records each attempted point before the
+next point starts. `.devices.json` retains device requests' receipts, optical-lobe
+provenance and the confirmed camera snapshot. PD finalized receipts must name the
+expected paths and contain clean, nonempty data of sufficient sampled duration.
 
-The split is deliberate.
+The built-in reference does not require an independent lux meter or an optical
+amplitude estimate. Camera lux is an operating coordinate with unmeasured absolute
+accuracy. Absolute photon flux and QE are not outputs of this acquisition.
 
-**Hard refusals** (nothing runs, or the point is skipped) are the things that
-make a threshold number mean anything at all:
+Automatic continuation after an application restart is not implemented in A4.
+The attempt journal and retained files support identifying completed and failed
+points. Do not overwrite an interrupted measurement directory.
 
-- STC, Trail or ERC enabled — they discard events before streaming, which is
-  the quantity being counted
-- no bias readback available — the method's central claim would be uncheckable
-- bias codes that disagree with the row, or a stale confirming reading
-- no output folder, an unreadable or invalid protocol
-- a partial, empty, unhashed or truncated recording
-
-**Flags** (the point is recorded and kept, and marked) are the bench-stability
-limits: `max_temperature_drift_c`, `max_illumination_drift_percent`,
-`max_event_rate`. Whether a 2 °C drift invalidated a point is a judgement to
-make later with the file in hand — a runner that discarded it would have thrown
-away the evidence for making it.
-
-A limit whose quantity could never be measured is flagged too, not passed: a
-camera with no temperature readback must not silently report every point as
-within a drift limit nobody checked.
-
-## Protocols
+## Legacy threshold protocols
 
 `protocols/` ships three worked examples, all parsed as test fixtures.
 
@@ -136,5 +127,6 @@ sidecar says so in the file.
   configuration back, so a host that was reloaded mid-survey has no session
   left and refuses — that gap is not yet closed.
 
-See [`docs/features/stage-a-a4.md`](../../docs/features/stage-a-a4.md) and
-[ADR 035](../../docs/adr/035-stage-a-a4-threshold-survey.md).
+See [`docs/features/stage-a-a4.md`](../../docs/features/stage-a-a4.md),
+[ADR 048](../../docs/adr/048-a4-matched-bright-reference.md) for the matched reference and
+[ADR 035](../../docs/adr/035-stage-a-a4-threshold-survey.md) for the threshold survey.

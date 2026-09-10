@@ -9,7 +9,7 @@
 //!    `refr`, the ROI and the pixel mask stay frozen because A4 copies them
 //!    forward unchanged (augur-rs ADR 037);
 //! 2. **confirms against the sensor's own readback** that the absolute codes on
-//!    the die are `factory_default + offset`, and skips the point if they are
+//!    the die are `factory_default + offset`, and retries the same point if they are
 //!    not, or if the reading is missing or older than the change;
 //! 3. settles, and refuses to record until a monitoring sample newer than the
 //!    settle has arrived — a settle that produced no fresh telemetry is not a
@@ -23,9 +23,9 @@
 //! Afterwards — on completion, on Stop, and on any abort — the biases the bench
 //! was on before the survey are put back.
 //!
-//! A4 owns no hardware and never drives the Teensy. The optical condition is
-//! the operator's: filters are changed by hand, and a protocol row that needs
-//! one says `pause_before` and waits for a button.
+//! The built-in bright reference leases the existing modulation and PD owners
+//! for constant illumination and paired recordings. Legacy threshold surveys
+//! retain externally controlled optics and explicit optical pauses.
 //!
 //! **What is a hard refusal and what is only a flag** is a deliberate split.
 //! The sensor state that makes a threshold number mean something at all — the
@@ -37,6 +37,7 @@
 //! have thrown away the evidence for making it.
 
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -46,10 +47,10 @@ use augur_plugin_api::{
     HostCommandRequest, HostContext, HostDatasetDescriptor, HostDatasetKind, HostOutput,
     HostViewDescriptor, HostViewKind, HostViewPlacement, HostViewRegistry, PathDialogKind, Plugin,
     PluginCapabilities, PluginControlContext, PluginControlInbox, PluginDiscontinuity, PluginFrame,
-    PluginInput, PluginRuntimeRole, RoiV1, SensorBiasReadbackV1, SensorMonitoringV1, SettingItem,
-    SettingKind, SettingsSchema, SettingsSection, StatusEntry, TableColumn, TableColumnData,
-    TableColumnValues, TableDatasetV1, TableSchema, TableValueType, CTX_GLOBAL_SETTINGS,
-    CTX_SENSOR_MONITORING,
+    PluginInput, PluginRuntimeRole, PluginServiceRequest, RoiV1, SensorBiasReadbackV1,
+    SensorMonitoringV1, SettingItem, SettingKind, SettingsSchema, SettingsSection, StatusEntry,
+    TableColumn, TableColumnData, TableColumnValues, TableDatasetV1, TableSchema, TableValueType,
+    CTX_GLOBAL_SETTINGS, CTX_SENSOR_MONITORING,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -158,6 +159,11 @@ enum RunPhase {
     StoppingRecording,
     /// Every point is done; putting the operator's biases back.
     RestoringBiases,
+    RecoveryPaused,
+    PreparingDevices,
+    StartingPd,
+    FinalizingPd,
+    CleaningDevices,
 }
 
 /// How one point ended.
@@ -251,6 +257,9 @@ struct Run {
     /// keeps `fo`, `hpf`, `refr`, the ROI and the mask frozen across the sweep.
     camera: Option<CameraConfigurationSnapshotV1>,
     biases_restored: bool,
+    retry_count: u32,
+    camera_may_record: bool,
+    device_failure: Option<String>,
 }
 
 impl Run {
@@ -260,6 +269,7 @@ impl Run {
 }
 
 pub struct StageAA4Plugin {
+    devices: crate::devices::Devices,
     enabled: bool,
     runtime_role: PluginRuntimeRole,
     generation: u64,
@@ -302,6 +312,7 @@ pub struct StageAA4Plugin {
 impl Default for StageAA4Plugin {
     fn default() -> Self {
         Self {
+            devices: crate::devices::Devices::default(),
             enabled: true,
             runtime_role: PluginRuntimeRole::LiveWorker,
             generation: 1,
@@ -324,7 +335,9 @@ impl Default for StageAA4Plugin {
             sensor_seq: 0,
             run: None,
             request_seq: 0,
-            message: "Pick an output folder and a protocol, then press Run protocol".into(),
+            message:
+                "Press Run for the bright reference; the PD output folder is reused when available"
+                    .into(),
             last_original: None,
             restore_request: None,
         }
@@ -335,9 +348,13 @@ impl Default for StageAA4Plugin {
 /// be tested without a host.
 trait HostControl {
     fn request_host(&mut self, request: &HostCommandRequest);
+    fn request_service(&mut self, _request: &PluginServiceRequest) {}
 }
 
 impl HostControl for PluginControlContext<'_> {
+    fn request_service(&mut self, request: &PluginServiceRequest) {
+        let _ = PluginControlContext::request_service(self, request);
+    }
     fn request_host(&mut self, request: &HostCommandRequest) {
         // Fully qualified: the trait method and the inherent one share a name,
         // so `self.request_host(..)` would resolve back to this one.
@@ -387,8 +404,13 @@ impl StageAA4Plugin {
         if self.output_folder.trim().is_empty() {
             return Some("Pick an output folder first — that is where the files go".into());
         }
-        if self.protocol_path.trim().is_empty() {
-            return Some("Choose a protocol file first".into());
+        if !Path::new(self.output_folder.trim()).is_absolute() {
+            return Some("Choose an absolute output folder".into());
+        }
+        if self.event_filters.is_none() {
+            return Some(
+                "Camera filter state is unavailable; wait for confirmed camera settings".into(),
+            );
         }
         if let Some(filters) = self.event_filters {
             let mut on = Vec::new();
@@ -432,8 +454,16 @@ impl StageAA4Plugin {
             self.note(blocker);
             return;
         }
-        let path = self.protocol_path.trim().to_owned();
-        let text = match std::fs::read_to_string(&path) {
+        let path = if self.protocol_path.trim().is_empty() {
+            "a4_bright_reference.toml".to_owned()
+        } else {
+            self.protocol_path.trim().to_owned()
+        };
+        let text = match if self.protocol_path.trim().is_empty() {
+            Ok(include_str!("../protocols/a4_bright_reference.toml").to_owned())
+        } else {
+            std::fs::read_to_string(&path)
+        } {
             Ok(text) => text,
             Err(error) => {
                 self.note(format!("Cannot read {path}: {error}"));
@@ -448,7 +478,33 @@ impl StageAA4Plugin {
             }
         };
 
-        let measurement_id = self.ensure_measurement_id();
+        if plan.preserve_current {
+            if let Some(reason) = self.devices.blocker(now_unix_ms()) {
+                self.note(reason);
+                return;
+            }
+        }
+        let mut measurement_id = self.ensure_measurement_id();
+        let mut dir = Path::new(self.output_folder.trim()).join(&measurement_id);
+        if dir.join("requested-protocol.txt").exists() {
+            let base = generate_measurement_id();
+            let mut attempt = 1_u64;
+            loop {
+                measurement_id = format!("{base}-{attempt}");
+                dir = Path::new(self.output_folder.trim()).join(&measurement_id);
+                if !dir.exists() {
+                    break;
+                }
+                attempt += 1;
+            }
+            self.measurement_id = measurement_id.clone();
+        }
+        if let Err(error) = std::fs::create_dir_all(&dir)
+            .and_then(|_| std::fs::write(dir.join("requested-protocol.txt"), &text))
+        {
+            self.note(format!("Cannot create measurement files: {error}"));
+            return;
+        }
         let now_ms = now_unix_ms();
         let (on_axis, off_axis) = plan.axis_counts();
         let total = plan.points.len();
@@ -486,6 +542,9 @@ impl StageAA4Plugin {
             original,
             camera: None,
             biases_restored: false,
+            retry_count: 0,
+            camera_may_record: false,
+            device_failure: None,
         });
         self.open_camera_session(context);
         self.bump();
@@ -603,7 +662,9 @@ impl StageAA4Plugin {
         let (index, total) = (run.index, run.plan.points.len());
         let id = run.measurement_id.clone();
         let stem = format!(
-            "{id}_{}_{}",
+            "{id}_p{:04}_a{:02}_{}_{}",
+            index + 1,
+            run.retry_count + 1,
             format_compact_utc(now_unix_ms() / 1_000),
             point.tag()
         );
@@ -614,11 +675,12 @@ impl StageAA4Plugin {
             command: HostCommand::StartRecording {
                 run_id: stem.clone(),
                 base_path: format!("{id}/{stem}.raw"),
-                root_dir: None,
+                root_dir: Some(self.output_folder.trim().to_owned()),
                 metadata,
             },
         });
         if let Some(run) = self.run.as_mut() {
+            run.camera_may_record = true;
             run.phase = RunPhase::StartingRecording;
             run.pending_request = Some(request_id);
             run.point.stem = stem;
@@ -661,6 +723,14 @@ impl StageAA4Plugin {
                 .unwrap_or_default(),
         );
         meta.insert("a4_label".into(), point.label.clone());
+        meta.insert("brightness_axis".into(), "camera_reported_lux".into());
+        if self.devices.active {
+            meta.insert("constant_mean_u".into(), "0.30".into());
+            meta.insert(
+                "external_attenuation".into(),
+                "unchanged from preceding A1-A3; verify actual camera lux".into(),
+            );
+        }
         meta.insert("a4_diff_on".into(), point.diff_on.to_string());
         meta.insert("a4_diff_off".into(), point.diff_off.to_string());
         meta.insert("a4_duration_s".into(), point.duration_s.to_string());
@@ -718,8 +788,8 @@ impl StageAA4Plugin {
         sanitize_stem(self.measurement_id.trim())
     }
 
-    /// Give up on the current point and move on. The run continues: one bad
-    /// point out of forty is not a reason to lose the other thirty-nine.
+    /// Retain the failed attempt and retry only this point when the camera is
+    /// confirmed idle. Exhausted retries or uncertain capture state require recovery.
     fn fail_point(&mut self, context: &mut impl HostControl, reason: impl Into<String>) {
         let reason = reason.into();
         let Some(point) = self.run.as_ref().and_then(|run| run.point().cloned()) else {
@@ -732,32 +802,94 @@ impl StageAA4Plugin {
             index + 1,
             point.label
         ));
-        self.advance(context);
+        let run = self.run.as_mut().expect("active run");
+        run.pending_request = None;
+        if run.camera_may_record {
+            run.phase = RunPhase::RecoveryPaused;
+            self.note(format!("Point {} failed: {reason}. Camera stop needs confirmation; press Continue to retry stop.", index + 1));
+        } else if run.stop_requested {
+            self.finish_run(context);
+        } else if run.retry_count < 2 {
+            run.retry_count += 1;
+            run.point = PointState::default();
+            self.send_biases(context);
+        } else {
+            run.phase = RunPhase::RecoveryPaused;
+            self.note(format!("Point {} failed after three attempts: {reason}. Press Continue to retry this point, or Stop.", index + 1));
+        }
     }
 
     /// File the point's outcome into the run's own record, and write its
     /// sidecar. Both happen for failures too — the record of a failed point is
     /// the reason the survey has a hole in it.
-    fn record_point(&mut self, point: &A4Point, index: usize, outcome: PointOutcome) {
+    fn record_point(&mut self, point: &A4Point, index: usize, mut outcome: PointOutcome) {
+        if let Some(run) = self.run.as_mut() {
+            if run.point.stem.is_empty() {
+                run.point.stem = format!(
+                    "{}_p{:04}_a{:02}_no_capture",
+                    run.measurement_id,
+                    index + 1,
+                    run.retry_count + 1
+                );
+            }
+        }
         let (rates, drift, status) = self.evaluate_point(point);
         let codes = self
             .run
             .as_ref()
             .and_then(|run| run.point.readback)
             .map(|readback| (readback.current.diff_on, readback.current.diff_off));
-        let raw = self.run.as_ref().and_then(|run| {
-            run.point
-                .finalized_path
-                .clone()
-                .or(run.point.raw_path.clone())
-        });
-
-        // Gather before writing, so the sidecar records the final paths.
+        // Gather before writing, so all evidence names the final paths.
         self.gather_point();
+        let raw = self
+            .run
+            .as_ref()
+            .and_then(|run| run.point.finalized_path.clone());
+        if self.devices.active {
+            if let (Some(dir), Some(run)) = (self.measurement_dir(), self.run.as_ref()) {
+                let value = json!({"modulation": self.devices.modulation, "photodiode": self.devices.photodiode,
+                    "receipts": self.devices.receipts, "error": run.device_failure,
+                    "camera_snapshot": run.camera, "brightness_axis": "camera_reported_lux", "absolute_accuracy": "unmeasured"});
+                if let Err(error) = std::fs::write(
+                    dir.join(format!("{}.devices.json", run.point.stem)),
+                    serde_json::to_vec_pretty(&value).unwrap(),
+                ) {
+                    outcome =
+                        PointOutcome::Failed(format!("Device provenance write failed: {error}"));
+                    if let Some(run) = self.run.as_mut() {
+                        run.stop_requested = true;
+                    }
+                }
+            }
+        }
         if let Err(error) = self.write_sidecar(point, index, &outcome, &rates, &drift, &status) {
+            outcome = PointOutcome::Failed(format!("Sidecar not saved: {error}"));
             self.message = format!("{}; sidecar not saved: {error}", self.message);
+            if let Some(run) = self.run.as_mut() {
+                run.stop_requested = true;
+            }
         }
 
+        if let (Some(dir), Some(run)) = (self.measurement_dir(), self.run.as_ref()) {
+            let row = json!({"point":index+1,"attempt":run.retry_count+1,"label":point.label,
+                "raw":raw,"outcome":match &outcome { PointOutcome::Recorded => "recorded", PointOutcome::Failed(_) => "failed" },
+                "reason":match &outcome { PointOutcome::Recorded => None, PointOutcome::Failed(reason) => Some(reason) },
+                "bias_snapshot":run.camera,"unix_ms":now_unix_ms()});
+            let result = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join("attempts.jsonl"))
+                .and_then(|mut file| {
+                    writeln!(file, "{row}")?;
+                    file.sync_data()
+                });
+            if let Err(error) = result {
+                outcome = PointOutcome::Failed(format!("Progress journal write failed: {error}"));
+                if let Some(run) = self.run.as_mut() {
+                    run.stop_requested = true;
+                }
+            }
+        }
         if let Some(run) = self.run.as_mut() {
             run.records.push(PointRecord {
                 row: index + 1,
@@ -794,6 +926,7 @@ impl StageAA4Plugin {
             return;
         };
         run.index += 1;
+        run.retry_count = 0;
         run.last_activity_ms = now_unix_ms();
         let done = run.index >= run.plan.points.len() || run.stop_requested;
         if done {
@@ -809,6 +942,13 @@ impl StageAA4Plugin {
     /// until it is answered — a survey that vanished while the sensor was still
     /// on its last threshold would leave the bench silently misconfigured.
     fn finish_run(&mut self, context: &mut impl HostControl) {
+        if self.devices.active {
+            self.devices.release();
+            if let Some(run) = self.run.as_mut() {
+                run.phase = RunPhase::CleaningDevices;
+            }
+            return;
+        }
         let Some(run) = self.run.as_ref() else {
             return;
         };
@@ -912,12 +1052,10 @@ impl StageAA4Plugin {
         if std::fs::create_dir_all(&dir).is_err() {
             return;
         }
-        let raw = self.run.as_ref().and_then(|run| {
-            run.point
-                .finalized_path
-                .clone()
-                .or(run.point.raw_path.clone())
-        });
+        let raw = self
+            .run
+            .as_ref()
+            .and_then(|run| run.point.finalized_path.clone());
         let Some(raw) = raw else {
             return;
         };
@@ -937,8 +1075,7 @@ impl StageAA4Plugin {
         self.gather_sensor_readout(&dir, &raw);
     }
 
-    /// Compact the host's sensor-telemetry CSV into the measurement folder
-    /// under this recording's own stem, and remove the wide original.
+    /// Export an additional compact telemetry view while retaining the original CSV.
     ///
     /// Best-effort throughout: a missing telemetry file is normal (a camera
     /// with no monitoring block, a host that did not poll) and must not cost
@@ -968,16 +1105,12 @@ impl StageAA4Plugin {
         };
         let readout = telemetry::parse_csv(&text);
         if readout.is_empty() {
-            // Nothing worth keeping, but the wide original is still clutter in
-            // the host's capture folder.
-            let _ = std::fs::remove_file(&source);
+            // An unsupported format is still original measurement evidence.
             return;
         }
         let destination = dir.join(format!("{stem}.sensor.json"));
         let json = readout.to_json(telemetry::SCHEMA_A4, &id, &stem);
-        if std::fs::write(&destination, json).is_ok() {
-            let _ = std::fs::remove_file(&source);
-        }
+        let _ = std::fs::write(&destination, json);
     }
 
     fn write_sidecar(
@@ -1133,7 +1266,7 @@ impl StageAA4Plugin {
         // operator keeps it.
         let source = Path::new(&run.protocol_path);
         if let Some(name) = source.file_name() {
-            let _ = std::fs::copy(source, dir.join(name));
+            let _ = std::fs::copy(dir.join("requested-protocol.txt"), dir.join(name));
         }
 
         let receipt = sidecar::ProtocolReceipt {
@@ -1226,7 +1359,11 @@ impl StageAA4Plugin {
                         HostCommandOutcome::CameraConfigurationRestored { .. }
                     );
                 }
-                self.close_run();
+                if self.run.as_ref().is_some_and(|r| r.biases_restored) {
+                    self.close_run();
+                } else {
+                    self.note("Camera restoration was not confirmed. Press Continue to retry restoration.");
+                }
             }
             _ => {}
         }
@@ -1241,9 +1378,35 @@ impl StageAA4Plugin {
     fn on_session_reply(&mut self, outcome: &HostCommandOutcome) {
         match outcome {
             // Kept here and consumed by `drive`, which owns advancing the run.
-            HostCommandOutcome::CameraConfigurationApplied { snapshot, .. } => {
+            HostCommandOutcome::CameraConfigurationApplied {
+                snapshot,
+                readback_age_s,
+                ..
+            } => {
+                let filters = &snapshot.digital_filter;
+                let valid = readback_age_s.is_finite()
+                    && *readback_age_s >= 0.0
+                    && *readback_age_s <= MAX_READBACK_AGE_S
+                    && !filters.stc_enabled
+                    && !filters.trail_enabled
+                    && filters.erc_enabled == Some(false)
+                    && snapshot.global.record_sensor_telemetry;
                 if let Some(run) = self.run.as_mut() {
+                    if run.plan.preserve_current {
+                        for point in &mut run.plan.points {
+                            point.diff_on = i64::from(snapshot.biases.diff_on);
+                            point.diff_off = i64::from(snapshot.biases.diff_off);
+                        }
+                    }
+                    run.original = Some(BiasOffsets {
+                        diff_on: snapshot.biases.diff_on,
+                        diff_off: snapshot.biases.diff_off,
+                    });
                     run.camera = Some(snapshot.clone());
+                    if !valid {
+                        run.stop_requested = true;
+                        run.pending_skip = Some("Baseline needs fresh readback, confirmed filters off and sensor telemetry enabled".into());
+                    }
                 }
             }
             HostCommandOutcome::Rejected { code, message } => {
@@ -1267,6 +1430,18 @@ impl StageAA4Plugin {
                 readback_age_s,
                 ..
             } => {
+                if let Some(run) = self.run.as_ref() {
+                    if let (Some(mut expected), Some(point)) = (run.camera.clone(), run.point()) {
+                        expected.biases.diff_on = point.diff_on as i32;
+                        expected.biases.diff_off = point.diff_off as i32;
+                        if expected != *snapshot {
+                            self.skip_current(
+                                "Camera snapshot differs from the requested complete configuration",
+                            );
+                            return;
+                        }
+                    }
+                }
                 let applied = BiasOffsets {
                     diff_on: snapshot.biases.diff_on,
                     diff_off: snapshot.biases.diff_off,
@@ -1289,7 +1464,10 @@ impl StageAA4Plugin {
                     self.skip_current(reason);
                     return;
                 }
-                if *readback_age_s > MAX_READBACK_AGE_S {
+                if !readback_age_s.is_finite()
+                    || *readback_age_s < 0.0
+                    || *readback_age_s > MAX_READBACK_AGE_S
+                {
                     self.skip_current(format!(
                         "the confirming bias reading was {readback_age_s:.1} s old, past the \
                          {MAX_READBACK_AGE_S:.0} s this point will accept"
@@ -1336,9 +1514,38 @@ impl StageAA4Plugin {
             } => {
                 let now_ms = now_unix_ms();
                 let sensor = self.sensor;
+                if self.devices.active {
+                    let run = self.run.as_ref().unwrap();
+                    let expected = Path::new(self.output_folder.trim())
+                        .join(&run.measurement_id)
+                        .join(format!("{}.raw", run.point.stem));
+                    let actual = Path::new(actual_raw_path);
+                    if !actual.is_file()
+                        || actual.canonicalize().ok() != expected.canonicalize().ok()
+                    {
+                        let run = self.run.as_mut().unwrap();
+                        run.point.raw_path = Some(actual_raw_path.clone());
+                        run.stop_requested = true;
+                        self.skip_current("Host did not open RAW at the requested common root; PD was not started");
+                        return;
+                    }
+                }
+                if self.devices.active {
+                    let run = self.run.as_ref().unwrap();
+                    self.devices.begin_pd(
+                        self.output_folder.trim().to_owned(),
+                        &run.measurement_id,
+                        &run.point.stem,
+                        run.point().unwrap().duration_s as f64,
+                    );
+                }
                 if let Some(run) = self.run.as_mut() {
                     run.point.raw_path = Some(actual_raw_path.clone());
-                    run.phase = RunPhase::Recording;
+                    run.phase = if self.devices.active {
+                        RunPhase::StartingPd
+                    } else {
+                        RunPhase::Recording
+                    };
                     run.point.started_unix_ms = now_ms;
                     // Freeze the bench conditions this point begins under,
                     // before the recording has had time to move them.
@@ -1352,6 +1559,9 @@ impl StageAA4Plugin {
                 }
             }
             HostCommandOutcome::Rejected { code, message } => {
+                if let Some(run) = self.run.as_mut() {
+                    run.camera_may_record = false;
+                }
                 self.skip_current(format!(
                     "the host refused the recording ({code}): {message}"
                 ));
@@ -1382,6 +1592,7 @@ impl StageAA4Plugin {
                 duration_us,
             } => {
                 let seconds = *duration_us as f64 / 1_000_000.0;
+                run.camera_may_record = false;
                 run.point.finalized_path = Some(actual_raw_path.clone());
                 run.point.size = Some(*size);
                 run.point.sha256 = Some(sha256.clone());
@@ -1410,6 +1621,7 @@ impl StageAA4Plugin {
             } => {
                 // Kept on disk and fully described, but never counted as a
                 // success: a partial file is not a threshold point.
+                run.camera_may_record = false;
                 run.point.finalized_path = Some(actual_raw_path.clone());
                 run.point.size = *size;
                 run.point.sha256 = sha256.clone();
@@ -1475,6 +1687,26 @@ impl StageAA4Plugin {
         }
 
         let now_ms = now_unix_ms();
+        if let Some(reason) = self.devices.error.clone() {
+            if let Some(run) = self.run.as_mut() {
+                if run.phase != RunPhase::CleaningDevices && run.device_failure.is_none() {
+                    run.device_failure = Some(reason.clone());
+                    run.stop_requested = true;
+                    if run.camera_may_record {
+                        self.stop_recording(context);
+                    } else {
+                        self.finish_run(context);
+                    }
+                    self.note(format!("A4 device failure: {reason}. Files are retained; no later point will start."));
+                    return;
+                }
+                if run.phase == RunPhase::CleaningDevices {
+                    self.note(format!(
+                        "Device cleanup needs recovery: {reason}. Press Continue to retry cleanup."
+                    ));
+                }
+            }
+        }
         // A reply handler decided this point cannot be recorded. File it here,
         // before anything else looks at the phase.
         if let Some(reason) = self.run.as_mut().and_then(|run| run.pending_skip.take()) {
@@ -1502,7 +1734,7 @@ impl StageAA4Plugin {
                     self.note(
                         "The host did not answer the bias restore — check the camera settings",
                     );
-                    self.close_run();
+                    self.note("Camera restore timed out. Press Continue to retry restoration.");
                 }
                 // Nothing has been changed or recorded yet, and there is no
                 // baseline to record against, so end the run rather than fail
@@ -1549,7 +1781,69 @@ impl StageAA4Plugin {
             // first point against it.
             RunPhase::OpeningSession => {
                 if self.run.as_ref().is_some_and(|run| run.camera.is_some()) {
-                    self.enter_point(context);
+                    if self.run.as_ref().is_some_and(|r| r.plan.preserve_current) {
+                        let id = self.run.as_ref().unwrap().measurement_id.clone();
+                        match self.devices.prepare(&id, now_ms) {
+                            Ok(()) => self.run.as_mut().unwrap().phase = RunPhase::PreparingDevices,
+                            Err(reason) => {
+                                self.note(reason);
+                                self.finish_run(context);
+                            }
+                        }
+                    } else {
+                        self.enter_point(context);
+                    }
+                }
+            }
+            RunPhase::PreparingDevices => {
+                if self.devices.ready() {
+                    if stop_requested {
+                        self.finish_run(context);
+                    } else {
+                        self.enter_point(context);
+                    }
+                }
+            }
+            RunPhase::StartingPd => {
+                if self.devices.ready() {
+                    let run = self.run.as_mut().unwrap();
+                    run.phase = RunPhase::Recording;
+                    run.point.started_unix_ms = now_ms;
+                }
+            }
+            RunPhase::FinalizingPd => {
+                if self.devices.ready() {
+                    self.stop_recording(context);
+                }
+            }
+            RunPhase::CleaningDevices => {
+                if self.devices.released() {
+                    self.devices.active = false;
+                    self.finish_run(context);
+                } else if self.continue_pending {
+                    self.continue_pending = false;
+                    self.devices.release();
+                }
+            }
+            RunPhase::RecoveryPaused => {
+                if self.continue_pending || stop_requested {
+                    self.continue_pending = false;
+                    if self.run.as_ref().is_some_and(|r| r.camera_may_record) {
+                        self.stop_recording(context);
+                    } else if stop_requested {
+                        self.finish_run(context);
+                    } else {
+                        let run = self.run.as_mut().unwrap();
+                        run.retry_count += 1;
+                        run.point = PointState::default();
+                        self.send_biases(context);
+                    }
+                }
+            }
+            RunPhase::RestoringBiases => {
+                if self.continue_pending {
+                    self.continue_pending = false;
+                    self.finish_run(context);
                 }
             }
             RunPhase::PausedForOperator => {
@@ -1559,7 +1853,7 @@ impl StageAA4Plugin {
                 }
             }
             // Waiting on a reply that has not arrived and has not timed out.
-            RunPhase::ApplyingBiases | RunPhase::StartingRecording | RunPhase::RestoringBiases => {}
+            RunPhase::ApplyingBiases | RunPhase::StartingRecording => {}
             RunPhase::Settling => {
                 if now_ms < self.run.as_ref().map_or(0, |run| run.point.settle_until_ms) {
                     return;
@@ -1595,7 +1889,12 @@ impl StageAA4Plugin {
                 let elapsed_ms = now_ms.saturating_sub(started);
                 let over = elapsed_ms >= (duration_s.max(0) as u64).saturating_mul(1_000);
                 if over || stop_requested {
-                    self.stop_recording(context);
+                    if self.devices.active {
+                        self.devices.finish_pd(stop_requested);
+                        self.run.as_mut().unwrap().phase = RunPhase::FinalizingPd;
+                    } else {
+                        self.stop_recording(context);
+                    }
                 }
             }
             RunPhase::StoppingRecording => {
@@ -1604,7 +1903,10 @@ impl StageAA4Plugin {
                     return;
                 };
                 let index = self.run.as_ref().map(|run| run.index).unwrap_or(0);
-                let complete = self.run.as_ref().is_some_and(|run| run.point.complete);
+                let complete = self
+                    .run
+                    .as_ref()
+                    .is_some_and(|run| run.point.complete && run.device_failure.is_none());
                 let reason = self
                     .run
                     .as_ref()
@@ -1674,6 +1976,11 @@ impl StageAA4Plugin {
             Some(RunPhase::StartingRecording) => "starting".to_owned(),
             Some(RunPhase::Recording) => "recording".to_owned(),
             Some(RunPhase::StoppingRecording) => "saving".to_owned(),
+            Some(RunPhase::PreparingDevices) => "preparing constant light and PD".to_owned(),
+            Some(RunPhase::StartingPd) => "starting PD capture".to_owned(),
+            Some(RunPhase::FinalizingPd) => "finalizing PD capture".to_owned(),
+            Some(RunPhase::CleaningDevices) => "releasing devices".to_owned(),
+            Some(RunPhase::RecoveryPaused) => "recovery paused".to_owned(),
             Some(RunPhase::RestoringBiases) => "restoring biases".to_owned(),
         };
         let progress = run
@@ -1790,6 +2097,18 @@ impl StageAA4Plugin {
 /// The absolute code a sensor programs for an offset: the factory trim plus the
 /// offset, saturated into the 8-bit register. Mirrors the host's own rule so
 /// A4 can state what it expects before the readback arrives.
+fn monitoring_is_new(previous: Option<SensorMonitoringV1>, current: SensorMonitoringV1) -> bool {
+    if !current.age_s.is_finite() || current.age_s < 0.0 {
+        return false;
+    }
+    previous.is_none_or(|old| {
+        current.age_s < old.age_s
+            || current.bias_codes != old.bias_codes
+            || current.temperature_c != old.temperature_c
+            || current.illumination_lux != old.illumination_lux
+    })
+}
+
 fn expected_code(factory_default: u8, offset: i64) -> u8 {
     (factory_default as i64 + offset).clamp(0, 255) as u8
 }
@@ -1913,13 +2232,11 @@ fn format_iso_utc(unix_secs: u64) -> String {
 
 impl Plugin for StageAA4Plugin {
     fn name(&self) -> &'static str {
-        "Stage-A A4 Threshold"
+        "Stage-A A4 Background"
     }
 
     fn description(&self) -> &'static str {
-        "Stage-A A4 contrast-threshold survey: steps diff_on/diff_off through a protocol at one \
-         fixed optical condition, confirming every point against the sensor's own bias readback \
-         before it records."
+        "Matched constant-light background reference with automatic PD capture and preserved camera settings; also supports legacy threshold surveys."
     }
 
     fn enabled(&self) -> bool {
@@ -1984,7 +2301,7 @@ impl Plugin for StageAA4Plugin {
             // Only a genuinely new reading counts as one: the host republishes
             // the same snapshot on every frame between polls, and the settle
             // gate is asking whether the sensor has been read *again*.
-            if self.sensor.map(|previous| previous.age_s) != Some(monitoring.age_s) {
+            if monitoring_is_new(self.sensor, monitoring) {
                 self.sensor_seq = self.sensor_seq.wrapping_add(1);
                 if let Some(run) = self.run.as_mut() {
                     if run.phase == RunPhase::Settling
@@ -2035,6 +2352,20 @@ impl Plugin for StageAA4Plugin {
 
     fn process_control(&mut self, context: &mut PluginControlContext<'_>) {
         let inbox: PluginControlInbox = context.inbox().clone();
+        self.devices.update(&inbox);
+        if self.run.is_none() && self.output_folder.trim().is_empty() {
+            if let Some(folder) = self
+                .devices
+                .photodiode
+                .as_ref()
+                .and_then(|p| p.data_dir.clone())
+            {
+                self.output_folder = folder;
+            }
+        }
+        if let Some(request) = self.devices.tick(now_unix_ms()) {
+            HostControl::request_service(context, &request);
+        }
         for reply in &inbox.host_replies {
             self.on_host_reply(reply);
         }
@@ -2092,19 +2423,17 @@ impl Plugin for StageAA4Plugin {
                 SettingsSection {
                     label: "Protocol".into(),
                     description: Some(
-                        "The survey itself: a CSV with one row per recording, or a TOML of \
-                         blocks and ranges. Every row names its bias pair, how long to record \
-                         and how long to settle first.\n\n\
-                         A4 changes nothing but diff_on and diff_off. The optical condition, the \
-                         ROI, the pixel mask and the other three biases are yours, and are \
-                         recorded with every point exactly as it found them."
+                        "Bright reference is built in: three 120-second captures at constant mean_u=0.30, \
+                         with automatic PD capture. Keep the A1-A3 AOD and laser settings. All five camera \
+                         biases, ROI and mask are preserved. Leave the custom protocol blank. \
+                         Legacy CSV/TOML threshold surveys retain their externally controlled light mode."
                             .into(),
                     ),
                     default_open: true,
                     items: vec![
                         SettingItem {
                             key: "protocol_path".into(),
-                            label: "Protocol file".into(),
+                            label: "Optional custom protocol (blank = bright reference)".into(),
                             tooltip: Some(
                                 "A .csv or .toml protocol. It is validated in full on Run, so a \
                                  bad file is refused before the first bias moves."
@@ -2130,7 +2459,7 @@ impl Plugin for StageAA4Plugin {
                             key: "continue_run".into(),
                             label: "Continue".into(),
                             tooltip: Some(
-                                "Resume a protocol paused for a filter change or a dark cap."
+                                "Retry the current point or an unconfirmed cleanup; also resumes optical pauses."
                                     .into(),
                             ),
                             kind: SettingKind::Button { enabled: true },
@@ -2176,6 +2505,12 @@ impl Plugin for StageAA4Plugin {
     }
 
     fn set_setting(&mut self, key: &str, value: Value) -> Result<(), String> {
+        if self.run.is_some() && matches!(key, "output_folder" | "measurement_id" | "protocol_path")
+        {
+            return Err(
+                "Recording configuration is locked until the run and restoration finish".into(),
+            );
+        }
         match key {
             "output_folder" => {
                 self.output_folder = value
@@ -2249,7 +2584,7 @@ impl Plugin for StageAA4Plugin {
                     .filter(|record| record.qc.is_flagged())
                     .count();
                 entries.push(StatusEntry::Text(format!(
-                    "{recorded} recorded, {} skipped, {flagged} QC-flagged",
+                    "{recorded} recorded, {} failed attempts, {flagged} QC-flagged",
                     run.records.len() - recorded
                 )));
             }
@@ -2805,7 +3140,7 @@ mod tests {
     }
 
     #[test]
-    fn codes_that_disagree_with_the_row_skip_the_point_and_keep_going() {
+    fn codes_that_disagree_retry_the_same_point() {
         // The central guarantee: a point whose biases cannot be shown to be
         // the requested ones is not recorded at all.
         let folder = temp_folder("mismatch");
@@ -2838,12 +3173,15 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert!(matches!(records[0].outcome, PointOutcome::Failed(_)));
         assert!(
-            records[0].status_text().contains("the row asks for"),
+            records[0]
+                .status_text()
+                .contains("requested complete configuration"),
             "{}",
             records[0].status_text()
         );
         // And the second point is under way rather than the run being over.
-        assert_eq!(plugin.run.as_ref().expect("still running").index, 1);
+        assert_eq!(plugin.run.as_ref().expect("still running").index, 0);
+        assert_eq!(plugin.run.as_ref().unwrap().retry_count, 1);
 
         let _ = std::fs::remove_dir_all(folder);
     }
@@ -2958,6 +3296,10 @@ mod tests {
             &mut sink,
         );
         tick(&mut plugin, vec![], &mut sink);
+        assert_eq!(plugin.run.as_ref().unwrap().index, 0);
+        assert_eq!(plugin.run.as_ref().unwrap().retry_count, 1);
+        plugin.stop_pending = true;
+        tick(&mut plugin, vec![], &mut sink);
         settle_restore(&mut plugin, &mut sink);
 
         let receipt = std::fs::read_to_string(folder.join("A4-TEST/A4-TEST.protocol-status.toml"))
@@ -3009,6 +3351,10 @@ mod tests {
             )],
             &mut sink,
         );
+        tick(&mut plugin, vec![], &mut sink);
+        assert_eq!(plugin.run.as_ref().unwrap().index, 0);
+        assert_eq!(plugin.run.as_ref().unwrap().retry_count, 1);
+        plugin.stop_pending = true;
         tick(&mut plugin, vec![], &mut sink);
         settle_restore(&mut plugin, &mut sink);
 
@@ -3203,7 +3549,10 @@ mod tests {
         tick(&mut plugin, vec![], &mut sink);
 
         assert!(
-            plugin.message.contains("did not answer") || plugin.message.contains("skipped"),
+            plugin
+                .run
+                .as_ref()
+                .is_some_and(|r| r.index == 0 && r.retry_count == 1),
             "{}",
             plugin.message
         );
@@ -3301,5 +3650,216 @@ mod tests {
     fn compact_utc_formats_a_known_epoch() {
         assert_eq!(format_compact_utc(1_767_225_600), "20260101-000000");
         assert_eq!(format_iso_utc(1_767_225_600), "2026-01-01T00:00:00Z");
+    }
+    #[test]
+    fn retries_are_bounded_and_do_not_advance_the_point() {
+        let folder = temp_folder("bounded");
+        let path = write_protocol(
+            &folder,
+            "diff_on,diff_off,duration_s,settle_s\n5,5,1,0\n10,10,1,0\n",
+        );
+        let mut p = ready_plugin(&folder, &path);
+        let mut sink = ControlSink::default();
+        start_survey(&mut p, &mut sink);
+        for _ in 0..3 {
+            let id = sink.last_id();
+            tick(
+                &mut p,
+                vec![rejected_reply(id, "busy", "temporary")],
+                &mut sink,
+            );
+        }
+        let r = p.run.as_ref().unwrap();
+        assert_eq!(r.index, 0);
+        assert_eq!(r.retry_count, 2);
+        assert_eq!(r.phase, RunPhase::RecoveryPaused);
+        assert_eq!(r.records.len(), 3);
+        p.continue_pending = true;
+        tick(&mut p, vec![], &mut sink);
+        assert_eq!(p.run.as_ref().unwrap().index, 0);
+        assert_eq!(p.run.as_ref().unwrap().phase, RunPhase::ApplyingBiases);
+    }
+    #[test]
+    fn rejected_restore_retains_the_session_and_can_be_retried() {
+        let folder = temp_folder("restore-recovery");
+        let path = write_protocol(&folder, "diff_on,diff_off\n5,5\n");
+        let mut p = ready_plugin(&folder, &path);
+        let mut sink = ControlSink::default();
+        start_survey(&mut p, &mut sink);
+        p.stop_pending = true;
+        tick(&mut p, vec![], &mut sink);
+        let id = sink.last_id();
+        tick(
+            &mut p,
+            vec![rejected_reply(id, "busy", "try again")],
+            &mut sink,
+        );
+        assert_eq!(p.run.as_ref().unwrap().phase, RunPhase::RestoringBiases);
+        p.continue_pending = true;
+        tick(&mut p, vec![], &mut sink);
+        assert_ne!(id, sink.last_id());
+        settle_restore(&mut p, &mut sink);
+        assert!(p.run.is_none());
+    }
+    #[test]
+    fn non_finite_readback_cannot_start_a_recording() {
+        for age in [f64::NAN, f64::INFINITY, -1.0] {
+            let folder = temp_folder("invalid-age");
+            let path = write_protocol(&folder, "diff_on,diff_off\n5,5\n");
+            let mut p = ready_plugin(&folder, &path);
+            let mut sink = ControlSink::default();
+            start_survey(&mut p, &mut sink);
+            let id = sink.last_id();
+            tick(&mut p, vec![applied_reply(id, 5, 5, age)], &mut sink);
+            assert_eq!(p.run.as_ref().unwrap().retry_count, 1);
+            assert!(!sink
+                .hosts
+                .iter()
+                .any(|h| matches!(h.command, HostCommand::StartRecording { .. })));
+            std::fs::remove_dir_all(folder).unwrap();
+        }
+    }
+    #[test]
+    fn capture_requests_the_selected_absolute_root() {
+        let folder = temp_folder("direct-root");
+        let path = write_protocol(&folder, "diff_on,diff_off,duration_s,settle_s\n5,5,1,0\n");
+        let mut p = ready_plugin(&folder, &path);
+        let mut sink = ControlSink::default();
+        start_survey(&mut p, &mut sink);
+        let id = sink.last_id();
+        tick(&mut p, vec![applied_reply(id, 5, 5, 0.1)], &mut sink);
+        deliver_fresh_sensor(&mut p, monitoring(5, 5, 0.1));
+        tick(&mut p, vec![], &mut sink);
+        match &sink.hosts.last().unwrap().command {
+            HostCommand::StartRecording {
+                root_dir,
+                base_path,
+                ..
+            } => {
+                assert_eq!(root_dir.as_deref(), Some(folder.to_str().unwrap()));
+                assert!(base_path.starts_with("A4-TEST/"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(p.set_setting("output_folder", json!("/tmp/other")).is_err());
+    }
+    #[test]
+    fn compact_export_preserves_original_monitoring_csv() {
+        let folder = temp_folder("telemetry-preserved");
+        let path = write_protocol(&folder, "diff_on,diff_off\n5,5\n");
+        let mut p = ready_plugin(&folder, &path);
+        let mut sink = ControlSink::default();
+        start_survey(&mut p, &mut sink);
+        let raw = folder.join("sample.raw");
+        let csv = folder.join("sample.sensor-monitoring.csv");
+        std::fs::write(&csv, "unrecognized raw evidence\n").unwrap();
+        p.gather_sensor_readout(&folder, &raw.to_string_lossy());
+        assert_eq!(
+            std::fs::read_to_string(csv).unwrap(),
+            "unrecognized raw evidence\n"
+        );
+    }
+
+    #[test]
+    fn bright_reference_runs_three_raw_pd_pairs_and_restores_the_original_camera() {
+        let folder = temp_folder("bright-e2e");
+        let mut p = ready_plugin(&folder, Path::new(""));
+        p.devices = crate::devices::Devices::simulated(now_unix_ms());
+        let mut sink = ControlSink::default();
+        p.start_pending = true;
+        tick(&mut p, vec![], &mut sink);
+        let mut handled = 0;
+        let mut raw = String::new();
+        let mut starts = 0;
+        for _ in 0..200 {
+            if let Some(request) = p.devices.tick(now_unix_ms()) {
+                p.devices.simulate_reply(&request);
+            }
+            while handled < sink.hosts.len() {
+                let h = sink.hosts[handled].clone();
+                handled += 1;
+                let reply = match h.command {
+                    HostCommand::ApplyCameraConfiguration { .. } => {
+                        applied_reply(h.request_id, BASELINE_ON as i64, BASELINE_OFF as i64, 0.1)
+                    }
+                    HostCommand::StartRecording {
+                        root_dir,
+                        base_path,
+                        ..
+                    } => {
+                        raw = Path::new(root_dir.as_ref().unwrap())
+                            .join(base_path)
+                            .display()
+                            .to_string();
+                        std::fs::write(&raw, b"test-raw").unwrap();
+                        starts += 1;
+                        started_reply(h.request_id, &raw)
+                    }
+                    HostCommand::StopRecording => {
+                        finalized_reply(h.request_id, &raw, 8, 120_000_000)
+                    }
+                    HostCommand::RestoreCameraConfiguration => restored_reply(h.request_id),
+                };
+                p.on_host_reply(&reply);
+            }
+            if let Some(r) = p.run.as_mut() {
+                if r.phase == RunPhase::Settling {
+                    r.point.settle_until_ms = 0;
+                    r.point.saw_fresh_sensor = true;
+                }
+                if r.phase == RunPhase::Recording {
+                    r.point.started_unix_ms = now_unix_ms().saturating_sub(121000);
+                }
+            }
+            p.drive(&mut sink);
+            if p.run.is_none() {
+                break;
+            }
+        }
+        assert!(
+            p.run.is_none(),
+            "{} {:?}",
+            p.message,
+            p.run.as_ref().map(|r| r.phase)
+        );
+        assert_eq!(starts, 3);
+        assert!(p.message.contains("3/3 recorded"), "{}", p.message);
+        for snapshot in sink.applied_snapshots() {
+            assert_eq!(snapshot, baseline_snapshot());
+        }
+        let files = std::fs::read_dir(folder.join("A4-TEST"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            files
+                .iter()
+                .filter(|p| p.extension().is_some_and(|e| e == "raw"))
+                .count(),
+            3
+        );
+        assert_eq!(
+            files
+                .iter()
+                .filter(|p| p.extension().is_some_and(|e| e == "pdq"))
+                .count(),
+            3
+        );
+        assert_eq!(
+            files
+                .iter()
+                .filter(|p| p.to_string_lossy().ends_with(".devices.json"))
+                .count(),
+            3
+        );
+        assert!(p.devices.released());
+    }
+
+    #[test]
+    fn aging_cached_telemetry_is_not_a_new_sensor_read() {
+        let old = monitoring(5, 5, 0.1);
+        assert!(!monitoring_is_new(Some(old), monitoring(5, 5, 0.2)));
+        assert!(monitoring_is_new(Some(old), monitoring(5, 5, 0.01)));
+        assert!(!monitoring_is_new(Some(old), monitoring(5, 5, f64::NAN)));
     }
 }

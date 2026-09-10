@@ -1,0 +1,7 @@
+# Run in the updated A4 plugin; use the confirmed current camera state.
+# Keep the AOD and laser settings used for A1-A3.
+mode = "current_reference"
+name = "A4 matched bright background reference"
+duration_s = 120
+settle_s = 10.0
+repeats = 3

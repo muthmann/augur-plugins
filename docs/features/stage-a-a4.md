@@ -1,18 +1,36 @@
-# Stage-A A4 Threshold Survey
+# Stage-A A4 Background
 
-- **Crate:** `plugins/stage-a-a4` (`augur-plugin-stage-a-a4`), id `stage-a.a4`
-- **Status:** built — protocol runner, per-point bias confirmation, QC summary,
-  sidecars and run receipt
-- **Design:** [ADR 035](../adr/035-stage-a-a4-threshold-survey.md) (a threshold
-  point is only real if the sensor confirms it),
-  [augur-rs ADR 037](https://github.com/muthmann/augur-rs/blob/main/docs/adr/037-host-owned-camera-profiles-and-plugin-configuration-sessions.md)
-  (the generic camera-configuration session it runs on),
-  [ADR 027](../adr/027-stage-a-a1-declarative-protocols.md) (the protocol shape
-  it follows), [ADR 028](../adr/028-stage-a-sensor-readout-travels-with-the-measurement.md)
-  (the telemetry compaction it shares with A1),
-  [ADR 031](../adr/031-evesmlm-plugins-share-a-types-crate.md) (why the shared
-  code lives in `stage-a-plugin-contract`)
-- **User docs:** [`plugins/stage-a-a4/README.md`](../../plugins/stage-a-a4/README.md)
+- Crate: `plugins/stage-a-a4`, plugin ID `stage-a.a4`, version 0.2.1.
+- User instructions: [A4 README](../../plugins/stage-a-a4/README.md).
+- Decision: [ADR 048](../adr/048-a4-matched-bright-reference.md).
+
+The default reference captures three constant-light RAW/PDQ pairs at the confirmed
+current camera state. It leases the existing modulation/PD owners, restores A1
+controller acquisition mode, applies calibrated constant mean_u=0.30, and handles
+PD start/finalization and safe-off release. Camera and PD use a common absolute root.
+
+Current camera state is resolved after the host confirms the baseline; all five
+bias offsets, ROI, mask and other settings are preserved for this reference.
+Legacy threshold CSV/TOML protocols remain available with their externally controlled
+optics. The new `current_reference` protocol form is distinct and rejects unknown fields.
+
+Camera failures retry the same point at most twice automatically. Uncertain stop
+or restore outcomes retain recovery state. Device failures stop later acquisition;
+cleanup must finish before the camera session closes. Partial data and original
+monitoring CSV files are retained. Per-attempt filenames and a progress journal
+prevent later attempts from replacing earlier evidence.
+
+Verification includes a simulated three-pair end-to-end run, command correlation,
+revision continuity after earlier experiments, lease renewal, same-point recovery,
+restore rejection, root selection, invalid readback and telemetry preservation.
+Windows installation and optical/hardware smoke remain separate delivery checks.
+A4 does not implement the proposed universal A1–A6 campaign controller.
+
+## Legacy threshold survey
+
+The sections below document the `diff_on`/`diff_off` threshold survey that
+version 0.2.1 keeps. Its protocols, refusals and on-disk layout are unchanged;
+only the new `current_reference` form bypasses the bias axis ([ADR 035](../adr/035-stage-a-a4-threshold-survey.md)).
 
 ## Purpose
 
