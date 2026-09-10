@@ -1,0 +1,243 @@
+# Stage-A dim-bias selection, version 20260910-v2
+# Six complete candidate states at each application light level. This is a
+# screening campaign, not a fitted A1/A3 result. All observations remain in
+# the campaign folder for offline multi-objective selection.
+name = "stage-a-dim-bias-selection"
+version = "20260910-v3"
+program = "dim_bias_selection"
+overhead_s_per_point = 11.0
+
+[[optical_states]]
+id = "F1"
+label = "application low light"
+operator_action = "Set AOD to the saved low-light setting."
+target_camera_lux = "about 0.8 (1/10 of F0)"
+pause_before = true
+
+[[optical_states]]
+id = "F2"
+label = "application very low light"
+operator_action = "Set AOD to the saved darker setting."
+target_camera_lux = "about 0.08 (1/100 of F0)"
+pause_before = true
+
+# Each block is deliberately self-describing. The delegated experiment must
+# apply and read back all five fields before recording.
+[[block]]
+experiment = "A4"
+name = "F1-B0"
+protocol = "a4_bias_selection"
+optical_state = "F1"
+retry_same_point = true
+[block.camera]
+diff_on = 0
+diff_off = 0
+fo = 0
+hpf = 0
+refr = 235
+filters_off = true
+[[block.points]]
+label = "F1_B0_background"
+duration_s = 120
+settle_s = 10
+
+[[block]]
+experiment = "A4"
+name = "F1-B1"
+protocol = "a4_bias_selection"
+optical_state = "F1"
+retry_same_point = true
+[block.camera]
+diff_on = -15
+diff_off = -2
+fo = 0
+hpf = 0
+refr = 235
+filters_off = true
+[[block.points]]
+label = "F1_B1_background"
+duration_s = 120
+settle_s = 10
+
+[[block]]
+experiment = "A4"
+name = "F1-B2"
+protocol = "a4_bias_selection"
+optical_state = "F1"
+retry_same_point = true
+[block.camera]
+diff_on = -30
+diff_off = -5
+fo = 0
+hpf = 0
+refr = 235
+filters_off = true
+[[block.points]]
+label = "F1_B2_background"
+duration_s = 120
+settle_s = 10
+
+[[block]]
+experiment = "A4"
+name = "F1-B3"
+protocol = "a4_bias_selection"
+optical_state = "F1"
+retry_same_point = true
+[block.camera]
+diff_on = 0
+diff_off = 0
+fo = 55
+hpf = 0
+refr = 235
+filters_off = true
+[[block.points]]
+label = "F1_B3_background"
+duration_s = 120
+settle_s = 10
+
+[[block]]
+experiment = "A4"
+name = "F1-B4"
+protocol = "a4_bias_selection"
+optical_state = "F1"
+retry_same_point = true
+[block.camera]
+diff_on = -15
+diff_off = -2
+fo = 55
+hpf = 0
+refr = 235
+filters_off = true
+[[block.points]]
+label = "F1_B4_background"
+duration_s = 120
+settle_s = 10
+
+[[block]]
+experiment = "A4"
+name = "F1-B5"
+protocol = "a4_bias_selection"
+optical_state = "F1"
+retry_same_point = true
+[block.camera]
+diff_on = -30
+diff_off = -5
+fo = 55
+hpf = 0
+refr = 235
+filters_off = true
+[[block.points]]
+label = "F1_B5_background"
+duration_s = 120
+settle_s = 10
+
+# The second level repeats the same complete map. It tests whether the choice
+# is stable in the regime that matters for the fluorescence samples.
+[[block]]
+experiment = "A4"
+name = "F2-B0"
+protocol = "a4_bias_selection"
+optical_state = "F2"
+pause_before = true
+retry_same_point = true
+[block.camera]
+diff_on = 0
+diff_off = 0
+fo = 0
+hpf = 0
+refr = 235
+filters_off = true
+[[block.points]]
+label = "F2_B0_background"
+duration_s = 180
+settle_s = 10
+
+[[block]]
+experiment = "A4"
+name = "F2-B1"
+protocol = "a4_bias_selection"
+optical_state = "F2"
+retry_same_point = true
+[block.camera]
+diff_on = -15
+diff_off = -2
+fo = 0
+hpf = 0
+refr = 235
+filters_off = true
+[[block.points]]
+label = "F2_B1_background"
+duration_s = 180
+settle_s = 10
+
+[[block]]
+experiment = "A4"
+name = "F2-B2"
+protocol = "a4_bias_selection"
+optical_state = "F2"
+retry_same_point = true
+[block.camera]
+diff_on = -30
+diff_off = -5
+fo = 0
+hpf = 0
+refr = 235
+filters_off = true
+[[block.points]]
+label = "F2_B2_background"
+duration_s = 180
+settle_s = 10
+
+[[block]]
+experiment = "A4"
+name = "F2-B3"
+protocol = "a4_bias_selection"
+optical_state = "F2"
+retry_same_point = true
+[block.camera]
+diff_on = 0
+diff_off = 0
+fo = 55
+hpf = 0
+refr = 235
+filters_off = true
+[[block.points]]
+label = "F2_B3_background"
+duration_s = 180
+settle_s = 10
+
+[[block]]
+experiment = "A4"
+name = "F2-B4"
+protocol = "a4_bias_selection"
+optical_state = "F2"
+retry_same_point = true
+[block.camera]
+diff_on = -15
+diff_off = -2
+fo = 55
+hpf = 0
+refr = 235
+filters_off = true
+[[block.points]]
+label = "F2_B4_background"
+duration_s = 180
+settle_s = 10
+
+[[block]]
+experiment = "A4"
+name = "F2-B5"
+protocol = "a4_bias_selection"
+optical_state = "F2"
+retry_same_point = true
+[block.camera]
+diff_on = -30
+diff_off = -5
+fo = 55
+hpf = 0
+refr = 235
+filters_off = true
+[[block.points]]
+label = "F2_B5_background"
+duration_s = 180
+settle_s = 10

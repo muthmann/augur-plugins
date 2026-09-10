@@ -42,21 +42,34 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use augur_plugin_api::{
-    export_plugin, CameraConfigurationSnapshotV1, CameraConfigurationSourceV1, EventFiltersV1,
-    EventStoreHandle, ExecutionContext, GlobalSettings, HostCommand, HostCommandOutcome, HostCommandReply,
-    HostCommandRequest, HostContext, HostDatasetDescriptor, HostDatasetKind, HostOutput,
-    HostViewDescriptor, HostViewKind, HostViewPlacement, HostViewRegistry, PathDialogKind, Plugin,
-    PluginCapabilities, PluginControlContext, PluginControlInbox, PluginDiscontinuity, PluginFrame,
-    PluginInput, PluginRuntimeRole, PluginServiceOutcome, PluginServiceReply, PluginServiceRequest,
-    PluginControlSnapshot,
-    RoiV1, SensorBiasReadbackV1,
-    SensorMonitoringV1, SettingItem, SettingKind, SettingsSchema, SettingsSection, StatusEntry,
-    TableColumn, TableColumnData, TableColumnValues, TableDatasetV1, TableSchema, TableValueType,
-    CTX_GLOBAL_SETTINGS, CTX_SENSOR_MONITORING,
+    CTX_GLOBAL_SETTINGS, CTX_SENSOR_MONITORING, CameraConfigurationSnapshotV1,
+    CameraConfigurationSourceV1, EventFiltersV1, EventStoreHandle, ExecutionContext,
+    GlobalSettings, HostCommand, HostCommandOutcome, HostCommandReply, HostCommandRequest,
+    HostContext, HostDatasetDescriptor, HostDatasetKind, HostOutput, HostViewDescriptor,
+    HostViewKind, HostViewPlacement, HostViewRegistry, PathDialogKind, Plugin, PluginCapabilities,
+    PluginControlContext, PluginControlInbox, PluginControlSnapshot, PluginDiscontinuity,
+    PluginFrame, PluginInput, PluginRuntimeRole, PluginServiceOutcome, PluginServiceReply,
+    PluginServiceRequest, RoiV1, SensorBiasReadbackV1, SensorMonitoringV1, SettingItem,
+    SettingKind, SettingsSchema, SettingsSection, StatusEntry, TableColumn, TableColumnData,
+    TableColumnValues, TableDatasetV1, TableSchema, TableValueType, export_plugin,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use stage_a_plugin_contract::telemetry;
+use stage_a_universal_runner::CameraSettings;
+
+fn materialize_universal_protocol(name: &str) -> Result<Option<String>, String> {
+    let contents = match name {
+        "a4_final_selection" => include_str!("../protocols/a4_bright_reference.toml"),
+        "a4_final_background_ladder" => {
+            include_str!("../protocols/a4_final_background_ladder.toml")
+        }
+        _ => return Ok(None),
+    };
+    let path = std::env::temp_dir().join(format!("stage-a-universal-{name}.toml"));
+    std::fs::write(&path, contents).map_err(|error| error.to_string())?;
+    Ok(Some(path.to_string_lossy().into_owned()))
+}
 
 use crate::protocol::{self, A4Point, Protocol};
 use crate::qc::{self, Drift, Endpoints, QcStatus, RateSummary};
@@ -279,6 +292,9 @@ pub struct StageAA4Plugin {
     output_folder: String,
     measurement_id: String,
     protocol_path: String,
+    /// Complete camera override supplied by the universal campaign runner.
+    /// Optional fields preserve the confirmed baseline.
+    camera_override: Option<CameraSettings>,
 
     press_start: PressLatch,
     press_stop: PressLatch,
@@ -322,6 +338,7 @@ impl Default for StageAA4Plugin {
             output_folder: String::new(),
             measurement_id: String::new(),
             protocol_path: String::new(),
+            camera_override: None,
             press_start: PressLatch::default(),
             press_stop: PressLatch::default(),
             press_continue: PressLatch::default(),
@@ -634,6 +651,22 @@ impl StageAA4Plugin {
         };
         snapshot.biases.diff_on = point.diff_on as i32;
         snapshot.biases.diff_off = point.diff_off as i32;
+        if let Some(override_camera) = &self.camera_override {
+            if let Some(value) = override_camera.fo {
+                snapshot.biases.fo = value;
+            }
+            if let Some(value) = override_camera.hpf {
+                snapshot.biases.hpf = value;
+            }
+            if let Some(value) = override_camera.refr {
+                snapshot.biases.refr = value;
+            }
+            if override_camera.filters_off == Some(true) {
+                snapshot.digital_filter.stc_enabled = false;
+                snapshot.digital_filter.trail_enabled = false;
+                snapshot.digital_filter.erc_enabled = Some(false);
+            }
+        }
         let request_id = self.next_request_id();
         context.request_host(&HostCommandRequest {
             request_id,
@@ -1188,8 +1221,7 @@ impl StageAA4Plugin {
                 illumination_lux_end: state.illumination.end,
                 pixel_dead_time_us: state.pixel_dead_time_us,
                 reading_age_s: state.sensor_age_s,
-                illumination_note:
-                    "Sensor lux is the die's own integrated reading, used here as a stability \
+                illumination_note: "Sensor lux is the die's own integrated reading, used here as a stability \
                      indicator only. It is not a calibrated optical power.",
             },
             filters: sidecar::FiltersSection {
@@ -2280,10 +2312,26 @@ impl Plugin for StageAA4Plugin {
                 request.payload.clone(),
             ) {
                 Ok(command) if command.experiment == stage_a_universal_runner::Experiment::A4 => {
+                    self.camera_override = Some(command.camera.clone());
                     self.protocol_path = if command.protocol == "a4_bright_reference" {
                         String::new()
                     } else {
-                        command.protocol
+                        match materialize_universal_protocol(command.protocol.trim()) {
+                            Ok(Some(path)) => path,
+                            Ok(None) => command.protocol,
+                            Err(error) => {
+                                return PluginServiceReply {
+                                    request_id: request.request_id,
+                                    source_plugin_id: request.source_plugin_id.clone(),
+                                    target_plugin_id: request.target_plugin_id.clone(),
+                                    service: request.service.clone(),
+                                    outcome: PluginServiceOutcome::Rejected {
+                                        code: "protocol_materialization_failed".into(),
+                                        message: error,
+                                    },
+                                };
+                            }
+                        }
                     };
                     self.measurement_id = command.measurement_id.clone();
                     self.start_pending = true;
@@ -2429,7 +2477,13 @@ impl Plugin for StageAA4Plugin {
     }
 
     fn control_snapshots(&self) -> Vec<PluginControlSnapshot> {
-        let state = if self.run.is_some() { "running" } else if self.last_completed_measurement_id.is_some() { "completed" } else { "idle" };
+        let state = if self.run.is_some() {
+            "running"
+        } else if self.last_completed_measurement_id.is_some() {
+            "completed"
+        } else {
+            "idle"
+        };
         vec![PluginControlSnapshot {
             plugin_id: "stage-a.a4".into(),
             topic: "stage-a.universal.block".into(),
@@ -3777,10 +3831,12 @@ mod tests {
             let id = sink.last_id();
             tick(&mut p, vec![applied_reply(id, 5, 5, age)], &mut sink);
             assert_eq!(p.run.as_ref().unwrap().retry_count, 1);
-            assert!(!sink
-                .hosts
-                .iter()
-                .any(|h| matches!(h.command, HostCommand::StartRecording { .. })));
+            assert!(
+                !sink
+                    .hosts
+                    .iter()
+                    .any(|h| matches!(h.command, HostCommand::StartRecording { .. }))
+            );
             std::fs::remove_dir_all(folder).unwrap();
         }
     }

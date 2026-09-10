@@ -1,0 +1,224 @@
+# Stage-A Grand Final, version 20260910-v2
+#
+# This is the single campaign manifest for the realistic low-light study.
+# The operator changes only the AOD at an optical-state pause. The runner
+# records the observed camera lux and PD level and passes them to every block.
+# A target camera lux is a label, never a substituted measurement.
+name = "stage-a-grand-final"
+version = "20260910-v3"
+program = "selected_state_final"
+overhead_s_per_point = 11.0
+
+[[optical_states]]
+id = "F0"
+label = "bright overlap reference"
+operator_action = "Keep the qualified bright AOD setting unchanged."
+target_camera_lux = "about 8"
+
+[[optical_states]]
+id = "F1"
+label = "application-level low light"
+operator_action = "Set the AOD to the saved low-light setting and wait for stable readback."
+target_camera_lux = "about 0.8 (1/10 of F0)"
+pause_before = true
+
+[[optical_states]]
+id = "F2"
+label = "application-level very low light"
+operator_action = "Set the AOD to the saved darker setting and wait for stable readback."
+target_camera_lux = "about 0.08 (1/100 of F0)"
+pause_before = true
+
+# The first block is a short bright bridge. It prevents the low-light curves
+# from becoming disconnected from the completed bright measurements.
+[[block]]
+experiment = "A1"
+name = "bright-overlap-bridge"
+protocol = ""
+optical_state = "F0"
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+[block.camera]
+diff_on = -15
+diff_off = -2
+fo = 55
+hpf = 0
+refr = 235
+filters_off = true
+[[block.points]]
+label = "F0_bridge_scout"
+duration_s = 60
+settle_s = 10
+repeats = 1
+role = "bright_overlap_not_full_fit"
+
+# One A4 observation at each flux level is enough for bias selection. The
+# selected bias is chosen offline from response, background and stability.
+[[block]]
+experiment = "A4"
+name = "bias-selection-background"
+protocol = "a4_final_selection"
+optical_state = "F1"
+pause_before = true
+retry_same_point = true
+required_artifacts = ["raw", "camera_sidecar", "monitoring", "protocol_receipt"]
+[block.camera]
+diff_on = -15
+diff_off = -2
+fo = 55
+hpf = 0
+refr = 235
+filters_off = true
+[[block.points]]
+label = "F1_bias_selection"
+duration_s = 120
+settle_s = 10
+repeats = 1
+
+# The final low-light A1/A3 block is run once per flux. Slow rows are reused
+# for A3; no duplicate A3 recording is required.
+[[block]]
+experiment = "A1"
+name = "low-light-frequency-and-threshold-final"
+protocol = "a1_a3_low_light_final"
+optical_state = "F1"
+pause_before = true
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+[block.camera]
+diff_on = -15
+diff_off = -2
+fo = 55
+hpf = 0
+refr = 235
+filters_off = true
+[[block.points]]
+label = "F1_A1_A3_final"
+duration_s = 1
+settle_s = 0
+repeats = 1
+
+[[block]]
+experiment = "A1"
+name = "very-low-light-frequency-and-threshold-final"
+protocol = "a1_a3_low_light_final"
+optical_state = "F2"
+pause_before = true
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+[block.camera]
+diff_on = -15
+diff_off = -2
+fo = 55
+hpf = 0
+refr = 235
+filters_off = true
+[[block.points]]
+label = "F2_A1_A3_final"
+duration_s = 1
+settle_s = 0
+repeats = 1
+
+[[block]]
+experiment = "A2"
+name = "matched-low-light-step-latency"
+protocol = "a2_low_light_final"
+optical_state = "F1"
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+[block.camera]
+diff_on = -15
+diff_off = -2
+fo = 55
+hpf = 0
+refr = 235
+filters_off = true
+[[block.points]]
+label = "F1_A2_final"
+duration_s = 1
+settle_s = 0
+repeats = 1
+
+[[block]]
+experiment = "A2"
+name = "matched-very-low-light-step-latency"
+protocol = "a2_low_light_final"
+optical_state = "F2"
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+[block.camera]
+diff_on = -15
+diff_off = -2
+fo = 55
+hpf = 0
+refr = 235
+filters_off = true
+[[block.points]]
+label = "F2_A2_final"
+duration_s = 1
+settle_s = 0
+repeats = 1
+
+[[block]]
+experiment = "A4"
+name = "final-background-ladder"
+protocol = "a4_final_background_ladder"
+optical_state = "F2"
+retry_same_point = true
+required_artifacts = ["raw", "camera_sidecar", "monitoring", "protocol_receipt"]
+[block.camera]
+diff_on = -15
+diff_off = -2
+fo = 55
+hpf = 0
+refr = 235
+filters_off = true
+[[block.points]]
+label = "F2_background_ladder"
+duration_s = 1
+settle_s = 0
+repeats = 1
+
+[[block]]
+experiment = "A5"
+name = "operating-state-load-and-recovery"
+protocol = "a5_final_load_recovery"
+optical_state = "F0"
+pause_before = true
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+[block.camera]
+diff_on = -15
+diff_off = -2
+fo = 55
+hpf = 0
+refr = 235
+filters_off = true
+[[block.points]]
+label = "F0_A5_nested_roi_load"
+duration_s = 1
+settle_s = 0
+repeats = 1
+role = "effective_load_and_recovery"
+
+[[block]]
+experiment = "A2"
+name = "held-out-application-validation"
+protocol = "a2_heldout_blink_validation"
+optical_state = "F2"
+pause_before = true
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+[block.camera]
+diff_on = -15
+diff_off = -2
+fo = 55
+hpf = 0
+refr = 235
+filters_off = true
+[[block.points]]
+label = "F2_heldout_application"
+duration_s = 1
+settle_s = 0
+repeats = 1
+role = "held_out_not_for_fitting"

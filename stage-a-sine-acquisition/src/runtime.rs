@@ -44,39 +44,52 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use augur_plugin_api::{
-    CameraBiasOffsetsV1, CameraConfigurationProvenanceV1, CameraConfigurationSnapshotV1,
-    CameraConfigurationSourceV1, EventStoreHandle, ExecutionContext, FfiCdEvent, GlobalSettings, HostCommand,
+    CTX_GLOBAL_SETTINGS, CTX_SENSOR_MONITORING, CameraBiasOffsetsV1,
+    CameraConfigurationProvenanceV1, CameraConfigurationSnapshotV1, CameraConfigurationSourceV1,
+    EventStoreHandle, ExecutionContext, FfiCdEvent, GlobalSettings, HostCommand,
     HostCommandOutcome, HostCommandReply, HostCommandRequest, HostContext, HostDatasetDescriptor,
     HostDatasetKind, HostOutput, HostViewDescriptor, HostViewKind, HostViewPlacement,
     HostViewRegistry, PathDialogKind, Plugin, PluginCapabilities, PluginControlContext,
-    PluginControlInbox, PluginDiscontinuity, PluginFrame, PluginInput, PluginRuntimeRole,
-    PluginServiceOutcome, PluginServiceReply, PluginServiceRequest, PluginControlSnapshot,
-    RoiV1, SensorBiasReadbackV1,
-    SensorMonitoringV1, Series1dLine, Series1dPoint, Series1dV1, SettingItem, SettingKind,
-    SettingsSchema, SettingsSection, StatusEntry, TableColumn, TableColumnData, TableColumnValues,
-    TableDatasetV1, TableSchema, TableValueType, CTX_GLOBAL_SETTINGS, CTX_SENSOR_MONITORING,
+    PluginControlInbox, PluginControlSnapshot, PluginDiscontinuity, PluginFrame, PluginInput,
+    PluginRuntimeRole, PluginServiceOutcome, PluginServiceReply, PluginServiceRequest, RoiV1,
+    SensorBiasReadbackV1, SensorMonitoringV1, Series1dLine, Series1dPoint, Series1dV1, SettingItem,
+    SettingKind, SettingsSchema, SettingsSection, StatusEntry, TableColumn, TableColumnData,
+    TableColumnValues, TableDatasetV1, TableSchema, TableValueType,
 };
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use stage_a_plugin_contract::{
-    ClientId, ConnectionStateV1, LeaseId, LeaseSnapshotV1, ModulationCommandV1,
-    ModulationRequestV1, ModulationStateV1, OpticalTargetV1, PdqReceiptV1, PdqStartSpecV1,
-    PhotodiodeCommandV1, PhotodiodeOpticalSummaryV1, PhotodiodeRequestV1, PhotodiodeResponseV1,
-    PhotodiodeSummaryV1, RequestId, RunId, SemanticRevision, WaveformV1,
-    CTX_STAGE_A_MODULATION_STATE_V1, CTX_STAGE_A_PHOTODIODE_SUMMARY_V1,
-    SERVICE_STAGE_A_MODULATION_CONTROL_V1, SERVICE_STAGE_A_PHOTODIODE_CONTROL_V1,
+    CTX_STAGE_A_MODULATION_STATE_V1, CTX_STAGE_A_PHOTODIODE_SUMMARY_V1, ClientId,
+    ConnectionStateV1, LeaseId, LeaseSnapshotV1, ModulationCommandV1, ModulationRequestV1,
+    ModulationStateV1, OpticalTargetV1, PdqReceiptV1, PdqStartSpecV1, PhotodiodeCommandV1,
+    PhotodiodeOpticalSummaryV1, PhotodiodeRequestV1, PhotodiodeResponseV1, PhotodiodeSummaryV1,
+    RequestId, RunId, SERVICE_STAGE_A_MODULATION_CONTROL_V1, SERVICE_STAGE_A_PHOTODIODE_CONTROL_V1,
+    SemanticRevision, WaveformV1,
 };
+use stage_a_universal_runner::CameraSettings;
 
-use crate::phase::{fold_events, fold_events_free_running, MarkerValidationConfig, PhaseFold};
+use crate::phase::{MarkerValidationConfig, PhaseFold, fold_events, fold_events_free_running};
 use crate::protocol;
-use crate::rates::{rolling_half_period_response, RollingResponsePoint};
-use crate::response_curve::{auto_windows, response_probability, PhaseWindow, ResponsePoint, Roi};
+use crate::rates::{RollingResponsePoint, rolling_half_period_response};
+use crate::response_curve::{PhaseWindow, ResponsePoint, Roi, auto_windows, response_probability};
 use crate::sensor;
 use crate::types::{CameraEvent, Polarity};
 
 const MODULATION_PLUGIN_ID: &str = "stage-a.modulation";
 const PHOTODIODE_PLUGIN_ID: &str = "stage-a.photodiode";
+
+fn materialize_universal_protocol(name: &str) -> Result<Option<String>, String> {
+    let contents = match name {
+        "a1_a3_low_light_final" => {
+            include_str!("../../plugins/stage-a-a1/protocols/a1_fc_flux_discriminator.csv")
+        }
+        _ => return Ok(None),
+    };
+    let path = std::env::temp_dir().join(format!("stage-a-universal-{name}.csv"));
+    std::fs::write(&path, contents).map_err(|error| error.to_string())?;
+    Ok(Some(path.to_string_lossy().into_owned()))
+}
 
 /// Camera events retained for the live fold. At the bench event rates this is a
 /// few seconds of history and keeps the fold cost bounded.
@@ -889,6 +902,7 @@ struct ProtocolRun {
     camera_apply_req: Option<u64>,
     camera_session_active: bool,
     camera_snapshot: Option<CameraConfigurationSnapshotV1>,
+    camera_override_applied: bool,
     camera_profile_provenance: Option<CameraConfigurationProvenanceV1>,
     camera_provenance: Option<CameraConfigurationProvenanceV1>,
     camera_confirmation: Option<(SensorBiasReadbackV1, f64)>,
@@ -1090,6 +1104,9 @@ pub struct SineAcquisition<const A3: bool> {
     // -- declarative protocol runs --
     /// Path of the TOML protocol file to run.
     protocol_path: String,
+    /// Complete camera override supplied by the universal campaign runner.
+    camera_override: Option<CameraSettings>,
+    pending_camera_override: Option<CameraConfigurationSnapshotV1>,
     /// Latched by the Run protocol button, consumed next control tick.
     protocol_pending: bool,
     /// Recording length for the *next* run, overriding the panel's setting.
@@ -1201,6 +1218,8 @@ impl<const A3: bool> Default for SineAcquisition<A3> {
             freq_sweep: None,
             protocol_path: String::new(),
             protocol_pending: false,
+            camera_override: None,
+            pending_camera_override: None,
             pending_duration_s: None,
             protocol: None,
             a0_locks: Vec::new(),
@@ -4846,7 +4865,11 @@ impl<const A3: bool> SineAcquisition<A3> {
                 .enumerate()
                 .find(|(_, p)| p.duration_s as f64 * p.frequency_hz < 5.0)
             {
-                self.message = format!("A3 row {} ({}) records fewer than 5 cycles; increase duration_s or frequency_hz", index + 1, point.block);
+                self.message = format!(
+                    "A3 row {} ({}) records fewer than 5 cycles; increase duration_s or frequency_hz",
+                    index + 1,
+                    point.block
+                );
                 return;
             }
         }
@@ -4912,7 +4935,8 @@ impl<const A3: bool> SineAcquisition<A3> {
             }
         }
 
-        let controls_camera = plan.camera.is_some()
+        let controls_camera = self.camera_override.is_some()
+            || plan.camera.is_some()
             || plan
                 .points
                 .iter()
@@ -4924,7 +4948,16 @@ impl<const A3: bool> SineAcquisition<A3> {
             Self::EXPERIMENT.to_ascii_lowercase(),
             format_compact_utc(now_ms / 1_000)
         ));
-        let camera_selection = plan.camera.clone();
+        // A universal override starts from the host-confirmed current state;
+        // the first camera reply below applies the requested fields. This
+        // deliberately takes precedence over a legacy named profile in the
+        // delegated CSV, otherwise the campaign would silently use the wrong
+        // bias candidate.
+        let camera_selection = if self.camera_override.is_some() {
+            None
+        } else {
+            plan.camera.clone()
+        };
         let phase = if controls_camera {
             ProtocolPhase::ApplyingCamera
         } else {
@@ -4964,6 +4997,7 @@ impl<const A3: bool> SineAcquisition<A3> {
             camera_apply_req: None,
             camera_session_active: false,
             camera_snapshot: None,
+            camera_override_applied: false,
             camera_profile_provenance: None,
             camera_provenance: None,
             camera_confirmation: None,
@@ -6047,6 +6081,46 @@ impl<const A3: bool> SineAcquisition<A3> {
                         readback,
                         readback_age_s,
                     } => {
+                        let mut snapshot = snapshot.clone();
+                        let override_camera = self.camera_override.clone();
+                        let needs_override = self
+                            .protocol
+                            .as_ref()
+                            .is_some_and(|run| !run.camera_override_applied)
+                            && override_camera.as_ref().is_some_and(|camera| {
+                                camera.diff_on.is_some()
+                                    || camera.diff_off.is_some()
+                                    || camera.fo.is_some()
+                                    || camera.hpf.is_some()
+                                    || camera.refr.is_some()
+                            });
+                        if needs_override {
+                            if let Some(camera) = override_camera {
+                                if let Some(value) = camera.diff_on {
+                                    snapshot.biases.diff_on = value;
+                                }
+                                if let Some(value) = camera.diff_off {
+                                    snapshot.biases.diff_off = value;
+                                }
+                                if let Some(value) = camera.fo {
+                                    snapshot.biases.fo = value;
+                                }
+                                if let Some(value) = camera.hpf {
+                                    snapshot.biases.hpf = value;
+                                }
+                                if let Some(value) = camera.refr {
+                                    snapshot.biases.refr = value;
+                                }
+                                if camera.filters_off == Some(true) {
+                                    snapshot.digital_filter.stc_enabled = false;
+                                    snapshot.digital_filter.trail_enabled = false;
+                                    snapshot.digital_filter.erc_enabled = Some(false);
+                                }
+                            }
+                            self.protocol.as_mut().unwrap().camera_override_applied = true;
+                            self.pending_camera_override = Some(snapshot);
+                            return;
+                        }
                         if let Some(run) = self.protocol.as_mut() {
                             run.camera_apply_req = None;
                             run.camera_session_active = true;
@@ -6057,7 +6131,7 @@ impl<const A3: bool> SineAcquisition<A3> {
                                 .then(|| provenance.clone());
                             run.camera_provenance = Some(provenance.clone());
                             run.camera_confirmation = Some((*readback, *readback_age_s));
-                            if let Some(reason) = a1_camera_configuration_refusal(snapshot) {
+                            if let Some(reason) = a1_camera_configuration_refusal(&snapshot) {
                                 run.stop_requested = true;
                                 run.finish_message = Some(format!(
                                     "Protocol aborted: applied camera configuration is incompatible: {reason}"
@@ -7391,24 +7465,62 @@ impl<const A3: bool> Plugin for SineAcquisition<A3> {
             stage_a_universal_runner::Experiment::A1
         };
         let outcome = if request.service != stage_a_universal_runner::SERVICE_EXECUTE_BLOCK_V1 {
-            PluginServiceOutcome::Rejected { code: "unsupported_service".into(), message: "A1/A3 does not support this service".into() }
+            PluginServiceOutcome::Rejected {
+                code: "unsupported_service".into(),
+                message: "A1/A3 does not support this service".into(),
+            }
         } else if !execution.hardware_effects_allowed() {
-            PluginServiceOutcome::Rejected { code: "effects_not_allowed".into(), message: "A1/A3 block execution requires the live worker".into() }
+            PluginServiceOutcome::Rejected {
+                code: "effects_not_allowed".into(),
+                message: "A1/A3 block execution requires the live worker".into(),
+            }
         } else {
-            match serde_json::from_value::<stage_a_universal_runner::ExecuteBlockRequest>(request.payload.clone()) {
+            match serde_json::from_value::<stage_a_universal_runner::ExecuteBlockRequest>(
+                request.payload.clone(),
+            ) {
                 Ok(command) if command.experiment == experiment => {
+                    self.camera_override = Some(command.camera.clone());
                     if !command.protocol.trim().is_empty() {
-                        self.protocol_path = command.protocol;
+                        match materialize_universal_protocol(command.protocol.trim()) {
+                            Ok(Some(path)) => self.protocol_path = path,
+                            Ok(None) => self.protocol_path = command.protocol,
+                            Err(error) => {
+                                return PluginServiceReply {
+                                    request_id: request.request_id,
+                                    source_plugin_id: request.source_plugin_id.clone(),
+                                    target_plugin_id: request.target_plugin_id.clone(),
+                                    service: request.service.clone(),
+                                    outcome: PluginServiceOutcome::Rejected {
+                                        code: "protocol_materialization_failed".into(),
+                                        message: error,
+                                    },
+                                };
+                            }
+                        }
                     }
                     self.measurement_id = command.measurement_id.clone();
                     self.protocol_pending = true;
-                    PluginServiceOutcome::Accepted { payload: json!({"measurement_id": command.measurement_id}) }
+                    PluginServiceOutcome::Accepted {
+                        payload: json!({"measurement_id": command.measurement_id}),
+                    }
                 }
-                Ok(command) => PluginServiceOutcome::Rejected { code: "wrong_target".into(), message: format!("this runner cannot execute {:?}", command.experiment) },
-                Err(error) => PluginServiceOutcome::Rejected { code: "invalid_payload".into(), message: error.to_string() },
+                Ok(command) => PluginServiceOutcome::Rejected {
+                    code: "wrong_target".into(),
+                    message: format!("this runner cannot execute {:?}", command.experiment),
+                },
+                Err(error) => PluginServiceOutcome::Rejected {
+                    code: "invalid_payload".into(),
+                    message: error.to_string(),
+                },
             }
         };
-        PluginServiceReply { request_id: request.request_id, source_plugin_id: request.source_plugin_id.clone(), target_plugin_id: request.target_plugin_id.clone(), service: request.service.clone(), outcome }
+        PluginServiceReply {
+            request_id: request.request_id,
+            source_plugin_id: request.source_plugin_id.clone(),
+            target_plugin_id: request.target_plugin_id.clone(),
+            service: request.service.clone(),
+            outcome,
+        }
     }
 
     fn reset(&mut self) {
@@ -7579,6 +7691,18 @@ impl<const A3: bool> Plugin for SineAcquisition<A3> {
         self.update_snapshots(&inbox);
         for reply in &inbox.host_replies {
             self.on_host_reply(reply);
+        }
+        if let Some(snapshot) = self.pending_camera_override.take() {
+            let request_id = self.next_request_id();
+            let _ = context.request_host(&HostCommandRequest {
+                request_id,
+                command: HostCommand::ApplyCameraConfiguration {
+                    configuration: CameraConfigurationSourceV1::Snapshot { snapshot },
+                },
+            });
+            if let Some(run) = self.protocol.as_mut() {
+                run.camera_apply_req = Some(request_id);
+            }
         }
         for reply in &inbox.service_replies {
             self.on_service_reply(reply);
@@ -8938,9 +9062,9 @@ fn connection_label(connection: &ConnectionStateV1) -> &'static str {
 #[cfg(test)]
 mod tests {
     use stage_a_plugin_contract::{
-        FreshnessV1, OwnerInstanceId, PdqFinalizedReceiptV1, PdqStartedReceiptV1,
-        PhotodiodeCalibrationV1, PhotodiodeStreamV1, RequestOutcomeV1, ResponseCommonV1, Sha256V1,
-        StreamIntegrityV1, SynchronizationV1, UnsyncedReasonV1, CONTRACT_VERSION_V1,
+        CONTRACT_VERSION_V1, FreshnessV1, OwnerInstanceId, PdqFinalizedReceiptV1,
+        PdqStartedReceiptV1, PhotodiodeCalibrationV1, PhotodiodeStreamV1, RequestOutcomeV1,
+        ResponseCommonV1, Sha256V1, StreamIntegrityV1, SynchronizationV1, UnsyncedReasonV1,
     };
 
     use super::*;
@@ -10408,9 +10532,11 @@ mod tests {
             .map(|entry| entry.path())
             .collect();
         assert_eq!(sidecars.len(), 1);
-        assert!(sidecars[0]
-            .file_name()
-            .is_some_and(|name| name.to_string_lossy().ends_with("_config.toml")));
+        assert!(
+            sidecars[0]
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().ends_with("_config.toml"))
+        );
         assert!(plugin.message.starts_with("Saved recording A1-row"));
 
         let doc: toml::Value =
@@ -10462,9 +10588,11 @@ mod tests {
         assert!((points[4].expected_a - 2.5).abs() < 1e-12);
         assert!((points[2].expected_a - 1.5).abs() < 1e-12);
         // The amplitude sweep trusts the calibration: it commands what it expects.
-        assert!(points
-            .iter()
-            .all(|point| point.commanded_a == point.expected_a));
+        assert!(
+            points
+                .iter()
+                .all(|point| point.commanded_a == point.expected_a)
+        );
     }
 
     #[test]
@@ -10784,9 +10912,11 @@ mod tests {
             .count();
         assert_eq!(acquired, 1, "one lease for the ladder, not one per child");
         assert_eq!(released, 1, "released exactly once, at the end");
-        assert!(commands
-            .iter()
-            .any(|command| matches!(command, ModulationCommandV1::SetDriveFrequency { .. })));
+        assert!(
+            commands
+                .iter()
+                .any(|command| matches!(command, ModulationCommandV1::SetDriveFrequency { .. }))
+        );
 
         // Both frequencies are locked, each at the depth its own roll-off needs.
         assert_eq!(plugin.a0_locks.len(), 2);
@@ -11848,15 +11978,17 @@ depth_a = 0.7
             .unwrap()
         };
         assert_eq!(scan().len(), 1);
-        assert!(completed_protocol_rows(
-            &folder.join("A1-proto"),
-            "A1-proto",
-            "changed",
-            2,
-            StageAA1Plugin::SIDECAR_SCHEMA
-        )
-        .unwrap()
-        .is_empty());
+        assert!(
+            completed_protocol_rows(
+                &folder.join("A1-proto"),
+                "A1-proto",
+                "changed",
+                2,
+                StageAA1Plugin::SIDECAR_SCHEMA
+            )
+            .unwrap()
+            .is_empty()
+        );
         for replacement in [
             "acquisition_complete = false",
             "",
@@ -12287,11 +12419,13 @@ depth_a = 0.7
             sink.hosts.last().map(|request| &request.command),
             Some(HostCommand::RestoreCameraConfiguration)
         ));
-        assert!(plugin
-            .protocol
-            .as_ref()
-            .and_then(|run| run.finish_message.as_deref())
-            .is_some_and(|message| message.contains("Record sensor monitoring")));
+        assert!(
+            plugin
+                .protocol
+                .as_ref()
+                .and_then(|run| run.finish_message.as_deref())
+                .is_some_and(|message| message.contains("Record sensor monitoring"))
+        );
         let _ = std::fs::remove_dir_all(&folder);
     }
 
@@ -14116,12 +14250,14 @@ bias_refr_code,status,error\n\
             payload: serde_json::to_value(response).unwrap(),
         };
         plugin.on_service_reply(&reply);
-        assert!(plugin
-            .protocol
-            .as_ref()
-            .unwrap()
-            .pending_reqs
-            .contains(&request_id));
+        assert!(
+            plugin
+                .protocol
+                .as_ref()
+                .unwrap()
+                .pending_reqs
+                .contains(&request_id)
+        );
         plugin.poll_modulation_requests(&mut sink);
         assert!(sink.services.iter().any(|request| {
             request.request_id != request_id
@@ -14268,10 +14404,12 @@ bias_refr_code,status,error\n\
         assert!(run.prepare_req.is_none());
         assert!(run.pending_reqs.is_empty());
         assert!(!run.stop_requested);
-        assert!(originals.iter().all(|original| !plugin
-            .modulation_requests
-            .iter()
-            .any(|(pending, _)| pending.request_id == original.request_id)));
+        assert!(originals.iter().all(|original| {
+            !plugin
+                .modulation_requests
+                .iter()
+                .any(|(pending, _)| pending.request_id == original.request_id)
+        }));
         let _ = std::fs::remove_dir_all(folder);
     }
 
@@ -14319,19 +14457,25 @@ bias_refr_code,status,error\n\
         plugin.begin_protocol(&mut sink);
         assert!(plugin.protocol.is_some(), "{}", plugin.message);
         assert!(plugin.camera_events.is_empty() && !plugin.live);
-        assert!(plugin
-            .protocol
-            .as_ref()
-            .unwrap()
-            .lease_id
-            .as_str()
-            .starts_with("a3-protocol-"));
-        assert!(plugin
-            .set_setting("measurement_id", json!("another"))
-            .is_err());
-        assert!(plugin
-            .set_setting("output_folder", json!(plugin.output_folder))
-            .is_ok());
+        assert!(
+            plugin
+                .protocol
+                .as_ref()
+                .unwrap()
+                .lease_id
+                .as_str()
+                .starts_with("a3-protocol-")
+        );
+        assert!(
+            plugin
+                .set_setting("measurement_id", json!("another"))
+                .is_err()
+        );
+        assert!(
+            plugin
+                .set_setting("output_folder", json!(plugin.output_folder))
+                .is_ok()
+        );
         plugin.append_protocol_event("test", "offline").unwrap();
         let progress =
             std::fs::read_to_string(folder.join("A3-test").join("progress.jsonl")).unwrap();
@@ -14405,12 +14549,14 @@ bias_refr_code,status,error\n\
         plugin.recording.stop_requested = true;
         let mut sink = ControlSink::default();
         plugin.drive_recording(&mut sink);
-        assert!(plugin
-            .recording
-            .failure
-            .as_deref()
-            .unwrap()
-            .contains("partial recording retained"));
+        assert!(
+            plugin
+                .recording
+                .failure
+                .as_deref()
+                .unwrap()
+                .contains("partial recording retained")
+        );
         assert_ne!(plugin.recording.phase, RecPhase::Running);
     }
 }
