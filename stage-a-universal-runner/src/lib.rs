@@ -7,6 +7,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub const SERVICE_EXECUTE_BLOCK_V1: &str = "stage-a.universal.execute-block.v1";
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Experiment {
@@ -113,6 +115,25 @@ impl Plan {
 
 pub fn parse(text: &str) -> Result<Plan, toml::de::Error> { toml::from_str(text) }
 
+/// Versioned hand-off between the universal runner and an experiment module.
+/// The target module remains responsible for its own camera, modulation and
+/// photodiode state machine; the universal runner only sequences these blocks.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecuteBlockRequest {
+    pub plan_name: String,
+    pub block_name: String,
+    pub experiment: Experiment,
+    pub protocol: String,
+    pub measurement_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecuteBlockReply {
+    pub accepted: bool,
+    pub measurement_id: String,
+    pub message: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,5 +153,19 @@ mod tests {
         let a6 = plan.blocks.iter().find(|b| b.experiment == Experiment::A6).expect("A6");
         assert_eq!(a6.protocol, "camera_lux_reference");
         assert!(a6.points.iter().all(|p| p.flux_id.as_deref() == Some("CAMERA_LUX")));
+    }
+
+    #[test]
+    fn block_handoff_is_versioned_and_keeps_experiment_ownership() {
+        let request = ExecuteBlockRequest {
+            plan_name: "day".into(),
+            block_name: "a5".into(),
+            experiment: Experiment::A5,
+            protocol: "a5_complete_scientific".into(),
+            measurement_id: "A5-20260910-01".into(),
+        };
+        let encoded = toml::to_string(&request).expect("request serializes");
+        assert!(encoded.contains("experiment = \"a5\""));
+        assert_eq!(SERVICE_EXECUTE_BLOCK_V1, "stage-a.universal.execute-block.v1");
     }
 }
