@@ -15,6 +15,7 @@ use stage_a_universal_runner::{
     ExecuteBlockRequest, Experiment, OpticalStateConfirmation, Plan, SERVICE_EXECUTE_BLOCK_V1,
     parse,
 };
+use std::path::Path;
 
 const ID: &str = "stage-a.universal-runner";
 
@@ -44,6 +45,8 @@ pub struct StageAUniversalRunnerPlugin {
     camera_lux: Option<f32>,
     photodiode_level: Option<f64>,
     confirmed_optical_state: Option<OpticalStateConfirmation>,
+    output_folder: String,
+    start_after_confirmation: bool,
 }
 
 impl Default for StageAUniversalRunnerPlugin {
@@ -62,6 +65,8 @@ impl Default for StageAUniversalRunnerPlugin {
             camera_lux: None,
             photodiode_level: None,
             confirmed_optical_state: None,
+            output_folder: String::new(),
+            start_after_confirmation: false,
         }
     }
 }
@@ -93,6 +98,18 @@ impl StageAUniversalRunnerPlugin {
     }
 
     fn start(&mut self, context: &mut PluginControlContext<'_>) {
+        if self.output_folder.trim().is_empty() {
+            self.message = "Choose a common output folder before starting; each measurement gets its own subfolder".into();
+            return;
+        }
+        if !Path::new(self.output_folder.trim()).is_absolute() {
+            self.message = "Choose an absolute common output folder".into();
+            return;
+        }
+        if let Err(error) = std::fs::create_dir_all(self.output_folder.trim()) {
+            self.message = format!("Cannot create the common output folder: {error}");
+            return;
+        }
         let text = if self.protocol_path.trim().is_empty() {
             let built_in = match self.program.trim() {
                 "smoke" => include_str!(
@@ -143,6 +160,21 @@ impl StageAUniversalRunnerPlugin {
             waiting_measurement_id: None,
             current_optical_state: None,
         });
+        if let Some(confirmation) = self.confirmed_optical_state.as_mut() {
+            if confirmation.state_id == "UNSPECIFIED" {
+                if let Some(state_id) = self
+                    .run
+                    .as_ref()
+                    .and_then(|run| run.plan.blocks.first())
+                    .and_then(|block| block.optical_state.clone())
+                {
+                    confirmation.state_id = state_id.clone();
+                    if let Some(run) = self.run.as_mut() {
+                        run.current_optical_state = Some(state_id);
+                    }
+                }
+            }
+        }
         self.message = "Universal Stage-A run started".into();
         self.dispatch_next(context);
     }
@@ -210,6 +242,7 @@ impl StageAUniversalRunnerPlugin {
             experiment,
             protocol,
             measurement_id,
+            output_folder: self.output_folder.trim().to_owned(),
             camera,
             optical_state: self.confirmed_optical_state.clone(),
             required_artifacts: self
@@ -315,6 +348,10 @@ impl Plugin for StageAUniversalRunnerPlugin {
         for reply in context.inbox().service_replies.clone() {
             self.service_reply(context, reply);
         }
+        if self.start_after_confirmation && self.run.is_none() {
+            self.start_after_confirmation = false;
+            self.start(context);
+        }
         if self.confirmed_optical_state.is_some()
             && self
                 .run
@@ -382,6 +419,7 @@ impl Plugin for StageAUniversalRunnerPlugin {
             SettingItem { key: "program".into(), label: "Built-in program".into(), tooltip: Some("Use smoke, bright_reference, dim_bias_selection, or selected_state_final.".into()), kind: SettingKind::Text { default: self.program.clone() } },
             SettingItem { key: "protocol_path".into(), label: "Protocol file (blank = built-in program)".into(), tooltip: None, kind: SettingKind::Path { dialog: augur_plugin_api::PathDialogKind::OpenFile, default: self.protocol_path.clone() } },
             SettingItem { key: "measurement_prefix".into(), label: "Measurement prefix".into(), tooltip: None, kind: SettingKind::Text { default: self.measurement_prefix.clone() } },
+            SettingItem { key: "output_folder".into(), label: "Common output folder".into(), tooltip: Some("Absolute campaign folder. Each measurement is saved in its own subfolder; all A1-A5 owners receive this path.".into()), kind: SettingKind::Path { dialog: augur_plugin_api::PathDialogKind::Directory, default: self.output_folder.clone() } },
             SettingItem { key: "aod_setting".into(), label: "AOD setting".into(), tooltip: Some("Control value only; not a flux measurement.".into()), kind: SettingKind::Text { default: self.aod_setting.clone() } },
             SettingItem { key: "confirm_optical_state".into(), label: "Continue: confirm optical state".into(), tooltip: Some("Required after every AOD change.".into()), kind: SettingKind::Button { enabled: true } },
             SettingItem { key: "start".into(), label: "Run universal protocol".into(), tooltip: None, kind: SettingKind::Button { enabled: true } },
@@ -392,6 +430,7 @@ impl Plugin for StageAUniversalRunnerPlugin {
             "program" => Some(json!(self.program)),
             "protocol_path" => Some(json!(self.protocol_path)),
             "measurement_prefix" => Some(json!(self.measurement_prefix)),
+            "output_folder" => Some(json!(self.output_folder)),
             "aod_setting" => Some(json!(self.aod_setting)),
             "confirm_optical_state" => Some(json!(0)),
             "start" => Some(json!(self.start_counter)),
@@ -415,6 +454,16 @@ impl Plugin for StageAUniversalRunnerPlugin {
                 self.measurement_prefix = value
                     .as_str()
                     .ok_or("measurement_prefix must be a string")?
+                    .into();
+                Ok(())
+            }
+            "output_folder" => {
+                if self.run.is_some() {
+                    return Err("Stop the universal run before changing its output folder".into());
+                }
+                self.output_folder = value
+                    .as_str()
+                    .ok_or("output_folder must be a string")?
                     .into();
                 Ok(())
             }
@@ -456,10 +505,14 @@ impl Plugin for StageAUniversalRunnerPlugin {
                     run.current_optical_state = Some(state_id);
                     run.waiting_for_operator = false;
                 }
+                if self.run.is_none() {
+                    self.start_after_confirmation = true;
+                }
                 self.message = if self.run.is_some() {
                     "Optical state confirmed; the next block will start automatically".into()
                 } else {
-                    "Optical state confirmed; press Run universal protocol".into()
+                    "Optical state confirmed; the universal protocol will start automatically"
+                        .into()
                 };
                 Ok(())
             }

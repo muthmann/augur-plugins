@@ -92,6 +92,19 @@ impl Plugin for StageAA5Plugin {
         } else {
             match serde_json::from_value::<ExecuteBlockRequest>(request.payload.clone()) {
                 Ok(command) if command.experiment == Experiment::A5 => {
+                    if command.output_folder.trim().is_empty() {
+                        return PluginServiceReply {
+                            request_id: request.request_id,
+                            source_plugin_id: request.source_plugin_id.clone(),
+                            target_plugin_id: request.target_plugin_id.clone(),
+                            service: request.service.clone(),
+                            outcome: PluginServiceOutcome::Rejected {
+                                code: "missing_output_folder".into(),
+                                message: "Universal Runner did not provide a common output folder"
+                                    .into(),
+                            },
+                        };
+                    }
                     if command.camera.roi.is_some() {
                         return PluginServiceReply { request_id: request.request_id, source_plugin_id: request.source_plugin_id.clone(), target_plugin_id: request.target_plugin_id.clone(), service: request.service.clone(), outcome: PluginServiceOutcome::Rejected { code: "camera_roi_not_supported".into(), message: "A5 adapter requires a preselected qualified ROI; ROI switching is not yet supported by the delegated engine".into() } };
                     }
@@ -139,6 +152,8 @@ impl Plugin for StageAA5Plugin {
                         }
                     } else {
                         self.inner.set_camera_override(Some(command.camera.clone()));
+                        self.inner
+                            .set_output_folder_override(Some(command.output_folder.clone()));
                         let _ = self.inner.set_setting("run_protocol", json!(1));
                         PluginServiceOutcome::Accepted {
                             payload: json!({"state":"started"}),

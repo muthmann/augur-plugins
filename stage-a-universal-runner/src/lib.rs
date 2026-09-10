@@ -172,6 +172,9 @@ pub struct ExecuteBlockRequest {
     pub experiment: Experiment,
     pub protocol: String,
     pub measurement_id: String,
+    /// Absolute campaign root. Owners create `<root>/<measurement_id>`.
+    #[serde(default)]
+    pub output_folder: String,
     pub camera: CameraSettings,
     #[serde(default)]
     pub optical_state: Option<OpticalStateConfirmation>,
@@ -301,6 +304,7 @@ mod tests {
             experiment: Experiment::A5,
             protocol: "a5_complete_scientific".into(),
             measurement_id: "A5-20260910-01".into(),
+            output_folder: "/tmp/stage-a".into(),
             camera: CameraSettings::default(),
             optical_state: None,
             required_artifacts: Vec::new(),

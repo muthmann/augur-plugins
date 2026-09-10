@@ -7480,6 +7480,20 @@ impl<const A3: bool> Plugin for SineAcquisition<A3> {
             ) {
                 Ok(command) if command.experiment == experiment => {
                     self.camera_override = Some(command.camera.clone());
+                    if command.output_folder.trim().is_empty() {
+                        return PluginServiceReply {
+                            request_id: request.request_id,
+                            source_plugin_id: request.source_plugin_id.clone(),
+                            target_plugin_id: request.target_plugin_id.clone(),
+                            service: request.service.clone(),
+                            outcome: PluginServiceOutcome::Rejected {
+                                code: "missing_output_folder".into(),
+                                message: "Universal Runner did not provide a common output folder"
+                                    .into(),
+                            },
+                        };
+                    }
+                    self.output_folder = command.output_folder.clone();
                     if !command.protocol.trim().is_empty() {
                         match materialize_universal_protocol(command.protocol.trim()) {
                             Ok(Some(path)) => self.protocol_path = path,

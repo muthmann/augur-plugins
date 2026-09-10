@@ -379,6 +379,7 @@ pub struct StageAA2Plugin {
     enabled: bool,
     role: PluginRuntimeRole,
     output_folder: String,
+    output_folder_override: Option<String>,
     measurement_id: String,
     protocol_path: String,
     protocol_preview: Option<Protocol>,
@@ -407,6 +408,7 @@ impl Default for StageAA2Plugin {
             enabled: true,
             role: PluginRuntimeRole::LiveWorker,
             output_folder: String::new(),
+            output_folder_override: None,
             measurement_id: String::new(),
             protocol_path: String::new(),
             protocol_preview: None,
@@ -454,6 +456,12 @@ impl StageAA2Plugin {
     /// plugin before the delegated protocol starts.
     pub fn set_camera_override(&mut self, camera: Option<CameraSettings>) {
         self.camera_override = camera;
+    }
+
+    /// Use the campaign root supplied by an orchestration plugin instead of
+    /// falling back to the photodiode owner's data directory.
+    pub fn set_output_folder_override(&mut self, folder: Option<String>) {
+        self.output_folder_override = folder;
     }
 
     fn next_id(&mut self) -> u64 {
@@ -553,7 +561,9 @@ impl StageAA2Plugin {
                 return;
             }
         };
-        if let Some(folder) = self.photodiode.as_ref().and_then(|pd| pd.data_dir.as_ref()) {
+        if let Some(folder) = self.output_folder_override.clone() {
+            self.output_folder = folder;
+        } else if let Some(folder) = self.photodiode.as_ref().and_then(|pd| pd.data_dir.as_ref()) {
             self.output_folder = folder.clone();
         }
         let measurement_id = if self.measurement_id.trim().is_empty() {
@@ -2640,7 +2650,21 @@ impl Plugin for StageAA2Plugin {
                 request.payload.clone(),
             ) {
                 Ok(command) if command.experiment == stage_a_universal_runner::Experiment::A2 => {
+                    if command.output_folder.trim().is_empty() {
+                        return PluginServiceReply {
+                            request_id: request.request_id,
+                            source_plugin_id: request.source_plugin_id.clone(),
+                            target_plugin_id: request.target_plugin_id.clone(),
+                            service: request.service.clone(),
+                            outcome: PluginServiceOutcome::Rejected {
+                                code: "missing_output_folder".into(),
+                                message: "Universal Runner did not provide a common output folder"
+                                    .into(),
+                            },
+                        };
+                    }
                     self.camera_override = Some(command.camera.clone());
+                    self.output_folder_override = Some(command.output_folder.clone());
                     if !command.protocol.trim().is_empty() {
                         match materialize_universal_protocol(command.protocol.trim()) {
                             Ok(Some(path)) => self.protocol_path = path,

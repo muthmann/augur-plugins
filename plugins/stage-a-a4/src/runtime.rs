@@ -2312,7 +2312,21 @@ impl Plugin for StageAA4Plugin {
                 request.payload.clone(),
             ) {
                 Ok(command) if command.experiment == stage_a_universal_runner::Experiment::A4 => {
+                    if command.output_folder.trim().is_empty() {
+                        return PluginServiceReply {
+                            request_id: request.request_id,
+                            source_plugin_id: request.source_plugin_id.clone(),
+                            target_plugin_id: request.target_plugin_id.clone(),
+                            service: request.service.clone(),
+                            outcome: PluginServiceOutcome::Rejected {
+                                code: "missing_output_folder".into(),
+                                message: "Universal Runner did not provide a common output folder"
+                                    .into(),
+                            },
+                        };
+                    }
                     self.camera_override = Some(command.camera.clone());
+                    self.output_folder = command.output_folder.clone();
                     self.protocol_path = if command.protocol == "a4_bright_reference" {
                         String::new()
                     } else {
