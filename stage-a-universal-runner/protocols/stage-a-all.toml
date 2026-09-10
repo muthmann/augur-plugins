@@ -63,6 +63,11 @@ name = "refractory-and-load"
 protocol = "a5_complete_scientific"
 pause_before = true
  [block.camera]
+ diff_on = -15
+ diff_off = -2
+ fo = 55
+ hpf = 0
+ refr = 235
  filters_off = true
 [[block.points]]
 label = "A5_log_slew_reference"
