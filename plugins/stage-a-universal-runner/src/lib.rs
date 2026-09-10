@@ -22,7 +22,6 @@ struct ActiveRun {
     pending_request_id: Option<u64>,
 }
 
-#[derive(Default)]
 pub struct StageAUniversalRunnerPlugin {
     enabled: bool,
     protocol_path: String,
@@ -32,6 +31,21 @@ pub struct StageAUniversalRunnerPlugin {
     request_sequence: u64,
     run: Option<ActiveRun>,
     message: String,
+}
+
+impl Default for StageAUniversalRunnerPlugin {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            protocol_path: String::new(),
+            measurement_prefix: String::new(),
+            start_counter: 0,
+            seen_start_counter: None,
+            request_sequence: 0,
+            run: None,
+            message: "Select a universal Stage-A protocol".into(),
+        }
+    }
 }
 
 impl StageAUniversalRunnerPlugin {
@@ -105,7 +119,7 @@ impl StageAUniversalRunnerPlugin {
             protocol,
             measurement_id,
         };
-        context.request_service(&PluginServiceRequest {
+        let _ = context.request_service(&PluginServiceRequest {
             request_id: id,
             source_plugin_id: ID.into(),
             target_plugin_id: Self::target(experiment).into(),
