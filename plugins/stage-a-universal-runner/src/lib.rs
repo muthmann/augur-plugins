@@ -21,6 +21,7 @@ struct ActiveRun {
     measurement_sequence: u32,
     pending_request_id: Option<u64>,
     waiting_for_completion: bool,
+    waiting_for_operator: bool,
     waiting_measurement_id: Option<String>,
 }
 
@@ -112,6 +113,7 @@ impl StageAUniversalRunnerPlugin {
             measurement_sequence: 1,
             pending_request_id: None,
             waiting_for_completion: false,
+            waiting_for_operator: false,
             waiting_measurement_id: None,
         });
         self.message = "Universal Stage-A run started".into();
@@ -119,6 +121,11 @@ impl StageAUniversalRunnerPlugin {
     }
 
     fn dispatch_next(&mut self, context: &mut PluginControlContext<'_>) {
+        if self.confirmed_optical_state.is_none() {
+            if let Some(run) = self.run.as_mut() { run.waiting_for_operator = true; }
+            self.message = "AOD changed; enter readbacks and press Continue before the next block".into();
+            return;
+        }
         let (experiment, block_name, protocol, camera, plan_name, measurement_sequence) = {
             let Some(run) = self.run.as_ref() else { return };
             let Some(block) = run.plan.blocks.get(run.block_index) else {
@@ -178,6 +185,9 @@ impl Plugin for StageAUniversalRunnerPlugin {
     fn process_frame(&mut self, _frame: &PluginFrame<'_>, _output: &mut HostOutput<'_>, _context: &mut HostContext<'_>, _event_store: &EventStoreHandle<'_>) {}
     fn process_control(&mut self, context: &mut PluginControlContext<'_>) {
         for reply in context.inbox().service_replies.clone() { self.service_reply(context, reply); }
+        if self.confirmed_optical_state.is_some() && self.run.as_ref().is_some_and(|run| run.waiting_for_operator) {
+            self.dispatch_next(context);
+        }
         let completed = context.inbox().snapshots.iter().any(|snapshot| {
             snapshot.topic == "stage-a.universal.block"
                 && snapshot.payload.get("state").and_then(Value::as_str) == Some("completed")
@@ -191,6 +201,7 @@ impl Plugin for StageAUniversalRunnerPlugin {
                     run.measurement_sequence += 1;
                     run.pending_request_id = None;
                     run.waiting_for_completion = false;
+                    run.waiting_for_operator = false;
                     run.waiting_measurement_id = None;
                     self.dispatch_next(context);
                 }
