@@ -262,13 +262,19 @@ pub fn parse_file(path: &str, text: &str) -> Result<Protocol, ProtocolError> {
             let rows = if reference.threshold.is_empty() {
                 vec![(0, 0)]
             } else {
-                reference.threshold.iter().map(|p| (p.diff_on, p.diff_off)).collect()
+                reference
+                    .threshold
+                    .iter()
+                    .map(|p| (p.diff_on, p.diff_off))
+                    .collect()
             };
             let csv = std::iter::once("diff_on,diff_off,duration_s,settle_s,repeats".to_owned())
-                .chain(rows.into_iter().map(|(diff_on, diff_off)| format!(
-                    "{diff_on},{diff_off},{},{},{}",
-                    reference.duration_s, reference.settle_s, reference.repeats
-                )))
+                .chain(rows.into_iter().map(|(diff_on, diff_off)| {
+                    format!(
+                        "{diff_on},{diff_off},{},{},{}",
+                        reference.duration_s, reference.settle_s, reference.repeats
+                    )
+                }))
                 .collect::<Vec<_>>()
                 .join("\n");
             let mut plan = parse_csv(&csv)?;

@@ -5,13 +5,13 @@
 //! latency conclusion is implied by reusing the camera/PD/modulation engine.
 
 use augur_plugin_api::{
-    EventStoreHandle, ExecutionContext, HostContext, HostOutput, Plugin, PluginControlContext,
-    PluginControlSnapshot, PluginDiscontinuity, PluginFrame, PluginInput, PluginRuntimeRole,
-    PluginServiceOutcome, PluginServiceReply, PluginServiceRequest, SettingsSchema, StatusEntry,
-    export_plugin,
+    export_plugin, EventStoreHandle, ExecutionContext, HostContext, HostOutput, Plugin,
+    PluginControlContext, PluginControlSnapshot, PluginDiscontinuity, PluginFrame, PluginInput,
+    PluginRuntimeRole, PluginServiceOutcome, PluginServiceReply, PluginServiceRequest,
+    SettingsSchema, StatusEntry,
 };
 use augur_plugin_stage_a_a2::StageAA2Plugin;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use stage_a_universal_runner::{ExecuteBlockRequest, Experiment, SERVICE_EXECUTE_BLOCK_V1};
 
 pub struct StageAA5Plugin {
@@ -79,105 +79,40 @@ impl Plugin for StageAA5Plugin {
         request: &PluginServiceRequest,
         execution: &ExecutionContext,
     ) -> PluginServiceReply {
-        let outcome = if request.service != SERVICE_EXECUTE_BLOCK_V1 {
-            PluginServiceOutcome::Rejected {
-                code: "unsupported_service".into(),
-                message: "A5 does not support this service".into(),
-            }
-        } else if !execution.hardware_effects_allowed() {
-            PluginServiceOutcome::Rejected {
-                code: "effects_not_allowed".into(),
-                message: "A5 block execution requires the live worker".into(),
-            }
-        } else {
-            match serde_json::from_value::<ExecuteBlockRequest>(request.payload.clone()) {
-                Ok(command) if command.experiment == Experiment::A5 => {
-                    if command.output_folder.trim().is_empty() {
-                        return PluginServiceReply {
-                            request_id: request.request_id,
-                            source_plugin_id: request.source_plugin_id.clone(),
-                            target_plugin_id: request.target_plugin_id.clone(),
-                            service: request.service.clone(),
-                            outcome: PluginServiceOutcome::Rejected {
-                                code: "missing_output_folder".into(),
-                                message: "Universal Runner did not provide a common output folder"
-                                    .into(),
-                            },
-                        };
-                    }
-                    if command.camera.roi.is_some() {
-                        return PluginServiceReply { request_id: request.request_id, source_plugin_id: request.source_plugin_id.clone(), target_plugin_id: request.target_plugin_id.clone(), service: request.service.clone(), outcome: PluginServiceOutcome::Rejected { code: "camera_roi_not_supported".into(), message: "A5 adapter requires a preselected qualified ROI; ROI switching is not yet supported by the delegated engine".into() } };
-                    }
-                    let protocol_path = if matches!(
-                        command.protocol.as_str(),
-                        "a5_complete_scientific" | "a5_final_load_recovery"
-                    ) {
-                        let path = std::env::temp_dir().join("stage-a-a5_complete_scientific.toml");
-                        std::fs::write(
-                            &path,
-                            include_str!("../protocols/a5_complete_scientific.toml"),
-                        )
-                        .map(|_| path.to_string_lossy().into_owned())
-                        .map_err(|error| error.to_string())
-                    } else {
-                        Ok(command.protocol)
-                    };
-                    let Ok(protocol_path) = protocol_path else {
-                        return PluginServiceReply {
-                            request_id: request.request_id,
-                            source_plugin_id: request.source_plugin_id.clone(),
-                            target_plugin_id: request.target_plugin_id.clone(),
-                            service: request.service.clone(),
-                            outcome: PluginServiceOutcome::Rejected {
-                                code: "protocol_materialization_failed".into(),
-                                message: "could not materialize the built-in A5 protocol".into(),
-                            },
-                        };
-                    };
-                    if let Err(error) = self
-                        .inner
-                        .set_setting("protocol_path", json!(protocol_path))
-                    {
-                        PluginServiceOutcome::Rejected {
-                            code: "invalid_protocol".into(),
-                            message: error,
-                        }
-                    } else if let Err(error) = self
-                        .inner
-                        .set_setting("measurement_id", json!(command.measurement_id))
-                    {
-                        PluginServiceOutcome::Rejected {
-                            code: "invalid_measurement_id".into(),
-                            message: error,
-                        }
-                    } else {
-                        self.inner.set_camera_override(Some(command.camera.clone()));
-                        self.inner
-                            .set_output_folder_override(Some(command.output_folder.clone()));
-                        let _ = self.inner.set_setting("run_protocol", json!(1));
-                        PluginServiceOutcome::Accepted {
-                            payload: json!({"state":"started"}),
-                        }
-                    }
-                }
-                Ok(command) => PluginServiceOutcome::Rejected {
-                    code: "wrong_target".into(),
-                    message: format!("A5 cannot execute {:?}", command.experiment),
-                },
-                Err(error) => PluginServiceOutcome::Rejected {
-                    code: "invalid_payload".into(),
-                    message: error.to_string(),
-                },
-            }
-        };
-        PluginServiceReply {
-            request_id: request.request_id,
-            source_plugin_id: request.source_plugin_id.clone(),
-            target_plugin_id: request.target_plugin_id.clone(),
-            service: request.service.clone(),
-            outcome,
+        if request.service != SERVICE_EXECUTE_BLOCK_V1 {
+            return self.inner.handle_service_request(request, execution);
         }
+        let command = serde_json::from_value::<ExecuteBlockRequest>(request.payload.clone());
+        let Ok(mut command) = command else {
+            return PluginServiceReply {
+                request_id: request.request_id,
+                source_plugin_id: request.source_plugin_id.clone(),
+                target_plugin_id: request.target_plugin_id.clone(),
+                service: request.service.clone(),
+                outcome: PluginServiceOutcome::Rejected {
+                    code: "invalid_payload".into(),
+                    message: "Invalid universal A5 request".into(),
+                },
+            };
+        };
+        if command.experiment != Experiment::A5 {
+            return PluginServiceReply {
+                request_id: request.request_id,
+                source_plugin_id: request.source_plugin_id.clone(),
+                target_plugin_id: request.target_plugin_id.clone(),
+                service: request.service.clone(),
+                outcome: PluginServiceOutcome::Rejected {
+                    code: "wrong_target".into(),
+                    message: "A5 requires an A5 block".into(),
+                },
+            };
+        }
+        command.experiment = Experiment::A2;
+        let mut delegated = request.clone();
+        delegated.payload = serde_json::to_value(command).expect("request serializes");
+        self.inner.handle_service_request(&delegated, execution)
     }
+
     fn settings_schema(&self) -> SettingsSchema {
         self.inner.settings_schema()
     }
@@ -200,3 +135,47 @@ impl Plugin for StageAA5Plugin {
 }
 
 export_plugin!(StageAA5Plugin);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn universal_handoff_reaches_recorder_and_retains_attempt_identity() {
+        let mut plugin = StageAA5Plugin::default();
+        let request = PluginServiceRequest {
+            request_id: 7,
+            source_plugin_id: "stage-a.universal-runner".into(),
+            target_plugin_id: "stage-a.a5".into(),
+            service: SERVICE_EXECUTE_BLOCK_V1.into(),
+            payload: json!({"plan_name":"smoke","block_name":"load","experiment":"A5",
+                "protocol":"load_smoke","measurement_id":"A5-test","output_folder":std::env::temp_dir(),
+                "attempt":2,"camera":{},"required_artifacts":[]}),
+        };
+        assert!(matches!(
+            plugin
+                .handle_service_request(&request, &ExecutionContext::default())
+                .outcome,
+            PluginServiceOutcome::Rejected { .. }
+        ));
+        let execution = ExecutionContext {
+            mode: augur_plugin_api::ExecutionMode::LiveCapture,
+            effects_allowed: true,
+            session_id: None,
+        };
+        assert!(matches!(
+            plugin.handle_service_request(&request, &execution).outcome,
+            PluginServiceOutcome::Accepted { .. }
+        ));
+        let snapshot = plugin
+            .control_snapshots()
+            .into_iter()
+            .find(|s| s.topic == "stage-a.universal.block")
+            .unwrap();
+        assert_eq!(snapshot.plugin_id, "stage-a.a5");
+        assert_eq!(snapshot.payload["attempt"], 2);
+        assert_eq!(snapshot.payload["measurement_id"], "A5-test");
+        assert!(
+            matches!(plugin.handle_service_request(&request,&execution).outcome,PluginServiceOutcome::Rejected {code,..} if code=="owner_busy")
+        );
+    }
+}

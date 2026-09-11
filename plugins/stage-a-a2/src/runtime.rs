@@ -3,25 +3,25 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use augur_plugin_api::{
-    CTX_GLOBAL_SETTINGS, CTX_SENSOR_MONITORING, CameraConfigurationProvenanceV1,
-    CameraConfigurationSnapshotV1, CameraConfigurationSourceV1, EventStoreHandle, ExecutionContext,
-    GlobalSettings, HostCommand, HostCommandOutcome, HostCommandRequest, HostContext, HostOutput,
-    PathDialogKind, Plugin, PluginCapabilities, PluginControlContext, PluginControlInbox,
-    PluginControlSnapshot, PluginDiscontinuity, PluginFrame, PluginInput, PluginRuntimeRole,
-    PluginServiceOutcome, PluginServiceReply, PluginServiceRequest, SensorMonitoringV1,
-    SettingItem, SettingKind, SettingsSchema, SettingsSection, StatusEntry,
+    CameraConfigurationProvenanceV1, CameraConfigurationSnapshotV1, CameraConfigurationSourceV1,
+    EventStoreHandle, ExecutionContext, GlobalSettings, HostCommand, HostCommandOutcome,
+    HostCommandRequest, HostContext, HostOutput, PathDialogKind, Plugin, PluginCapabilities,
+    PluginControlContext, PluginControlInbox, PluginControlSnapshot, PluginDiscontinuity,
+    PluginFrame, PluginInput, PluginRuntimeRole, PluginServiceOutcome, PluginServiceReply,
+    PluginServiceRequest, SensorMonitoringV1, SettingItem, SettingKind, SettingsSchema,
+    SettingsSection, StatusEntry, CTX_GLOBAL_SETTINGS, CTX_SENSOR_MONITORING,
 };
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use stage_a_plugin_contract::{
-    A2AcquisitionConfigV1, A2TimingReferenceV1, CTX_STAGE_A_MODULATION_STATE_V1,
-    CTX_STAGE_A_PHOTODIODE_SUMMARY_V1, ClientId, ConnectionStateV1, LeaseId, ModulationCommandV1,
-    ModulationRequestV1, ModulationResponseV1, ModulationStateV1, PdqReceiptV1, PdqStartSpecV1,
-    PdqTerminationV1, PhotodiodeCommandV1, PhotodiodeDarkReferenceV1, PhotodiodeLevelV1,
-    PhotodiodePlacementV1, PhotodiodeRequestV1, PhotodiodeResponseV1, PhotodiodeSummaryV1,
-    RequestId, RequestOutcomeV1, RunId, SERVICE_STAGE_A_MODULATION_CONTROL_V1,
-    SERVICE_STAGE_A_PHOTODIODE_CONTROL_V1, SemanticRevision, StreamIntegrityV1, WaveformV1,
+    A2AcquisitionConfigV1, A2TimingReferenceV1, ClientId, ConnectionStateV1, LeaseId,
+    ModulationCommandV1, ModulationRequestV1, ModulationResponseV1, ModulationStateV1,
+    PdqReceiptV1, PdqStartSpecV1, PdqTerminationV1, PhotodiodeCommandV1, PhotodiodeDarkReferenceV1,
+    PhotodiodeLevelV1, PhotodiodePlacementV1, PhotodiodeRequestV1, PhotodiodeResponseV1,
+    PhotodiodeSummaryV1, RequestId, RequestOutcomeV1, RunId, SemanticRevision, StreamIntegrityV1,
+    WaveformV1, CTX_STAGE_A_MODULATION_STATE_V1, CTX_STAGE_A_PHOTODIODE_SUMMARY_V1,
+    SERVICE_STAGE_A_MODULATION_CONTROL_V1, SERVICE_STAGE_A_PHOTODIODE_CONTROL_V1,
 };
 
 use crate::protocol::{self, Acquisition, ControllerSetup, Point, Protocol, TriggerValidation};
@@ -38,6 +38,9 @@ const LEASE_TTL_MS: u64 = 60_000;
 const RECORDER_SAFETY_LIMIT_EVENTS_PER_US: u64 = 6;
 
 fn materialize_universal_protocol(name: &str) -> Result<Option<String>, String> {
+    if let Some(path) = stage_a_universal_runner::materialize_protocol(name)? {
+        return Ok(Some(path));
+    }
     let (extension, contents) = match name {
         "a2_low_light_final" => (
             "toml",
@@ -384,6 +387,8 @@ pub struct StageAA2Plugin {
     protocol_path: String,
     protocol_preview: Option<Protocol>,
     camera_override: Option<CameraSettings>,
+    universal_request: Option<stage_a_universal_runner::ExecuteBlockRequest>,
+    universal_terminal: Option<&'static str>,
     new_id: Press,
     start: Press,
     stop: Press,
@@ -413,6 +418,8 @@ impl Default for StageAA2Plugin {
             protocol_path: String::new(),
             protocol_preview: None,
             camera_override: None,
+            universal_request: None,
+            universal_terminal: None,
             new_id: Press::default(),
             start: Press::default(),
             stop: Press::default(),
@@ -1073,11 +1080,13 @@ impl StageAA2Plugin {
         if now < deadline {
             return;
         }
-        let step = self
-            .run
-            .as_ref()
-            .and_then(|run| run.probe)
-            .map(|probe| if low { probe.low } else { probe.high });
+        let step = self.run.as_ref().and_then(|run| run.probe).map(|probe| {
+            if low {
+                probe.low
+            } else {
+                probe.high
+            }
+        });
         let Some(step) = step else {
             self.fail(
                 control,
@@ -1505,6 +1514,16 @@ impl StageAA2Plugin {
             }
         }
         if let Some(run) = self.run.take() {
+            self.universal_terminal = Some(
+                if run.abort_reason.is_none()
+                    && run.cleanup_failures.is_empty()
+                    && run.completed_points + run.resumed_points.len() == run.protocol.points.len()
+                {
+                    "completed"
+                } else {
+                    "failed"
+                },
+            );
             self.message = if let Some(reason) = run.abort_reason {
                 format!(
                     "A2 stopped: {reason}. Files retained in {}/{}",
@@ -2361,9 +2380,17 @@ impl StageAA2Plugin {
                                 || camera.fo.is_some()
                                 || camera.hpf.is_some()
                                 || camera.refr.is_some()
+                                || camera.roi.is_some()
+                                || camera.filters_off == Some(true)
                         });
                     if needs_override {
                         if let Some(camera) = override_camera {
+                            if let Some(mode) = &camera.roi {
+                                if let Err(reason) = apply_roi_mode(&mut snapshot, mode) {
+                                    self.fail(control, reason);
+                                    return;
+                                }
+                            }
                             if let Some(value) = camera.diff_on {
                                 snapshot.biases.diff_on = value;
                             }
@@ -2635,7 +2662,42 @@ impl Plugin for StageAA2Plugin {
         request: &PluginServiceRequest,
         execution: &ExecutionContext,
     ) -> PluginServiceReply {
-        let outcome = if request.service != stage_a_universal_runner::SERVICE_EXECUTE_BLOCK_V1 {
+        let outcome = if request.service == stage_a_universal_runner::SERVICE_READY_V1 {
+            if execution.hardware_effects_allowed() {
+                PluginServiceOutcome::Accepted {
+                    payload: json!({"ready": !(self.run.is_some() || self.start_pending)}),
+                }
+            } else {
+                PluginServiceOutcome::Rejected {
+                    code: "effects_not_allowed".into(),
+                    message: "Owner is not a live worker".into(),
+                }
+            }
+        } else if request.service == stage_a_universal_runner::SERVICE_STOP_V1 {
+            let matches = self.universal_request.as_ref().is_some_and(|r| {
+                request
+                    .payload
+                    .get("measurement_id")
+                    .and_then(Value::as_str)
+                    == Some(r.measurement_id.as_str())
+            });
+            if execution.hardware_effects_allowed() && matches {
+                self.stop_pending = true;
+                PluginServiceOutcome::Accepted {
+                    payload: json!({"stopping": true}),
+                }
+            } else {
+                PluginServiceOutcome::Rejected {
+                    code: "wrong_measurement".into(),
+                    message: "Stop must name the active live universal measurement".into(),
+                }
+            }
+        } else if self.run.is_some() || self.start_pending {
+            PluginServiceOutcome::Rejected {
+                code: "owner_busy".into(),
+                message: "Finish the current measurement before another handoff".into(),
+            }
+        } else if request.service != stage_a_universal_runner::SERVICE_EXECUTE_BLOCK_V1 {
             PluginServiceOutcome::Rejected {
                 code: "unsupported_service".into(),
                 message: "A2 does not support this service".into(),
@@ -2663,6 +2725,8 @@ impl Plugin for StageAA2Plugin {
                             },
                         };
                     }
+                    self.universal_request = Some(command.clone());
+                    self.universal_terminal = None;
                     self.camera_override = Some(command.camera.clone());
                     self.output_folder_override = Some(command.output_folder.clone());
                     if !command.protocol.trim().is_empty() {
@@ -2772,6 +2836,15 @@ impl Plugin for StageAA2Plugin {
     fn process_control(&mut self, c: &mut PluginControlContext<'_>) {
         let inbox = c.inbox().clone();
         self.snapshots(&inbox);
+        if self
+            .universal_request
+            .as_ref()
+            .and_then(|r| r.acquisition_deadline_unix_ms)
+            .is_some_and(|deadline| now_ms() >= deadline)
+            && (self.run.as_ref().is_some_and(|r| !r.stop) || self.start_pending)
+        {
+            self.stop_pending = true;
+        }
         self.finish_async_mod(c);
         for reply in inbox.service_replies {
             let expected = self.run.as_ref().and_then(|r| r.pending);
@@ -2798,17 +2871,24 @@ impl Plugin for StageAA2Plugin {
     }
 
     fn control_snapshots(&self) -> Vec<PluginControlSnapshot> {
-        let completed = self.run.is_none()
-            && (self.message.starts_with("A2 capture finished")
-                || self.message.starts_with("A2 acquisition checks passed"));
+        let state = if self.run.is_some() {
+            "running"
+        } else if self.start_pending {
+            "pending"
+        } else {
+            self.universal_terminal
+                .unwrap_or(if self.universal_request.is_some() {
+                    "failed"
+                } else {
+                    "idle"
+                })
+        };
         vec![PluginControlSnapshot {
             plugin_id: "stage-a.a2".into(),
             topic: "stage-a.universal.block".into(),
             revision: self.revision,
-            payload: json!({
-                "state": if completed { "completed" } else if self.run.is_some() { "running" } else { "idle" },
-                "measurement_id": self.measurement_id,
-            }),
+            payload: json!({"state": state, "measurement_id": self.universal_request.as_ref().map(|r| &r.measurement_id),
+                "attempt": self.universal_request.as_ref().map(|r|r.attempt), "message": self.message}),
         }]
     }
 
@@ -2969,6 +3049,39 @@ fn point_seconds(point: &Point) -> f64 {
     point.acquisition_seconds() + point.settle_s.max(0.25)
 }
 
+fn apply_roi_mode(snapshot: &mut CameraConfigurationSnapshotV1, mode: &str) -> Result<(), String> {
+    if mode != "center_half" {
+        return Err(format!("Unsupported ROI mode '{mode}'"));
+    }
+    let roi = snapshot.roi;
+    let (x, width) = if roi.width == 0 {
+        (0, snapshot.global.sensor_width)
+    } else {
+        (roi.x, roi.width)
+    };
+    let (y, height) = if roi.height == 0 {
+        (0, snapshot.global.sensor_height)
+    } else {
+        (roi.y, roi.height)
+    };
+    if width < 2
+        || height < 2
+        || u32::from(x) + u32::from(width) > u32::from(snapshot.global.sensor_width)
+        || u32::from(y) + u32::from(height) > u32::from(snapshot.global.sensor_height)
+    {
+        return Err(
+            "Cannot derive a nested ROI from an invalid or smaller-than-two-pixel baseline".into(),
+        );
+    }
+    snapshot.roi = augur_plugin_api::RoiV1 {
+        x: x + (width - width / 2) / 2,
+        y: y + (height - height / 2) / 2,
+        width: width / 2,
+        height: height / 2,
+    };
+    Ok(())
+}
+
 fn remaining_seconds(run: &Run, now: u64) -> f64 {
     let later: f64 = run
         .protocol
@@ -2990,7 +3103,11 @@ fn remaining_seconds(run: &Run, now: u64) -> f64 {
         Phase::ReleasePd | Phase::ReleaseMod | Phase::RestoreCamera => return 0.0,
         _ => point_seconds(point),
     };
-    if run.stop { 0.0 } else { later + current }
+    if run.stop {
+        0.0
+    } else {
+        later + current
+    }
 }
 
 fn format_bench_time(seconds: f64) -> String {
@@ -3602,7 +3719,64 @@ fn camera_configuration_refusal(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bundled_owner_rows_parse_and_match_campaign_timing() {
+        for entry in stage_a_universal_runner::builtin_protocols()
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry.experiment,
+                    stage_a_universal_runner::Experiment::A2
+                        | stage_a_universal_runner::Experiment::A5
+                )
+            })
+        {
+            let plan =
+                protocol::parse(entry.contents).unwrap_or_else(|e| panic!("{}: {e}", entry.name));
+            assert_eq!(plan.points.len(), entry.points, "{}", entry.name);
+            let seconds = plan
+                .points
+                .iter()
+                .map(|p| p.acquisition_seconds() + p.settle_s + 0.25 + 11.0)
+                .sum::<f64>();
+            assert!(
+                (seconds - entry.seconds).abs() < 0.01,
+                "{}: {seconds} != {}",
+                entry.name,
+                entry.seconds
+            );
+        }
+    }
+
     use crate::protocol::ComparatorThreshold;
+
+    #[test]
+    fn nested_roi_is_centered_and_does_not_change_the_baseline() {
+        let mut snapshot = qualified_camera().0;
+        snapshot.global.sensor_width = 1280;
+        snapshot.global.sensor_height = 720;
+        snapshot.roi = augur_plugin_api::RoiV1 {
+            x: 100,
+            y: 40,
+            width: 200,
+            height: 160,
+        };
+        let original = snapshot.clone();
+        apply_roi_mode(&mut snapshot, "center_half").unwrap();
+        assert_eq!(
+            snapshot.roi,
+            augur_plugin_api::RoiV1 {
+                x: 150,
+                y: 80,
+                width: 100,
+                height: 80
+            }
+        );
+        assert_eq!(snapshot.biases, original.biases);
+        assert_eq!(original.roi.width, 200);
+        assert!(apply_roi_mode(&mut snapshot, "unknown").is_err());
+    }
 
     #[derive(Default)]
     struct MockControl {
@@ -3648,8 +3822,8 @@ settle_s=0
 
     fn ready_plugin(label: &str) -> StageAA2Plugin {
         use stage_a_plugin_contract::{
-            CONTRACT_VERSION_V1, ControllerStateV1, FreshnessV1, OwnerInstanceId,
-            PhotodiodeStreamV1, StreamIntegrityV1, SynchronizationV1, UnsyncedReasonV1,
+            ControllerStateV1, FreshnessV1, OwnerInstanceId, PhotodiodeStreamV1, StreamIntegrityV1,
+            SynchronizationV1, UnsyncedReasonV1, CONTRACT_VERSION_V1,
         };
         let folder = test_folder(label);
         std::fs::create_dir_all(&folder).unwrap();
@@ -3826,7 +4000,7 @@ settle_s=0
 
     fn started_pd_payload(request_id: u64, run_id: &str, pdq: &str, sidecar: &str) -> Value {
         use stage_a_plugin_contract::{
-            CONTRACT_VERSION_V1, OwnerInstanceId, PdqStartedReceiptV1, ResponseCommonV1,
+            OwnerInstanceId, PdqStartedReceiptV1, ResponseCommonV1, CONTRACT_VERSION_V1,
         };
         serde_json::to_value(PhotodiodeResponseV1 {
             common: ResponseCommonV1 {
@@ -3854,8 +4028,8 @@ settle_s=0
 
     fn finalized_pd_payload(request_id: u64, run_id: &str) -> Value {
         use stage_a_plugin_contract::{
-            CONTRACT_VERSION_V1, OwnerInstanceId, PdqFinalizedReceiptV1, ResponseCommonV1,
-            Sha256V1, StreamIntegrityV1,
+            OwnerInstanceId, PdqFinalizedReceiptV1, ResponseCommonV1, Sha256V1, StreamIntegrityV1,
+            CONTRACT_VERSION_V1,
         };
         serde_json::to_value(PhotodiodeResponseV1 {
             common: ResponseCommonV1 {
@@ -4018,11 +4192,9 @@ settle_s=0
                 record_sensor_telemetry: true,
             },
         };
-        assert!(
-            camera_configuration_refusal(&snapshot, 0.1)
-                .unwrap()
-                .contains("ERC")
-        );
+        assert!(camera_configuration_refusal(&snapshot, 0.1)
+            .unwrap()
+            .contains("ERC"));
         snapshot.digital_filter.erc_enabled = Some(false);
         assert!(camera_configuration_refusal(&snapshot, 0.1).is_none());
     }
@@ -4973,16 +5145,14 @@ comparator_threshold_dac=500
             serde_json::from_value::<PhotodiodeRequestV1>(r.payload.clone())
                 .is_ok_and(|r| matches!(r.command, PhotodiodeCommandV1::FinalizeRecording { .. }))
         }));
-        assert!(
-            plugin
-                .run
-                .as_ref()
-                .unwrap()
-                .abort_reason
-                .as_ref()
-                .unwrap()
-                .contains("test reason")
-        );
+        assert!(plugin
+            .run
+            .as_ref()
+            .unwrap()
+            .abort_reason
+            .as_ref()
+            .unwrap()
+            .contains("test reason"));
     }
 
     fn plugin_at_finalization(
@@ -5055,16 +5225,14 @@ comparator_threshold_dac=500
         plugin.run.as_mut().unwrap().evidence.failure = Some("PDQ sample gap".into());
         plugin.finish_point(&mut control, &raw_finalized());
         assert_eq!(plugin.run.as_ref().unwrap().index, 1);
-        assert!(
-            plugin
-                .run
-                .as_ref()
-                .unwrap()
-                .abort_reason
-                .as_ref()
-                .unwrap()
-                .contains("PDQ sample gap")
-        );
+        assert!(plugin
+            .run
+            .as_ref()
+            .unwrap()
+            .abort_reason
+            .as_ref()
+            .unwrap()
+            .contains("PDQ sample gap"));
     }
 
     #[test]
@@ -5075,16 +5243,14 @@ comparator_threshold_dac=500
         std::fs::write(&blocked, b"blocked").unwrap();
         plugin.run.as_mut().unwrap().output_root = blocked;
         plugin.finish_point(&mut control, &raw_finalized());
-        assert!(
-            plugin
-                .run
-                .as_ref()
-                .unwrap()
-                .abort_reason
-                .as_ref()
-                .unwrap()
-                .contains("cannot save A2 sidecar")
-        );
+        assert!(plugin
+            .run
+            .as_ref()
+            .unwrap()
+            .abort_reason
+            .as_ref()
+            .unwrap()
+            .contains("cannot save A2 sidecar"));
     }
 
     #[test]
@@ -5094,16 +5260,14 @@ comparator_threshold_dac=500
         plugin.run.as_mut().unwrap().pending.as_mut().unwrap().2 = 0;
         plugin.drive(&mut control);
         assert_eq!(plugin.run.as_ref().unwrap().phase, Phase::ReleasePd);
-        assert!(
-            plugin
-                .run
-                .as_ref()
-                .unwrap()
-                .abort_reason
-                .as_ref()
-                .unwrap()
-                .contains("original plateau failure")
-        );
+        assert!(plugin
+            .run
+            .as_ref()
+            .unwrap()
+            .abort_reason
+            .as_ref()
+            .unwrap()
+            .contains("original plateau failure"));
         assert!(!plugin.run.as_ref().unwrap().cleanup_failures.is_empty());
     }
 
@@ -5135,24 +5299,20 @@ comparator_threshold_dac=500
         );
         assert_eq!(configuration.comparator_threshold_dac, 0);
         assert_eq!(configuration.min_half_us, 0);
-        assert!(
-            plugin
-                .run
-                .as_ref()
-                .unwrap()
-                .evidence
-                .threshold_measurement
-                .is_none()
-        );
-        assert!(
-            plugin
-                .run
-                .as_ref()
-                .unwrap()
-                .resolved
-                .pixel_dead_time_us
-                .is_none()
-        );
+        assert!(plugin
+            .run
+            .as_ref()
+            .unwrap()
+            .evidence
+            .threshold_measurement
+            .is_none());
+        assert!(plugin
+            .run
+            .as_ref()
+            .unwrap()
+            .resolved
+            .pixel_dead_time_us
+            .is_none());
     }
 
     #[test]
@@ -5185,16 +5345,14 @@ comparator_threshold_dac=500
         run.pd_recording = true;
         run.pd_progress = Some((index, now_ms() - 6000));
         plugin.drive(&mut control);
-        assert!(
-            plugin
-                .run
-                .as_ref()
-                .unwrap()
-                .abort_reason
-                .as_ref()
-                .unwrap()
-                .contains("stopped advancing")
-        );
+        assert!(plugin
+            .run
+            .as_ref()
+            .unwrap()
+            .abort_reason
+            .as_ref()
+            .unwrap()
+            .contains("stopped advancing"));
     }
 
     #[test]
@@ -5208,12 +5366,11 @@ comparator_threshold_dac=500
         plugin.drive(&mut control);
         let run = plugin.run.as_ref().unwrap();
         assert!(run.stop);
-        assert!(
-            run.abort_reason
-                .as_ref()
-                .unwrap()
-                .contains("camera stop timed out")
-        );
+        assert!(run
+            .abort_reason
+            .as_ref()
+            .unwrap()
+            .contains("camera stop timed out"));
     }
     #[test]
     fn drive_sync_starts_its_identifiable_pulse_train_after_both_recorders_open() {
@@ -5394,16 +5551,14 @@ comparator_threshold_dac=500
             },
         );
         assert!(plugin.run.as_ref().unwrap().stop);
-        assert!(
-            plugin
-                .run
-                .as_ref()
-                .unwrap()
-                .abort_reason
-                .as_ref()
-                .unwrap()
-                .contains("outside the measurement folder")
-        );
+        assert!(plugin
+            .run
+            .as_ref()
+            .unwrap()
+            .abort_reason
+            .as_ref()
+            .unwrap()
+            .contains("outside the measurement folder"));
         assert!(matches!(
             control.hosts.last().unwrap().command,
             HostCommand::StopRecording
@@ -5428,11 +5583,9 @@ comparator_threshold_dac=500
             },
         );
         assert!(!plugin.run.as_ref().unwrap().camera_recording);
-        assert!(
-            !control.hosts[host_count..]
-                .iter()
-                .any(|r| matches!(r.command, HostCommand::StopRecording))
-        );
+        assert!(!control.hosts[host_count..]
+            .iter()
+            .any(|r| matches!(r.command, HostCommand::StopRecording)));
     }
 
     #[test]
@@ -5550,7 +5703,7 @@ comparator_threshold_dac=500
     #[test]
     fn another_clients_snapshot_cannot_abort_a_pending_command() {
         use stage_a_plugin_contract::{
-            CONTRACT_VERSION_V1, ControllerStateV1, OwnerInstanceId, ResponseCommonV1,
+            ControllerStateV1, OwnerInstanceId, ResponseCommonV1, CONTRACT_VERSION_V1,
         };
         let mut plugin = ready_plugin("snapshot-collision");
         let mut control = MockControl::default();

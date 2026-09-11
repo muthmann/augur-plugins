@@ -1,224 +1,403 @@
-# Stage-A Grand Final, version 20260910-v2
-#
-# This is the single campaign manifest for the realistic low-light study.
-# The operator changes only the AOD at an optical-state pause. The runner
-# records the observed camera lux and PD level and passes them to every block.
-# A target camera lux is a label, never a substituted measurement.
+# Generated from actual owner rows. Do not edit timing independently.
 name = "stage-a-grand-final"
-version = "20260910-v3"
+version = "20260910-v4"
 program = "selected_state_final"
 overhead_s_per_point = 11.0
+wall_clock_limit_s = 21600
+acquisition_cutoff_s = 19800
+
+[[optical_states]]
+id = "DARK"
+label = "DARK"
+target_camera_lux = "laser off"
+operator_action = "Switch the laser off. Keep the optical path unchanged; confirm the laser-off reference."
 
 [[optical_states]]
 id = "F0"
-label = "bright overlap reference"
-operator_action = "Keep the qualified bright AOD setting unchanged."
+label = "F0"
 target_camera_lux = "about 8"
-
-[[optical_states]]
-id = "F1"
-label = "application-level low light"
-operator_action = "Set the AOD to the saved low-light setting and wait for stable readback."
-target_camera_lux = "about 0.8 (1/10 of F0)"
-pause_before = true
+operator_action = "Switch the laser on. Set the AOD for about 8 camera-lux; wait for stable readback."
 
 [[optical_states]]
 id = "F2"
-label = "application-level very low light"
-operator_action = "Set the AOD to the saved darker setting and wait for stable readback."
-target_camera_lux = "about 0.08 (1/100 of F0)"
-pause_before = true
+label = "F2"
+target_camera_lux = "about 0.08"
+operator_action = "Keep the laser on. Set the AOD for about 0.08 camera-lux; wait for stable readback."
 
-# The first block is a short bright bridge. It prevents the low-light curves
-# from becoming disconnected from the completed bright measurements.
+[[optical_states]]
+id = "F1"
+label = "F1"
+target_camera_lux = "about 0.8"
+operator_action = "Keep the laser on. Set the AOD for about 0.8 camera-lux; wait for stable readback."
+
+[[optical_states]]
+id = "LOW"
+label = "LOW"
+target_camera_lux = "about 0.03"
+operator_action = "Keep the laser on. Set the AOD for about 0.03 camera-lux; wait for stable readback."
+
+[[optical_states]]
+id = "MID"
+label = "MID"
+target_camera_lux = "about 0.3"
+operator_action = "Keep the laser on. Set the AOD for about 0.3 camera-lux; wait for stable readback."
+
+[[block]]
+experiment = "A4"
+name = "laser_off_open"
+protocol = "static_final"
+optical_state = "DARK"
+estimated_points = 1
+estimated_seconds = 201.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+camera_from = "selected"
+
 [[block]]
 experiment = "A1"
-name = "bright-overlap-bridge"
-protocol = ""
+name = "bright_bright_bridge"
+protocol = "bright_bridge"
 optical_state = "F0"
+estimated_points = 6
+estimated_seconds = 156.0
 retry_same_point = true
 required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
-[block.camera]
-diff_on = -15
-diff_off = -2
-fo = 55
-hpf = 0
-refr = 235
-filters_off = true
-[[block.points]]
-label = "F0_bridge_scout"
-duration_s = 60
-settle_s = 10
-repeats = 1
-role = "bright_overlap_not_full_fit"
-
-# One A4 observation at each flux level is enough for bias selection. The
-# selected bias is chosen offline from response, background and stability.
-[[block]]
-experiment = "A4"
-name = "bias-selection-background"
-protocol = "a4_final_selection"
-optical_state = "F1"
-pause_before = true
-retry_same_point = true
-required_artifacts = ["raw", "camera_sidecar", "monitoring", "protocol_receipt"]
-[block.camera]
-diff_on = -15
-diff_off = -2
-fo = 55
-hpf = 0
-refr = 235
-filters_off = true
-[[block.points]]
-label = "F1_bias_selection"
-duration_s = 120
-settle_s = 10
-repeats = 1
-
-# The final low-light A1/A3 block is run once per flux. Slow rows are reused
-# for A3; no duplicate A3 recording is required.
-[[block]]
-experiment = "A1"
-name = "low-light-frequency-and-threshold-final"
-protocol = "a1_a3_low_light_final"
-optical_state = "F1"
-pause_before = true
-retry_same_point = true
-required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
-[block.camera]
-diff_on = -15
-diff_off = -2
-fo = 55
-hpf = 0
-refr = 235
-filters_off = true
-[[block.points]]
-label = "F1_A1_A3_final"
-duration_s = 1
-settle_s = 0
-repeats = 1
-
-[[block]]
-experiment = "A1"
-name = "very-low-light-frequency-and-threshold-final"
-protocol = "a1_a3_low_light_final"
-optical_state = "F2"
-pause_before = true
-retry_same_point = true
-required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
-[block.camera]
-diff_on = -15
-diff_off = -2
-fo = 55
-hpf = 0
-refr = 235
-filters_off = true
-[[block.points]]
-label = "F2_A1_A3_final"
-duration_s = 1
-settle_s = 0
-repeats = 1
-
-[[block]]
-experiment = "A2"
-name = "matched-low-light-step-latency"
-protocol = "a2_low_light_final"
-optical_state = "F1"
-retry_same_point = true
-required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
-[block.camera]
-diff_on = -15
-diff_off = -2
-fo = 55
-hpf = 0
-refr = 235
-filters_off = true
-[[block.points]]
-label = "F1_A2_final"
-duration_s = 1
-settle_s = 0
-repeats = 1
-
-[[block]]
-experiment = "A2"
-name = "matched-very-low-light-step-latency"
-protocol = "a2_low_light_final"
-optical_state = "F2"
-retry_same_point = true
-required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
-[block.camera]
-diff_on = -15
-diff_off = -2
-fo = 55
-hpf = 0
-refr = 235
-filters_off = true
-[[block.points]]
-label = "F2_A2_final"
-duration_s = 1
-settle_s = 0
-repeats = 1
+camera_from = "selected"
 
 [[block]]
 experiment = "A4"
-name = "final-background-ladder"
-protocol = "a4_final_background_ladder"
-optical_state = "F2"
+name = "bright_static_final"
+protocol = "static_final"
+optical_state = "F0"
+estimated_points = 1
+estimated_seconds = 201.0
 retry_same_point = true
-required_artifacts = ["raw", "camera_sidecar", "monitoring", "protocol_receipt"]
-[block.camera]
-diff_on = -15
-diff_off = -2
-fo = 55
-hpf = 0
-refr = 235
-filters_off = true
-[[block.points]]
-label = "F2_background_ladder"
-duration_s = 1
-settle_s = 0
-repeats = 1
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+camera_from = "selected"
 
 [[block]]
 experiment = "A5"
-name = "operating-state-load-and-recovery"
-protocol = "a5_final_load_recovery"
+name = "bright_load_recovery"
+protocol = "load_recovery"
 optical_state = "F0"
-pause_before = true
+estimated_points = 6
+estimated_seconds = 319.5
 retry_same_point = true
 required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
-[block.camera]
-diff_on = -15
-diff_off = -2
-fo = 55
-hpf = 0
-refr = 235
-filters_off = true
-[[block.points]]
-label = "F0_A5_nested_roi_load"
-duration_s = 1
-settle_s = 0
-repeats = 1
-role = "effective_load_and_recovery"
+camera_from = "selected"
+
+[[block]]
+experiment = "A5"
+name = "bright_nested_roi"
+protocol = "load_roi_compare"
+optical_state = "F0"
+estimated_points = 1
+estimated_seconds = 17.25
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+camera_from = "selected"
+roi_mode = "center_half"
+
+[[block]]
+experiment = "A4"
+name = "F2_background_pre"
+protocol = "static_final"
+optical_state = "F2"
+estimated_points = 1
+estimated_seconds = 201.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+camera_from = "selected"
+
+[[block]]
+experiment = "A1"
+name = "F2_main_1"
+protocol = "main_1"
+optical_state = "F2"
+estimated_points = 36
+estimated_seconds = 1562.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+camera_from = "selected"
+optional_priority = 0
+
+[[block]]
+experiment = "A1"
+name = "F2_main_2"
+protocol = "main_2"
+optical_state = "F2"
+estimated_points = 34
+estimated_seconds = 884.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+camera_from = "selected"
+optional_priority = 0
+
+[[block]]
+experiment = "A1"
+name = "F2_main_3"
+protocol = "main_3"
+optical_state = "F2"
+estimated_points = 36
+estimated_seconds = 936.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+camera_from = "selected"
+optional_priority = 0
 
 [[block]]
 experiment = "A2"
-name = "held-out-application-validation"
-protocol = "a2_heldout_blink_validation"
+name = "F2_latency"
+protocol = "latency_core"
 optical_state = "F2"
-pause_before = true
+estimated_points = 3
+estimated_seconds = 342.75
 retry_same_point = true
 required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
-[block.camera]
-diff_on = -15
-diff_off = -2
-fo = 55
-hpf = 0
-refr = 235
-filters_off = true
-[[block.points]]
-label = "F2_heldout_application"
-duration_s = 1
-settle_s = 0
-repeats = 1
-role = "held_out_not_for_fitting"
+camera_from = "selected"
+optional_priority = 0
+
+[[block]]
+experiment = "A2"
+name = "F2_cadence"
+protocol = "latency_cadence"
+optical_state = "F2"
+estimated_points = 3
+estimated_seconds = 392.75
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+camera_from = "selected"
+
+[[block]]
+experiment = "A2"
+name = "F2_heldout"
+protocol = "heldout_temporal"
+optical_state = "F2"
+estimated_points = 4
+estimated_seconds = 242.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+camera_from = "selected"
+
+[[block]]
+experiment = "A4"
+name = "F2_background_post"
+protocol = "static_final"
+optical_state = "F2"
+estimated_points = 1
+estimated_seconds = 201.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+camera_from = "selected"
+
+[[block]]
+experiment = "A4"
+name = "F1_background_pre"
+protocol = "static_final"
+optical_state = "F1"
+estimated_points = 1
+estimated_seconds = 201.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+camera_from = "selected"
+
+[[block]]
+experiment = "A1"
+name = "F1_main_1"
+protocol = "main_1"
+optical_state = "F1"
+estimated_points = 36
+estimated_seconds = 1562.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+camera_from = "selected"
+optional_priority = 0
+
+[[block]]
+experiment = "A1"
+name = "F1_main_2"
+protocol = "main_2"
+optical_state = "F1"
+estimated_points = 34
+estimated_seconds = 884.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+camera_from = "selected"
+optional_priority = 0
+
+[[block]]
+experiment = "A1"
+name = "F1_main_3"
+protocol = "main_3"
+optical_state = "F1"
+estimated_points = 36
+estimated_seconds = 936.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+camera_from = "selected"
+optional_priority = 0
+
+[[block]]
+experiment = "A2"
+name = "F1_latency"
+protocol = "latency_core"
+optical_state = "F1"
+estimated_points = 3
+estimated_seconds = 342.75
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+camera_from = "selected"
+optional_priority = 0
+
+[[block]]
+experiment = "A4"
+name = "F1_background_post"
+protocol = "static_final"
+optical_state = "F1"
+estimated_points = 1
+estimated_seconds = 201.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+camera_from = "selected"
+
+[[block]]
+experiment = "A4"
+name = "LOW_background_pre"
+protocol = "static_final"
+optical_state = "LOW"
+estimated_points = 1
+estimated_seconds = 201.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+camera_from = "selected"
+
+[[block]]
+experiment = "A1"
+name = "LOW_lower_1"
+protocol = "lower_1"
+optical_state = "LOW"
+estimated_points = 24
+estimated_seconds = 1090.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+camera_from = "selected"
+optional_priority = 1
+
+[[block]]
+experiment = "A1"
+name = "LOW_lower_2"
+protocol = "lower_2"
+optical_state = "LOW"
+estimated_points = 22
+estimated_seconds = 624.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+camera_from = "selected"
+optional_priority = 1
+
+[[block]]
+experiment = "A1"
+name = "LOW_lower_3"
+protocol = "lower_3"
+optical_state = "LOW"
+estimated_points = 24
+estimated_seconds = 624.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+camera_from = "selected"
+optional_priority = 1
+
+[[block]]
+experiment = "A2"
+name = "LOW_latency"
+protocol = "latency_core"
+optical_state = "LOW"
+estimated_points = 3
+estimated_seconds = 342.75
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+camera_from = "selected"
+optional_priority = 1
+
+[[block]]
+experiment = "A4"
+name = "LOW_background_post"
+protocol = "static_final"
+optical_state = "LOW"
+estimated_points = 1
+estimated_seconds = 201.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+camera_from = "selected"
+
+[[block]]
+experiment = "A1"
+name = "MID_intermediate_bridge"
+protocol = "intermediate_bridge"
+optical_state = "MID"
+estimated_points = 8
+estimated_seconds = 234.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+camera_from = "selected"
+optional_priority = 2
+
+[[block]]
+experiment = "A2"
+name = "MID_latency_bridge"
+protocol = "latency_bridge"
+optical_state = "MID"
+estimated_points = 2
+estimated_seconds = 228.5
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+camera_from = "selected"
+optional_priority = 2
+
+[[block]]
+experiment = "A4"
+name = "MID_static_final"
+protocol = "static_final"
+optical_state = "MID"
+estimated_points = 1
+estimated_seconds = 201.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+camera_from = "selected"
+optional_priority = 2
+
+[[block]]
+experiment = "A4"
+name = "closing_background"
+protocol = "static_final"
+optical_state = "F2"
+estimated_points = 1
+estimated_seconds = 201.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+camera_from = "selected"
+closing = true
+
+[[block]]
+experiment = "A1"
+name = "closing_response"
+protocol = "closing_response"
+optical_state = "F2"
+estimated_points = 2
+estimated_seconds = 52.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+camera_from = "selected"
+closing = true
+
+[[block]]
+experiment = "A4"
+name = "laser_off_close"
+protocol = "static_final"
+optical_state = "DARK"
+estimated_points = 1
+estimated_seconds = 201.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+camera_from = "selected"
+closing = true

@@ -1,92 +1,96 @@
-# Short operator smoke test for the universal runner.
-# This validates dispatch, camera-state handoff, AOD confirmation metadata,
-# explicit block completion and resume identity. It is not scientific data.
+# Generated from actual owner rows. Do not edit timing independently.
 name = "stage-a-smoke-test"
-overhead_s_per_point = 1.0
+version = "20260910-v4"
+program = "smoke"
+overhead_s_per_point = 11.0
+
+[[optical_states]]
+id = "F2"
+label = "F2"
+target_camera_lux = "about 0.08"
+operator_action = "Keep the laser on. Set the AOD for about 0.08 camera-lux; wait for stable readback."
 
 [[block]]
 experiment = "A1"
-name = "a1-dispatch"
-protocol = ""
- [block.camera]
- diff_on = -15
- diff_off = -2
- fo = 55
- hpf = 0
- refr = 235
- filters_off = true
-[[block.points]]
-label = "A1_smoke"
-duration_s = 2
-settle_s = 1
-repeats = 1
+name = "a1"
+protocol = "sine_smoke"
+optical_state = "F2"
+estimated_points = 1
+estimated_seconds = 16.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+[block.camera]
+diff_on = -15
+diff_off = -2
+fo = 55
+hpf = 0
+refr = 235
+filters_off = true
 
 [[block]]
 experiment = "A2"
-name = "a2-dispatch"
-protocol = ""
- [block.camera]
- diff_on = -15
- diff_off = -2
- fo = 55
- hpf = 0
- refr = 235
- filters_off = true
-[[block.points]]
-label = "A2_smoke"
-duration_s = 2
-settle_s = 1
-repeats = 1
+name = "a2"
+protocol = "steps_smoke"
+optical_state = "F2"
+estimated_points = 1
+estimated_seconds = 18.25
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+[block.camera]
+diff_on = -15
+diff_off = -2
+fo = 55
+hpf = 0
+refr = 235
+filters_off = true
 
 [[block]]
 experiment = "A3"
-name = "a3-dispatch"
-protocol = ""
- [block.camera]
- diff_on = -15
- diff_off = -2
- fo = 55
- hpf = 0
- refr = 235
- filters_off = true
-[[block.points]]
-label = "A3_smoke"
-duration_s = 2
-settle_s = 1
-repeats = 1
+name = "a3"
+protocol = "sine_smoke"
+optical_state = "F2"
+estimated_points = 1
+estimated_seconds = 16.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+[block.camera]
+diff_on = -15
+diff_off = -2
+fo = 55
+hpf = 0
+refr = 235
+filters_off = true
 
 [[block]]
 experiment = "A4"
-name = "a4-dispatch"
-protocol = "a4_bright_reference"
-pause_before = true
- [block.camera]
- diff_on = -15
- diff_off = -2
- fo = 55
- hpf = 0
- refr = 235
- filters_off = true
-[[block.points]]
-label = "A4_smoke"
-duration_s = 2
-settle_s = 1
-repeats = 1
+name = "a4"
+protocol = "static_smoke"
+optical_state = "F2"
+estimated_points = 1
+estimated_seconds = 23.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+[block.camera]
+diff_on = -15
+diff_off = -2
+fo = 55
+hpf = 0
+refr = 235
+filters_off = true
 
 [[block]]
 experiment = "A5"
-name = "a5-dispatch"
-protocol = "a5_complete_scientific"
-pause_before = true
- [block.camera]
- diff_on = -15
- diff_off = -2
- fo = 55
- hpf = 0
- refr = 235
- filters_off = true
-[[block.points]]
-label = "A5_smoke"
-duration_s = 2
-settle_s = 1
-repeats = 1
+name = "a5"
+protocol = "load_smoke"
+optical_state = "F2"
+estimated_points = 1
+estimated_seconds = 20.25
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+[block.camera]
+diff_on = -15
+diff_off = -2
+fo = 55
+hpf = 0
+refr = 235
+filters_off = true

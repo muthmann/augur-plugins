@@ -1,116 +1,44 @@
-name = "stage-a-complete-repetition"
-overhead_s_per_point = 8.0
+# Generated from actual owner rows. Do not edit timing independently.
+name = "stage-a-all"
+version = "20260910-v4"
+program = "bright_reference"
+overhead_s_per_point = 11.0
+
+[[optical_states]]
+id = "F0"
+label = "F0"
+target_camera_lux = "about 8"
+operator_action = "Switch the laser on. Set the AOD for about 8 camera-lux; wait for stable readback."
 
 [[block]]
 experiment = "A1"
-name = "frequency-response"
-# Empty means: use the A1 protocol already selected in the A1 plugin.
-protocol = ""
- [block.camera]
- filters_off = true
-[[block.points]]
-label = "A1_current_optical_state"
-duration_s = 60
-settle_s = 10
-repeats = 1
-
-[[block]]
-experiment = "A2"
-name = "step-latency"
-# Empty means: use the A2 protocol already selected in the A2 plugin.
-protocol = ""
- [block.camera]
- filters_off = true
-[[block.points]]
-label = "A2_current_optical_state"
-duration_s = 120
-settle_s = 10
-repeats = 1
-
-[[block]]
-experiment = "A3"
-name = "threshold-map"
-# Empty means: use the A3 protocol already selected in the A3 plugin.
-protocol = ""
- [block.camera]
- diff_on = -15
- diff_off = -2
- fo = 55
- hpf = 0
- refr = 235
- filters_off = true
-[[block.points]]
-label = "A3_current_optical_state"
-duration_s = 60
-settle_s = 10
-repeats = 1
+name = "bright_bridge"
+protocol = "bright_bridge"
+optical_state = "F0"
+estimated_points = 6
+estimated_seconds = 156.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+camera_from = "selected"
 
 [[block]]
 experiment = "A4"
-name = "background-threshold-survey"
-protocol = "a4_bright_reference"
- [block.camera]
- filters_off = true
-[[block.points]]
-label = "A4_threshold_survey"
-duration_s = 120
-settle_s = 10
-repeats = 15
+name = "static_final"
+protocol = "static_final"
+optical_state = "F0"
+estimated_points = 1
+estimated_seconds = 201.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+camera_from = "selected"
 
 [[block]]
 experiment = "A5"
-name = "refractory-and-load"
-protocol = "a5_complete_scientific"
-pause_before = true
- [block.camera]
- diff_on = -15
- diff_off = -2
- fo = 55
- hpf = 0
- refr = 235
- filters_off = true
-[[block.points]]
-label = "A5_log_slew_reference"
-role = "slew_rate"
-duration_s = 120
-settle_s = 10
-repeats = 1
-flux_id = "CAMERA_LUX_CURRENT"
-frequency_hz = 32
-depth_a = 0.5
-transitions_per_polarity = 100
-pause_before = true
-[[block.points]]
-label = "A5_global_load_low"
-role = "global_load_diagnostic"
-duration_s = 120
-settle_s = 10
-repeats = 1
-flux_id = "CAMERA_LUX_CURRENT"
-frequency_hz = 32
-depth_a = 0.5
-transitions_per_polarity = 100
-[[block.points]]
-label = "A5_global_load_high"
-role = "global_load_diagnostic"
-duration_s = 120
-settle_s = 10
-repeats = 1
-flux_id = "CAMERA_LUX_CURRENT"
-frequency_hz = 32
-depth_a = 0.5
-transitions_per_polarity = 100
-[[block.points]]
-label = "A5_polarity_reference"
-role = "polarity_check"
-duration_s = 120
-settle_s = 10
-repeats = 2
-flux_id = "CAMERA_LUX_CURRENT"
-frequency_hz = 32
-depth_a = 0.5
-transitions_per_polarity = 100
-
-# A6 is optional and intentionally not part of this A1-A5 run. Use the
-# separate camera-lux reference plan when a dedicated calibration observation
-# is desired; camera Lux is the operational axis, not an absolute radiometer.
+name = "load_recovery"
+protocol = "load_recovery"
+optical_state = "F0"
+estimated_points = 6
+estimated_seconds = 319.5
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+camera_from = "selected"

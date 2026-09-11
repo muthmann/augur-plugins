@@ -42,25 +42,30 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use augur_plugin_api::{
-    CTX_GLOBAL_SETTINGS, CTX_SENSOR_MONITORING, CameraConfigurationSnapshotV1,
-    CameraConfigurationSourceV1, EventFiltersV1, EventStoreHandle, ExecutionContext,
-    GlobalSettings, HostCommand, HostCommandOutcome, HostCommandReply, HostCommandRequest,
-    HostContext, HostDatasetDescriptor, HostDatasetKind, HostOutput, HostViewDescriptor,
-    HostViewKind, HostViewPlacement, HostViewRegistry, PathDialogKind, Plugin, PluginCapabilities,
-    PluginControlContext, PluginControlInbox, PluginControlSnapshot, PluginDiscontinuity,
-    PluginFrame, PluginInput, PluginRuntimeRole, PluginServiceOutcome, PluginServiceReply,
-    PluginServiceRequest, RoiV1, SensorBiasReadbackV1, SensorMonitoringV1, SettingItem,
-    SettingKind, SettingsSchema, SettingsSection, StatusEntry, TableColumn, TableColumnData,
-    TableColumnValues, TableDatasetV1, TableSchema, TableValueType, export_plugin,
+    export_plugin, CameraConfigurationSnapshotV1, CameraConfigurationSourceV1, EventFiltersV1,
+    EventStoreHandle, ExecutionContext, GlobalSettings, HostCommand, HostCommandOutcome,
+    HostCommandReply, HostCommandRequest, HostContext, HostDatasetDescriptor, HostDatasetKind,
+    HostOutput, HostViewDescriptor, HostViewKind, HostViewPlacement, HostViewRegistry,
+    PathDialogKind, Plugin, PluginCapabilities, PluginControlContext, PluginControlInbox,
+    PluginControlSnapshot, PluginDiscontinuity, PluginFrame, PluginInput, PluginRuntimeRole,
+    PluginServiceOutcome, PluginServiceReply, PluginServiceRequest, RoiV1, SensorBiasReadbackV1,
+    SensorMonitoringV1, SettingItem, SettingKind, SettingsSchema, SettingsSection, StatusEntry,
+    TableColumn, TableColumnData, TableColumnValues, TableDatasetV1, TableSchema, TableValueType,
+    CTX_GLOBAL_SETTINGS, CTX_SENSOR_MONITORING,
 };
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use stage_a_plugin_contract::telemetry;
 use stage_a_universal_runner::CameraSettings;
 
 fn materialize_universal_protocol(name: &str) -> Result<Option<String>, String> {
+    if let Some(path) = stage_a_universal_runner::materialize_protocol(name)? {
+        return Ok(Some(path));
+    }
     let contents = match name {
         "a4_final_selection" => include_str!("../protocols/a4_bright_reference.toml"),
+        "a4_bias_selection_f1" => include_str!("../protocols/a4_bias_selection_f1.toml"),
+        "a4_bias_selection_f2" => include_str!("../protocols/a4_bias_selection_f2.toml"),
         "a4_final_background_ladder" => {
             include_str!("../protocols/a4_final_background_ladder.toml")
         }
@@ -283,7 +288,15 @@ impl Run {
     }
 }
 
+struct ReferenceHold {
+    id: String,
+    closing: bool,
+    deadline: u64,
+    failure: Option<String>,
+}
+
 pub struct StageAA4Plugin {
+    reference_hold: Option<ReferenceHold>,
     devices: crate::devices::Devices,
     enabled: bool,
     runtime_role: PluginRuntimeRole,
@@ -295,6 +308,8 @@ pub struct StageAA4Plugin {
     /// Complete camera override supplied by the universal campaign runner.
     /// Optional fields preserve the confirmed baseline.
     camera_override: Option<CameraSettings>,
+    universal_request: Option<stage_a_universal_runner::ExecuteBlockRequest>,
+    universal_terminal: Option<&'static str>,
 
     press_start: PressLatch,
     press_stop: PressLatch,
@@ -338,7 +353,10 @@ impl Default for StageAA4Plugin {
             output_folder: String::new(),
             measurement_id: String::new(),
             protocol_path: String::new(),
+            reference_hold: None,
             camera_override: None,
+            universal_request: None,
+            universal_terminal: None,
             press_start: PressLatch::default(),
             press_stop: PressLatch::default(),
             press_continue: PressLatch::default(),
@@ -491,7 +509,7 @@ impl StageAA4Plugin {
                 return;
             }
         };
-        let plan = match protocol::parse_file(&path, &text) {
+        let mut plan = match protocol::parse_file(&path, &text) {
             Ok(plan) => plan,
             Err(error) => {
                 self.note(format!("Protocol rejected — {error}"));
@@ -499,6 +517,22 @@ impl StageAA4Plugin {
             }
         };
 
+        if let Some(request) = &self.universal_request {
+            if let Some(optical) = &request.optical_state {
+                for point in &mut plan.points {
+                    point.flux_id = optical.state_id.clone();
+                    point.optical_state = if optical.state_id == "DARK" {
+                        "laser-off instrument background; residual illumination not excluded".into()
+                    } else {
+                        format!(
+                            "{}; constant mean_u=0.30; camera lux {}",
+                            optical.state_id, optical.camera_lux
+                        )
+                    };
+                    point.label = request.block_name.clone();
+                }
+            }
+        }
         if plan.preserve_current {
             if let Some(reason) = self.devices.blocker(now_unix_ms()) {
                 self.note(reason);
@@ -1031,6 +1065,18 @@ impl StageAA4Plugin {
         let stopped = run.stop_requested;
 
         let receipt = self.write_receipt(&run, recorded, failed, flagged);
+        self.universal_terminal = Some(
+            if !stopped
+                && recorded == total
+                && failed == 0
+                && run.biases_restored
+                && receipt.is_ok()
+            {
+                "completed"
+            } else {
+                "failed"
+            },
+        );
 
         let mut message = format!(
             "Protocol '{name}' {}: {recorded}/{total} recorded",
@@ -1221,7 +1267,8 @@ impl StageAA4Plugin {
                 illumination_lux_end: state.illumination.end,
                 pixel_dead_time_us: state.pixel_dead_time_us,
                 reading_age_s: state.sensor_age_s,
-                illumination_note: "Sensor lux is the die's own integrated reading, used here as a stability \
+                illumination_note:
+                    "Sensor lux is the die's own integrated reading, used here as a stability \
                      indicator only. It is not a calibrated optical power.",
             },
             filters: sidecar::FiltersSection {
@@ -1431,8 +1478,20 @@ impl StageAA4Plugin {
                 if let Some(run) = self.run.as_mut() {
                     if run.plan.preserve_current {
                         for point in &mut run.plan.points {
-                            point.diff_on = i64::from(snapshot.biases.diff_on);
-                            point.diff_off = i64::from(snapshot.biases.diff_off);
+                            // A universal fixed-state block supplies its selected
+                            // thresholds; standalone references retain the session.
+                            point.diff_on = i64::from(
+                                self.camera_override
+                                    .as_ref()
+                                    .and_then(|c| c.diff_on)
+                                    .unwrap_or(snapshot.biases.diff_on),
+                            );
+                            point.diff_off = i64::from(
+                                self.camera_override
+                                    .as_ref()
+                                    .and_then(|c| c.diff_off)
+                                    .unwrap_or(snapshot.biases.diff_off),
+                            );
                         }
                     }
                     run.original = Some(BiasOffsets {
@@ -2297,7 +2356,123 @@ impl Plugin for StageAA4Plugin {
         request: &PluginServiceRequest,
         execution: &ExecutionContext,
     ) -> PluginServiceReply {
-        let outcome = if request.service != stage_a_universal_runner::SERVICE_EXECUTE_BLOCK_V1 {
+        if request.service == stage_a_universal_runner::SERVICE_REFERENCE_V1 {
+            let id = request
+                .payload
+                .get("reference_id")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let action = request
+                .payload
+                .get("action")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let outcome = if !execution.hardware_effects_allowed()
+                || self.run.is_some()
+                || self.start_pending
+                || id.is_empty()
+            {
+                Err("Reference hold needs an idle live A4 owner and a reference ID".to_owned())
+            } else if action == "release" {
+                match self.reference_hold.as_mut() {
+                    Some(hold) if hold.id == id => {
+                        if !hold.closing {
+                            hold.closing = true;
+                            self.devices.release();
+                        }
+                        Ok(())
+                    }
+                    _ => Err("Reference ID does not match the held optical state".into()),
+                }
+            } else if action == "start" {
+                if self.reference_hold.as_ref().is_some_and(|h| h.id == id) {
+                    Ok(())
+                } else if self
+                    .reference_hold
+                    .as_ref()
+                    .is_some_and(|h| !h.closing || !self.devices.released())
+                {
+                    Err("Release the previous optical reference first".into())
+                } else {
+                    let deadline = request
+                        .payload
+                        .get("deadline_unix_ms")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    if deadline <= now_unix_ms() {
+                        Err("Optical reference deadline has expired".into())
+                    } else {
+                        self.devices.prepare(id, now_unix_ms()).map(|()| {
+                            self.reference_hold = Some(ReferenceHold {
+                                id: id.into(),
+                                closing: false,
+                                deadline,
+                                failure: None,
+                            });
+                        })
+                    }
+                }
+            } else {
+                Err("Unknown optical reference action".into())
+            };
+            return PluginServiceReply {
+                request_id: request.request_id,
+                source_plugin_id: request.source_plugin_id.clone(),
+                target_plugin_id: request.target_plugin_id.clone(),
+                service: request.service.clone(),
+                outcome: match outcome {
+                    Ok(()) => PluginServiceOutcome::Accepted {
+                        payload: json!({"reference_id":id}),
+                    },
+                    Err(message) => PluginServiceOutcome::Rejected {
+                        code: "reference_unavailable".into(),
+                        message,
+                    },
+                },
+            };
+        }
+        let outcome = if request.service == stage_a_universal_runner::SERVICE_READY_V1 {
+            if execution.hardware_effects_allowed() {
+                PluginServiceOutcome::Accepted {
+                    payload: json!({"ready": !(self.run.is_some() || self.start_pending)}),
+                }
+            } else {
+                PluginServiceOutcome::Rejected {
+                    code: "effects_not_allowed".into(),
+                    message: "Owner is not a live worker".into(),
+                }
+            }
+        } else if request.service == stage_a_universal_runner::SERVICE_STOP_V1 {
+            let matches = self.universal_request.as_ref().is_some_and(|r| {
+                request
+                    .payload
+                    .get("measurement_id")
+                    .and_then(Value::as_str)
+                    == Some(r.measurement_id.as_str())
+            });
+            if execution.hardware_effects_allowed() && matches {
+                self.stop_pending = true;
+                PluginServiceOutcome::Accepted {
+                    payload: json!({"stopping": true}),
+                }
+            } else {
+                PluginServiceOutcome::Rejected {
+                    code: "wrong_measurement".into(),
+                    message: "Stop must name the active live universal measurement".into(),
+                }
+            }
+        } else if self.run.is_some()
+            || self.start_pending
+            || self
+                .reference_hold
+                .as_ref()
+                .is_some_and(|h| !h.closing || !self.devices.released())
+        {
+            PluginServiceOutcome::Rejected {
+                code: "owner_busy".into(),
+                message: "Finish the current measurement before another handoff".into(),
+            }
+        } else if request.service != stage_a_universal_runner::SERVICE_EXECUTE_BLOCK_V1 {
             PluginServiceOutcome::Rejected {
                 code: "unsupported_service".into(),
                 message: format!("service '{}' is not supported by A4", request.service),
@@ -2325,6 +2500,9 @@ impl Plugin for StageAA4Plugin {
                             },
                         };
                     }
+                    self.reference_hold = None;
+                    self.universal_request = Some(command.clone());
+                    self.universal_terminal = None;
                     self.camera_override = Some(command.camera.clone());
                     self.output_folder = command.output_folder.clone();
                     self.protocol_path = if command.protocol == "a4_bright_reference" {
@@ -2469,7 +2647,31 @@ impl Plugin for StageAA4Plugin {
 
     fn process_control(&mut self, context: &mut PluginControlContext<'_>) {
         let inbox: PluginControlInbox = context.inbox().clone();
+        if self
+            .universal_request
+            .as_ref()
+            .and_then(|r| r.acquisition_deadline_unix_ms)
+            .is_some_and(|deadline| now_unix_ms() >= deadline)
+            && (self.run.as_ref().is_some_and(|r| !r.stop_requested) || self.start_pending)
+        {
+            self.stop_pending = true;
+        }
         self.devices.update(&inbox);
+        if let Some(hold) = self.reference_hold.as_mut() {
+            if !hold.closing && (now_unix_ms() >= hold.deadline || self.devices.error.is_some()) {
+                hold.failure = Some(
+                    self.devices
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "Optical reference deadline reached".into()),
+                );
+                hold.closing = true;
+                self.devices.release();
+            }
+            if hold.closing && self.devices.released() {
+                self.devices.active = false;
+            }
+        }
         if self.run.is_none() && self.output_folder.trim().is_empty() {
             if let Some(folder) = self
                 .devices
@@ -2493,17 +2695,48 @@ impl Plugin for StageAA4Plugin {
     fn control_snapshots(&self) -> Vec<PluginControlSnapshot> {
         let state = if self.run.is_some() {
             "running"
-        } else if self.last_completed_measurement_id.is_some() {
-            "completed"
+        } else if self.start_pending {
+            "pending"
         } else {
-            "idle"
+            self.universal_terminal
+                .unwrap_or(if self.universal_request.is_some() {
+                    "failed"
+                } else {
+                    "idle"
+                })
         };
-        vec![PluginControlSnapshot {
+        let mut snapshots = vec![PluginControlSnapshot {
             plugin_id: "stage-a.a4".into(),
             topic: "stage-a.universal.block".into(),
             revision: self.generation,
-            payload: json!({"state": state, "measurement_id": self.last_completed_measurement_id}),
-        }]
+            payload: json!({"state": state, "measurement_id": self.universal_request.as_ref().map(|r| &r.measurement_id),
+                "attempt": self.universal_request.as_ref().map(|r|r.attempt), "message": self.message}),
+        }];
+        if let Some(hold) = &self.reference_hold {
+            let state = if hold.closing && self.devices.released() {
+                if hold.failure.is_some() {
+                    "failed"
+                } else {
+                    "released"
+                }
+            } else if self.devices.error.is_some() {
+                "failed"
+            } else if hold.closing {
+                "releasing"
+            } else if self.devices.ready() {
+                "ready"
+            } else {
+                "preparing"
+            };
+            snapshots.push(PluginControlSnapshot {
+                plugin_id: "stage-a.a4".into(),
+                topic: "stage-a.universal.reference".into(),
+                revision: self.generation,
+                payload: json!({"reference_id":hold.id,"state":state,
+                    "failure":hold.failure.as_ref().or(self.devices.error.as_ref())}),
+            });
+        }
+        snapshots
     }
 
     fn settings_schema(&self) -> SettingsSchema {
@@ -2845,6 +3078,26 @@ export_plugin!(StageAA4Plugin);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bundled_owner_rows_parse_and_match_campaign_timing() {
+        for entry in stage_a_universal_runner::builtin_protocols()
+            .iter()
+            .filter(|entry| entry.experiment == stage_a_universal_runner::Experiment::A4)
+        {
+            let plan = protocol::parse_file("catalog.toml", entry.contents)
+                .unwrap_or_else(|e| panic!("{}: {e}", entry.name));
+            assert_eq!(plan.points.len(), entry.points, "{}", entry.name);
+            let seconds = plan.total_seconds() + 11.0 * plan.points.len() as f64;
+            assert!(
+                (seconds - entry.seconds).abs() < 0.01,
+                "{}: {seconds} != {}",
+                entry.name,
+                entry.seconds
+            );
+        }
+    }
+
     use augur_plugin_api::{
         CameraBiasOffsetsV1, CameraConfigurationProvenanceV1, CameraDigitalFilterV1,
         CameraExternalTriggerV1, CameraGlobalSettingsV1, SensorBiasCodesV1, SensorBiasReadbackV1,
@@ -3003,6 +3256,22 @@ mod tests {
         let path = folder.join("survey.csv");
         std::fs::write(&path, body).expect("protocol written");
         path
+    }
+
+    #[test]
+    fn universal_bias_selection_aliases_materialize_to_valid_protocols() {
+        for (name, duration) in [
+            ("a4_bias_selection_f1", 120.0),
+            ("a4_bias_selection_f2", 180.0),
+        ] {
+            let path = materialize_universal_protocol(name)
+                .expect("materialization succeeds")
+                .expect("known universal protocol");
+            let text = std::fs::read_to_string(path).expect("materialized protocol is readable");
+            let protocol = protocol::parse_file("materialized.toml", &text)
+                .expect("materialized protocol parses");
+            assert_eq!(protocol.total_seconds(), duration + 10.0);
+        }
     }
 
     /// Mark the settle as satisfied, the way a fresh monitoring frame would.
@@ -3170,6 +3439,111 @@ mod tests {
         );
         tick(plugin, vec![], sink);
         raw
+    }
+
+    #[test]
+    fn optical_reference_holds_then_releases_both_owner_leases() {
+        let mut plugin = StageAA4Plugin {
+            devices: crate::devices::Devices::simulated(now_unix_ms()),
+            ..Default::default()
+        };
+        let execution = ExecutionContext {
+            mode: augur_plugin_api::ExecutionMode::LiveCapture,
+            effects_allowed: true,
+            session_id: None,
+        };
+        let mut request = PluginServiceRequest {
+            request_id: 1,
+            source_plugin_id: "stage-a.universal-runner".into(),
+            target_plugin_id: "stage-a.a4".into(),
+            service: stage_a_universal_runner::SERVICE_REFERENCE_V1.into(),
+            payload: json!({"action":"start","reference_id":"REF-test","deadline_unix_ms":now_unix_ms()+60_000}),
+        };
+        assert!(matches!(
+            plugin.handle_service_request(&request, &execution).outcome,
+            PluginServiceOutcome::Accepted { .. }
+        ));
+        for _ in 0..10 {
+            if let Some(r) = plugin.devices.tick(now_unix_ms()) {
+                plugin.devices.simulate_reply(&r);
+            }
+        }
+        assert!(plugin.devices.ready());
+        assert_eq!(
+            plugin.control_snapshots().last().unwrap().payload["state"],
+            "ready"
+        );
+        request.request_id = 2;
+        request.payload["action"] = json!("release");
+        assert!(matches!(
+            plugin.handle_service_request(&request, &execution).outcome,
+            PluginServiceOutcome::Accepted { .. }
+        ));
+        for _ in 0..10 {
+            if let Some(r) = plugin.devices.tick(now_unix_ms()) {
+                plugin.devices.simulate_reply(&r);
+            }
+        }
+        assert!(plugin.devices.released());
+        assert_eq!(
+            plugin.control_snapshots().last().unwrap().payload["state"],
+            "released"
+        );
+        assert!(plugin.run.is_none());
+    }
+
+    #[test]
+    fn universal_fixed_reference_applies_each_complete_candidate() {
+        for fo in [0, 55] {
+            for (on, off) in [(0, 0), (-15, -2), (-30, -5)] {
+                let folder = temp_folder(&format!("universal-{fo}-{on}"));
+                let protocol =
+                    write_protocol(&folder, "diff_on,diff_off,duration_s,settle_s\n0,0,1,0\n");
+                let mut plugin = ready_plugin(&folder, &protocol);
+                plugin.camera_override = Some(CameraSettings {
+                    diff_on: Some(on),
+                    diff_off: Some(off),
+                    fo: Some(fo),
+                    hpf: Some(0),
+                    refr: Some(235),
+                    filters_off: Some(true),
+                    roi: None,
+                });
+                let mut sink = ControlSink::default();
+                plugin.begin_run(&mut sink);
+                // The fixed-reference protocol keeps owner-controlled optics.
+                // Exercise its session response without starting real devices.
+                plugin.run.as_mut().unwrap().plan.preserve_current = true;
+                plugin.on_host_reply(&applied_reply(
+                    sink.last_id(),
+                    BASELINE_ON as i64,
+                    BASELINE_OFF as i64,
+                    0.1,
+                ));
+                let run = plugin.run.as_ref().unwrap();
+                assert_eq!(
+                    (run.plan.points[0].diff_on, run.plan.points[0].diff_off),
+                    (on as i64, off as i64)
+                );
+                assert_eq!(run.original.unwrap().diff_on, BASELINE_ON);
+                plugin.send_biases(&mut sink);
+                let applied = sink.applied_snapshots().pop().unwrap();
+                assert_eq!(
+                    (
+                        applied.biases.diff_on,
+                        applied.biases.diff_off,
+                        applied.biases.fo,
+                        applied.biases.hpf,
+                        applied.biases.refr
+                    ),
+                    (on, off, fo, 0, 235)
+                );
+                assert_eq!(applied.roi, baseline_snapshot().roi);
+                assert!(!applied.digital_filter.stc_enabled);
+                assert!(!applied.digital_filter.trail_enabled);
+                assert_eq!(applied.digital_filter.erc_enabled, Some(false));
+            }
+        }
     }
 
     #[test]
@@ -3845,12 +4219,10 @@ mod tests {
             let id = sink.last_id();
             tick(&mut p, vec![applied_reply(id, 5, 5, age)], &mut sink);
             assert_eq!(p.run.as_ref().unwrap().retry_count, 1);
-            assert!(
-                !sink
-                    .hosts
-                    .iter()
-                    .any(|h| matches!(h.command, HostCommand::StartRecording { .. }))
-            );
+            assert!(!sink
+                .hosts
+                .iter()
+                .any(|h| matches!(h.command, HostCommand::StartRecording { .. })));
             std::fs::remove_dir_all(folder).unwrap();
         }
     }

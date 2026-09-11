@@ -44,35 +44,35 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use augur_plugin_api::{
-    CTX_GLOBAL_SETTINGS, CTX_SENSOR_MONITORING, CameraBiasOffsetsV1,
-    CameraConfigurationProvenanceV1, CameraConfigurationSnapshotV1, CameraConfigurationSourceV1,
-    EventStoreHandle, ExecutionContext, FfiCdEvent, GlobalSettings, HostCommand,
-    HostCommandOutcome, HostCommandReply, HostCommandRequest, HostContext, HostDatasetDescriptor,
-    HostDatasetKind, HostOutput, HostViewDescriptor, HostViewKind, HostViewPlacement,
-    HostViewRegistry, PathDialogKind, Plugin, PluginCapabilities, PluginControlContext,
-    PluginControlInbox, PluginControlSnapshot, PluginDiscontinuity, PluginFrame, PluginInput,
-    PluginRuntimeRole, PluginServiceOutcome, PluginServiceReply, PluginServiceRequest, RoiV1,
-    SensorBiasReadbackV1, SensorMonitoringV1, Series1dLine, Series1dPoint, Series1dV1, SettingItem,
-    SettingKind, SettingsSchema, SettingsSection, StatusEntry, TableColumn, TableColumnData,
-    TableColumnValues, TableDatasetV1, TableSchema, TableValueType,
+    CameraBiasOffsetsV1, CameraConfigurationProvenanceV1, CameraConfigurationSnapshotV1,
+    CameraConfigurationSourceV1, EventStoreHandle, ExecutionContext, FfiCdEvent, GlobalSettings,
+    HostCommand, HostCommandOutcome, HostCommandReply, HostCommandRequest, HostContext,
+    HostDatasetDescriptor, HostDatasetKind, HostOutput, HostViewDescriptor, HostViewKind,
+    HostViewPlacement, HostViewRegistry, PathDialogKind, Plugin, PluginCapabilities,
+    PluginControlContext, PluginControlInbox, PluginControlSnapshot, PluginDiscontinuity,
+    PluginFrame, PluginInput, PluginRuntimeRole, PluginServiceOutcome, PluginServiceReply,
+    PluginServiceRequest, RoiV1, SensorBiasReadbackV1, SensorMonitoringV1, Series1dLine,
+    Series1dPoint, Series1dV1, SettingItem, SettingKind, SettingsSchema, SettingsSection,
+    StatusEntry, TableColumn, TableColumnData, TableColumnValues, TableDatasetV1, TableSchema,
+    TableValueType, CTX_GLOBAL_SETTINGS, CTX_SENSOR_MONITORING,
 };
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use stage_a_plugin_contract::{
-    CTX_STAGE_A_MODULATION_STATE_V1, CTX_STAGE_A_PHOTODIODE_SUMMARY_V1, ClientId,
-    ConnectionStateV1, LeaseId, LeaseSnapshotV1, ModulationCommandV1, ModulationRequestV1,
-    ModulationStateV1, OpticalTargetV1, PdqReceiptV1, PdqStartSpecV1, PhotodiodeCommandV1,
-    PhotodiodeOpticalSummaryV1, PhotodiodeRequestV1, PhotodiodeResponseV1, PhotodiodeSummaryV1,
-    RequestId, RunId, SERVICE_STAGE_A_MODULATION_CONTROL_V1, SERVICE_STAGE_A_PHOTODIODE_CONTROL_V1,
-    SemanticRevision, WaveformV1,
+    ClientId, ConnectionStateV1, LeaseId, LeaseSnapshotV1, ModulationCommandV1,
+    ModulationRequestV1, ModulationStateV1, OpticalTargetV1, PdqReceiptV1, PdqStartSpecV1,
+    PhotodiodeCommandV1, PhotodiodeOpticalSummaryV1, PhotodiodeRequestV1, PhotodiodeResponseV1,
+    PhotodiodeSummaryV1, RequestId, RunId, SemanticRevision, WaveformV1,
+    CTX_STAGE_A_MODULATION_STATE_V1, CTX_STAGE_A_PHOTODIODE_SUMMARY_V1,
+    SERVICE_STAGE_A_MODULATION_CONTROL_V1, SERVICE_STAGE_A_PHOTODIODE_CONTROL_V1,
 };
 use stage_a_universal_runner::CameraSettings;
 
-use crate::phase::{MarkerValidationConfig, PhaseFold, fold_events, fold_events_free_running};
+use crate::phase::{fold_events, fold_events_free_running, MarkerValidationConfig, PhaseFold};
 use crate::protocol;
-use crate::rates::{RollingResponsePoint, rolling_half_period_response};
-use crate::response_curve::{PhaseWindow, ResponsePoint, Roi, auto_windows, response_probability};
+use crate::rates::{rolling_half_period_response, RollingResponsePoint};
+use crate::response_curve::{auto_windows, response_probability, PhaseWindow, ResponsePoint, Roi};
 use crate::sensor;
 use crate::types::{CameraEvent, Polarity};
 
@@ -80,7 +80,13 @@ const MODULATION_PLUGIN_ID: &str = "stage-a.modulation";
 const PHOTODIODE_PLUGIN_ID: &str = "stage-a.photodiode";
 
 fn materialize_universal_protocol(name: &str) -> Result<Option<String>, String> {
+    if let Some(path) = stage_a_universal_runner::materialize_protocol(name)? {
+        return Ok(Some(path));
+    }
     let contents = match name {
+        "a1_bright_overlap_bridge" => {
+            include_str!("../../plugins/stage-a-a1/protocols/a1_illuminated_smoke.csv")
+        }
         "a1_a3_low_light_final" => {
             include_str!("../../plugins/stage-a-a1/protocols/a1_fc_flux_discriminator.csv")
         }
@@ -1106,6 +1112,8 @@ pub struct SineAcquisition<const A3: bool> {
     protocol_path: String,
     /// Complete camera override supplied by the universal campaign runner.
     camera_override: Option<CameraSettings>,
+    universal_request: Option<stage_a_universal_runner::ExecuteBlockRequest>,
+    universal_terminal: Option<&'static str>,
     pending_camera_override: Option<CameraConfigurationSnapshotV1>,
     /// Latched by the Run protocol button, consumed next control tick.
     protocol_pending: bool,
@@ -1219,6 +1227,8 @@ impl<const A3: bool> Default for SineAcquisition<A3> {
             protocol_path: String::new(),
             protocol_pending: false,
             camera_override: None,
+            universal_request: None,
+            universal_terminal: None,
             pending_camera_override: None,
             pending_duration_s: None,
             protocol: None,
@@ -5148,6 +5158,18 @@ impl<const A3: bool> SineAcquisition<A3> {
             Err(error) => format!("{message}; cannot save protocol progress: {error}"),
         };
         if let Some(run) = self.protocol.take() {
+            self.universal_terminal = Some(
+                if !run.stop_requested
+                    && run.failed.is_empty()
+                    && run.recorded + run.reused.len() == run.plan.points.len()
+                    && run.restore_error.is_none()
+                    && (!run.camera_session_active || run.restore_confirmed)
+                {
+                    "completed"
+                } else {
+                    "failed"
+                },
+            );
             if run.lease_granted {
                 let request = self.modulation_request(
                     ModulationCommandV1::ReleaseLease {
@@ -7464,7 +7486,42 @@ impl<const A3: bool> Plugin for SineAcquisition<A3> {
         } else {
             stage_a_universal_runner::Experiment::A1
         };
-        let outcome = if request.service != stage_a_universal_runner::SERVICE_EXECUTE_BLOCK_V1 {
+        let outcome = if request.service == stage_a_universal_runner::SERVICE_READY_V1 {
+            if execution.hardware_effects_allowed() {
+                PluginServiceOutcome::Accepted {
+                    payload: json!({"ready": !(self.protocol.is_some() || self.protocol_pending)}),
+                }
+            } else {
+                PluginServiceOutcome::Rejected {
+                    code: "effects_not_allowed".into(),
+                    message: "Owner is not a live worker".into(),
+                }
+            }
+        } else if request.service == stage_a_universal_runner::SERVICE_STOP_V1 {
+            let matches = self.universal_request.as_ref().is_some_and(|r| {
+                request
+                    .payload
+                    .get("measurement_id")
+                    .and_then(Value::as_str)
+                    == Some(r.measurement_id.as_str())
+            });
+            if execution.hardware_effects_allowed() && matches {
+                self.request_stop();
+                PluginServiceOutcome::Accepted {
+                    payload: json!({"stopping": true}),
+                }
+            } else {
+                PluginServiceOutcome::Rejected {
+                    code: "wrong_measurement".into(),
+                    message: "Stop must name the active live universal measurement".into(),
+                }
+            }
+        } else if self.protocol.is_some() || self.protocol_pending {
+            PluginServiceOutcome::Rejected {
+                code: "owner_busy".into(),
+                message: "Finish the current measurement before another handoff".into(),
+            }
+        } else if request.service != stage_a_universal_runner::SERVICE_EXECUTE_BLOCK_V1 {
             PluginServiceOutcome::Rejected {
                 code: "unsupported_service".into(),
                 message: "A1/A3 does not support this service".into(),
@@ -7479,6 +7536,8 @@ impl<const A3: bool> Plugin for SineAcquisition<A3> {
                 request.payload.clone(),
             ) {
                 Ok(command) if command.experiment == experiment => {
+                    self.universal_request = Some(command.clone());
+                    self.universal_terminal = None;
                     self.camera_override = Some(command.camera.clone());
                     if command.output_folder.trim().is_empty() {
                         return PluginServiceReply {
@@ -7703,6 +7762,15 @@ impl<const A3: bool> Plugin for SineAcquisition<A3> {
     fn process_control(&mut self, context: &mut PluginControlContext<'_>) {
         let inbox = context.inbox().clone();
         self.update_snapshots(&inbox);
+        if self
+            .universal_request
+            .as_ref()
+            .and_then(|r| r.acquisition_deadline_unix_ms)
+            .is_some_and(|deadline| now_unix_ms() >= deadline)
+            && (self.protocol.as_ref().is_some_and(|r| !r.stop_requested) || self.protocol_pending)
+        {
+            self.request_stop();
+        }
         for reply in &inbox.host_replies {
             self.on_host_reply(reply);
         }
@@ -7745,17 +7813,24 @@ impl<const A3: bool> Plugin for SineAcquisition<A3> {
     }
 
     fn control_snapshots(&self) -> Vec<PluginControlSnapshot> {
-        let experiment = if A3 { "A3" } else { "A1" };
-        let completed = self.protocol.is_none() && self.recording_completed_ok;
+        let state = if self.protocol.is_some() {
+            "running"
+        } else if self.protocol_pending {
+            "pending"
+        } else {
+            self.universal_terminal
+                .unwrap_or(if self.universal_request.is_some() {
+                    "failed"
+                } else {
+                    "idle"
+                })
+        };
         vec![PluginControlSnapshot {
             plugin_id: Self::PLUGIN_ID.into(),
             topic: "stage-a.universal.block".into(),
             revision: self.dataset_generation,
-            payload: json!({
-                "state": if completed { "completed" } else if self.protocol.is_some() { "running" } else { "idle" },
-                "experiment": experiment,
-                "measurement_id": self.measurement_id,
-            }),
+            payload: json!({"state": state, "measurement_id": self.universal_request.as_ref().map(|r| &r.measurement_id),
+                "attempt": self.universal_request.as_ref().map(|r|r.attempt), "message": self.message}),
         }]
     }
 
@@ -9076,12 +9151,35 @@ fn connection_label(connection: &ConnectionStateV1) -> &'static str {
 #[cfg(test)]
 mod tests {
     use stage_a_plugin_contract::{
-        CONTRACT_VERSION_V1, FreshnessV1, OwnerInstanceId, PdqFinalizedReceiptV1,
-        PdqStartedReceiptV1, PhotodiodeCalibrationV1, PhotodiodeStreamV1, RequestOutcomeV1,
-        ResponseCommonV1, Sha256V1, StreamIntegrityV1, SynchronizationV1, UnsyncedReasonV1,
+        FreshnessV1, OwnerInstanceId, PdqFinalizedReceiptV1, PdqStartedReceiptV1,
+        PhotodiodeCalibrationV1, PhotodiodeStreamV1, RequestOutcomeV1, ResponseCommonV1, Sha256V1,
+        StreamIntegrityV1, SynchronizationV1, UnsyncedReasonV1, CONTRACT_VERSION_V1,
     };
 
     use super::*;
+
+    #[test]
+    fn bundled_owner_rows_parse_and_match_campaign_timing() {
+        for entry in stage_a_universal_runner::builtin_protocols()
+            .iter()
+            .filter(|entry| entry.experiment == stage_a_universal_runner::Experiment::A1)
+        {
+            let plan = protocol::parse_file("catalog.csv", entry.contents)
+                .unwrap_or_else(|e| panic!("{}: {e}", entry.name));
+            assert_eq!(plan.points.len(), entry.points, "{}", entry.name);
+            let seconds = plan
+                .points
+                .iter()
+                .map(|p| p.duration_s as f64 + p.settle_s + 11.0)
+                .sum::<f64>();
+            assert!(
+                (seconds - entry.seconds).abs() < 0.01,
+                "{}: {seconds} != {}",
+                entry.name,
+                entry.seconds
+            );
+        }
+    }
 
     #[derive(Default)]
     struct ControlSink {
@@ -10546,11 +10644,9 @@ mod tests {
             .map(|entry| entry.path())
             .collect();
         assert_eq!(sidecars.len(), 1);
-        assert!(
-            sidecars[0]
-                .file_name()
-                .is_some_and(|name| name.to_string_lossy().ends_with("_config.toml"))
-        );
+        assert!(sidecars[0]
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().ends_with("_config.toml")));
         assert!(plugin.message.starts_with("Saved recording A1-row"));
 
         let doc: toml::Value =
@@ -10602,11 +10698,9 @@ mod tests {
         assert!((points[4].expected_a - 2.5).abs() < 1e-12);
         assert!((points[2].expected_a - 1.5).abs() < 1e-12);
         // The amplitude sweep trusts the calibration: it commands what it expects.
-        assert!(
-            points
-                .iter()
-                .all(|point| point.commanded_a == point.expected_a)
-        );
+        assert!(points
+            .iter()
+            .all(|point| point.commanded_a == point.expected_a));
     }
 
     #[test]
@@ -10926,11 +11020,9 @@ mod tests {
             .count();
         assert_eq!(acquired, 1, "one lease for the ladder, not one per child");
         assert_eq!(released, 1, "released exactly once, at the end");
-        assert!(
-            commands
-                .iter()
-                .any(|command| matches!(command, ModulationCommandV1::SetDriveFrequency { .. }))
-        );
+        assert!(commands
+            .iter()
+            .any(|command| matches!(command, ModulationCommandV1::SetDriveFrequency { .. })));
 
         // Both frequencies are locked, each at the depth its own roll-off needs.
         assert_eq!(plugin.a0_locks.len(), 2);
@@ -11992,17 +12084,15 @@ depth_a = 0.7
             .unwrap()
         };
         assert_eq!(scan().len(), 1);
-        assert!(
-            completed_protocol_rows(
-                &folder.join("A1-proto"),
-                "A1-proto",
-                "changed",
-                2,
-                StageAA1Plugin::SIDECAR_SCHEMA
-            )
-            .unwrap()
-            .is_empty()
-        );
+        assert!(completed_protocol_rows(
+            &folder.join("A1-proto"),
+            "A1-proto",
+            "changed",
+            2,
+            StageAA1Plugin::SIDECAR_SCHEMA
+        )
+        .unwrap()
+        .is_empty());
         for replacement in [
             "acquisition_complete = false",
             "",
@@ -12433,13 +12523,11 @@ depth_a = 0.7
             sink.hosts.last().map(|request| &request.command),
             Some(HostCommand::RestoreCameraConfiguration)
         ));
-        assert!(
-            plugin
-                .protocol
-                .as_ref()
-                .and_then(|run| run.finish_message.as_deref())
-                .is_some_and(|message| message.contains("Record sensor monitoring"))
-        );
+        assert!(plugin
+            .protocol
+            .as_ref()
+            .and_then(|run| run.finish_message.as_deref())
+            .is_some_and(|message| message.contains("Record sensor monitoring")));
         let _ = std::fs::remove_dir_all(&folder);
     }
 
@@ -14264,14 +14352,12 @@ bias_refr_code,status,error\n\
             payload: serde_json::to_value(response).unwrap(),
         };
         plugin.on_service_reply(&reply);
-        assert!(
-            plugin
-                .protocol
-                .as_ref()
-                .unwrap()
-                .pending_reqs
-                .contains(&request_id)
-        );
+        assert!(plugin
+            .protocol
+            .as_ref()
+            .unwrap()
+            .pending_reqs
+            .contains(&request_id));
         plugin.poll_modulation_requests(&mut sink);
         assert!(sink.services.iter().any(|request| {
             request.request_id != request_id
@@ -14471,25 +14557,19 @@ bias_refr_code,status,error\n\
         plugin.begin_protocol(&mut sink);
         assert!(plugin.protocol.is_some(), "{}", plugin.message);
         assert!(plugin.camera_events.is_empty() && !plugin.live);
-        assert!(
-            plugin
-                .protocol
-                .as_ref()
-                .unwrap()
-                .lease_id
-                .as_str()
-                .starts_with("a3-protocol-")
-        );
-        assert!(
-            plugin
-                .set_setting("measurement_id", json!("another"))
-                .is_err()
-        );
-        assert!(
-            plugin
-                .set_setting("output_folder", json!(plugin.output_folder))
-                .is_ok()
-        );
+        assert!(plugin
+            .protocol
+            .as_ref()
+            .unwrap()
+            .lease_id
+            .as_str()
+            .starts_with("a3-protocol-"));
+        assert!(plugin
+            .set_setting("measurement_id", json!("another"))
+            .is_err());
+        assert!(plugin
+            .set_setting("output_folder", json!(plugin.output_folder))
+            .is_ok());
         plugin.append_protocol_event("test", "offline").unwrap();
         let progress =
             std::fs::read_to_string(folder.join("A3-test").join("progress.jsonl")).unwrap();
@@ -14563,14 +14643,12 @@ bias_refr_code,status,error\n\
         plugin.recording.stop_requested = true;
         let mut sink = ControlSink::default();
         plugin.drive_recording(&mut sink);
-        assert!(
-            plugin
-                .recording
-                .failure
-                .as_deref()
-                .unwrap()
-                .contains("partial recording retained")
-        );
+        assert!(plugin
+            .recording
+            .failure
+            .as_deref()
+            .unwrap()
+            .contains("partial recording retained"));
         assert_ne!(plugin.recording.phase, RecPhase::Running);
     }
 }

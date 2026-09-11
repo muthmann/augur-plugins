@@ -42,3 +42,5 @@ A withheld photodiode `a` names which of the four gates holds it, and A1 renders
 - [Windows lab watcher](stage-a-lab-watch.md): independent RAW/PDQ progress warnings to an iPhone through ntfy.
 
 - [Stage-A A3 Threshold](./stage-a-a3.md) — CSV/TOML sine protocols, A3 measurement folders, offline thresholds and full frequency/depth/bias fixtures.
+
+- [Universal Stage-A campaigns](stage-a-universal-campaigns.md): executable v4 bias preparation, six-hour final, deadlines and recovery.

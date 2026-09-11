@@ -1,0 +1,10 @@
+# One fixed-bias background point at the F1 application light level.
+mode = "current_reference"
+name = "A4 dim bias selection F1"
+duration_s = 120
+settle_s = 10
+repeats = 1
+
+[[threshold]]
+diff_on = 0
+diff_off = 0
