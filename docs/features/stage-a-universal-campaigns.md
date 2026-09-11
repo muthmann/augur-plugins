@@ -45,6 +45,11 @@ Changing display estimates alone is rejected. The short program names are unchan
 ## Bias selection
 
 Keep all six B0–B5 candidates, hpf=0, refr=235, filters off and the qualified ROI.
+B3–B5 use `fo = 53`, not the range maximum 55: on the bench IMX636 a requested
+code 142 (factory 87 + 55) reads back 140 and the host refuses the unconfirmed
+point (`bias_readback_mismatch`, 2026-09-11 smoke). 140 is a code the sensor
+demonstrably holds, so 53 is the highest confirmed offset. The value lives in
+`candidate_camera()` and `scripts/build_universal_protocols.py`.
 At 0.08 lux each candidate receives a 45-second static record and seven sine rows:
 0.5/8 Hz crossed with depths 0.08/0.20/0.80, plus 0.25 Hz at depth 0.80. Use at
 least eight cycles and eight recording seconds per sine row, with two settling

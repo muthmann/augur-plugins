@@ -46,14 +46,20 @@ pub fn materialize_protocol(name: &str) -> Result<Option<String>, String> {
     Ok(Some(path.to_string_lossy().into_owned()))
 }
 
+/// Highest `fo` offset the bench sensor confirms. The IMX636 range ends at
+/// +55, but for a requested code 142 (factory 87 + 55) the sensor reads back
+/// 140 and the host refuses the unconfirmed point; 140 is a code it
+/// demonstrably holds. Keep in step with `scripts/build_universal_protocols.py`.
+pub const CANDIDATE_FO_HIGH: i32 = 53;
+
 pub fn candidate_camera(name: &str) -> Result<CameraSettings, String> {
     let (on, off, fo) = match name.trim() {
         "B0" => (0, 0, 0),
         "B1" => (-15, -2, 0),
         "B2" => (-30, -5, 0),
-        "B3" => (0, 0, 55),
-        "B4" => (-15, -2, 55),
-        "B5" => (-30, -5, 55),
+        "B3" => (0, 0, CANDIDATE_FO_HIGH),
+        "B4" => (-15, -2, CANDIDATE_FO_HIGH),
+        "B5" => (-30, -5, CANDIDATE_FO_HIGH),
         _ => return Err("Select a measured candidate B0 through B5".into()),
     };
     Ok(CameraSettings {

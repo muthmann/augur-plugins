@@ -11,8 +11,13 @@ VERSION = '20260911-v5-4h'
 OVERHEAD = 11.0
 FREQS = [.25, .5, 1, 2, 4, 8, 16, 32, 128, 512]
 DEPTHS = [.04, .08, .12, .20, .36, .80]
+# fo 53, not the range maximum 55: the bench IMX636 sits at code 140 for a
+# requested 142 (factory 87 + 55) and the host refuses the unconfirmed point.
+# 140 is a code the sensor demonstrably holds, so 53 is the highest confirmed
+# offset. Keep this in step with candidate_camera() in stage-a-universal-runner.
+FO_HIGH = 53
 CANDIDATES = [dict(diff_on=on, diff_off=off, fo=fo, hpf=0, refr=235, filters_off=True)
-              for fo in [0, 55] for on, off in [(0, 0), (-15, -2), (-30, -5)]]
+              for fo in [0, FO_HIGH] for on, off in [(0, 0), (-15, -2), (-30, -5)]]
 
 def scalar(value):
     return json.dumps(value, ensure_ascii=False)

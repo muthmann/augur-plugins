@@ -22,7 +22,7 @@ required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_re
 [block.camera]
 diff_on = -15
 diff_off = -2
-fo = 55
+fo = 53
 hpf = 0
 refr = 235
 filters_off = true
@@ -39,7 +39,7 @@ required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_re
 [block.camera]
 diff_on = -15
 diff_off = -2
-fo = 55
+fo = 53
 hpf = 0
 refr = 235
 filters_off = true
@@ -56,7 +56,7 @@ required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_re
 [block.camera]
 diff_on = -15
 diff_off = -2
-fo = 55
+fo = 53
 hpf = 0
 refr = 235
 filters_off = true
@@ -73,7 +73,7 @@ required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_re
 [block.camera]
 diff_on = -15
 diff_off = -2
-fo = 55
+fo = 53
 hpf = 0
 refr = 235
 filters_off = true
@@ -90,7 +90,7 @@ required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_re
 [block.camera]
 diff_on = -15
 diff_off = -2
-fo = 55
+fo = 53
 hpf = 0
 refr = 235
 filters_off = true
