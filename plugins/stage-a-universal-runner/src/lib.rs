@@ -6,9 +6,9 @@
 
 use augur_plugin_api::{
     export_plugin, EventStoreHandle, HostContext, HostOutput, Plugin, PluginControlContext,
-    PluginControlInbox, PluginFrame, PluginInput, PluginServiceOutcome, PluginServiceReply,
-    PluginServiceRequest, SensorMonitoringV1, SettingItem, SettingKind, SettingsSchema,
-    SettingsSection, StatusEntry, CTX_SENSOR_MONITORING,
+    PluginControlInbox, PluginDiscontinuity, PluginFrame, PluginInput, PluginServiceOutcome,
+    PluginServiceReply, PluginServiceRequest, SensorMonitoringV1, SettingItem, SettingKind,
+    SettingsSchema, SettingsSection, StatusEntry, CTX_SENSOR_MONITORING,
 };
 use serde_json::{json, Value};
 use stage_a_universal_runner::{
@@ -1179,6 +1179,14 @@ impl Plugin for StageAUniversalRunnerPlugin {
     fn reset(&mut self) {
         self.stop_pending = self.run.is_some();
     }
+    fn on_discontinuity(&mut self, _: PluginDiscontinuity) {
+        // The host raises SettingsChanged on every settings sync of any
+        // plugin, including the operator's own Continue press, and reports
+        // each owner's recorder start/stop as SourceChanged. The default
+        // implementation would call `reset` and stop the campaign on the first
+        // of these. The runner accumulates nothing from frames; only the
+        // operator's Stop ends a campaign.
+    }
     fn input_kind(&self) -> PluginInput {
         PluginInput::RawEvents
     }
@@ -1279,8 +1287,13 @@ impl Plugin for StageAUniversalRunnerPlugin {
                 if self.run.as_ref().is_some_and(|r| r.waiting_for_completion) {
                     return Err("Do not change attenuation during capture".into());
                 }
-                self.aod_setting = value.as_str().ok_or("aod_setting must be text")?.into();
-                self.confirmed_optical_state = None;
+                let aod_setting = value.as_str().ok_or("aod_setting must be text")?;
+                // The host re-applies the full settings snapshot on every
+                // sync; only an actual change invalidates the confirmation.
+                if aod_setting != self.aod_setting {
+                    self.aod_setting = aod_setting.into();
+                    self.confirmed_optical_state = None;
+                }
                 Ok(())
             }
             "confirm_optical_state" => {
@@ -1613,6 +1626,31 @@ mod tests {
         assert!(!p.run.as_ref().unwrap().waiting_for_completion);
         c.requests.clear();
         reference_snapshot(p, c, "released");
+    }
+    #[test]
+    fn host_settings_sync_does_not_stop_or_unconfirm_the_campaign() {
+        // The host raises SettingsChanged and re-applies every plugin's full
+        // settings snapshot on any settings change, including the operator's
+        // own Continue press; the recorder start/stop arrives as SourceChanged.
+        let mut p = plugin("smoke");
+        let mut c = Control::default();
+        preflight(&mut p, &mut c);
+        p.on_discontinuity(PluginDiscontinuity::SettingsChanged);
+        p.on_discontinuity(PluginDiscontinuity::SourceChanged);
+        p.drive_control(&PluginControlInbox::default(), &mut c);
+        assert!(p.run.as_ref().is_some_and(|r| !r.user_stop));
+        assert_eq!(c.requests.last().unwrap().payload["action"], "start");
+        c.requests.clear();
+        reference_snapshot(&mut p, &mut c, "ready");
+        p.set_setting("confirm_optical_state", json!(true)).unwrap();
+        p.drive_control(&PluginControlInbox::default(), &mut c);
+        assert_eq!(c.requests.last().unwrap().payload["action"], "release");
+        c.requests.clear();
+        // The unchanged AOD value comes back with the next full snapshot.
+        p.set_setting("aod_setting", json!("saved dim")).unwrap();
+        assert!(p.confirmed_optical_state.is_some());
+        reference_snapshot(&mut p, &mut c, "released");
+        assert_eq!(c.requests[0].service, SERVICE_EXECUTE_BLOCK_V1);
     }
     #[test]
     fn continue_waits_for_real_reference_ready_and_release() {
