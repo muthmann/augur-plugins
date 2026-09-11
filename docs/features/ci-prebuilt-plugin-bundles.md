@@ -94,6 +94,11 @@ to travel with the plugin, and that macOS copies need their dylib id rewritten t
 source of truth. CI runs the same commands a developer runs, only with
 `--dest dist/<bundle>`.
 
+On Windows, the staged DLLs are then checked for the required
+`augur_plugin_vtable` export before the bundle can be uploaded. A2 is built with
+its standalone `plugin-entrypoint` feature explicitly enabled; A5 keeps A2's
+entrypoint disabled when it embeds the A2 implementation.
+
 **Archiving happens once, in the release job.** The build matrix uploads raw
 folders; the Ubuntu release job zips them. `zip` is not available in the Windows
 runner's bash by default, so packaging on each runner would have needed a

@@ -125,6 +125,12 @@ jobs:
         working-directory: augur-plugins
         run: bash scripts/install-built-plugins.sh --profile release --dest "dist/${{ matrix.bundle }}"
 
+      - name: Verify Windows runtime exports
+        if: runner.os == 'Windows'
+        working-directory: augur-plugins
+        shell: pwsh
+        run: ./scripts/check-windows-runtime-exports.ps1 -Root "dist/windows-x86_64"
+
       - name: Set up Python for the lab watcher
         uses: actions/setup-python@v5
         with:

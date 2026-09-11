@@ -141,7 +141,14 @@ if [[ -n "${local_augur_rs_repo:-}" ]]; then
 fi
 echo
 for package in "${packages[@]}"; do
-    cmd=(cargo build "${common_args[@]}" -p "${package}")
+    package_args=()
+    # A5 embeds A2 as a library with its default features disabled so that A5
+    # exports the one vtable belonging to the A5 runtime.  The standalone A2
+    # cdylib must explicitly re-enable its own entrypoint.
+    if [[ "${package}" == "augur-plugin-stage-a-a2" ]]; then
+        package_args+=(--features plugin-entrypoint)
+    fi
+    cmd=(cargo build "${common_args[@]}" -p "${package}" "${package_args[@]}")
     if [[ ${#cargo_args[@]} -gt 0 ]]; then
         cmd+=("${cargo_args[@]}")
     fi
