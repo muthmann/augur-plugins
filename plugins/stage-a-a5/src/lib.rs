@@ -10,8 +10,8 @@ use augur_plugin_api::{
     PluginRuntimeRole, PluginServiceOutcome, PluginServiceReply, PluginServiceRequest,
     SettingsSchema, StatusEntry,
 };
-use stage_a_step_acquisition::StageAA2Plugin;
 use serde_json::{json, Value};
+use stage_a_step_acquisition::StageAA2Plugin;
 use stage_a_universal_runner::{ExecuteBlockRequest, Experiment, SERVICE_EXECUTE_BLOCK_V1};
 
 pub struct StageAA5Plugin {

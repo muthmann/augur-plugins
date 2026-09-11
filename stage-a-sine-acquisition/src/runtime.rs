@@ -8498,12 +8498,16 @@ impl<const A3: bool> Plugin for SineAcquisition<A3> {
         {
             return Err(format!("A3 has no setting '{key}'"));
         }
-        if A3
-            && self.automation_active()
-            && matches!(
-                key,
-                "output_folder" | "measurement_id" | "protocol_path" | "new_id"
-            )
+        // The host re-applies the UI mirror's full settings snapshot to the
+        // live worker on every sync. A universal hand-off sets the folder, ID
+        // and protocol on the worker only, so from the hand-off until the
+        // protocol has finished those fields must not follow the mirror.
+        if matches!(
+            key,
+            "output_folder" | "measurement_id" | "protocol_path" | "new_id"
+        ) && ((A3 && self.automation_active())
+            || self.protocol_pending
+            || self.protocol.is_some())
         {
             let unchanged = key != "new_id" && self.get_setting(key).as_ref() == Some(&value);
             if !unchanged {
@@ -14650,5 +14654,42 @@ bias_refr_code,status,error\n\
             .unwrap()
             .contains("partial recording retained"));
         assert_ne!(plugin.recording.phase, RecPhase::Running);
+    }
+
+    #[test]
+    fn host_settings_sync_cannot_replace_a_pending_universal_handoff() {
+        let mut plugin = StageAA1Plugin::default();
+        let request = PluginServiceRequest {
+            request_id: 1,
+            source_plugin_id: "stage-a.universal-runner".into(),
+            target_plugin_id: "stage-a.a1".into(),
+            service: stage_a_universal_runner::SERVICE_EXECUTE_BLOCK_V1.into(),
+            payload: serde_json::json!({"plan_name":"smoke","block_name":"b","experiment":"A1",
+                "protocol":"sine_smoke","measurement_id":"A1-sync-01",
+                "output_folder":std::env::temp_dir().join("universal-sync-A1"),
+                "attempt":0,"camera":{},"required_artifacts":[]}),
+        };
+        let execution = ExecutionContext {
+            mode: augur_plugin_api::ExecutionMode::LiveCapture,
+            effects_allowed: true,
+            session_id: None,
+        };
+        assert!(matches!(
+            plugin.handle_service_request(&request, &execution).outcome,
+            PluginServiceOutcome::Accepted { .. }
+        ));
+        let handed_off = plugin.protocol_path.clone();
+        // The mirror's snapshot carries its own, different values.
+        assert!(plugin
+            .set_setting("protocol_path", serde_json::json!("mirror.csv"))
+            .is_err());
+        assert!(plugin
+            .set_setting("measurement_id", serde_json::json!("mirror-id"))
+            .is_err());
+        assert!(plugin
+            .set_setting("output_folder", serde_json::json!("/mirror"))
+            .is_err());
+        assert_eq!(plugin.protocol_path, handed_off);
+        assert_eq!(plugin.measurement_id, "A1-sync-01");
     }
 }

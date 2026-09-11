@@ -2871,7 +2871,11 @@ impl Plugin for StageAA4Plugin {
     }
 
     fn set_setting(&mut self, key: &str, value: Value) -> Result<(), String> {
-        if self.run.is_some() && matches!(key, "output_folder" | "measurement_id" | "protocol_path")
+        // `start_pending` covers the tick between a universal hand-off and the
+        // run it creates; a host settings sync in that window must not replace
+        // the handed-off folder, protocol or measurement ID with the mirror's.
+        if (self.run.is_some() || self.start_pending)
+            && matches!(key, "output_folder" | "measurement_id" | "protocol_path")
         {
             return Err(
                 "Recording configuration is locked until the run and restoration finish".into(),
@@ -4368,5 +4372,42 @@ mod tests {
         assert!(!monitoring_is_new(Some(old), monitoring(5, 5, 0.2)));
         assert!(monitoring_is_new(Some(old), monitoring(5, 5, 0.01)));
         assert!(!monitoring_is_new(Some(old), monitoring(5, 5, f64::NAN)));
+    }
+
+    #[test]
+    fn host_settings_sync_cannot_replace_a_pending_universal_handoff() {
+        let mut plugin = StageAA4Plugin::default();
+        let request = PluginServiceRequest {
+            request_id: 1,
+            source_plugin_id: "stage-a.universal-runner".into(),
+            target_plugin_id: "stage-a.a4".into(),
+            service: stage_a_universal_runner::SERVICE_EXECUTE_BLOCK_V1.into(),
+            payload: serde_json::json!({"plan_name":"smoke","block_name":"b","experiment":"A4",
+                "protocol":"static_smoke","measurement_id":"A4-sync-01",
+                "output_folder":std::env::temp_dir().join("universal-sync-A4"),
+                "attempt":0,"camera":{},"required_artifacts":[]}),
+        };
+        let execution = ExecutionContext {
+            mode: augur_plugin_api::ExecutionMode::LiveCapture,
+            effects_allowed: true,
+            session_id: None,
+        };
+        assert!(matches!(
+            plugin.handle_service_request(&request, &execution).outcome,
+            PluginServiceOutcome::Accepted { .. }
+        ));
+        let handed_off = plugin.protocol_path.clone();
+        // The mirror's snapshot carries its own, different values.
+        assert!(plugin
+            .set_setting("protocol_path", serde_json::json!("mirror.csv"))
+            .is_err());
+        assert!(plugin
+            .set_setting("measurement_id", serde_json::json!("mirror-id"))
+            .is_err());
+        assert!(plugin
+            .set_setting("output_folder", serde_json::json!("/mirror"))
+            .is_err());
+        assert_eq!(plugin.protocol_path, handed_off);
+        assert_eq!(plugin.measurement_id, "A4-sync-01");
     }
 }

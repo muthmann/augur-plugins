@@ -913,8 +913,14 @@ impl StageAUniversalRunnerPlugin {
                     } else {
                         run.plan.acquisition_cutoff_s
                     };
-                    let deadline = seconds
-                        .map_or_else(|| unix_ms() + 900_000, |s| run.started_unix_ms + s * 1000);
+                    // A4 drops the reference at this deadline and reports it
+                    // as failed, which ends the campaign. Untimed programs get
+                    // the whole four-hour operator window rather than a
+                    // fifteen-minute pause budget nobody is told about.
+                    let deadline = seconds.map_or_else(
+                        || unix_ms() + 4 * 3_600_000,
+                        |s| run.started_unix_ms + s * 1000,
+                    );
                     run.reference_request_id = Some(request_id);
                     run.reference_id = Some(reference_id.clone());
                     run.reference_ready = false;
