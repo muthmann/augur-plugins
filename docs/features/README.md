@@ -43,4 +43,4 @@ A withheld photodiode `a` names which of the four gates holds it, and A1 renders
 
 - [Stage-A A3 Threshold](./stage-a-a3.md) — CSV/TOML sine protocols, A3 measurement folders, offline thresholds and full frequency/depth/bias fixtures.
 
-- [Universal Stage-A campaigns](stage-a-universal-campaigns.md): executable v4 bias preparation, six-hour final, deadlines and recovery.
+- [Universal Stage-A campaigns](stage-a-universal-campaigns.md): executable v5 bias preparation and final within a shared four-hour budget.

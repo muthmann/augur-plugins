@@ -39,7 +39,7 @@ pub fn materialize_protocol(name: &str) -> Result<Option<String>, String> {
     let Some(protocol) = builtin_protocol(name) else {
         return Ok(None);
     };
-    let root = std::env::temp_dir().join("stage-a-universal-20260910-v4");
+    let root = std::env::temp_dir().join("stage-a-universal-20260911-v5-4h");
     std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
     let path = root.join(format!("{}.{}", protocol.name, protocol.extension));
     std::fs::write(&path, protocol.contents).map_err(|e| e.to_string())?;
@@ -395,11 +395,11 @@ mod tests {
     }
 
     #[test]
-    fn final_retains_both_main_levels_and_six_hour_limit() {
+    fn final_retains_both_main_levels_within_shared_four_hour_budget() {
         let plan = parse(include_str!("../protocols/stage-a-grand-final.toml")).unwrap();
-        assert_eq!(plan.wall_clock_limit_s, Some(21600));
-        assert_eq!(plan.acquisition_cutoff_s, Some(19800));
-        assert!(plan.total_seconds() < 18000.0);
+        assert_eq!(plan.wall_clock_limit_s, Some(10800));
+        assert_eq!(plan.acquisition_cutoff_s, Some(9900));
+        assert!(plan.total_seconds() < 7200.0);
         for state in ["F1", "F2"] {
             let points: usize = plan
                 .blocks
@@ -409,12 +409,37 @@ mod tests {
                 })
                 .map(Block::point_count)
                 .sum();
-            assert_eq!(points, 106);
+            assert_eq!(points, 70);
         }
         assert!(plan
             .blocks
             .iter()
             .all(|b| b.camera_from.as_deref() == Some("selected")));
+    }
+
+    #[test]
+    fn preparation_and_final_leave_ten_minutes_within_four_hours() {
+        let screen = parse(include_str!("../protocols/stage-a-dim-bias-selection.toml")).unwrap();
+        let final_plan = parse(include_str!("../protocols/stage-a-grand-final.toml")).unwrap();
+        assert_eq!(screen.wall_clock_limit_s, Some(3000));
+        assert_eq!(screen.acquisition_cutoff_s, Some(2700));
+        assert!(screen.total_seconds() < 2400.0);
+        assert_eq!(
+            screen.wall_clock_limit_s.unwrap() + final_plan.wall_clock_limit_s.unwrap() + 600,
+            4 * 3600
+        );
+        assert!(screen
+            .optical_states
+            .iter()
+            .all(|s| matches!(s.id.as_str(), "F1" | "F2")));
+        assert!(final_plan.blocks.iter().all(|b| matches!(
+            b.experiment,
+            Experiment::A1 | Experiment::A2 | Experiment::A4
+        )));
+        assert!(final_plan
+            .optical_states
+            .iter()
+            .all(|s| matches!(s.id.as_str(), "DARK" | "F1" | "F2")));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # Universal Runner bench test protocol
 
-Current executable version: **20260910-v4**. Read the [campaign guide](stage-a-universal-campaigns.md) first. Historical v1 files are not the run order.
+Current executable version: **20260911-v5-4h**. Read the [campaign guide](stage-a-universal-campaigns.md) first. Historical v1/v4 files are not the run order.
 
 This protocol verifies the complete hand-off path before a final Stage-A run.
 It is a bench acceptance test, not a scientific result. Record the date, host
@@ -18,9 +18,9 @@ root in the run log.
 2. The Universal Runner status must show the selected protocol name, block
    count, expanded owner-point count, owner-time estimate and an absolute
    output folder. The estimate excludes manual pauses and retries.
-3. Every listed required plugin must be loaded. For the final program this is
-   Universal Runner, A1/A3, A2, A4, A5, Modulation and Photodiode. A5 uses A2
-   internally; A3 is only needed when an A3 block is present.
+3. Every listed required plugin must be loaded. For the short final this is
+   Universal Runner, A1, A2, A4, Modulation and Photodiode. The broader smoke also
+   uses A3 and A5.
 4. The status must show camera-lux readback, photodiode connection/data path,
    modulation connection and modulation calibration as ready. If a required
    item is missing, do not press Run.
@@ -77,17 +77,17 @@ estimate, not a guaranteed wall-clock time: manual AOD changes, stabilization,
 retries and hardware recovery add time. Keep the complete output root and its
 manifest; never treat a skipped or missing block as a successful final run.
 
-## Version 4 acceptance checks
+## Version 5 acceptance checks
 
 - Set `selected_candidate` to the measured B0–B5 winner before the final.
   During preparation, enter two distinct finalists when the runner requests them.
 - At each light change, wait for the A4-owned constant optical reference to be
   ready. Adjust the AOD or laser, then Continue. Confirm that the reference leases
   are released before the next acquisition starts. Do not use Preview to reset it.
-- Confirm that 0.08 and 0.8 lux each expand to 106 A1/A3 rows and that the live
+- Confirm that 0.08 and 0.8 lux each expand to 70 A1/A3 rows and that the live
   camera readback contains the requested ON/OFF, fo, hpf, refr and filter state.
-- Verify A5 starts a real coordinated recording. For `load_roi_compare`, inspect
-  the smaller centered ROI and the restored original ROI after completion.
+- The shortened bias/final sequence uses A1/A2/A4 and keeps the qualified ROI.
+  A5 and nested-ROI checks remain standalone diagnostics outside the four-hour run.
 - Stop once during a saved smoke record. Confirm terminal RAW/PDQ receipts and
   restoration before resuming from `checkpoint.json`. The original start time
   and completed blocks must remain unchanged. A resumed failed attempt must not
@@ -100,3 +100,8 @@ manifest; never treat a skipped or missing block as a successful final run.
 
 Source tests and a local macOS release build do not establish Windows bench
 readiness. Verify the matched Windows host/bundle and this saved-data smoke.
+
+Version 5 budget check: bias 50 minutes, final 180 minutes, plus five minutes
+smoke and five minutes selection. Verify the displayed version and these limits
+before starting. Both independent runner clocks must fit the overall four-hour
+operator window.

@@ -1,6 +1,6 @@
 # Generated from actual owner rows. Do not edit timing independently.
 name = "stage-a-smoke-test"
-version = "20260910-v4"
+version = "20260911-v5-4h"
 program = "smoke"
 overhead_s_per_point = 11.0
 

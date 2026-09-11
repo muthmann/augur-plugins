@@ -697,7 +697,7 @@ impl StageAUniversalRunnerPlugin {
                     .is_some_and(|s| elapsed >= s * 1000)
                 {
                     return Err(
-                        "Original six-hour deadline has expired; resume cannot reset it".into(),
+                        "Original campaign deadline has expired; resume cannot reset it".into(),
                     );
                 }
                 Ok(())
@@ -1657,7 +1657,7 @@ mod tests {
         );
         assert_eq!(
             r.acquisition_deadline_unix_ms,
-            Some(p.run.as_ref().unwrap().started_unix_ms + 19_800_000)
+            Some(p.run.as_ref().unwrap().started_unix_ms + 9_900_000)
         );
         assert!(Path::new(&r.output_folder)
             .join(&r.measurement_id)
@@ -1846,7 +1846,7 @@ mod tests {
         let mut c = Control::default();
         preflight(&mut p, &mut c);
         confirm(&mut p, &mut c);
-        p.run.as_mut().unwrap().started_at = Instant::now() - std::time::Duration::from_secs(19801);
+        p.run.as_mut().unwrap().started_at = Instant::now() - std::time::Duration::from_secs(9901);
         p.drive_control(&PluginControlInbox::default(), &mut c);
         p.drive_control(&PluginControlInbox::default(), &mut c);
         assert_eq!(

@@ -4,7 +4,7 @@
     "experiment": "A4",
     "extension": "toml",
     "points": 1,
-    "seconds": 201.0,
+    "seconds": 111.0,
     "path": "stage-a-universal-runner/protocols/acquisition/static_final.toml"
   },
   {
@@ -12,7 +12,7 @@
     "experiment": "A4",
     "extension": "toml",
     "points": 1,
-    "seconds": 141.0,
+    "seconds": 66.0,
     "path": "stage-a-universal-runner/protocols/acquisition/static_screen.toml"
   },
   {
@@ -20,7 +20,7 @@
     "experiment": "A4",
     "extension": "toml",
     "points": 1,
-    "seconds": 111.0,
+    "seconds": 66.0,
     "path": "stage-a-universal-runner/protocols/acquisition/static_finalist.toml"
   },
   {
@@ -59,8 +59,8 @@
     "name": "screen_response",
     "experiment": "A1",
     "extension": "csv",
-    "points": 22,
-    "seconds": 758.0,
+    "points": 7,
+    "seconds": 210.0,
     "path": "stage-a-universal-runner/protocols/acquisition/screen_response.csv"
   },
   {
@@ -75,40 +75,40 @@
     "name": "finalist_response",
     "experiment": "A1",
     "extension": "csv",
-    "points": 6,
-    "seconds": 158.0,
+    "points": 4,
+    "seconds": 106.0,
     "path": "stage-a-universal-runner/protocols/acquisition/finalist_response.csv"
   },
   {
     "name": "main_1",
     "experiment": "A1",
     "extension": "csv",
-    "points": 36,
-    "seconds": 1562.0,
+    "points": 24,
+    "seconds": 1090.0,
     "path": "stage-a-universal-runner/protocols/acquisition/main_1.csv"
   },
   {
     "name": "main_2",
     "experiment": "A1",
     "extension": "csv",
-    "points": 34,
-    "seconds": 884.0,
+    "points": 22,
+    "seconds": 624.0,
     "path": "stage-a-universal-runner/protocols/acquisition/main_2.csv"
   },
   {
     "name": "main_3",
     "experiment": "A1",
     "extension": "csv",
-    "points": 36,
-    "seconds": 936.0,
+    "points": 24,
+    "seconds": 624.0,
     "path": "stage-a-universal-runner/protocols/acquisition/main_3.csv"
   },
   {
     "name": "main_complete",
     "experiment": "A1",
     "extension": "csv",
-    "points": 106,
-    "seconds": 3382.0,
+    "points": 70,
+    "seconds": 2338.0,
     "path": "stage-a-universal-runner/protocols/acquisition/main_complete.csv"
   },
   {
@@ -180,15 +180,15 @@
     "experiment": "A2",
     "extension": "toml",
     "points": 3,
-    "seconds": 342.75,
+    "seconds": 192.75,
     "path": "stage-a-universal-runner/protocols/acquisition/latency_core.toml"
   },
   {
     "name": "latency_cadence",
     "experiment": "A2",
     "extension": "toml",
-    "points": 3,
-    "seconds": 392.75,
+    "points": 2,
+    "seconds": 153.5,
     "path": "stage-a-universal-runner/protocols/acquisition/latency_cadence.toml"
   },
   {
@@ -204,7 +204,7 @@
     "experiment": "A2",
     "extension": "toml",
     "points": 4,
-    "seconds": 242.0,
+    "seconds": 205.0,
     "path": "stage-a-universal-runner/protocols/acquisition/heldout_temporal.toml"
   },
   {

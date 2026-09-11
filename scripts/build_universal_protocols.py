@@ -7,10 +7,10 @@ import json
 import math
 from pathlib import Path
 
-VERSION = '20260910-v4'
+VERSION = '20260911-v5-4h'
 OVERHEAD = 11.0
-FREQS = [.25, .5, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
-DEPTHS = [.02, .04, .08, .12, .20, .36, .64, 1.0]
+FREQS = [.25, .5, 1, 2, 4, 8, 16, 32, 128, 512]
+DEPTHS = [.04, .08, .12, .20, .36, .80]
 CANDIDATES = [dict(diff_on=on, diff_off=off, fo=fo, hpf=0, refr=235, filters_off=True)
               for fo in [0, 55] for on, off in [(0, 0), (-15, -2), (-30, -5)]]
 
@@ -80,11 +80,11 @@ class Builder:
         block.update(extra)
         return block
 
-    def campaign(self, filename, program, blocks, states, limit=None):
+    def campaign(self, filename, program, blocks, states, limit=None, closing_seconds=900):
         values = dict(name=filename.removesuffix('.toml'), version=VERSION, program=program,
                       overhead_s_per_point=OVERHEAD)
         if limit:
-            values.update(wall_clock_limit_s=limit, acquisition_cutoff_s=limit-1800)
+            values.update(wall_clock_limit_s=limit, acquisition_cutoff_s=limit-closing_seconds)
         text = '# Generated from actual owner rows. Do not edit timing independently.\n'
         text += '\n'.join(f'{k} = {scalar(v)}' for k,v in values.items())+'\n'
         for id, target, action in states:
@@ -97,15 +97,15 @@ class Builder:
         self.save('stage-a-universal-runner/protocols/'+filename, text)
 
     def build(self):
-        for name, seconds in [('static_final',180),('static_screen',120),('static_finalist',90),('static_smoke',2)]:
+        for name, seconds in [('static_final',90),('static_screen',45),('static_finalist',45),('static_smoke',2)]:
             self.static(name, seconds)
         self.sine('sine_smoke',[sine_row('smoke',2,.36,4,2)])
         self.steps('steps_smoke',[(.36,1,2,'smoke')])
         self.steps('load_smoke',[(.36,1,2,'smoke')], 'A5')
-        self.sine('screen_response', grid([.5,2,8],[.04,.08,.12,.20,.36,.80], 'screen',8,10)
-                  + grid([.125,.25],[.20,.80],'slow_guard',8,10))
+        self.sine('screen_response', grid([.5,8],[.08,.20,.80], 'screen',8,8)
+                  + [sine_row('screen_slow_guard',.25,.80,8,8)])
         self.sine('screen_reference', [sine_row(f'reference_{a}',2,a,8,10) for a in [.20,.80]])
-        self.sine('finalist_response',grid([.5,2,8],[.12,.80],'finalist',8,10))
+        self.sine('finalist_response',grid([.5,8],[.12,.80],'finalist',8,8))
         for name, fs, depths in [('main', FREQS, DEPTHS),
                                  ('lower',[.25,.5,1,2,4,8,16,32,128,512],[.04,.08,.12,.20,.36,.80])]:
             rows = grid(fs, depths, name)
@@ -122,10 +122,10 @@ class Builder:
         self.sine('intermediate_bridge',grid([.5,4,32,256],[.20,.80],'bridge'))
         self.sine('closing_response',[sine_row(f'closing_{a}',2,a) for a in [.20,.80]])
         self.sine('slow_extension',[sine_row(f'extension_{a}',.0625,a) for a in [.20,.80]])
-        self.steps('latency_core',[(a,1,50,'identification') for a in [.12,.36,.80]])
-        self.steps('latency_cadence',[(.36,.5,50,'cadence'),(.36,2,50,'cadence'),(.36,1,50,'reference')])
+        self.steps('latency_core',[(a,1,25,'identification') for a in [.12,.36,.80]])
+        self.steps('latency_cadence',[(.36,.5,25,'cadence'),(.36,2,25,'cadence')])
         self.steps('latency_bridge',[(a,1,50,'interpolation_check') for a in [.12,.80]])
-        self.steps('heldout_temporal',[(a,h,25,'held_out_not_for_fitting') for a in [.24,.60] for h in [.35,1.5]])
+        self.steps('heldout_temporal',[(a,h,20,'held_out_not_for_fitting') for a in [.24,.60] for h in [.35,1.5]])
         self.steps('load_recovery',[(a,h,100,'effective_rate_recovery') for a in [.36,.80] for h in [.5,.05,.005]],'A5')
         self.steps('load_roi_compare',[(.80,.005,100,'matched_roi_load')],'A5')
         states = [('DARK','laser off','Switch the laser off. Keep the optical path unchanged; confirm the laser-off reference.'),
@@ -137,24 +137,19 @@ class Builder:
         final=[]
         def add(name,protocol,state,**kw): final.append(self.block(name,protocol,state,camera_from='selected',**kw))
         add('laser_off_open','static_final','DARK')
-        for name in ['bright_bridge','static_final','load_recovery']:
-            add('bright_'+name,name,'F0')
-        add('bright_nested_roi','load_roi_compare','F0',roi_mode='center_half')
-        for state,kind in [('F2','main'),('F1','main'),('LOW','lower')]:
-            priority = 1 if state=='LOW' else 0
+        for state in ['F2','F1']:
             add(f'{state}_background_pre','static_final',state)
-            for i in range(1,4): add(f'{state}_{kind}_{i}',f'{kind}_{i}',state,optional_priority=priority)
-            add(f'{state}_latency','latency_core',state,optional_priority=priority)
+            for i in range(1,4): add(f'{state}_main_{i}',f'main_{i}',state)
+            add(f'{state}_latency','latency_core',state)
             if state=='F2':
                 add('F2_cadence','latency_cadence',state)
                 add('F2_heldout','heldout_temporal',state)
             add(f'{state}_background_post','static_final',state)
-        for name in ['intermediate_bridge','latency_bridge','static_final']:
-            add('MID_'+name,name,'MID',optional_priority=2)
         add('closing_background','static_final','F2',closing=True)
         add('closing_response','closing_response','F2',closing=True)
         add('laser_off_close','static_final','DARK',closing=True)
-        self.campaign('stage-a-grand-final.toml','selected_state_final',final,states,21600)
+        self.campaign('stage-a-grand-final.toml','selected_state_final',final,
+                      [s for s in states if s[0] in ['DARK','F2','F1']],10800)
         screen=[]
         for i, c in enumerate([0,4,2,3,1,5]):
             for protocol in ['static_screen','screen_response']:
@@ -162,11 +157,13 @@ class Builder:
             if i in [2,5]:
                 for protocol in ['static_screen','screen_reference']:
                     screen.append(self.block(f'F2_B0_repeat_{i}_{protocol}',protocol,'F2',candidate=0))
-        for state in ['F1','LOW']:
+        for state in ['F1']:
             for slot in ['finalist_1','finalist_2']:
                 for protocol in ['static_finalist','finalist_response']:
                     screen.append(self.block(f'{state}_{slot}_{protocol}',protocol,state,camera_from=slot))
-        self.campaign('stage-a-dim-bias-selection.toml','dim_bias_selection',screen,[s for s in states if s[0] in ['F2','F1','LOW']])
+        for block in screen[-2:]: block['closing'] = True
+        self.campaign('stage-a-dim-bias-selection.toml','dim_bias_selection',screen,
+                      [s for s in states if s[0] in ['F2','F1']],3000,closing_seconds=300)
         smoke=[self.block(name,p,'F2',candidate=4) for name,p in [('a1','sine_smoke'),('a2','steps_smoke'),('a3','sine_smoke'),('a4','static_smoke'),('a5','load_smoke')]]
         smoke[2]['experiment']='A3'
         self.campaign('stage-a-smoke-test.toml','smoke',smoke,[s for s in states if s[0]=='F2'])

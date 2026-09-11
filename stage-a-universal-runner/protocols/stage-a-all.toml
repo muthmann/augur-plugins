@@ -1,6 +1,6 @@
 # Generated from actual owner rows. Do not edit timing independently.
 name = "stage-a-all"
-version = "20260910-v4"
+version = "20260911-v5-4h"
 program = "bright_reference"
 overhead_s_per_point = 11.0
 
@@ -27,7 +27,7 @@ name = "static_final"
 protocol = "static_final"
 optical_state = "F0"
 estimated_points = 1
-estimated_seconds = 201.0
+estimated_seconds = 111.0
 retry_same_point = true
 required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
 camera_from = "selected"

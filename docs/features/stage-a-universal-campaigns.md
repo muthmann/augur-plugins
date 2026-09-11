@@ -1,92 +1,110 @@
-# Universal Stage-A campaigns, 20260910-v4
+# Universal Stage-A campaigns, 20260911-v5-4h
 
-The active campaigns implement the response-based bias preparation and the
-six-hour selected-state final. Both 0.08 and 0.8 camera-lux are full main levels.
-Camera lux is the operational brightness axis; it is not photon flux or QE.
+Bias preparation and the selected-state final share a **four-hour operator
+budget**. This replaces the v4 six-hour final plus separate preparation. Both
+0.08 and 0.8 camera-lux remain main levels. The old v4 files remain available in
+Git commit `c96508a`; do not mix their checkpoints or measurement IDs with v5.
 
-## Executable files
+## Four-hour schedule
 
-| Campaign | File under `stage-a-universal-runner/protocols/` | Expanded rows | Estimated owner minutes |
-|---|---|---:|---:|
-| Preparation | `stage-a-dim-bias-selection.toml` | 172 | 114.13 |
-| Grand Final | `stage-a-grand-final.toml` | 334 | 233.05 |
-| Mixed-owner smoke | `stage-a-smoke-test.toml` | 5 | 1.56 |
-| Bright reference | `stage-a-all.toml` | 13 | 11.28 |
+| Elapsed window | Work | Maximum minutes |
+|---|---|---:|
+| 00:00–00:05 | Saved-data smoke and setup check | 5 |
+| 00:05–00:55 | `dim_bias_selection`, including finalist checks and light changes | 50 |
+| 00:55–01:00 | Select and freeze the winner; new final measurement ID | 5 |
+| 01:00–04:00 | `selected_state_final`, including closing and recovery | 180 |
+| Total | Preparation, selection and final | **240** |
 
-Preparation has a separate 150-minute operator budget. The final is planned as
-300 minutes of work plus 60 minutes reserve. Estimates include row settling,
-recording and 11 seconds per file. They do not guarantee physical file closure
-or operator speed. The campaign clock starts at Run, including readiness and
-optical pauses; begin any additional initial checks within the operator budget.
+The two runner clocks are independent. Their limits total 230 minutes; the
+remaining ten minutes cover smoke and selection. Start the overall laboratory
+clock before smoke and do not let a delayed final start move the four-hour stop.
+The final should start by overall T+60 min. If setup or selection exceeds its
+allowance, stop by the original overall deadline and record missing coverage.
+The runner does not share a clock automatically between these separate programs.
 
-`scripts/build_universal_protocols.py` generates all active manifests and 28
-actual owner protocols in `protocols/acquisition/` beneath the shared runner
-crate. `--check` detects drift. The compiled catalog includes the same CSV/TOML
-contents, row counts and duration totals. Editing display estimates alone is
-rejected. Historical bright studies and the separate v1 low-light bundle remain
-archives, not additional steps in this campaign.
+## Executable files and measured-row estimates
 
-## Scientific scope
+All paths below are under `stage-a-universal-runner/protocols/`.
 
-Preparation pairs static background with modulated response for all six B0–B5
-candidates at 0.08 lux. Two operator-selected finalists are checked at 0.8 and
-0.03 lux. B4 is not an automatic winner. Each candidate uses hpf=0, refr=235,
-filters off and the qualified ROI; ON/OFF and fo vary as defined in the catalog.
+| Campaign | File | Blocks | Rows | Estimated owner minutes |
+|---|---|---:|---:|---:|
+| Bias preparation | `stage-a-dim-bias-selection.toml` | 20 | 64 | 37.13 |
+| Grand Final | `stage-a-grand-final.toml` | 18 | 161 | 104.15 |
 
-Each main level has 96 frequency/depth rows, two slow guards and eight repeated
-reference rows, split into three owner files. The 0.03-lux extension has 70 rows.
-A2 adds depth, cadence and held-out temporal checks. A4 supplies matched static
-and laser-off backgrounds. A5 supplies effective load/recovery checks, including
-one centered half-width/half-height ROI comparison. It does not identify an
-intrinsic refractory time by itself. A6 is integrated lux/PD provenance; the
-standalone A6 reference file now delegates a static record to A4.
+Estimates include recording, settling and 11 seconds per file. The difference
+from the operator limits is deliberate recovery/handling margin, not additional
+requested acquisitions. Do not consume spare time with the older extension files.
+The generator also retains standalone diagnostic protocols; these are not part
+of the shortened bias/final sequence. Its 28-file catalog is not a 28-step run.
 
-Step protocols correct the arithmetic mean to maintain the intended geometric
-midpoint. Measured optical input, polarity-separated response, misses, background
-and stationarity remain necessary for offline interpretation. Keep held-out rows
-out of fitting. Spatial microscopy validation remains separate.
+`scripts/build_universal_protocols.py` generates the actual owner CSV/TOML rows,
+compiled catalog and campaign manifests together. `--check` detects drift. The
+plugins embed these files; an empty external protocol path selects the built-ins.
+Changing display estimates alone is rejected. The short program names are unchanged.
 
-## Operator sequence
+## Bias selection
 
-1. Install matching host and plugins, restart, and complete the
-   [saved-data smoke](stage-a-universal-runner-test-protocol.md).
-2. Use an absolute common output folder and a new campaign prefix. Run preparation.
-3. At each optical pause wait for the constant reference, set the AOD/laser, then
-   Continue. Lux and PD observations are captured automatically with the AOD value.
-4. Enter two distinct measured finalists when requested. Review signal and
-   background together, then freeze the final readback state in the bench log.
-5. Set `selected_candidate` and run `selected_state_final` with a fresh prefix.
+Keep all six B0–B5 candidates, hpf=0, refr=235, filters off and the qualified ROI.
+At 0.08 lux each candidate receives a 45-second static record and seven sine rows:
+0.5/8 Hz crossed with depths 0.08/0.20/0.80, plus 0.25 Hz at depth 0.80. Use at
+least eight cycles and eight recording seconds per sine row, with two settling
+cycles or three seconds, whichever is longer. Repeat B0 static and two 2-Hz
+reference rows after the third and sixth candidate.
 
-Readiness is checked for every recorder. A4 owns the temporary constant reference
-and releases it before recording. A5 directly starts the A2 recorder through the
-service interface, preserving the A5 routing identity and attempt number.
+Review stimulus-locked response, misses, polarity balance, background and drift
+together. Pick two distinct finalists; the runner checks each at 0.8 lux using
+a 45-second static record and 0.5/8 Hz crossed with depths 0.12/0.80. There is no
+0.03-lux finalist check in this version. The final winner is selected manually;
+B4 is not predetermined. The smaller screen ranks candidates coarsely, not a
+continuous optimum. Short static records give weaker rare-noise estimates.
 
-## Deadline, recovery and records
+## Grand Final
 
-The final has a 21,600-second campaign limit and a 19,800-second acquisition
-cutoff. Non-closing blocks receive the cutoff; closing blocks receive the final
-deadline. Optional 0.3-lux blocks are omitted first, then reduced 0.03-lux blocks.
-Every omission is retained. A required block that cannot fit is missing coverage,
-not a successful measurement. Deadline expiry requests safe owner stop; file
-finalization must complete and can take longer if hardware or storage fails.
+Run only laser-off, 0.08 lux and 0.8 lux states. At both lit levels retain:
 
-The runner accepts a terminal result only from the current owner, measurement ID
-and attempt. Automatic retries are bounded to three attempts. A1/A2/A5 can reuse
-their completed point artifacts; A4 retries use distinct IDs. No failed point is
-silently represented as measured. Continue cannot launch duplicate active blocks.
+- 60 A1/A3 grid rows: 0.25/0.5/1/2/4/8/16/32/128/512 Hz crossed with depths
+  0.04/0.08/0.12/0.20/0.36/0.80.
+- Two 0.125-Hz guards at depths 0.20/0.80 and eight 2-Hz reference rows,
+  giving **70 rows per main level**, split into three owner files.
+- At least 12 cycles and 12 recording seconds per sine row; two settling cycles
+  or three seconds. Repeated anchors bracket the chunks.
+- 90-second static records before and after each main level.
+- A2 steps at depths 0.12/0.36/0.80, one-second plateaus and 25 transitions per
+  polarity. At 0.08 lux add 0.5/2-second cadence checks at depth 0.36.
+- At 0.08 lux keep four held-out conditions: depths 0.24/0.60 crossed with
+  0.35/1.5-second plateaus, 20 transitions per polarity. Exclude these from fitting.
 
-Each campaign stores `plan.json`, `events.jsonl`, `checkpoint.json` and a previous
-checkpoint. Each measurement retains its exact `universal-request*.json` plus
-owner RAW, PDQ and sidecars. Persistence failure stops the campaign. To recover,
-first ensure all owners are idle and finalized, set `resume_checkpoint`, and Run.
-Completed blocks remain completed and optical state must be reconfirmed. Resume
-retains the original clock; an expired six-hour run cannot be extended by resume.
-Manual recovery requires an operator review of the failure and artifacts.
+Open with 90 seconds laser-off. Close with a 0.08-lux static record, two response
+anchors and 90 seconds laser-off. The 8/0.3/0.03-lux blocks, A5 load/recovery,
+nested ROI, extra cadence repeat and very-low-frequency extension are removed.
+This avoids additional optical states and recorder/ROI transitions. It does not
+establish independent refractory behavior, bright-load limits, sub-0.08-lux
+performance or a precise cutoff in an unsampled frequency gap.
 
-## Verification boundary
+Fit the measured optical input, separate ON/OFF and background, and report bounds
+when a response plateau or roll-off is not resolved. This dataset supports a
+local behavioral twin at the frozen state. Camera lux is an operating coordinate,
+not independently calibrated photon flux or QE; spatial validation stays separate.
 
-Production parsers validate all generated owner files. Tests exercise bias
-overrides, AOD reference lifecycle, active Continue, owner/attempt identity,
-deadlines, full sequencing, resume and A5 handoff. Release compilation is local
-macOS verification. A matching Windows installation, physical saved-data smoke,
-actual optical stability and backup verification remain bench acceptance work.
+## Controls, deadlines and delivery
+
+Use the [bench smoke procedure](stage-a-universal-runner-test-protocol.md) with a
+matching Windows bundle. The short final uses A1, A2 and A4 plus the existing
+modulation/photodiode owners; no A5 acquisition or ROI change is requested.
+The broader standalone `smoke` still exercises all owners and lasts about 1.56
+owner minutes. A4 prepares/releases a constant reference around each AOD pause.
+Set the requested AOD/laser state, wait for stable readings, then Continue.
+
+Bias acquisition cutoff is 45 minutes, with a 50-minute campaign limit; the last
+finalist pair is closing work. Final acquisition cutoff is 165 minutes, with a
+180-minute campaign limit and 15 minutes for closing. Limits include in-program
+pauses and retries. Safe file cleanup can exceed a deadline after hardware or
+storage failure; software cannot guarantee physical completion in that case.
+Any omitted required block means incomplete coverage. Do not select a bias from
+an incomplete candidate comparison without explicitly reviewing that loss.
+
+Keep the existing bounded retries, explicit owner/measurement/attempt terminal
+identity, `plan.json`, `events.jsonl`, checkpoints and `universal-request*.json`
+alongside RAW/PDQ/sidecars. Resume retains the original program clock. Use a fresh
+campaign for v5; old v4 checkpoints have different sampling and timing. Preserve
+an incremental second copy rather than postponing all copying until the end.

@@ -35,3 +35,14 @@ rows. Safe cleanup can exceed a deadline after hardware/storage failure; the
 runner must report this instead of claiming a physically guaranteed finish.
 The new bundle needs Windows saved-data validation. No new controller firmware
 or host service API is introduced.
+
+## 2026-09-11 — shortened v5 schedule
+
+The operator reduced the total available time to four hours for preparation and
+final together. The existing architecture is unchanged. The generated schedules
+now have 50-minute bias and 180-minute final limits, leaving ten minutes for
+smoke and selection. Both main levels remain, with 70 sine rows per level.
+Extra flux states, A5 and nested ROI are outside this shortened campaign. The
+independent program clocks do not automatically enforce a shared start time;
+the operator keeps the overall four-hour window. Previous six-hour values above
+describe v4 and are superseded for active acquisition.
