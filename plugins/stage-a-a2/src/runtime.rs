@@ -5976,6 +5976,3 @@ comparator_threshold_dac=500
         assert!(plugin.run.as_ref().unwrap().pause_acknowledged);
     }
 }
-
-#[cfg(feature = "plugin-entrypoint")]
-augur_plugin_api::export_plugin!(StageAA2Plugin);
