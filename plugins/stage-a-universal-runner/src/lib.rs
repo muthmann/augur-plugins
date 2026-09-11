@@ -367,17 +367,22 @@ impl StageAUniversalRunnerPlugin {
                         }
                     } else if run.reference_ready && !run.reference_releasing {
                         if let (Some(lux), Some(pd)) = (self.camera_lux, self.photodiode_level) {
-                            if lux.is_finite()
-                                && pd.is_finite()
-                                && !self.aod_setting.trim().is_empty()
-                            {
+                            if lux.is_finite() && pd.is_finite() {
                                 let state = run.plan.blocks[run.block_index]
                                     .optical_state
                                     .clone()
                                     .unwrap_or_default();
+                                // The AOD text is provenance only; the camera
+                                // lux and PD readbacks are the measured state.
+                                // An empty field must not hold up the bench.
+                                let aod_setting = if self.aod_setting.trim().is_empty() {
+                                    format!("not entered; camera lux {lux:.4}")
+                                } else {
+                                    self.aod_setting.clone()
+                                };
                                 self.confirmed_optical_state = Some(OpticalStateConfirmation {
                                     state_id: state.clone(),
-                                    aod_setting: self.aod_setting.clone(),
+                                    aod_setting,
                                     camera_lux: lux.to_string(),
                                     photodiode_level: pd.to_string(),
                                     confirmed_at_utc: (unix_ms() / 1000).to_string(),
@@ -386,7 +391,7 @@ impl StageAUniversalRunnerPlugin {
                                 release = true;
                             } else {
                                 self.message =
-                                    "Wait for finite readbacks and enter the AOD setting".into();
+                                    "Wait for finite camera-lux and photodiode readbacks".into();
                             }
                         } else {
                             self.message = "Camera lux or photodiode readback is missing".into();
@@ -1229,7 +1234,7 @@ impl Plugin for StageAUniversalRunnerPlugin {
             SettingItem { key: "resume_checkpoint".into(), label: "Resume checkpoint (optional)".into(), tooltip: Some("Load checkpoint.json to resume unfinished work. The original final deadline is retained.".into()), kind: SettingKind::Path { dialog: augur_plugin_api::PathDialogKind::OpenFile, default: self.resume_checkpoint.clone() } },
             SettingItem { key: "measurement_prefix".into(), label: "Measurement prefix".into(), tooltip: None, kind: SettingKind::Text { default: self.measurement_prefix.clone() } },
             SettingItem { key: "output_folder".into(), label: "Common output folder".into(), tooltip: Some("Absolute campaign folder. Each measurement is saved in its own subfolder; all A1-A5 owners receive this path.".into()), kind: SettingKind::Path { dialog: augur_plugin_api::PathDialogKind::Directory, default: self.output_folder.clone() } },
-            SettingItem { key: "aod_setting".into(), label: "AOD setting".into(), tooltip: Some("Control value only; not a flux measurement.".into()), kind: SettingKind::Text { default: self.aod_setting.clone() } },
+            SettingItem { key: "aod_setting".into(), label: "AOD setting".into(), tooltip: Some("Optional control value for the record; not a flux measurement. Left empty, the camera-lux readback is recorded instead.".into()), kind: SettingKind::Text { default: self.aod_setting.clone() } },
             SettingItem { key: "confirm_optical_state".into(), label: "Continue: confirm optical state".into(), tooltip: Some("Required after every AOD change.".into()), kind: SettingKind::Button { enabled: true } },
             SettingItem { key: "selected_candidate".into(), label: "Selected final bias (B0–B5)".into(), tooltip: Some("Choose after reviewing the bias screen; no automatic winner.".into()), kind: SettingKind::Text { default: self.selected_candidate.clone() } },
             SettingItem { key: "finalist_1".into(), label: "First screen finalist (B0–B5)".into(), tooltip: None, kind: SettingKind::Text { default: self.finalist_1.clone() } },
@@ -1506,7 +1511,7 @@ impl Plugin for StageAUniversalRunnerPlugin {
                 if run.waiting_for_operator {
                     let state = block.optical_state.as_deref().unwrap_or("unspecified");
                     lines.push(StatusEntry::Text(format!(
-                        "NEXT OPERATOR ACTION: set/read back optical state {state}; enter AOD setting; press Continue. Confirmed camera lux: {:?}; PD: {:?}",
+                        "NEXT OPERATOR ACTION: set optical state {state}, then press Continue (AOD setting optional). Camera lux: {:?}; PD: {:?}",
                         self.camera_lux, self.photodiode_level
                     )));
                 } else {
@@ -1726,6 +1731,19 @@ mod tests {
         p.set_setting("stop", json!(true)).unwrap();
         p.drive_control(&PluginControlInbox::default(), &mut c);
         assert!(p.run.is_none(), "{}", p.message);
+    }
+    #[test]
+    fn empty_aod_setting_does_not_block_confirmation() {
+        let mut p = plugin("smoke");
+        p.aod_setting.clear();
+        let mut c = Control::default();
+        preflight(&mut p, &mut c);
+        confirm(&mut p, &mut c);
+        assert_eq!(c.requests[0].service, SERVICE_EXECUTE_BLOCK_V1);
+        assert_eq!(
+            c.requests[0].payload["optical_state"]["aod_setting"],
+            "not entered; camera lux 0.0800"
+        );
     }
     #[test]
     fn continue_without_a_campaign_does_not_start_one() {
