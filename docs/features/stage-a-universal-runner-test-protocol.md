@@ -36,6 +36,9 @@ Run these one at a time and confirm that the status explains the correction:
 | Missing A2 plugin | The block is refused with the exact target and service error; no later block starts. |
 | Missing modulation or photodiode | The owner refuses the block; the Universal Runner retains the block and reports failure. |
 | AOD setting empty | Continue is refused before optical confirmation. |
+| Continue with no campaign running | Refused; status says to press Run. Nothing starts. |
+| AOD value re-typed between two blocks at the same state | The next block waits, A4 prepares the reference again, and Continue records the new value. |
+| A4 refuses or fails the optical reference | The campaign shows the error and Stop ends it; no block starts. |
 | No camera-lux or PD readback | Continue is refused and identifies the missing readback. |
 
 ## Test 2: smoke program

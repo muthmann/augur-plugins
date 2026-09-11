@@ -147,12 +147,15 @@ impl StageAUniversalRunnerPlugin {
                     .and_then(Value::as_f64);
             }
         }
-        if self.start_pending || (self.continue_pending && self.run.is_none()) {
+        if self.start_pending {
             self.start_pending = false;
-            self.continue_pending = false;
             if self.run.is_none() {
                 self.start(context);
             }
+        }
+        if self.continue_pending && self.run.is_none() {
+            self.continue_pending = false;
+            self.message = "No campaign is running; press Run universal protocol".into();
         }
         for reply in inbox.service_replies.clone() {
             self.service_reply(context, reply);
@@ -198,6 +201,11 @@ impl StageAUniversalRunnerPlugin {
                                     snapshot.payload
                                 ));
                                 self.message = run.error.clone().unwrap();
+                                // A4 reports this hold as failed for good and
+                                // never as released; the operator cleans up.
+                                run.reference_id = None;
+                                run.reference_ready = false;
+                                run.reference_releasing = false;
                             }
                             _ => {}
                         }
@@ -867,14 +875,22 @@ impl StageAUniversalRunnerPlugin {
             .as_ref()
             .and_then(|run| run.plan.blocks.get(run.block_index))
             .and_then(|block| block.optical_state.clone());
+        let block_has_state = required_state.is_some();
         if let Some(required_state) = required_state {
             let current_state = self
                 .run
                 .as_ref()
                 .and_then(|run| run.current_optical_state.as_deref());
-            if current_state != Some(required_state.as_str()) {
+            // A changed AOD value or a resumed campaign leaves the state
+            // unconfirmed even when its ID has not changed. Confirmation is
+            // only possible while A4 holds the constant reference, so every
+            // path that waits for the operator must also request one.
+            if current_state != Some(required_state.as_str())
+                || self.confirmed_optical_state.is_none()
+            {
                 if let Some(run) = self.run.as_mut() {
                     run.waiting_for_operator = true;
+                    run.current_optical_state = None;
                 }
                 self.confirmed_optical_state = None;
                 if self.run.as_ref().unwrap().reference_id.is_none() {
@@ -918,14 +934,6 @@ impl StageAUniversalRunnerPlugin {
                 return;
             }
         }
-        if self.confirmed_optical_state.is_none() {
-            if let Some(run) = self.run.as_mut() {
-                run.waiting_for_operator = true;
-            }
-            self.message =
-                "Set the AOD, enter its control value and press Continue; camera lux and PD are read automatically".into();
-            return;
-        }
         let id = self.next_request_id();
         let attempt = self
             .run
@@ -955,7 +963,9 @@ impl StageAUniversalRunnerPlugin {
                 limit.map(|seconds| run.started_unix_ms + seconds * 1000)
             }),
             camera,
-            optical_state: self.confirmed_optical_state.clone(),
+            optical_state: block_has_state
+                .then(|| self.confirmed_optical_state.clone())
+                .flatten(),
             required_artifacts: self
                 .run
                 .as_ref()
@@ -1023,6 +1033,11 @@ impl StageAUniversalRunnerPlugin {
                 if let PluginServiceOutcome::Rejected { code, message } = &reply.outcome {
                     run.error = Some(format!("Optical reference failed ({code}): {message}"));
                     self.message = run.error.clone().unwrap();
+                    // A4 holds nothing for this ID, so no "released" snapshot
+                    // will ever arrive; drop it so Stop can end the campaign.
+                    run.reference_id = None;
+                    run.reference_ready = false;
+                    run.reference_releasing = false;
                 }
                 return;
             }
@@ -1651,6 +1666,75 @@ mod tests {
         assert!(p.confirmed_optical_state.is_some());
         reference_snapshot(&mut p, &mut c, "released");
         assert_eq!(c.requests[0].service, SERVICE_EXECUTE_BLOCK_V1);
+    }
+    #[test]
+    fn changed_aod_at_the_same_state_requests_a_new_reference() {
+        let mut p = plugin("smoke");
+        let mut c = Control::default();
+        preflight(&mut p, &mut c);
+        confirm(&mut p, &mut c);
+        complete_current(&mut p, &mut c, "completed", 0);
+        // Block 2 shares F2 with block 1 and was dispatched without a pause.
+        assert!(p.run.as_ref().unwrap().waiting_for_completion);
+        p.run.as_mut().unwrap().waiting_for_completion = false;
+        p.set_setting("aod_setting", json!("re-typed")).unwrap();
+        p.run.as_mut().unwrap().waiting_for_completion = true;
+        complete_current(&mut p, &mut c, "completed", 0);
+        // Block 3 at the same state must wait, with a reference prepared, so
+        // that Continue can confirm the new AOD instead of being refused.
+        assert!(p.run.as_ref().unwrap().waiting_for_operator);
+        assert!(p.run.as_ref().unwrap().reference_id.is_some());
+        confirm(&mut p, &mut c);
+        assert_eq!(c.requests[0].service, SERVICE_EXECUTE_BLOCK_V1);
+        assert_eq!(
+            c.requests[0].payload["optical_state"]["aod_setting"],
+            "re-typed"
+        );
+    }
+    #[test]
+    fn refused_or_failed_reference_still_lets_stop_end_the_campaign() {
+        let mut p = plugin("smoke");
+        let mut c = Control::default();
+        preflight(&mut p, &mut c);
+        let start = c.requests.last().unwrap().clone();
+        p.drive_control(
+            &PluginControlInbox {
+                service_replies: vec![PluginServiceReply {
+                    request_id: start.request_id,
+                    source_plugin_id: start.source_plugin_id,
+                    target_plugin_id: start.target_plugin_id,
+                    service: start.service,
+                    outcome: PluginServiceOutcome::Rejected {
+                        code: "reference_unavailable".into(),
+                        message: "busy".into(),
+                    },
+                }],
+                ..Default::default()
+            },
+            &mut c,
+        );
+        assert!(p.run.as_ref().unwrap().error.is_some());
+        p.set_setting("stop", json!(true)).unwrap();
+        p.drive_control(&PluginControlInbox::default(), &mut c);
+        assert!(p.run.is_none(), "{}", p.message);
+
+        let mut p = plugin("smoke");
+        let mut c = Control::default();
+        preflight(&mut p, &mut c);
+        reference_snapshot(&mut p, &mut c, "failed");
+        assert!(p.run.as_ref().unwrap().error.is_some());
+        p.set_setting("stop", json!(true)).unwrap();
+        p.drive_control(&PluginControlInbox::default(), &mut c);
+        assert!(p.run.is_none(), "{}", p.message);
+    }
+    #[test]
+    fn continue_without_a_campaign_does_not_start_one() {
+        let mut p = plugin("smoke");
+        let mut c = Control::default();
+        p.set_setting("confirm_optical_state", json!(true)).unwrap();
+        p.drive_control(&PluginControlInbox::default(), &mut c);
+        assert!(p.run.is_none());
+        assert!(c.requests.is_empty());
     }
     #[test]
     fn continue_waits_for_real_reference_ready_and_release() {
