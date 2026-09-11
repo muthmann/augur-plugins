@@ -4,6 +4,7 @@ members = [
   "stage-a-io",
   "stage-a-plugin-contract",
   "stage-a-sine-acquisition",
+  "stage-a-step-acquisition",
   "stage-a-universal-runner",
   "plugins/stage-a-universal-runner",
   "plugins/stage-a-a5",

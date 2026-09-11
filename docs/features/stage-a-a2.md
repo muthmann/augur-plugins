@@ -5,6 +5,10 @@ points. It leases the existing modulation and photodiode owners and uses the hos
 camera recorder. Latency, measured contrast, optical t50 and timing uncertainty are
 estimated offline. A completed capture is not proof of a qualified latency result.
 
+The recorder lives in the non-runtime `stage-a-step-acquisition` crate;
+`plugins/stage-a-a2` is the entry point that exports its vtable and A5 embeds the
+same recorder (ADR 050). The protocol files stay under `plugins/stage-a-a2/protocols/`.
+
 ## Production capture
 
 Use `plugins/stage-a-a2/protocols/a2_drive_sync_smoke.toml` first, then

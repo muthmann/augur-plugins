@@ -95,9 +95,12 @@ source of truth. CI runs the same commands a developer runs, only with
 `--dest dist/<bundle>`.
 
 On Windows, the staged DLLs are then checked for the required
-`augur_plugin_vtable` export before the bundle can be uploaded. A2 is built with
-its standalone `plugin-entrypoint` feature explicitly enabled; A5 keeps A2's
-entrypoint disabled when it embeds the A2 implementation.
+`augur_plugin_vtable` export before the bundle can be uploaded. The check exists
+because a plugin crate that another plugin links as a library loses its export
+without any build error: Cargo rebuilds the dependency with the dependent's
+feature set and uplifts that copy over the standalone one. A2 and A5 share the
+step recorder through the non-runtime `stage-a-step-acquisition` crate instead
+([ADR 050](../adr/050-shared-a2-a5-step-acquisition.md)).
 
 **Archiving happens once, in the release job.** The build matrix uploads raw
 folders; the Ubuntu release job zips them. `zip` is not available in the Windows

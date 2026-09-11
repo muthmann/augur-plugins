@@ -11,7 +11,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 augur-plugin-api.workspace = true
-augur-plugin-stage-a-a2 = { path = "../stage-a-a2", default-features = false }
+stage-a-step-acquisition = { path = "../../stage-a-step-acquisition" }
 serde_json.workspace = true
 stage-a-universal-runner = { path = "../../stage-a-universal-runner" }
 

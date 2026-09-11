@@ -44,11 +44,11 @@ fn materialize_universal_protocol(name: &str) -> Result<Option<String>, String> 
     let (extension, contents) = match name {
         "a2_low_light_final" => (
             "toml",
-            include_str!("../protocols/a2_production_drive_sync.toml"),
+            include_str!("../../plugins/stage-a-a2/protocols/a2_production_drive_sync.toml"),
         ),
         "a2_heldout_blink_validation" => (
             "toml",
-            include_str!("../protocols/a2_fluorescence_chain_followup.toml"),
+            include_str!("../../plugins/stage-a-a2/protocols/a2_fluorescence_chain_followup.toml"),
         ),
         _ => return Ok(None),
     };
@@ -4216,7 +4216,7 @@ settle_s=0
 
     #[test]
     fn manifest_declares_every_camera_command_used_by_a2() {
-        let manifest: toml::Value = toml::from_str(include_str!("../plugin.toml")).unwrap();
+        let manifest: toml::Value = toml::from_str(include_str!("../../plugins/stage-a-a2/plugin.toml")).unwrap();
         let commands = manifest["host_commands"]
             .as_array()
             .unwrap()

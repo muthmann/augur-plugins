@@ -6,22 +6,13 @@ license.workspace = true
 authors.workspace = true
 description = "Stage-A A2 optical step-latency protocol runner"
 
-[features]
-default = ["plugin-entrypoint"]
-plugin-entrypoint = []
-
 [lib]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 augur-plugin-api.workspace = true
-serde.workspace = true
 serde_json.workspace = true
-sha2 = "0.10"
-stage-a-plugin-contract = { path = "../../stage-a-plugin-contract" }
-stage-a-universal-runner = { path = "../../stage-a-universal-runner" }
-toml = "0.8"
-tempfile = "3"
+stage-a-step-acquisition = { path = "../../stage-a-step-acquisition" }
 
 [lints.rust]
 unsafe_code = "forbid"

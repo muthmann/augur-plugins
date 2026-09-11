@@ -344,7 +344,7 @@ duration_s = 30
 
     #[test]
     fn shipped_technical_smoke_is_a_short_point_only_protocol() {
-        let text = include_str!("../protocols/a2_emission_path_technical_smoke.toml");
+        let text = include_str!("../../plugins/stage-a-a2/protocols/a2_emission_path_technical_smoke.toml");
         let protocol = parse(text).unwrap();
         assert_eq!(protocol.points.len(), 3);
         assert_eq!(protocol.total_seconds(), 47.0);
@@ -352,12 +352,12 @@ duration_s = 30
 
     #[test]
     fn shipped_followup_is_point_only_and_parseable() {
-        let text = include_str!("../protocols/a2_fluorescence_chain_followup.toml");
+        let text = include_str!("../../plugins/stage-a-a2/protocols/a2_fluorescence_chain_followup.toml");
         assert!(!parse(text).unwrap().points.is_empty());
     }
     #[test]
     fn production_drive_sync_schedule_is_valid_and_matches_cycle_mean_targets() {
-        let plan = parse(include_str!("../protocols/a2_production_drive_sync.toml")).unwrap();
+        let plan = parse(include_str!("../../plugins/stage-a-a2/protocols/a2_production_drive_sync.toml")).unwrap();
         assert_eq!(
             plan.timing_reference,
             stage_a_plugin_contract::A2TimingReferenceV1::DriveSync
@@ -394,12 +394,12 @@ duration_s = 30
         }
         assert_eq!(seen.len(), 15);
         assert!(seen.values().all(|n| *n == 2));
-        let smoke = parse(include_str!("../protocols/a2_drive_sync_smoke.toml")).unwrap();
+        let smoke = parse(include_str!("../../plugins/stage-a-a2/protocols/a2_drive_sync_smoke.toml")).unwrap();
         assert_eq!(smoke.total_seconds(), 37.0);
     }
     #[test]
     fn short_core_keeps_three_fluxes_three_depths_and_physical_controls() {
-        let plan = parse(include_str!("../protocols/a2_core_drive_sync.toml")).unwrap();
+        let plan = parse(include_str!("../../plugins/stage-a-a2/protocols/a2_core_drive_sync.toml")).unwrap();
         assert_eq!(plan.points.len(), 19);
         assert_eq!(plan.total_seconds(), 1195.0);
         assert_eq!(plan.trigger_validation, TriggerValidation::OfflineReview);

@@ -88,7 +88,7 @@ mod tests {
     #[test]
     fn duplicate_conditions_are_distinct_rows_and_partial_records_do_not_count() {
         let mut plan =
-            crate::protocol::parse(include_str!("../protocols/a2_drive_sync_smoke.toml")).unwrap();
+            crate::protocol::parse(include_str!("../../plugins/stage-a-a2/protocols/a2_drive_sync_smoke.toml")).unwrap();
         plan.points = vec![plan.points[0].clone(); 3];
         let dir = tempfile::tempdir().unwrap();
         for suffix in ["raw", "toml", "pdq", "pd.json"] {

@@ -1,3 +1,0 @@
-LIBRARY augur_plugin_stage_a_a2
-EXPORTS
-    augur_plugin_vtable
