@@ -1,0 +1,705 @@
+{
+  "anchor_note": "detector_volts_at_null is a lower bound on the total-power anchor I_tot, not the anchor: on the reject port the residual transmitted floor is not separable from it",
+  "calibration_id": "pockels-20260730-083123",
+  "detector_geometry": "REJECT PORT (PD falls as light rises)",
+  "detector_volts_at_null": 0.05832880721662921,
+  "detector_volts_at_peak": 0.0075745061683017215,
+  "hysteresis": 0.25679725274851173,
+  "lobe_coverage": 4.796857893386575,
+  "max_level": 3000,
+  "points": [
+    {
+      "clipped": true,
+      "code": 0,
+      "direction": "up",
+      "peak_to_peak_volts": 0.004835164835164834,
+      "volts": 0.002619047619047619
+    },
+    {
+      "clipped": true,
+      "code": 63,
+      "direction": "up",
+      "peak_to_peak_volts": 0.0016117216117216115,
+      "volts": 0.002216117216117216
+    },
+    {
+      "clipped": true,
+      "code": 125,
+      "direction": "up",
+      "peak_to_peak_volts": 0.004835164835164834,
+      "volts": 0.002619047619047619
+    },
+    {
+      "clipped": true,
+      "code": 188,
+      "direction": "up",
+      "peak_to_peak_volts": 0.006446886446886447,
+      "volts": 0.004230769230769231
+    },
+    {
+      "clipped": true,
+      "code": 250,
+      "direction": "up",
+      "peak_to_peak_volts": 0.002417582417582417,
+      "volts": 0.0034249084249084244
+    },
+    {
+      "clipped": true,
+      "code": 313,
+      "direction": "up",
+      "peak_to_peak_volts": 0.01128205128205128,
+      "volts": 0.006849816849816849
+    },
+    {
+      "clipped": false,
+      "code": 375,
+      "direction": "up",
+      "peak_to_peak_volts": 0.05399267399267399,
+      "volts": 0.044120879120879114
+    },
+    {
+      "clipped": false,
+      "code": 438,
+      "direction": "up",
+      "peak_to_peak_volts": 0.05399267399267399,
+      "volts": 0.04230769230769231
+    },
+    {
+      "clipped": false,
+      "code": 500,
+      "direction": "up",
+      "peak_to_peak_volts": 0.025787545787545788,
+      "volts": 0.024175824175824177
+    },
+    {
+      "clipped": false,
+      "code": 563,
+      "direction": "up",
+      "peak_to_peak_volts": 0.029816849816849816,
+      "volts": 0.0558058608058608
+    },
+    {
+      "clipped": false,
+      "code": 625,
+      "direction": "up",
+      "peak_to_peak_volts": 0.004835164835164834,
+      "volts": 0.06366300366300366
+    },
+    {
+      "clipped": false,
+      "code": 688,
+      "direction": "up",
+      "peak_to_peak_volts": 0.02498168498168498,
+      "volts": 0.0543956043956044
+    },
+    {
+      "clipped": false,
+      "code": 750,
+      "direction": "up",
+      "peak_to_peak_volts": 0.012087912087912088,
+      "volts": 0.06043956043956044
+    },
+    {
+      "clipped": false,
+      "code": 813,
+      "direction": "up",
+      "peak_to_peak_volts": 0.020146520146520148,
+      "volts": 0.055
+    },
+    {
+      "clipped": false,
+      "code": 875,
+      "direction": "up",
+      "peak_to_peak_volts": 0.03465201465201465,
+      "volts": 0.039285714285714285
+    },
+    {
+      "clipped": false,
+      "code": 938,
+      "direction": "up",
+      "peak_to_peak_volts": 0.02256410256410256,
+      "volts": 0.05983516483516483
+    },
+    {
+      "clipped": false,
+      "code": 1000,
+      "direction": "up",
+      "peak_to_peak_volts": 0.05479853479853479,
+      "volts": 0.05177655677655677
+    },
+    {
+      "clipped": true,
+      "code": 1063,
+      "direction": "up",
+      "peak_to_peak_volts": 0.010476190476190476,
+      "volts": 0.007051282051282051
+    },
+    {
+      "clipped": true,
+      "code": 1125,
+      "direction": "up",
+      "peak_to_peak_volts": 0.041098901098901096,
+      "volts": 0.021153846153846155
+    },
+    {
+      "clipped": true,
+      "code": 1188,
+      "direction": "up",
+      "peak_to_peak_volts": 0.008864468864468863,
+      "volts": 0.00402930402930403
+    },
+    {
+      "clipped": true,
+      "code": 1250,
+      "direction": "up",
+      "peak_to_peak_volts": 0.03304029304029304,
+      "volts": 0.01672161172161172
+    },
+    {
+      "clipped": true,
+      "code": 1313,
+      "direction": "up",
+      "peak_to_peak_volts": 0.03223443223443224,
+      "volts": 0.0139010989010989
+    },
+    {
+      "clipped": true,
+      "code": 1375,
+      "direction": "up",
+      "peak_to_peak_volts": 0.01531135531135531,
+      "volts": 0.009267399267399268
+    },
+    {
+      "clipped": false,
+      "code": 1438,
+      "direction": "up",
+      "peak_to_peak_volts": 0.017728937728937726,
+      "volts": 0.01652014652014652
+    },
+    {
+      "clipped": false,
+      "code": 1500,
+      "direction": "up",
+      "peak_to_peak_volts": 0.008864468864468863,
+      "volts": 0.029816849816849816
+    },
+    {
+      "clipped": true,
+      "code": 1563,
+      "direction": "up",
+      "peak_to_peak_volts": 0.021758241758241755,
+      "volts": 0.008864468864468863
+    },
+    {
+      "clipped": true,
+      "code": 1625,
+      "direction": "up",
+      "peak_to_peak_volts": 0.04996336996336996,
+      "volts": 0.01631868131868132
+    },
+    {
+      "clipped": false,
+      "code": 1688,
+      "direction": "up",
+      "peak_to_peak_volts": 0.03948717948717948,
+      "volts": 0.03485347985347985
+    },
+    {
+      "clipped": false,
+      "code": 1750,
+      "direction": "up",
+      "peak_to_peak_volts": 0.014505494505494505,
+      "volts": 0.06064102564102564
+    },
+    {
+      "clipped": false,
+      "code": 1813,
+      "direction": "up",
+      "peak_to_peak_volts": 0.029816849816849816,
+      "volts": 0.058424908424908426
+    },
+    {
+      "clipped": false,
+      "code": 1875,
+      "direction": "up",
+      "peak_to_peak_volts": 0.041098901098901096,
+      "volts": 0.053791208791208786
+    },
+    {
+      "clipped": false,
+      "code": 1938,
+      "direction": "up",
+      "peak_to_peak_volts": 0.021758241758241755,
+      "volts": 0.04714285714285714
+    },
+    {
+      "clipped": false,
+      "code": 2000,
+      "direction": "up",
+      "peak_to_peak_volts": 0.02498168498168498,
+      "volts": 0.0554029304029304
+    },
+    {
+      "clipped": false,
+      "code": 2063,
+      "direction": "up",
+      "peak_to_peak_volts": 0.012893772893772894,
+      "volts": 0.06023809523809523
+    },
+    {
+      "clipped": false,
+      "code": 2125,
+      "direction": "up",
+      "peak_to_peak_volts": 0.02820512820512821,
+      "volts": 0.05036630036630037
+    },
+    {
+      "clipped": false,
+      "code": 2188,
+      "direction": "up",
+      "peak_to_peak_volts": 0.025787545787545788,
+      "volts": 0.05822344322344322
+    },
+    {
+      "clipped": false,
+      "code": 2250,
+      "direction": "up",
+      "peak_to_peak_volts": 0.038681318681318674,
+      "volts": 0.05076923076923076
+    },
+    {
+      "clipped": false,
+      "code": 2313,
+      "direction": "up",
+      "peak_to_peak_volts": 0.03223443223443224,
+      "volts": 0.02296703296703297
+    },
+    {
+      "clipped": false,
+      "code": 2375,
+      "direction": "up",
+      "peak_to_peak_volts": 0.014505494505494505,
+      "volts": 0.009670329670329669
+    },
+    {
+      "clipped": true,
+      "code": 2438,
+      "direction": "up",
+      "peak_to_peak_volts": 0.008864468864468863,
+      "volts": 0.004835164835164834
+    },
+    {
+      "clipped": false,
+      "code": 2500,
+      "direction": "up",
+      "peak_to_peak_volts": 0.03626373626373627,
+      "volts": 0.02478021978021978
+    },
+    {
+      "clipped": true,
+      "code": 2563,
+      "direction": "up",
+      "peak_to_peak_volts": 0.03465201465201465,
+      "volts": 0.02095238095238095
+    },
+    {
+      "clipped": false,
+      "code": 2625,
+      "direction": "up",
+      "peak_to_peak_volts": 0.02336996336996337,
+      "volts": 0.014505494505494505
+    },
+    {
+      "clipped": false,
+      "code": 2688,
+      "direction": "up",
+      "peak_to_peak_volts": 0.004835164835164834,
+      "volts": 0.01672161172161172
+    },
+    {
+      "clipped": true,
+      "code": 2750,
+      "direction": "up",
+      "peak_to_peak_volts": 0.007252747252747252,
+      "volts": 0.005641025641025641
+    },
+    {
+      "clipped": true,
+      "code": 2813,
+      "direction": "up",
+      "peak_to_peak_volts": 0.037875457875457874,
+      "volts": 0.02195970695970696
+    },
+    {
+      "clipped": true,
+      "code": 2875,
+      "direction": "up",
+      "peak_to_peak_volts": 0.03948717948717948,
+      "volts": 0.013095238095238096
+    },
+    {
+      "clipped": false,
+      "code": 2938,
+      "direction": "up",
+      "peak_to_peak_volts": 0.040293040293040296,
+      "volts": 0.037875457875457874
+    },
+    {
+      "clipped": false,
+      "code": 3000,
+      "direction": "up",
+      "peak_to_peak_volts": 0.031428571428571424,
+      "volts": 0.04976190476190476
+    },
+    {
+      "clipped": false,
+      "code": 3000,
+      "direction": "down",
+      "peak_to_peak_volts": 0.02901098901098901,
+      "volts": 0.05238095238095238
+    },
+    {
+      "clipped": false,
+      "code": 2938,
+      "direction": "down",
+      "peak_to_peak_volts": 0.008864468864468863,
+      "volts": 0.0552014652014652
+    },
+    {
+      "clipped": false,
+      "code": 2875,
+      "direction": "down",
+      "peak_to_peak_volts": 0.041098901098901096,
+      "volts": 0.02498168498168498
+    },
+    {
+      "clipped": false,
+      "code": 2813,
+      "direction": "down",
+      "peak_to_peak_volts": 0.03545787545787545,
+      "volts": 0.021758241758241755
+    },
+    {
+      "clipped": false,
+      "code": 2750,
+      "direction": "down",
+      "peak_to_peak_volts": 0.008864468864468863,
+      "volts": 0.02880952380952381
+    },
+    {
+      "clipped": false,
+      "code": 2688,
+      "direction": "down",
+      "peak_to_peak_volts": 0.012087912087912088,
+      "volts": 0.011886446886446888
+    },
+    {
+      "clipped": true,
+      "code": 2625,
+      "direction": "down",
+      "peak_to_peak_volts": 0.02095238095238095,
+      "volts": 0.014706959706959706
+    },
+    {
+      "clipped": true,
+      "code": 2563,
+      "direction": "down",
+      "peak_to_peak_volts": 0.01128205128205128,
+      "volts": 0.004835164835164834
+    },
+    {
+      "clipped": true,
+      "code": 2500,
+      "direction": "down",
+      "peak_to_peak_volts": 0.0427106227106227,
+      "volts": 0.017527472527472526
+    },
+    {
+      "clipped": true,
+      "code": 2438,
+      "direction": "down",
+      "peak_to_peak_volts": 0.02820512820512821,
+      "volts": 0.014706959706959706
+    },
+    {
+      "clipped": false,
+      "code": 2375,
+      "direction": "down",
+      "peak_to_peak_volts": 0.05479853479853479,
+      "volts": 0.0408974358974359
+    },
+    {
+      "clipped": false,
+      "code": 2313,
+      "direction": "down",
+      "peak_to_peak_volts": 0.01128205128205128,
+      "volts": 0.011483516483516485
+    },
+    {
+      "clipped": false,
+      "code": 2250,
+      "direction": "down",
+      "peak_to_peak_volts": 0.018534798534798533,
+      "volts": 0.05983516483516483
+    },
+    {
+      "clipped": false,
+      "code": 2188,
+      "direction": "down",
+      "peak_to_peak_volts": 0.038681318681318674,
+      "volts": 0.039285714285714285
+    },
+    {
+      "clipped": false,
+      "code": 2125,
+      "direction": "down",
+      "peak_to_peak_volts": 0.02336996336996337,
+      "volts": 0.052985347985347986
+    },
+    {
+      "clipped": false,
+      "code": 2063,
+      "direction": "down",
+      "peak_to_peak_volts": 0.02336996336996337,
+      "volts": 0.045128205128205125
+    },
+    {
+      "clipped": false,
+      "code": 2000,
+      "direction": "down",
+      "peak_to_peak_volts": 0.01531135531135531,
+      "volts": 0.058424908424908426
+    },
+    {
+      "clipped": false,
+      "code": 1938,
+      "direction": "down",
+      "peak_to_peak_volts": 0.006446886446886447,
+      "volts": 0.06124542124542124
+    },
+    {
+      "clipped": false,
+      "code": 1875,
+      "direction": "down",
+      "peak_to_peak_volts": 0.007252747252747252,
+      "volts": 0.06326007326007327
+    },
+    {
+      "clipped": false,
+      "code": 1813,
+      "direction": "down",
+      "peak_to_peak_volts": 0.013699633699633696,
+      "volts": 0.06386446886446887
+    },
+    {
+      "clipped": false,
+      "code": 1750,
+      "direction": "down",
+      "peak_to_peak_volts": 0.03948717948717948,
+      "volts": 0.04049450549450549
+    },
+    {
+      "clipped": false,
+      "code": 1688,
+      "direction": "down",
+      "peak_to_peak_volts": 0.038681318681318674,
+      "volts": 0.02860805860805861
+    },
+    {
+      "clipped": false,
+      "code": 1625,
+      "direction": "down",
+      "peak_to_peak_volts": 0.02659340659340659,
+      "volts": 0.04452380952380952
+    },
+    {
+      "clipped": true,
+      "code": 1563,
+      "direction": "down",
+      "peak_to_peak_volts": 0.045128205128205125,
+      "volts": 0.017124542124542126
+    },
+    {
+      "clipped": true,
+      "code": 1500,
+      "direction": "down",
+      "peak_to_peak_volts": 0.016923076923076923,
+      "volts": 0.007051282051282051
+    },
+    {
+      "clipped": false,
+      "code": 1438,
+      "direction": "down",
+      "peak_to_peak_volts": 0.012087912087912088,
+      "volts": 0.02195970695970696
+    },
+    {
+      "clipped": true,
+      "code": 1375,
+      "direction": "down",
+      "peak_to_peak_volts": 0.01128205128205128,
+      "volts": 0.006648351648351648
+    },
+    {
+      "clipped": false,
+      "code": 1313,
+      "direction": "down",
+      "peak_to_peak_volts": 0.005641025641025641,
+      "volts": 0.009670329670329669
+    },
+    {
+      "clipped": true,
+      "code": 1250,
+      "direction": "down",
+      "peak_to_peak_volts": 0.03465201465201465,
+      "volts": 0.01631868131868132
+    },
+    {
+      "clipped": true,
+      "code": 1188,
+      "direction": "down",
+      "peak_to_peak_volts": 0.027399267399267395,
+      "volts": 0.010677655677655676
+    },
+    {
+      "clipped": true,
+      "code": 1125,
+      "direction": "down",
+      "peak_to_peak_volts": 0.005641025641025641,
+      "volts": 0.003626373626373626
+    },
+    {
+      "clipped": false,
+      "code": 1063,
+      "direction": "down",
+      "peak_to_peak_volts": 0.04351648351648351,
+      "volts": 0.04230769230769231
+    },
+    {
+      "clipped": false,
+      "code": 1000,
+      "direction": "down",
+      "peak_to_peak_volts": 0.007252747252747252,
+      "volts": 0.011886446886446888
+    },
+    {
+      "clipped": false,
+      "code": 938,
+      "direction": "down",
+      "peak_to_peak_volts": 0.04351648351648351,
+      "volts": 0.02901098901098901
+    },
+    {
+      "clipped": false,
+      "code": 875,
+      "direction": "down",
+      "peak_to_peak_volts": 0.006446886446886447,
+      "volts": 0.06426739926739927
+    },
+    {
+      "clipped": false,
+      "code": 813,
+      "direction": "down",
+      "peak_to_peak_volts": 0.01611721611721612,
+      "volts": 0.042912087912087914
+    },
+    {
+      "clipped": false,
+      "code": 750,
+      "direction": "down",
+      "peak_to_peak_volts": 0.012087912087912088,
+      "volts": 0.06043956043956044
+    },
+    {
+      "clipped": false,
+      "code": 688,
+      "direction": "down",
+      "peak_to_peak_volts": 0.019340659340659337,
+      "volts": 0.05661172161172161
+    },
+    {
+      "clipped": false,
+      "code": 625,
+      "direction": "down",
+      "peak_to_peak_volts": 0.02659340659340659,
+      "volts": 0.0554029304029304
+    },
+    {
+      "clipped": false,
+      "code": 563,
+      "direction": "down",
+      "peak_to_peak_volts": 0.04593406593406593,
+      "volts": 0.03747252747252747
+    },
+    {
+      "clipped": false,
+      "code": 500,
+      "direction": "down",
+      "peak_to_peak_volts": 0.05963369963369963,
+      "volts": 0.04956043956043956
+    },
+    {
+      "clipped": true,
+      "code": 438,
+      "direction": "down",
+      "peak_to_peak_volts": 0.027399267399267395,
+      "volts": 0.010073260073260074
+    },
+    {
+      "clipped": false,
+      "code": 375,
+      "direction": "down",
+      "peak_to_peak_volts": 0.06285714285714285,
+      "volts": 0.031025641025641024
+    },
+    {
+      "clipped": false,
+      "code": 313,
+      "direction": "down",
+      "peak_to_peak_volts": 0.006446886446886447,
+      "volts": 0.062454212454212454
+    },
+    {
+      "clipped": true,
+      "code": 250,
+      "direction": "down",
+      "peak_to_peak_volts": 0.005641025641025641,
+      "volts": 0.004835164835164834
+    },
+    {
+      "clipped": false,
+      "code": 188,
+      "direction": "down",
+      "peak_to_peak_volts": 0.002417582417582417,
+      "volts": 0.005439560439560439
+    },
+    {
+      "clipped": true,
+      "code": 125,
+      "direction": "down",
+      "peak_to_peak_volts": 0.0016117216117216115,
+      "volts": 0.003223443223443223
+    },
+    {
+      "clipped": true,
+      "code": 63,
+      "direction": "down",
+      "peak_to_peak_volts": 0.002417582417582417,
+      "volts": 0.002417582417582417
+    },
+    {
+      "clipped": true,
+      "code": 0,
+      "direction": "down",
+      "peak_to_peak_volts": 0.0016117216117216115,
+      "volts": 0.002014652014652015
+    }
+  ],
+  "port": "auto",
+  "quality": 0.2227805649633928,
+  "rejected_points": 0,
+  "rms_residual_volts": 0.011307071861868518,
+  "span_volts": -0.05075430104832749,
+  "v_null_dac": 711.9225837107243,
+  "v_pi_dac": 625.4093964584814
+}

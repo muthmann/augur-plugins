@@ -1,0 +1,12 @@
+# Final A4 static-background capture. The Universal Runner changes the AOD
+# between optical states; this file keeps the sensor state fixed and records
+# the noise distribution at that state.
+mode = "current_reference"
+name = "A4 final static background"
+duration_s = 180
+settle_s = 10.0
+repeats = 1
+
+[[threshold]]
+diff_on = 0
+diff_off = 0

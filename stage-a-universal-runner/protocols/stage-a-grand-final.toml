@@ -1,0 +1,226 @@
+# Generated from actual owner rows. Do not edit timing independently.
+name = "stage-a-grand-final"
+version = "20260911-v5-4h"
+program = "selected_state_final"
+overhead_s_per_point = 11.0
+wall_clock_limit_s = 10800
+acquisition_cutoff_s = 9900
+
+[[optical_states]]
+id = "DARK"
+label = "DARK"
+target_camera_lux = "laser off"
+operator_action = "Switch the laser off. Keep the optical path unchanged; confirm the laser-off reference."
+
+[[optical_states]]
+id = "F2"
+label = "F2"
+target_camera_lux = "about 0.08"
+operator_action = "Keep the laser on. Set the AOD for about 0.08 camera-lux; wait for stable readback."
+
+[[optical_states]]
+id = "F1"
+label = "F1"
+target_camera_lux = "about 0.8"
+operator_action = "Keep the laser on. Set the AOD for about 0.8 camera-lux; wait for stable readback."
+
+[[block]]
+experiment = "A4"
+name = "laser_off_open"
+protocol = "static_final"
+optical_state = "DARK"
+estimated_points = 1
+estimated_seconds = 111.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+camera_from = "selected"
+
+[[block]]
+experiment = "A4"
+name = "F2_background_pre"
+protocol = "static_final"
+optical_state = "F2"
+estimated_points = 1
+estimated_seconds = 111.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+camera_from = "selected"
+
+[[block]]
+experiment = "A1"
+name = "F2_main_1"
+protocol = "main_1"
+optical_state = "F2"
+estimated_points = 24
+estimated_seconds = 1090.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+camera_from = "selected"
+
+[[block]]
+experiment = "A1"
+name = "F2_main_2"
+protocol = "main_2"
+optical_state = "F2"
+estimated_points = 22
+estimated_seconds = 624.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+camera_from = "selected"
+
+[[block]]
+experiment = "A1"
+name = "F2_main_3"
+protocol = "main_3"
+optical_state = "F2"
+estimated_points = 24
+estimated_seconds = 624.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+camera_from = "selected"
+
+[[block]]
+experiment = "A2"
+name = "F2_latency"
+protocol = "latency_core"
+optical_state = "F2"
+estimated_points = 3
+estimated_seconds = 192.75
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+camera_from = "selected"
+
+[[block]]
+experiment = "A2"
+name = "F2_cadence"
+protocol = "latency_cadence"
+optical_state = "F2"
+estimated_points = 2
+estimated_seconds = 153.5
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+camera_from = "selected"
+
+[[block]]
+experiment = "A2"
+name = "F2_heldout"
+protocol = "heldout_temporal"
+optical_state = "F2"
+estimated_points = 4
+estimated_seconds = 205.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+camera_from = "selected"
+
+[[block]]
+experiment = "A4"
+name = "F2_background_post"
+protocol = "static_final"
+optical_state = "F2"
+estimated_points = 1
+estimated_seconds = 111.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+camera_from = "selected"
+
+[[block]]
+experiment = "A4"
+name = "F1_background_pre"
+protocol = "static_final"
+optical_state = "F1"
+estimated_points = 1
+estimated_seconds = 111.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+camera_from = "selected"
+
+[[block]]
+experiment = "A1"
+name = "F1_main_1"
+protocol = "main_1"
+optical_state = "F1"
+estimated_points = 24
+estimated_seconds = 1090.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+camera_from = "selected"
+
+[[block]]
+experiment = "A1"
+name = "F1_main_2"
+protocol = "main_2"
+optical_state = "F1"
+estimated_points = 22
+estimated_seconds = 624.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+camera_from = "selected"
+
+[[block]]
+experiment = "A1"
+name = "F1_main_3"
+protocol = "main_3"
+optical_state = "F1"
+estimated_points = 24
+estimated_seconds = 624.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+camera_from = "selected"
+
+[[block]]
+experiment = "A2"
+name = "F1_latency"
+protocol = "latency_core"
+optical_state = "F1"
+estimated_points = 3
+estimated_seconds = 192.75
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+camera_from = "selected"
+
+[[block]]
+experiment = "A4"
+name = "F1_background_post"
+protocol = "static_final"
+optical_state = "F1"
+estimated_points = 1
+estimated_seconds = 111.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+camera_from = "selected"
+
+[[block]]
+experiment = "A4"
+name = "closing_background"
+protocol = "static_final"
+optical_state = "F2"
+estimated_points = 1
+estimated_seconds = 111.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+camera_from = "selected"
+closing = true
+
+[[block]]
+experiment = "A1"
+name = "closing_response"
+protocol = "closing_response"
+optical_state = "F2"
+estimated_points = 2
+estimated_seconds = 52.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+camera_from = "selected"
+closing = true
+
+[[block]]
+experiment = "A4"
+name = "laser_off_close"
+protocol = "static_final"
+optical_state = "DARK"
+estimated_points = 1
+estimated_seconds = 111.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+camera_from = "selected"
+closing = true

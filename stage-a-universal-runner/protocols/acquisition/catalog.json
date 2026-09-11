@@ -1,0 +1,226 @@
+[
+  {
+    "name": "static_final",
+    "experiment": "A4",
+    "extension": "toml",
+    "points": 1,
+    "seconds": 111.0,
+    "path": "stage-a-universal-runner/protocols/acquisition/static_final.toml"
+  },
+  {
+    "name": "static_screen",
+    "experiment": "A4",
+    "extension": "toml",
+    "points": 1,
+    "seconds": 66.0,
+    "path": "stage-a-universal-runner/protocols/acquisition/static_screen.toml"
+  },
+  {
+    "name": "static_finalist",
+    "experiment": "A4",
+    "extension": "toml",
+    "points": 1,
+    "seconds": 66.0,
+    "path": "stage-a-universal-runner/protocols/acquisition/static_finalist.toml"
+  },
+  {
+    "name": "static_smoke",
+    "experiment": "A4",
+    "extension": "toml",
+    "points": 1,
+    "seconds": 23.0,
+    "path": "stage-a-universal-runner/protocols/acquisition/static_smoke.toml"
+  },
+  {
+    "name": "sine_smoke",
+    "experiment": "A1",
+    "extension": "csv",
+    "points": 1,
+    "seconds": 16.0,
+    "path": "stage-a-universal-runner/protocols/acquisition/sine_smoke.csv"
+  },
+  {
+    "name": "steps_smoke",
+    "experiment": "A2",
+    "extension": "toml",
+    "points": 1,
+    "seconds": 18.25,
+    "path": "stage-a-universal-runner/protocols/acquisition/steps_smoke.toml"
+  },
+  {
+    "name": "load_smoke",
+    "experiment": "A5",
+    "extension": "toml",
+    "points": 1,
+    "seconds": 20.25,
+    "path": "stage-a-universal-runner/protocols/acquisition/load_smoke.toml"
+  },
+  {
+    "name": "screen_response",
+    "experiment": "A1",
+    "extension": "csv",
+    "points": 7,
+    "seconds": 210.0,
+    "path": "stage-a-universal-runner/protocols/acquisition/screen_response.csv"
+  },
+  {
+    "name": "screen_reference",
+    "experiment": "A1",
+    "extension": "csv",
+    "points": 2,
+    "seconds": 48.0,
+    "path": "stage-a-universal-runner/protocols/acquisition/screen_reference.csv"
+  },
+  {
+    "name": "finalist_response",
+    "experiment": "A1",
+    "extension": "csv",
+    "points": 4,
+    "seconds": 106.0,
+    "path": "stage-a-universal-runner/protocols/acquisition/finalist_response.csv"
+  },
+  {
+    "name": "main_1",
+    "experiment": "A1",
+    "extension": "csv",
+    "points": 24,
+    "seconds": 1090.0,
+    "path": "stage-a-universal-runner/protocols/acquisition/main_1.csv"
+  },
+  {
+    "name": "main_2",
+    "experiment": "A1",
+    "extension": "csv",
+    "points": 22,
+    "seconds": 624.0,
+    "path": "stage-a-universal-runner/protocols/acquisition/main_2.csv"
+  },
+  {
+    "name": "main_3",
+    "experiment": "A1",
+    "extension": "csv",
+    "points": 24,
+    "seconds": 624.0,
+    "path": "stage-a-universal-runner/protocols/acquisition/main_3.csv"
+  },
+  {
+    "name": "main_complete",
+    "experiment": "A1",
+    "extension": "csv",
+    "points": 70,
+    "seconds": 2338.0,
+    "path": "stage-a-universal-runner/protocols/acquisition/main_complete.csv"
+  },
+  {
+    "name": "lower_1",
+    "experiment": "A1",
+    "extension": "csv",
+    "points": 24,
+    "seconds": 1090.0,
+    "path": "stage-a-universal-runner/protocols/acquisition/lower_1.csv"
+  },
+  {
+    "name": "lower_2",
+    "experiment": "A1",
+    "extension": "csv",
+    "points": 22,
+    "seconds": 624.0,
+    "path": "stage-a-universal-runner/protocols/acquisition/lower_2.csv"
+  },
+  {
+    "name": "lower_3",
+    "experiment": "A1",
+    "extension": "csv",
+    "points": 24,
+    "seconds": 624.0,
+    "path": "stage-a-universal-runner/protocols/acquisition/lower_3.csv"
+  },
+  {
+    "name": "lower_complete",
+    "experiment": "A1",
+    "extension": "csv",
+    "points": 70,
+    "seconds": 2338.0,
+    "path": "stage-a-universal-runner/protocols/acquisition/lower_complete.csv"
+  },
+  {
+    "name": "bright_bridge",
+    "experiment": "A1",
+    "extension": "csv",
+    "points": 6,
+    "seconds": 156.0,
+    "path": "stage-a-universal-runner/protocols/acquisition/bright_bridge.csv"
+  },
+  {
+    "name": "intermediate_bridge",
+    "experiment": "A1",
+    "extension": "csv",
+    "points": 8,
+    "seconds": 234.0,
+    "path": "stage-a-universal-runner/protocols/acquisition/intermediate_bridge.csv"
+  },
+  {
+    "name": "closing_response",
+    "experiment": "A1",
+    "extension": "csv",
+    "points": 2,
+    "seconds": 52.0,
+    "path": "stage-a-universal-runner/protocols/acquisition/closing_response.csv"
+  },
+  {
+    "name": "slow_extension",
+    "experiment": "A1",
+    "extension": "csv",
+    "points": 2,
+    "seconds": 470.0,
+    "path": "stage-a-universal-runner/protocols/acquisition/slow_extension.csv"
+  },
+  {
+    "name": "latency_core",
+    "experiment": "A2",
+    "extension": "toml",
+    "points": 3,
+    "seconds": 192.75,
+    "path": "stage-a-universal-runner/protocols/acquisition/latency_core.toml"
+  },
+  {
+    "name": "latency_cadence",
+    "experiment": "A2",
+    "extension": "toml",
+    "points": 2,
+    "seconds": 153.5,
+    "path": "stage-a-universal-runner/protocols/acquisition/latency_cadence.toml"
+  },
+  {
+    "name": "latency_bridge",
+    "experiment": "A2",
+    "extension": "toml",
+    "points": 2,
+    "seconds": 228.5,
+    "path": "stage-a-universal-runner/protocols/acquisition/latency_bridge.toml"
+  },
+  {
+    "name": "heldout_temporal",
+    "experiment": "A2",
+    "extension": "toml",
+    "points": 4,
+    "seconds": 205.0,
+    "path": "stage-a-universal-runner/protocols/acquisition/heldout_temporal.toml"
+  },
+  {
+    "name": "load_recovery",
+    "experiment": "A5",
+    "extension": "toml",
+    "points": 6,
+    "seconds": 319.5,
+    "path": "stage-a-universal-runner/protocols/acquisition/load_recovery.toml"
+  },
+  {
+    "name": "load_roi_compare",
+    "experiment": "A5",
+    "extension": "toml",
+    "points": 1,
+    "seconds": 17.25,
+    "path": "stage-a-universal-runner/protocols/acquisition/load_roi_compare.toml"
+  }
+]

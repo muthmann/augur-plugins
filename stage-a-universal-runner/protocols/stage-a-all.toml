@@ -1,0 +1,44 @@
+# Generated from actual owner rows. Do not edit timing independently.
+name = "stage-a-all"
+version = "20260911-v5-4h"
+program = "bright_reference"
+overhead_s_per_point = 11.0
+
+[[optical_states]]
+id = "F0"
+label = "F0"
+target_camera_lux = "about 8"
+operator_action = "Switch the laser on. Set the AOD for about 8 camera-lux; wait for stable readback."
+
+[[block]]
+experiment = "A1"
+name = "bright_bridge"
+protocol = "bright_bridge"
+optical_state = "F0"
+estimated_points = 6
+estimated_seconds = 156.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+camera_from = "selected"
+
+[[block]]
+experiment = "A4"
+name = "static_final"
+protocol = "static_final"
+optical_state = "F0"
+estimated_points = 1
+estimated_seconds = 111.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+camera_from = "selected"
+
+[[block]]
+experiment = "A5"
+name = "load_recovery"
+protocol = "load_recovery"
+optical_state = "F0"
+estimated_points = 6
+estimated_seconds = 319.5
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+camera_from = "selected"

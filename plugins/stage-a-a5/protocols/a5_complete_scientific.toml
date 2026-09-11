@@ -1,0 +1,78 @@
+# A5: refractory/load acquisition at the current confirmed camera state.
+# The A5 adapter reuses the coordinated RAW + PDQ transport engine. Analyse
+# rates, ISIs, polarity separation and ROI/global-load effects offline.
+name = "a5-complete-scientific"
+timing_reference = "drive_sync"
+trigger_validation = "offline_review"
+
+[[point]]
+label = "a5_reference_start"
+role = "reference"
+acquisition_mode = "stepped"
+mean_u = 0.30
+depth_a = 0.50
+half_period_s = 0.50
+transitions_per_polarity = 100
+settle_s = 10
+pause_before = true
+
+[[point]]
+label = "a5_slew_slow"
+role = "log_slew"
+acquisition_mode = "stepped"
+mean_u = 0.30
+depth_a = 0.20
+half_period_s = 0.10
+transitions_per_polarity = 100
+settle_s = 5
+
+[[point]]
+label = "a5_slew_mid"
+role = "log_slew"
+acquisition_mode = "stepped"
+mean_u = 0.30
+depth_a = 0.50
+half_period_s = 0.01
+transitions_per_polarity = 100
+settle_s = 5
+
+[[point]]
+label = "a5_slew_fast"
+role = "log_slew"
+acquisition_mode = "stepped"
+mean_u = 0.30
+depth_a = 1.00
+half_period_s = 0.001
+transitions_per_polarity = 100
+settle_s = 5
+
+[[point]]
+label = "a5_polarity"
+role = "polarity_check"
+acquisition_mode = "stepped"
+mean_u = 0.30
+depth_a = 1.00
+half_period_s = 0.001
+transitions_per_polarity = 200
+settle_s = 5
+pause_before = true
+
+[[point]]
+label = "a5_load_repeat"
+role = "load_diagnostic"
+acquisition_mode = "stepped"
+mean_u = 0.30
+depth_a = 0.50
+half_period_s = 0.001
+transitions_per_polarity = 200
+settle_s = 5
+
+[[point]]
+label = "a5_reference_end"
+role = "reference"
+acquisition_mode = "stepped"
+mean_u = 0.30
+depth_a = 0.50
+half_period_s = 0.50
+transitions_per_polarity = 100
+settle_s = 10

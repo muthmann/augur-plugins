@@ -1,4 +1,4 @@
-use augur_plugin_evesmlm_fitting::EveLocalizationResults;
+use evesmlm_types::EveLocalizationResults;
 
 pub fn estimate_correction_shift(
     reference_points: &[(f64, f64)],

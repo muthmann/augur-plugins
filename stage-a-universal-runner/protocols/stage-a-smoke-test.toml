@@ -1,0 +1,96 @@
+# Generated from actual owner rows. Do not edit timing independently.
+name = "stage-a-smoke-test"
+version = "20260911-v5-4h"
+program = "smoke"
+overhead_s_per_point = 11.0
+
+[[optical_states]]
+id = "F2"
+label = "F2"
+target_camera_lux = "about 0.08"
+operator_action = "Keep the laser on. Set the AOD for about 0.08 camera-lux; wait for stable readback."
+
+[[block]]
+experiment = "A1"
+name = "a1"
+protocol = "sine_smoke"
+optical_state = "F2"
+estimated_points = 1
+estimated_seconds = 16.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+[block.camera]
+diff_on = -15
+diff_off = -2
+fo = 53
+hpf = 0
+refr = 235
+filters_off = true
+
+[[block]]
+experiment = "A2"
+name = "a2"
+protocol = "steps_smoke"
+optical_state = "F2"
+estimated_points = 1
+estimated_seconds = 18.25
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+[block.camera]
+diff_on = -15
+diff_off = -2
+fo = 53
+hpf = 0
+refr = 235
+filters_off = true
+
+[[block]]
+experiment = "A3"
+name = "a3"
+protocol = "sine_smoke"
+optical_state = "F2"
+estimated_points = 1
+estimated_seconds = 16.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+[block.camera]
+diff_on = -15
+diff_off = -2
+fo = 53
+hpf = 0
+refr = 235
+filters_off = true
+
+[[block]]
+experiment = "A4"
+name = "a4"
+protocol = "static_smoke"
+optical_state = "F2"
+estimated_points = 1
+estimated_seconds = 23.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+[block.camera]
+diff_on = -15
+diff_off = -2
+fo = 53
+hpf = 0
+refr = 235
+filters_off = true
+
+[[block]]
+experiment = "A5"
+name = "a5"
+protocol = "load_smoke"
+optical_state = "F2"
+estimated_points = 1
+estimated_seconds = 20.25
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+[block.camera]
+diff_on = -15
+diff_off = -2
+fo = 53
+hpf = 0
+refr = 235
+filters_off = true

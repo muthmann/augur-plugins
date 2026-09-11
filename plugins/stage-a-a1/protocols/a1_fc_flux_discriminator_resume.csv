@@ -1,0 +1,299 @@
+# A1 Drei-Fluss-Tiefensteigung — f_c proportional I Discriminator
+# Zweck: den korrigierten Tiefensteigungs-Pol bei drei Flusswerten messen.
+# Primaer: beta_p(f)=d E[N_p]/da aus vollstaendigen Triggerzyklen; Intercept frei.
+# Piloten, Floors, Referenzen und verschiedene mean_u niemals als Grid poolen.
+# 
+# Frequenzen: 5, 12.5, 25, 50, 100, 160, 220, 280, 350, 450, 640, 800 Hz.
+# Sechs Tiefen je Frequenz: 0.15, 0.28, 0.45, 0.80, 1.30, 1.70.
+# 220 Hz wird in beiden Paessen wiederholt und ist die Zustands-/Driftbruecke.
+# Pass B kehrt Frequenz- und Flussrichtung um; Tiefenrichtung wechselt je Frequenz.
+# 640/800 Hz sind Censoring-/Null-Guards und werden nur bei bestandener Linearitaet
+# in einen Fit aufgenommen. Fitband vor dem Fit gemeinsam fuer alle Fluesse festlegen.
+# 
+# VORHER: a1_lux_dark_offset.csv blockiert, danach a1_illuminated_smoke.csv
+# beleuchtet und mit Depth a source = Photodiode measured erfolgreich fahren.
+# Bias-v1, ROI, Probe, Optik, Kalibration und PD-Last bleiben ueber beide Paesse fest.
+# Ausfuehrbare Aufbau-/Abbruchregeln: knowledge base/experiments/A1-bode/
+# next-flux-discriminator-protocol.md.
+#
+#
+# FORTSETZUNG: erzeugt aus a1_fc_flux_discriminator.csv
+# (sha256 336668dfb5520c0994f4cc9662da1a01f9967509dbcaaadae19d47ab26264953).
+# Punkte 1-41 von 297 sind in Session A1-20260907-bb52 bereits aufgenommen und
+# hier entfernt. Diese Datei beginnt bei Punkt 42 des Originals (grid_a, mean_u=0.15,
+# 640 Hz, depth_a=1.30). Punktnummern in dieser Datei zaehlen wieder ab 1.
+# Bias-v1, ROI, Probe, Optik, Kalibration und PD-Last muessen unveraendert bleiben.
+# Umfang: 256 Recordings, ~145 min reine Aufnahmezeit (inkl. 11 s Overhead je Recording)
+camera_profile,label,mean_u,frequency_hz,depth_a,duration_s,settle_s,role
+#
+# === a: Frequenzen [5.0, 25.0, 100.0, 220.0, 350.0, 640.0]; Flussfolge [0.15, 0.3, 0.45]
+#
+# --- a, mean_u=0.15
+A1-bias-v1-monitoring,grid_a,0.15,640,1.30,20,3,
+A1-bias-v1-monitoring,grid_a,0.15,640,0.80,20,3,
+A1-bias-v1-monitoring,grid_a,0.15,640,0.45,20,3,
+A1-bias-v1-monitoring,grid_a,0.15,640,0.28,20,3,
+A1-bias-v1-monitoring,grid_a,0.15,640,0.15,20,3,
+A1-bias-v1-monitoring,ref,0.15,220,0.80,20,3,
+A1-bias-v1-monitoring,ref,0.15,220,0.80,20,3,
+#
+# --- a, mean_u=0.30
+A1-bias-v1-monitoring,floor_a,0.30,5,0.02,20,8,background
+A1-bias-v1-monitoring,windows_a,0.30,5,1.70,20,3,pilot
+A1-bias-v1-monitoring,floor_a,0.30,100,0.02,20,3,background
+A1-bias-v1-monitoring,windows_a,0.30,100,1.70,20,3,pilot
+A1-bias-v1-monitoring,floor_a,0.30,350,0.02,20,3,background
+A1-bias-v1-monitoring,windows_a,0.30,350,1.70,20,3,pilot
+A1-bias-v1-monitoring,ref,0.30,220,0.80,20,3,
+A1-bias-v1-monitoring,ref,0.30,220,0.80,20,3,
+A1-bias-v1-monitoring,grid_a,0.30,5,0.15,20,3,
+A1-bias-v1-monitoring,grid_a,0.30,5,0.28,20,3,
+A1-bias-v1-monitoring,grid_a,0.30,5,0.45,20,3,
+A1-bias-v1-monitoring,grid_a,0.30,5,0.80,20,3,
+A1-bias-v1-monitoring,grid_a,0.30,5,1.30,20,3,
+A1-bias-v1-monitoring,grid_a,0.30,5,1.70,20,3,
+A1-bias-v1-monitoring,grid_a,0.30,25,1.70,20,3,
+A1-bias-v1-monitoring,grid_a,0.30,25,1.30,20,3,
+A1-bias-v1-monitoring,grid_a,0.30,25,0.80,20,3,
+A1-bias-v1-monitoring,grid_a,0.30,25,0.45,20,3,
+A1-bias-v1-monitoring,grid_a,0.30,25,0.28,20,3,
+A1-bias-v1-monitoring,grid_a,0.30,25,0.15,20,3,
+A1-bias-v1-monitoring,ref,0.30,220,0.80,20,3,
+A1-bias-v1-monitoring,grid_a,0.30,100,0.15,20,3,
+A1-bias-v1-monitoring,grid_a,0.30,100,0.28,20,3,
+A1-bias-v1-monitoring,grid_a,0.30,100,0.45,20,3,
+A1-bias-v1-monitoring,grid_a,0.30,100,0.80,20,3,
+A1-bias-v1-monitoring,grid_a,0.30,100,1.30,20,3,
+A1-bias-v1-monitoring,grid_a,0.30,100,1.70,20,3,
+A1-bias-v1-monitoring,grid_a,0.30,220,1.70,20,3,
+A1-bias-v1-monitoring,grid_a,0.30,220,1.30,20,3,
+A1-bias-v1-monitoring,grid_a,0.30,220,0.80,20,3,
+A1-bias-v1-monitoring,grid_a,0.30,220,0.45,20,3,
+A1-bias-v1-monitoring,grid_a,0.30,220,0.28,20,3,
+A1-bias-v1-monitoring,grid_a,0.30,220,0.15,20,3,
+A1-bias-v1-monitoring,ref,0.30,220,0.80,20,3,
+A1-bias-v1-monitoring,grid_a,0.30,350,0.15,20,3,
+A1-bias-v1-monitoring,grid_a,0.30,350,0.28,20,3,
+A1-bias-v1-monitoring,grid_a,0.30,350,0.45,20,3,
+A1-bias-v1-monitoring,grid_a,0.30,350,0.80,20,3,
+A1-bias-v1-monitoring,grid_a,0.30,350,1.30,20,3,
+A1-bias-v1-monitoring,grid_a,0.30,350,1.70,20,3,
+A1-bias-v1-monitoring,grid_a,0.30,640,1.70,20,3,
+A1-bias-v1-monitoring,grid_a,0.30,640,1.30,20,3,
+A1-bias-v1-monitoring,grid_a,0.30,640,0.80,20,3,
+A1-bias-v1-monitoring,grid_a,0.30,640,0.45,20,3,
+A1-bias-v1-monitoring,grid_a,0.30,640,0.28,20,3,
+A1-bias-v1-monitoring,grid_a,0.30,640,0.15,20,3,
+A1-bias-v1-monitoring,ref,0.30,220,0.80,20,3,
+A1-bias-v1-monitoring,ref,0.30,220,0.80,20,3,
+#
+# --- a, mean_u=0.45
+A1-bias-v1-monitoring,floor_a,0.45,5,0.02,20,8,background
+A1-bias-v1-monitoring,windows_a,0.45,5,1.70,20,3,pilot
+A1-bias-v1-monitoring,floor_a,0.45,100,0.02,20,3,background
+A1-bias-v1-monitoring,windows_a,0.45,100,1.70,20,3,pilot
+A1-bias-v1-monitoring,floor_a,0.45,350,0.02,20,3,background
+A1-bias-v1-monitoring,windows_a,0.45,350,1.70,20,3,pilot
+A1-bias-v1-monitoring,ref,0.45,220,0.80,20,3,
+A1-bias-v1-monitoring,ref,0.45,220,0.80,20,3,
+A1-bias-v1-monitoring,grid_a,0.45,5,0.15,20,3,
+A1-bias-v1-monitoring,grid_a,0.45,5,0.28,20,3,
+A1-bias-v1-monitoring,grid_a,0.45,5,0.45,20,3,
+A1-bias-v1-monitoring,grid_a,0.45,5,0.80,20,3,
+A1-bias-v1-monitoring,grid_a,0.45,5,1.30,20,3,
+A1-bias-v1-monitoring,grid_a,0.45,5,1.70,20,3,
+A1-bias-v1-monitoring,grid_a,0.45,25,1.70,20,3,
+A1-bias-v1-monitoring,grid_a,0.45,25,1.30,20,3,
+A1-bias-v1-monitoring,grid_a,0.45,25,0.80,20,3,
+A1-bias-v1-monitoring,grid_a,0.45,25,0.45,20,3,
+A1-bias-v1-monitoring,grid_a,0.45,25,0.28,20,3,
+A1-bias-v1-monitoring,grid_a,0.45,25,0.15,20,3,
+A1-bias-v1-monitoring,ref,0.45,220,0.80,20,3,
+A1-bias-v1-monitoring,grid_a,0.45,100,0.15,20,3,
+A1-bias-v1-monitoring,grid_a,0.45,100,0.28,20,3,
+A1-bias-v1-monitoring,grid_a,0.45,100,0.45,20,3,
+A1-bias-v1-monitoring,grid_a,0.45,100,0.80,20,3,
+A1-bias-v1-monitoring,grid_a,0.45,100,1.30,20,3,
+A1-bias-v1-monitoring,grid_a,0.45,100,1.70,20,3,
+A1-bias-v1-monitoring,grid_a,0.45,220,1.70,20,3,
+A1-bias-v1-monitoring,grid_a,0.45,220,1.30,20,3,
+A1-bias-v1-monitoring,grid_a,0.45,220,0.80,20,3,
+A1-bias-v1-monitoring,grid_a,0.45,220,0.45,20,3,
+A1-bias-v1-monitoring,grid_a,0.45,220,0.28,20,3,
+A1-bias-v1-monitoring,grid_a,0.45,220,0.15,20,3,
+A1-bias-v1-monitoring,ref,0.45,220,0.80,20,3,
+A1-bias-v1-monitoring,grid_a,0.45,350,0.15,20,3,
+A1-bias-v1-monitoring,grid_a,0.45,350,0.28,20,3,
+A1-bias-v1-monitoring,grid_a,0.45,350,0.45,20,3,
+A1-bias-v1-monitoring,grid_a,0.45,350,0.80,20,3,
+A1-bias-v1-monitoring,grid_a,0.45,350,1.30,20,3,
+A1-bias-v1-monitoring,grid_a,0.45,350,1.70,20,3,
+A1-bias-v1-monitoring,grid_a,0.45,640,1.70,20,3,
+A1-bias-v1-monitoring,grid_a,0.45,640,1.30,20,3,
+A1-bias-v1-monitoring,grid_a,0.45,640,0.80,20,3,
+A1-bias-v1-monitoring,grid_a,0.45,640,0.45,20,3,
+A1-bias-v1-monitoring,grid_a,0.45,640,0.28,20,3,
+A1-bias-v1-monitoring,grid_a,0.45,640,0.15,20,3,
+A1-bias-v1-monitoring,ref,0.45,220,0.80,20,3,
+A1-bias-v1-monitoring,ref,0.45,220,0.80,20,3,
+#
+# === b: Frequenzen [800.0, 450.0, 280.0, 220.0, 160.0, 50.0, 12.5]; Flussfolge [0.45, 0.3, 0.15]
+#
+# --- b, mean_u=0.45
+A1-bias-v1-monitoring,floor_b,0.45,800,0.02,20,8,background
+A1-bias-v1-monitoring,windows_b,0.45,800,1.70,20,3,pilot
+A1-bias-v1-monitoring,ref,0.45,220,0.80,20,3,
+A1-bias-v1-monitoring,ref,0.45,220,0.80,20,3,
+A1-bias-v1-monitoring,grid_b,0.45,800,0.15,20,3,
+A1-bias-v1-monitoring,grid_b,0.45,800,0.28,20,3,
+A1-bias-v1-monitoring,grid_b,0.45,800,0.45,20,3,
+A1-bias-v1-monitoring,grid_b,0.45,800,0.80,20,3,
+A1-bias-v1-monitoring,grid_b,0.45,800,1.30,20,3,
+A1-bias-v1-monitoring,grid_b,0.45,800,1.70,20,3,
+A1-bias-v1-monitoring,grid_b,0.45,450,1.70,20,3,
+A1-bias-v1-monitoring,grid_b,0.45,450,1.30,20,3,
+A1-bias-v1-monitoring,grid_b,0.45,450,0.80,20,3,
+A1-bias-v1-monitoring,grid_b,0.45,450,0.45,20,3,
+A1-bias-v1-monitoring,grid_b,0.45,450,0.28,20,3,
+A1-bias-v1-monitoring,grid_b,0.45,450,0.15,20,3,
+A1-bias-v1-monitoring,ref,0.45,220,0.80,20,3,
+A1-bias-v1-monitoring,grid_b,0.45,280,0.15,20,3,
+A1-bias-v1-monitoring,grid_b,0.45,280,0.28,20,3,
+A1-bias-v1-monitoring,grid_b,0.45,280,0.45,20,3,
+A1-bias-v1-monitoring,grid_b,0.45,280,0.80,20,3,
+A1-bias-v1-monitoring,grid_b,0.45,280,1.30,20,3,
+A1-bias-v1-monitoring,grid_b,0.45,280,1.70,20,3,
+A1-bias-v1-monitoring,grid_b,0.45,220,1.70,20,3,
+A1-bias-v1-monitoring,grid_b,0.45,220,1.30,20,3,
+A1-bias-v1-monitoring,grid_b,0.45,220,0.80,20,3,
+A1-bias-v1-monitoring,grid_b,0.45,220,0.45,20,3,
+A1-bias-v1-monitoring,grid_b,0.45,220,0.28,20,3,
+A1-bias-v1-monitoring,grid_b,0.45,220,0.15,20,3,
+A1-bias-v1-monitoring,ref,0.45,220,0.80,20,3,
+A1-bias-v1-monitoring,grid_b,0.45,160,0.15,20,3,
+A1-bias-v1-monitoring,grid_b,0.45,160,0.28,20,3,
+A1-bias-v1-monitoring,grid_b,0.45,160,0.45,20,3,
+A1-bias-v1-monitoring,grid_b,0.45,160,0.80,20,3,
+A1-bias-v1-monitoring,grid_b,0.45,160,1.30,20,3,
+A1-bias-v1-monitoring,grid_b,0.45,160,1.70,20,3,
+A1-bias-v1-monitoring,grid_b,0.45,50,1.70,20,3,
+A1-bias-v1-monitoring,grid_b,0.45,50,1.30,20,3,
+A1-bias-v1-monitoring,grid_b,0.45,50,0.80,20,3,
+A1-bias-v1-monitoring,grid_b,0.45,50,0.45,20,3,
+A1-bias-v1-monitoring,grid_b,0.45,50,0.28,20,3,
+A1-bias-v1-monitoring,grid_b,0.45,50,0.15,20,3,
+A1-bias-v1-monitoring,ref,0.45,220,0.80,20,3,
+A1-bias-v1-monitoring,grid_b,0.45,12.5,0.15,20,3,
+A1-bias-v1-monitoring,grid_b,0.45,12.5,0.28,20,3,
+A1-bias-v1-monitoring,grid_b,0.45,12.5,0.45,20,3,
+A1-bias-v1-monitoring,grid_b,0.45,12.5,0.80,20,3,
+A1-bias-v1-monitoring,grid_b,0.45,12.5,1.30,20,3,
+A1-bias-v1-monitoring,grid_b,0.45,12.5,1.70,20,3,
+A1-bias-v1-monitoring,ref,0.45,220,0.80,20,3,
+A1-bias-v1-monitoring,ref,0.45,220,0.80,20,3,
+#
+# --- b, mean_u=0.30
+A1-bias-v1-monitoring,floor_b,0.30,800,0.02,20,8,background
+A1-bias-v1-monitoring,windows_b,0.30,800,1.70,20,3,pilot
+A1-bias-v1-monitoring,ref,0.30,220,0.80,20,3,
+A1-bias-v1-monitoring,ref,0.30,220,0.80,20,3,
+A1-bias-v1-monitoring,grid_b,0.30,800,0.15,20,3,
+A1-bias-v1-monitoring,grid_b,0.30,800,0.28,20,3,
+A1-bias-v1-monitoring,grid_b,0.30,800,0.45,20,3,
+A1-bias-v1-monitoring,grid_b,0.30,800,0.80,20,3,
+A1-bias-v1-monitoring,grid_b,0.30,800,1.30,20,3,
+A1-bias-v1-monitoring,grid_b,0.30,800,1.70,20,3,
+A1-bias-v1-monitoring,grid_b,0.30,450,1.70,20,3,
+A1-bias-v1-monitoring,grid_b,0.30,450,1.30,20,3,
+A1-bias-v1-monitoring,grid_b,0.30,450,0.80,20,3,
+A1-bias-v1-monitoring,grid_b,0.30,450,0.45,20,3,
+A1-bias-v1-monitoring,grid_b,0.30,450,0.28,20,3,
+A1-bias-v1-monitoring,grid_b,0.30,450,0.15,20,3,
+A1-bias-v1-monitoring,ref,0.30,220,0.80,20,3,
+A1-bias-v1-monitoring,grid_b,0.30,280,0.15,20,3,
+A1-bias-v1-monitoring,grid_b,0.30,280,0.28,20,3,
+A1-bias-v1-monitoring,grid_b,0.30,280,0.45,20,3,
+A1-bias-v1-monitoring,grid_b,0.30,280,0.80,20,3,
+A1-bias-v1-monitoring,grid_b,0.30,280,1.30,20,3,
+A1-bias-v1-monitoring,grid_b,0.30,280,1.70,20,3,
+A1-bias-v1-monitoring,grid_b,0.30,220,1.70,20,3,
+A1-bias-v1-monitoring,grid_b,0.30,220,1.30,20,3,
+A1-bias-v1-monitoring,grid_b,0.30,220,0.80,20,3,
+A1-bias-v1-monitoring,grid_b,0.30,220,0.45,20,3,
+A1-bias-v1-monitoring,grid_b,0.30,220,0.28,20,3,
+A1-bias-v1-monitoring,grid_b,0.30,220,0.15,20,3,
+A1-bias-v1-monitoring,ref,0.30,220,0.80,20,3,
+A1-bias-v1-monitoring,grid_b,0.30,160,0.15,20,3,
+A1-bias-v1-monitoring,grid_b,0.30,160,0.28,20,3,
+A1-bias-v1-monitoring,grid_b,0.30,160,0.45,20,3,
+A1-bias-v1-monitoring,grid_b,0.30,160,0.80,20,3,
+A1-bias-v1-monitoring,grid_b,0.30,160,1.30,20,3,
+A1-bias-v1-monitoring,grid_b,0.30,160,1.70,20,3,
+A1-bias-v1-monitoring,grid_b,0.30,50,1.70,20,3,
+A1-bias-v1-monitoring,grid_b,0.30,50,1.30,20,3,
+A1-bias-v1-monitoring,grid_b,0.30,50,0.80,20,3,
+A1-bias-v1-monitoring,grid_b,0.30,50,0.45,20,3,
+A1-bias-v1-monitoring,grid_b,0.30,50,0.28,20,3,
+A1-bias-v1-monitoring,grid_b,0.30,50,0.15,20,3,
+A1-bias-v1-monitoring,ref,0.30,220,0.80,20,3,
+A1-bias-v1-monitoring,grid_b,0.30,12.5,0.15,20,3,
+A1-bias-v1-monitoring,grid_b,0.30,12.5,0.28,20,3,
+A1-bias-v1-monitoring,grid_b,0.30,12.5,0.45,20,3,
+A1-bias-v1-monitoring,grid_b,0.30,12.5,0.80,20,3,
+A1-bias-v1-monitoring,grid_b,0.30,12.5,1.30,20,3,
+A1-bias-v1-monitoring,grid_b,0.30,12.5,1.70,20,3,
+A1-bias-v1-monitoring,ref,0.30,220,0.80,20,3,
+A1-bias-v1-monitoring,ref,0.30,220,0.80,20,3,
+#
+# --- b, mean_u=0.15
+A1-bias-v1-monitoring,floor_b,0.15,800,0.02,20,8,background
+A1-bias-v1-monitoring,windows_b,0.15,800,1.70,20,3,pilot
+A1-bias-v1-monitoring,ref,0.15,220,0.80,20,3,
+A1-bias-v1-monitoring,ref,0.15,220,0.80,20,3,
+A1-bias-v1-monitoring,grid_b,0.15,800,0.15,20,3,
+A1-bias-v1-monitoring,grid_b,0.15,800,0.28,20,3,
+A1-bias-v1-monitoring,grid_b,0.15,800,0.45,20,3,
+A1-bias-v1-monitoring,grid_b,0.15,800,0.80,20,3,
+A1-bias-v1-monitoring,grid_b,0.15,800,1.30,20,3,
+A1-bias-v1-monitoring,grid_b,0.15,800,1.70,20,3,
+A1-bias-v1-monitoring,grid_b,0.15,450,1.70,20,3,
+A1-bias-v1-monitoring,grid_b,0.15,450,1.30,20,3,
+A1-bias-v1-monitoring,grid_b,0.15,450,0.80,20,3,
+A1-bias-v1-monitoring,grid_b,0.15,450,0.45,20,3,
+A1-bias-v1-monitoring,grid_b,0.15,450,0.28,20,3,
+A1-bias-v1-monitoring,grid_b,0.15,450,0.15,20,3,
+A1-bias-v1-monitoring,ref,0.15,220,0.80,20,3,
+A1-bias-v1-monitoring,grid_b,0.15,280,0.15,20,3,
+A1-bias-v1-monitoring,grid_b,0.15,280,0.28,20,3,
+A1-bias-v1-monitoring,grid_b,0.15,280,0.45,20,3,
+A1-bias-v1-monitoring,grid_b,0.15,280,0.80,20,3,
+A1-bias-v1-monitoring,grid_b,0.15,280,1.30,20,3,
+A1-bias-v1-monitoring,grid_b,0.15,280,1.70,20,3,
+A1-bias-v1-monitoring,grid_b,0.15,220,1.70,20,3,
+A1-bias-v1-monitoring,grid_b,0.15,220,1.30,20,3,
+A1-bias-v1-monitoring,grid_b,0.15,220,0.80,20,3,
+A1-bias-v1-monitoring,grid_b,0.15,220,0.45,20,3,
+A1-bias-v1-monitoring,grid_b,0.15,220,0.28,20,3,
+A1-bias-v1-monitoring,grid_b,0.15,220,0.15,20,3,
+A1-bias-v1-monitoring,ref,0.15,220,0.80,20,3,
+A1-bias-v1-monitoring,grid_b,0.15,160,0.15,20,3,
+A1-bias-v1-monitoring,grid_b,0.15,160,0.28,20,3,
+A1-bias-v1-monitoring,grid_b,0.15,160,0.45,20,3,
+A1-bias-v1-monitoring,grid_b,0.15,160,0.80,20,3,
+A1-bias-v1-monitoring,grid_b,0.15,160,1.30,20,3,
+A1-bias-v1-monitoring,grid_b,0.15,160,1.70,20,3,
+A1-bias-v1-monitoring,grid_b,0.15,50,1.70,20,3,
+A1-bias-v1-monitoring,grid_b,0.15,50,1.30,20,3,
+A1-bias-v1-monitoring,grid_b,0.15,50,0.80,20,3,
+A1-bias-v1-monitoring,grid_b,0.15,50,0.45,20,3,
+A1-bias-v1-monitoring,grid_b,0.15,50,0.28,20,3,
+A1-bias-v1-monitoring,grid_b,0.15,50,0.15,20,3,
+A1-bias-v1-monitoring,ref,0.15,220,0.80,20,3,
+A1-bias-v1-monitoring,grid_b,0.15,12.5,0.15,20,3,
+A1-bias-v1-monitoring,grid_b,0.15,12.5,0.28,20,3,
+A1-bias-v1-monitoring,grid_b,0.15,12.5,0.45,20,3,
+A1-bias-v1-monitoring,grid_b,0.15,12.5,0.80,20,3,
+A1-bias-v1-monitoring,grid_b,0.15,12.5,1.30,20,3,
+A1-bias-v1-monitoring,grid_b,0.15,12.5,1.70,20,3,
+A1-bias-v1-monitoring,ref,0.15,220,0.80,20,3,
+A1-bias-v1-monitoring,ref,0.15,220,0.80,20,3,

@@ -1,0 +1,337 @@
+# Generated from actual owner rows. Do not edit timing independently.
+name = "stage-a-dim-bias-selection"
+version = "20260911-v5-4h"
+program = "dim_bias_selection"
+overhead_s_per_point = 11.0
+wall_clock_limit_s = 3000
+acquisition_cutoff_s = 2700
+
+[[optical_states]]
+id = "F2"
+label = "F2"
+target_camera_lux = "about 0.08"
+operator_action = "Keep the laser on. Set the AOD for about 0.08 camera-lux; wait for stable readback."
+
+[[optical_states]]
+id = "F1"
+label = "F1"
+target_camera_lux = "about 0.8"
+operator_action = "Keep the laser on. Set the AOD for about 0.8 camera-lux; wait for stable readback."
+
+[[block]]
+experiment = "A4"
+name = "F2_B0_static_screen"
+protocol = "static_screen"
+optical_state = "F2"
+estimated_points = 1
+estimated_seconds = 66.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+[block.camera]
+diff_on = 0
+diff_off = 0
+fo = 0
+hpf = 0
+refr = 235
+filters_off = true
+
+[[block]]
+experiment = "A1"
+name = "F2_B0_screen_response"
+protocol = "screen_response"
+optical_state = "F2"
+estimated_points = 7
+estimated_seconds = 210.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+[block.camera]
+diff_on = 0
+diff_off = 0
+fo = 0
+hpf = 0
+refr = 235
+filters_off = true
+
+[[block]]
+experiment = "A4"
+name = "F2_B4_static_screen"
+protocol = "static_screen"
+optical_state = "F2"
+estimated_points = 1
+estimated_seconds = 66.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+[block.camera]
+diff_on = -15
+diff_off = -2
+fo = 53
+hpf = 0
+refr = 235
+filters_off = true
+
+[[block]]
+experiment = "A1"
+name = "F2_B4_screen_response"
+protocol = "screen_response"
+optical_state = "F2"
+estimated_points = 7
+estimated_seconds = 210.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+[block.camera]
+diff_on = -15
+diff_off = -2
+fo = 53
+hpf = 0
+refr = 235
+filters_off = true
+
+[[block]]
+experiment = "A4"
+name = "F2_B2_static_screen"
+protocol = "static_screen"
+optical_state = "F2"
+estimated_points = 1
+estimated_seconds = 66.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+[block.camera]
+diff_on = -30
+diff_off = -5
+fo = 0
+hpf = 0
+refr = 235
+filters_off = true
+
+[[block]]
+experiment = "A1"
+name = "F2_B2_screen_response"
+protocol = "screen_response"
+optical_state = "F2"
+estimated_points = 7
+estimated_seconds = 210.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+[block.camera]
+diff_on = -30
+diff_off = -5
+fo = 0
+hpf = 0
+refr = 235
+filters_off = true
+
+[[block]]
+experiment = "A4"
+name = "F2_B0_repeat_2_static_screen"
+protocol = "static_screen"
+optical_state = "F2"
+estimated_points = 1
+estimated_seconds = 66.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+[block.camera]
+diff_on = 0
+diff_off = 0
+fo = 0
+hpf = 0
+refr = 235
+filters_off = true
+
+[[block]]
+experiment = "A1"
+name = "F2_B0_repeat_2_screen_reference"
+protocol = "screen_reference"
+optical_state = "F2"
+estimated_points = 2
+estimated_seconds = 48.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+[block.camera]
+diff_on = 0
+diff_off = 0
+fo = 0
+hpf = 0
+refr = 235
+filters_off = true
+
+[[block]]
+experiment = "A4"
+name = "F2_B3_static_screen"
+protocol = "static_screen"
+optical_state = "F2"
+estimated_points = 1
+estimated_seconds = 66.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+[block.camera]
+diff_on = 0
+diff_off = 0
+fo = 53
+hpf = 0
+refr = 235
+filters_off = true
+
+[[block]]
+experiment = "A1"
+name = "F2_B3_screen_response"
+protocol = "screen_response"
+optical_state = "F2"
+estimated_points = 7
+estimated_seconds = 210.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+[block.camera]
+diff_on = 0
+diff_off = 0
+fo = 53
+hpf = 0
+refr = 235
+filters_off = true
+
+[[block]]
+experiment = "A4"
+name = "F2_B1_static_screen"
+protocol = "static_screen"
+optical_state = "F2"
+estimated_points = 1
+estimated_seconds = 66.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+[block.camera]
+diff_on = -15
+diff_off = -2
+fo = 0
+hpf = 0
+refr = 235
+filters_off = true
+
+[[block]]
+experiment = "A1"
+name = "F2_B1_screen_response"
+protocol = "screen_response"
+optical_state = "F2"
+estimated_points = 7
+estimated_seconds = 210.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+[block.camera]
+diff_on = -15
+diff_off = -2
+fo = 0
+hpf = 0
+refr = 235
+filters_off = true
+
+[[block]]
+experiment = "A4"
+name = "F2_B5_static_screen"
+protocol = "static_screen"
+optical_state = "F2"
+estimated_points = 1
+estimated_seconds = 66.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+[block.camera]
+diff_on = -30
+diff_off = -5
+fo = 53
+hpf = 0
+refr = 235
+filters_off = true
+
+[[block]]
+experiment = "A1"
+name = "F2_B5_screen_response"
+protocol = "screen_response"
+optical_state = "F2"
+estimated_points = 7
+estimated_seconds = 210.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+[block.camera]
+diff_on = -30
+diff_off = -5
+fo = 53
+hpf = 0
+refr = 235
+filters_off = true
+
+[[block]]
+experiment = "A4"
+name = "F2_B0_repeat_5_static_screen"
+protocol = "static_screen"
+optical_state = "F2"
+estimated_points = 1
+estimated_seconds = 66.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+[block.camera]
+diff_on = 0
+diff_off = 0
+fo = 0
+hpf = 0
+refr = 235
+filters_off = true
+
+[[block]]
+experiment = "A1"
+name = "F2_B0_repeat_5_screen_reference"
+protocol = "screen_reference"
+optical_state = "F2"
+estimated_points = 2
+estimated_seconds = 48.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+[block.camera]
+diff_on = 0
+diff_off = 0
+fo = 0
+hpf = 0
+refr = 235
+filters_off = true
+
+[[block]]
+experiment = "A4"
+name = "F1_finalist_1_static_finalist"
+protocol = "static_finalist"
+optical_state = "F1"
+estimated_points = 1
+estimated_seconds = 66.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+camera_from = "finalist_1"
+
+[[block]]
+experiment = "A1"
+name = "F1_finalist_1_finalist_response"
+protocol = "finalist_response"
+optical_state = "F1"
+estimated_points = 4
+estimated_seconds = 106.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+camera_from = "finalist_1"
+
+[[block]]
+experiment = "A4"
+name = "F1_finalist_2_static_finalist"
+protocol = "static_finalist"
+optical_state = "F1"
+estimated_points = 1
+estimated_seconds = 66.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+camera_from = "finalist_2"
+closing = true
+
+[[block]]
+experiment = "A1"
+name = "F1_finalist_2_finalist_response"
+protocol = "finalist_response"
+optical_state = "F1"
+estimated_points = 4
+estimated_seconds = 106.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+camera_from = "finalist_2"
+closing = true

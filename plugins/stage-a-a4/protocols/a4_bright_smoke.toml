@@ -1,0 +1,6 @@
+# Short installed-build check with the same automatic bright-reference behavior.
+mode = "current_reference"
+name = "A4 bright installed-build smoke"
+duration_s = 10
+settle_s = 3.0
+repeats = 1

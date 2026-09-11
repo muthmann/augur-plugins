@@ -1,0 +1,27 @@
+# Full A4 matched bright threshold survey; use the confirmed current camera state.
+# Keep the AOD and laser settings used for A1-A3.
+mode = "current_reference"
+name = "A4 matched bright threshold survey"
+duration_s = 120
+settle_s = 10.0
+repeats = 3
+
+[[threshold]]
+diff_on = 0
+diff_off = 0
+
+[[threshold]]
+diff_on = -10
+diff_off = 0
+
+[[threshold]]
+diff_on = 10
+diff_off = 0
+
+[[threshold]]
+diff_on = 0
+diff_off = -5
+
+[[threshold]]
+diff_on = 0
+diff_off = 5

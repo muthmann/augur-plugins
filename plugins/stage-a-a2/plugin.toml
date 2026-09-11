@@ -1,0 +1,14 @@
+id = "stage-a.a2"
+name = "Stage-A A2 Latency"
+version = "0.1.0"
+description = "Runs validated optical step-latency protocols with synchronized camera RAW and photodiode PDQ acquisition."
+domain = "stage-a"
+library = "augur_plugin_stage_a_a2"
+phase = "raw_events"
+min_augur_version = "2.0.2"
+host_commands = [
+  "start_recording",
+  "stop_recording",
+  "apply_camera_configuration",
+  "restore_camera_configuration",
+]

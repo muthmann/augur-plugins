@@ -1,0 +1,477 @@
+# A2 production capture, prepared 2026-09-06.
+# Camera trigger cable must use J24 (digital phase-zero sync), not ACMP output.
+# No online PD-amplitude or comparator-threshold qualification.
+# mean_u remains the GEOMETRIC pedestal in the A2 contract.
+# To match A1 cycle-mean targets, mean_u = target / cosh(depth_a/2), rounded to 0.001.
+# Exact observed flux/depth/t50 are determined from each concurrent PDQ offline.
+# Both polarities of the narrow J24 pulse refer to phase zero; falling is NOT optical OFF.
+name = "a2-production-drive-sync-20260907"
+timing_reference = "drive_sync"
+trigger_validation = "offline_review"
+
+[[point]]
+label = "floor_pre"
+role = "floor_pre_shutter_closed"
+acquisition_mode = "dark"
+duration_s = 30.0
+settle_s = 2.0
+pause_before = true
+
+[[point]]
+label = "blocked_drive_sham"
+role = "blocked_drive_sham"
+acquisition_mode = "stepped"
+mean_u = 0.293
+depth_a = 0.45
+half_period_s = 1.0
+transitions_per_polarity = 50
+settle_s = 3.0
+pause_before = true
+
+[[point]]
+label = "cadence_2s"
+role = "commissioning"
+acquisition_mode = "stepped"
+mean_u = 0.293
+depth_a = 0.45
+half_period_s = 2
+transitions_per_polarity = 50
+settle_s = 3.0
+pause_before = true
+
+[[point]]
+label = "cadence_1s"
+role = "commissioning"
+acquisition_mode = "stepped"
+mean_u = 0.293
+depth_a = 0.45
+half_period_s = 1
+transitions_per_polarity = 50
+settle_s = 3.0
+pause_before = false
+
+[[point]]
+label = "cadence_0p5s"
+role = "commissioning"
+acquisition_mode = "stepped"
+mean_u = 0.293
+depth_a = 0.45
+half_period_s = 0.5
+transitions_per_polarity = 50
+settle_s = 3.0
+pause_before = false
+
+[[point]]
+label = "reference_open"
+role = "reference"
+acquisition_mode = "stepped"
+mean_u = 0.293
+depth_a = 0.45
+half_period_s = 1.0
+transitions_per_polarity = 50
+settle_s = 3.0
+pause_before = false
+
+[[point]]
+label = "grid_a_flux300_a0150"
+role = "identification_pass_a"
+acquisition_mode = "stepped"
+mean_u = 0.299
+depth_a = 0.15
+half_period_s = 1.0
+transitions_per_polarity = 100
+settle_s = 3.0
+pause_before = false
+
+[[point]]
+label = "grid_a_flux300_a0280"
+role = "identification_pass_a"
+acquisition_mode = "stepped"
+mean_u = 0.297
+depth_a = 0.28
+half_period_s = 1.0
+transitions_per_polarity = 100
+settle_s = 3.0
+pause_before = false
+
+[[point]]
+label = "grid_a_flux300_a0450"
+role = "identification_pass_a"
+acquisition_mode = "stepped"
+mean_u = 0.293
+depth_a = 0.45
+half_period_s = 1.0
+transitions_per_polarity = 100
+settle_s = 3.0
+pause_before = false
+
+[[point]]
+label = "grid_a_flux300_a0800"
+role = "identification_pass_a"
+acquisition_mode = "stepped"
+mean_u = 0.278
+depth_a = 0.8
+half_period_s = 1.0
+transitions_per_polarity = 100
+settle_s = 3.0
+pause_before = false
+
+[[point]]
+label = "grid_a_flux300_a1300"
+role = "identification_pass_a"
+acquisition_mode = "stepped"
+mean_u = 0.246
+depth_a = 1.3
+half_period_s = 1.0
+transitions_per_polarity = 100
+settle_s = 3.0
+pause_before = false
+
+[[point]]
+label = "reference_after_a_flux300"
+role = "reference"
+acquisition_mode = "stepped"
+mean_u = 0.293
+depth_a = 0.45
+half_period_s = 1.0
+transitions_per_polarity = 50
+settle_s = 3.0
+pause_before = false
+
+[[point]]
+label = "grid_a_flux150_a1300"
+role = "identification_pass_a"
+acquisition_mode = "stepped"
+mean_u = 0.123
+depth_a = 1.3
+half_period_s = 1.0
+transitions_per_polarity = 100
+settle_s = 3.0
+pause_before = false
+
+[[point]]
+label = "grid_a_flux150_a0800"
+role = "identification_pass_a"
+acquisition_mode = "stepped"
+mean_u = 0.139
+depth_a = 0.8
+half_period_s = 1.0
+transitions_per_polarity = 100
+settle_s = 3.0
+pause_before = false
+
+[[point]]
+label = "grid_a_flux150_a0450"
+role = "identification_pass_a"
+acquisition_mode = "stepped"
+mean_u = 0.146
+depth_a = 0.45
+half_period_s = 1.0
+transitions_per_polarity = 100
+settle_s = 3.0
+pause_before = false
+
+[[point]]
+label = "grid_a_flux150_a0280"
+role = "identification_pass_a"
+acquisition_mode = "stepped"
+mean_u = 0.149
+depth_a = 0.28
+half_period_s = 1.0
+transitions_per_polarity = 100
+settle_s = 3.0
+pause_before = false
+
+[[point]]
+label = "grid_a_flux150_a0150"
+role = "identification_pass_a"
+acquisition_mode = "stepped"
+mean_u = 0.15
+depth_a = 0.15
+half_period_s = 1.0
+transitions_per_polarity = 100
+settle_s = 3.0
+pause_before = false
+
+[[point]]
+label = "reference_after_a_flux150"
+role = "reference"
+acquisition_mode = "stepped"
+mean_u = 0.293
+depth_a = 0.45
+half_period_s = 1.0
+transitions_per_polarity = 50
+settle_s = 3.0
+pause_before = false
+
+[[point]]
+label = "grid_a_flux450_a0150"
+role = "identification_pass_a"
+acquisition_mode = "stepped"
+mean_u = 0.449
+depth_a = 0.15
+half_period_s = 1.0
+transitions_per_polarity = 100
+settle_s = 3.0
+pause_before = false
+
+[[point]]
+label = "grid_a_flux450_a0280"
+role = "identification_pass_a"
+acquisition_mode = "stepped"
+mean_u = 0.446
+depth_a = 0.28
+half_period_s = 1.0
+transitions_per_polarity = 100
+settle_s = 3.0
+pause_before = false
+
+[[point]]
+label = "grid_a_flux450_a0450"
+role = "identification_pass_a"
+acquisition_mode = "stepped"
+mean_u = 0.439
+depth_a = 0.45
+half_period_s = 1.0
+transitions_per_polarity = 100
+settle_s = 3.0
+pause_before = false
+
+[[point]]
+label = "grid_a_flux450_a0800"
+role = "identification_pass_a"
+acquisition_mode = "stepped"
+mean_u = 0.416
+depth_a = 0.8
+half_period_s = 1.0
+transitions_per_polarity = 100
+settle_s = 3.0
+pause_before = false
+
+[[point]]
+label = "grid_a_flux450_a1300"
+role = "identification_pass_a"
+acquisition_mode = "stepped"
+mean_u = 0.369
+depth_a = 1.3
+half_period_s = 1.0
+transitions_per_polarity = 100
+settle_s = 3.0
+pause_before = false
+
+[[point]]
+label = "reference_after_a_flux450"
+role = "reference"
+acquisition_mode = "stepped"
+mean_u = 0.293
+depth_a = 0.45
+half_period_s = 1.0
+transitions_per_polarity = 50
+settle_s = 3.0
+pause_before = false
+
+[[point]]
+label = "grid_b_flux450_a1300"
+role = "identification_pass_b"
+acquisition_mode = "stepped"
+mean_u = 0.369
+depth_a = 1.3
+half_period_s = 1.0
+transitions_per_polarity = 100
+settle_s = 3.0
+pause_before = false
+
+[[point]]
+label = "grid_b_flux450_a0800"
+role = "identification_pass_b"
+acquisition_mode = "stepped"
+mean_u = 0.416
+depth_a = 0.8
+half_period_s = 1.0
+transitions_per_polarity = 100
+settle_s = 3.0
+pause_before = false
+
+[[point]]
+label = "grid_b_flux450_a0450"
+role = "identification_pass_b"
+acquisition_mode = "stepped"
+mean_u = 0.439
+depth_a = 0.45
+half_period_s = 1.0
+transitions_per_polarity = 100
+settle_s = 3.0
+pause_before = false
+
+[[point]]
+label = "grid_b_flux450_a0280"
+role = "identification_pass_b"
+acquisition_mode = "stepped"
+mean_u = 0.446
+depth_a = 0.28
+half_period_s = 1.0
+transitions_per_polarity = 100
+settle_s = 3.0
+pause_before = false
+
+[[point]]
+label = "grid_b_flux450_a0150"
+role = "identification_pass_b"
+acquisition_mode = "stepped"
+mean_u = 0.449
+depth_a = 0.15
+half_period_s = 1.0
+transitions_per_polarity = 100
+settle_s = 3.0
+pause_before = false
+
+[[point]]
+label = "reference_after_b_flux450"
+role = "reference"
+acquisition_mode = "stepped"
+mean_u = 0.293
+depth_a = 0.45
+half_period_s = 1.0
+transitions_per_polarity = 50
+settle_s = 3.0
+pause_before = false
+
+[[point]]
+label = "grid_b_flux150_a0150"
+role = "identification_pass_b"
+acquisition_mode = "stepped"
+mean_u = 0.15
+depth_a = 0.15
+half_period_s = 1.0
+transitions_per_polarity = 100
+settle_s = 3.0
+pause_before = false
+
+[[point]]
+label = "grid_b_flux150_a0280"
+role = "identification_pass_b"
+acquisition_mode = "stepped"
+mean_u = 0.149
+depth_a = 0.28
+half_period_s = 1.0
+transitions_per_polarity = 100
+settle_s = 3.0
+pause_before = false
+
+[[point]]
+label = "grid_b_flux150_a0450"
+role = "identification_pass_b"
+acquisition_mode = "stepped"
+mean_u = 0.146
+depth_a = 0.45
+half_period_s = 1.0
+transitions_per_polarity = 100
+settle_s = 3.0
+pause_before = false
+
+[[point]]
+label = "grid_b_flux150_a0800"
+role = "identification_pass_b"
+acquisition_mode = "stepped"
+mean_u = 0.139
+depth_a = 0.8
+half_period_s = 1.0
+transitions_per_polarity = 100
+settle_s = 3.0
+pause_before = false
+
+[[point]]
+label = "grid_b_flux150_a1300"
+role = "identification_pass_b"
+acquisition_mode = "stepped"
+mean_u = 0.123
+depth_a = 1.3
+half_period_s = 1.0
+transitions_per_polarity = 100
+settle_s = 3.0
+pause_before = false
+
+[[point]]
+label = "reference_after_b_flux150"
+role = "reference"
+acquisition_mode = "stepped"
+mean_u = 0.293
+depth_a = 0.45
+half_period_s = 1.0
+transitions_per_polarity = 50
+settle_s = 3.0
+pause_before = false
+
+[[point]]
+label = "grid_b_flux300_a1300"
+role = "identification_pass_b"
+acquisition_mode = "stepped"
+mean_u = 0.246
+depth_a = 1.3
+half_period_s = 1.0
+transitions_per_polarity = 100
+settle_s = 3.0
+pause_before = false
+
+[[point]]
+label = "grid_b_flux300_a0800"
+role = "identification_pass_b"
+acquisition_mode = "stepped"
+mean_u = 0.278
+depth_a = 0.8
+half_period_s = 1.0
+transitions_per_polarity = 100
+settle_s = 3.0
+pause_before = false
+
+[[point]]
+label = "grid_b_flux300_a0450"
+role = "identification_pass_b"
+acquisition_mode = "stepped"
+mean_u = 0.293
+depth_a = 0.45
+half_period_s = 1.0
+transitions_per_polarity = 100
+settle_s = 3.0
+pause_before = false
+
+[[point]]
+label = "grid_b_flux300_a0280"
+role = "identification_pass_b"
+acquisition_mode = "stepped"
+mean_u = 0.297
+depth_a = 0.28
+half_period_s = 1.0
+transitions_per_polarity = 100
+settle_s = 3.0
+pause_before = false
+
+[[point]]
+label = "grid_b_flux300_a0150"
+role = "identification_pass_b"
+acquisition_mode = "stepped"
+mean_u = 0.299
+depth_a = 0.15
+half_period_s = 1.0
+transitions_per_polarity = 100
+settle_s = 3.0
+pause_before = false
+
+[[point]]
+label = "reference_after_b_flux300"
+role = "reference"
+acquisition_mode = "stepped"
+mean_u = 0.293
+depth_a = 0.45
+half_period_s = 1.0
+transitions_per_polarity = 50
+settle_s = 3.0
+pause_before = false
+
+[[point]]
+label = "floor_post"
+role = "floor_post_shutter_closed"
+acquisition_mode = "dark"
+duration_s = 30.0
+settle_s = 2.0
+pause_before = true

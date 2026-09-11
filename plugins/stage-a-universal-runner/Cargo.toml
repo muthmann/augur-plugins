@@ -1,0 +1,18 @@
+[package]
+name = "augur-plugin-stage-a-universal-runner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Universal Stage-A A1-A6 measurement orchestrator."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+augur-plugin-api.workspace = true
+serde_json.workspace = true
+stage-a-universal-runner = { path = "../../stage-a-universal-runner" }
+
+[lints.rust]
+unsafe_code = "forbid"

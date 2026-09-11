@@ -1,0 +1,22 @@
+# Generated from actual owner rows. Do not edit timing independently.
+name = "a6_camera_lux_reference"
+version = "20260911-v5-4h"
+program = "camera_lux_reference"
+overhead_s_per_point = 11.0
+
+[[optical_states]]
+id = "F2"
+label = "F2"
+target_camera_lux = "about 0.08"
+operator_action = "Keep the laser on. Set the AOD for about 0.08 camera-lux; wait for stable readback."
+
+[[block]]
+experiment = "A4"
+name = "camera_lux_reference"
+protocol = "static_final"
+optical_state = "F2"
+estimated_points = 1
+estimated_seconds = 111.0
+retry_same_point = true
+required_artifacts = ["raw", "pdq", "camera_sidecar", "monitoring", "protocol_receipt"]
+camera_from = "selected"

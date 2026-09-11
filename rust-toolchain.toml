@@ -1,0 +1,8 @@
+[toolchain]
+# Must match augur-rs/rust-toolchain.toml. Plugins are cdylibs that the host
+# dlopens into its own process, so the compiler that builds them and the
+# compiler that builds augur-gui have to agree — an unpinned "stable" here
+# means CI can hand the bench a bundle built against a different std.
+# Bump this together with augur-rs, in its own commit.
+channel = "1.95.0"
+components = ["clippy", "rustfmt"]

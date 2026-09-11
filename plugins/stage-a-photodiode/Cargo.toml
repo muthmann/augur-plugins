@@ -1,0 +1,20 @@
+[package]
+name = "augur-plugin-stage-a-photodiode"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Stage-A photodiode readout (SMA5/pin 18/A4) from the Teensy stream port: raw values or excitation power I_exc = I_tot - I_pd."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+augur-plugin-api.workspace = true
+serde_json.workspace = true
+serialport.workspace = true
+# `hardware` brings in the shared platform-aware port discovery; serialport is
+# already a direct dependency here, so it adds nothing new to the build.
+stage-a-io = { path = "../../stage-a-io" }
+stage-a-plugin-contract = { path = "../../stage-a-plugin-contract" }
+

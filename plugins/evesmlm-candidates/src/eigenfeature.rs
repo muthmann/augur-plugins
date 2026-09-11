@@ -2,6 +2,13 @@ use nalgebra::Matrix2;
 
 use crate::EveEvent;
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ClusterEigenInfo {
+    pub lambda_1: f64,
+    pub lambda_2: f64,
+    pub angle_rad: f64,
+}
+
 pub fn filter_clusters(
     events: &[EveEvent],
     clusters: Vec<Vec<usize>>,
@@ -13,20 +20,20 @@ pub fn filter_clusters(
     clusters
         .into_iter()
         .filter(|indices| {
-            let Some((lambda_1, lambda_2)) = cluster_eigenvalues(events, indices) else {
+            let Some(info) = cluster_eigen_info(events, indices) else {
                 return false;
             };
-            let isotropy = if lambda_1 <= 1e-9 {
+            let isotropy = if info.lambda_1 <= 1e-9 {
                 1.0
             } else {
-                lambda_2 / lambda_1
+                info.lambda_2 / info.lambda_1
             };
-            lambda_1 <= max_variance && isotropy >= min_isotropy
+            info.lambda_1 <= max_variance && isotropy >= min_isotropy
         })
         .collect()
 }
 
-pub fn cluster_eigenvalues(events: &[EveEvent], indices: &[usize]) -> Option<(f64, f64)> {
+pub fn cluster_eigen_info(events: &[EveEvent], indices: &[usize]) -> Option<ClusterEigenInfo> {
     if indices.len() < 2 {
         return None;
     }
@@ -55,7 +62,21 @@ pub fn cluster_eigenvalues(events: &[EveEvent], indices: &[usize]) -> Option<(f6
     covariance /= n.max(1.0);
 
     let eigen = covariance.symmetric_eigen();
-    let mut eigenvalues = [eigen.eigenvalues[0], eigen.eigenvalues[1]];
-    eigenvalues.sort_by(|left, right| right.total_cmp(left));
-    Some((eigenvalues[0], eigenvalues[1]))
+    let major_index = if eigen.eigenvalues[0] >= eigen.eigenvalues[1] {
+        0
+    } else {
+        1
+    };
+    let minor_index = 1 - major_index;
+    let major_vector = eigen.eigenvectors.column(major_index);
+
+    Some(ClusterEigenInfo {
+        lambda_1: eigen.eigenvalues[major_index],
+        lambda_2: eigen.eigenvalues[minor_index],
+        angle_rad: major_vector[1].atan2(major_vector[0]),
+    })
+}
+
+pub fn cluster_eigenvalues(events: &[EveEvent], indices: &[usize]) -> Option<(f64, f64)> {
+    cluster_eigen_info(events, indices).map(|info| (info.lambda_1, info.lambda_2))
 }

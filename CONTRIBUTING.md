@@ -137,6 +137,18 @@ Plugins do not render `egui` directly. Instead, expose:
 
 The host owns rendering, export, caching, and window state for declared host views.
 
+When a table dataset should participate in the linked investigation workspace, also populate the additive metadata the host can use:
+
+- `coordinate_space_2d`
+- `coordinate_space_3d`
+- `row_id_column`
+- `time_column`
+- `layer_id`
+- `semantic_label`
+- `HostDatasetDescriptor.display`
+
+Prefer structured datasets for selection/linking and use overlays only for supplemental 2D annotations or hit-testing.
+
 ### 7. Write `plugin.toml`
 
 Use the runtime format:
@@ -158,6 +170,14 @@ cargo build -p augur-plugin-my-plugin --release
 mkdir -p ~/.augur/plugins/my-plugin
 cp plugins/my-plugin/plugin.toml ~/.augur/plugins/my-plugin/
 cp target/release/libaugur_plugin_my_plugin.dylib ~/.augur/plugins/my-plugin/
+```
+
+On macOS, either run `./scripts/install-built-plugins.sh --profile release` instead of the manual
+copy steps or rewrite the installed dylib id yourself:
+
+```bash
+install_name_tool -id "@loader_path/libaugur_plugin_my_plugin.dylib" \
+  ~/.augur/plugins/my-plugin/libaugur_plugin_my_plugin.dylib
 ```
 
 Then open `augur-gui`, go to **Plugins**, click **Scan for New Plugins**, and enable the plugin.

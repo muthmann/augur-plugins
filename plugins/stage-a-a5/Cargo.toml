@@ -1,0 +1,19 @@
+[package]
+name = "augur-plugin-stage-a-a5"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Stage-A A5 refractory and load acquisition adapter."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+augur-plugin-api.workspace = true
+stage-a-step-acquisition = { path = "../../stage-a-step-acquisition" }
+serde_json.workspace = true
+stage-a-universal-runner = { path = "../../stage-a-universal-runner" }
+
+[lints.rust]
+unsafe_code = "forbid"

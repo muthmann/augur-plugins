@@ -6,18 +6,28 @@
 
 pub mod dbscan;
 pub mod eigenfeature;
-pub mod types;
+mod tracking;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use augur_plugin_api::{
-    export_plugin, AnalysisSeverity, EventStoreHandle, FfiCdEvent, FfiPixel, HostContext,
-    HostOutput, Plugin, PluginFrame, PluginInput, SettingItem, SettingKind, SettingsSchema,
-    SettingsSection, StatusEntry,
+    export_plugin, AnalysisSeverity, EventStoreHandle, FfiCdEvent, FfiColorRgba,
+    FfiMarkerOverlayItem, FfiMarkerShape, FfiPixel, FfiString, HostContext, HostDatasetDescriptor,
+    HostDatasetDisplayMetadata, HostDatasetKind, HostDatasetRelation, HostMarkerShape, HostOutput,
+    HostViewDescriptor, HostViewKind, HostViewPlacement, HostViewRegistry, Plugin,
+    PluginCapabilities, PluginFrame, PluginInput, PluginStateKind, SettingItem, SettingKind,
+    SettingsSchema, SettingsSection, StatusEntry, TableColumn, TableColumnData,
+    TableColumnDisplayEntry, TableColumnDisplayFormat, TableColumnDisplayMetadata,
+    TableColumnValues, TableColumnWidthPriority, TableCoordinateSpace2d, TableCoordinateSpace3d,
+    TableDatasetV1, TableRowProvenance, TableSchema, TableValueType,
 };
 use serde_json::{json, Value};
 
-pub use types::{CandidateFindingMethod, EveCandidates, EveCluster, EveEvent, CTX_EVE_CANDIDATES};
+pub use evesmlm_types::{
+    CandidateFindingMethod, ClusterBoundary, EveCandidates, EveCluster, EveEvent,
+    CTX_EVE_CANDIDATES,
+};
+use tracking::TrackedCluster;
 
 const KERNEL_G1: [f64; 5] = [1.0 / 16.0, 0.25, 3.0 / 8.0, 0.25, 1.0 / 16.0];
 const KERNEL_G2: [f64; 9] = [
@@ -31,7 +41,56 @@ const KERNEL_G2: [f64; 9] = [
     0.0,
     1.0 / 16.0,
 ];
-const OVERLAY_COLOR: [u8; 4] = [255, 210, 32, 220];
+const ACCEPTED_EVENTS_COLOR: [u8; 4] = [60, 220, 140, 255];
+const REJECTED_EVENTS_COLOR: [u8; 4] = [255, 110, 110, 235];
+const COMPLETE_BOUNDARY_COLOR: [u8; 4] = [255, 255, 255, 60];
+const PROVISIONAL_BOUNDARY_COLOR: [u8; 4] = [255, 255, 255, 28];
+const COMPLETE_MARKER_COLOR: [u8; 4] = [255, 255, 255, 180];
+const PROVISIONAL_MARKER_COLOR: [u8; 4] = [255, 255, 255, 110];
+const ACCEPTED_EVENTS_DATASET_ID: &str = "augur.evesmlm.candidates.accepted_events";
+const REJECTED_EVENTS_DATASET_ID: &str = "augur.evesmlm.candidates.rejected_events";
+const ACCEPTED_EVENTS_LAYER_ID: &str = "augur.layer.evesmlm.accepted_events";
+const REJECTED_EVENTS_LAYER_ID: &str = "augur.layer.evesmlm.rejected_events";
+const ACCEPTED_EVENTS_COMPACT_VIEW_ID: &str = "augur.evesmlm.candidates.accepted_events.compact";
+const REJECTED_EVENTS_COMPACT_VIEW_ID: &str = "augur.evesmlm.candidates.rejected_events.compact";
+const ACCEPTED_EVENTS_TABLE_VIEW_ID: &str = "augur.evesmlm.candidates.accepted_events.table";
+const REJECTED_EVENTS_TABLE_VIEW_ID: &str = "augur.evesmlm.candidates.rejected_events.table";
+const ACCEPTED_EVENTS_3D_VIEW_ID: &str = "augur.evesmlm.candidates.accepted_events.scatter3d";
+const REJECTED_EVENTS_3D_VIEW_ID: &str = "augur.evesmlm.candidates.rejected_events.scatter3d";
+const CANDIDATE_FINDINGS_DATASET_ID: &str = "augur.evesmlm.candidates.candidate_findings";
+const CANDIDATE_FINDING_PIXELS_DATASET_ID: &str =
+    "augur.evesmlm.candidates.candidate_finding_pixels";
+const CANDIDATE_FINDINGS_LAYER_ID: &str = "augur.layer.evesmlm.candidate_findings";
+const CANDIDATE_FINDINGS_COMPACT_VIEW_ID: &str =
+    "augur.evesmlm.candidates.candidate_findings.compact";
+const CANDIDATE_FINDINGS_TABLE_VIEW_ID: &str = "augur.evesmlm.candidates.candidate_findings.table";
+const CANDIDATE_FINDING_PIXELS_TABLE_VIEW_ID: &str =
+    "augur.evesmlm.candidates.candidate_finding_pixels.table";
+
+#[derive(Debug, Clone)]
+struct CandidateEventRow {
+    event_id: u64,
+    x_px: f64,
+    y_px: f64,
+    timestamp_us: u64,
+    polarity: bool,
+    cluster_id: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct CandidateEventDatasets {
+    accepted: Vec<CandidateEventRow>,
+    rejected: Vec<CandidateEventRow>,
+    sensor_dims: Option<(u16, u16)>,
+    frame_window_start_us: u64,
+    frame_window_end_us: u64,
+}
+
+#[derive(Debug, Clone)]
+struct CandidateFinding {
+    cluster: EveCluster,
+    method: CandidateFindingMethod,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PolarityMode {
@@ -75,36 +134,22 @@ impl PolarityMode {
     }
 }
 
-impl CandidateFindingMethod {
-    fn from_index(index: usize) -> Self {
-        match index {
-            1 => Self::Eigenfeature,
-            2 => Self::FrameBased,
-            _ => Self::Dbscan,
-        }
-    }
-
-    fn index(self) -> usize {
-        match self {
-            Self::Dbscan => 0,
-            Self::Eigenfeature => 1,
-            Self::FrameBased => 2,
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct CandidateSettings {
     pub finding_method: CandidateFindingMethod,
     pub polarity: PolarityMode,
     pub epsilon_px: f64,
     pub min_events: usize,
+    pub lookback_us: u64,
+    pub stable_frames: usize,
     pub max_spatial_extent_px: f64,
     pub min_isotropy: f64,
     pub threshold_factor: f64,
     pub fit_radius_px: usize,
     pub max_candidates: usize,
     pub show_overlay: bool,
+    pub show_boundaries: bool,
+    pub show_provisional: bool,
 }
 
 impl Default for CandidateSettings {
@@ -114,12 +159,16 @@ impl Default for CandidateSettings {
             polarity: PolarityMode::Both,
             epsilon_px: 3.0,
             min_events: 5,
+            lookback_us: 66_000,
+            stable_frames: 2,
             max_spatial_extent_px: 5.0,
             min_isotropy: 0.2,
             threshold_factor: 1.5,
             fit_radius_px: 4,
             max_candidates: 512,
             show_overlay: true,
+            show_boundaries: true,
+            show_provisional: true,
         }
     }
 }
@@ -127,9 +176,19 @@ impl Default for CandidateSettings {
 pub struct EveSmlmCandidatePlugin {
     enabled: bool,
     settings: CandidateSettings,
+    current_event_datasets: CandidateEventDatasets,
     last_candidate_count: usize,
+    last_complete_visible_count: usize,
+    last_provisional_count: usize,
     last_event_count: usize,
     last_status: String,
+    dataset_generation: u64,
+    findings: Vec<CandidateFinding>,
+    findings_generation: u64,
+    frame_counter: u64,
+    next_cluster_id: u64,
+    tracked_clusters: Vec<TrackedCluster>,
+    event_buffer: Vec<FfiCdEvent>,
 }
 
 impl Default for EveSmlmCandidatePlugin {
@@ -137,24 +196,107 @@ impl Default for EveSmlmCandidatePlugin {
         Self {
             enabled: false,
             settings: CandidateSettings::default(),
+            current_event_datasets: CandidateEventDatasets::default(),
             last_candidate_count: 0,
+            last_complete_visible_count: 0,
+            last_provisional_count: 0,
             last_event_count: 0,
             last_status: "Enable the plugin to cluster raw eveSMLM events into candidates.".into(),
+            dataset_generation: 0,
+            findings: Vec::new(),
+            findings_generation: 0,
+            frame_counter: 0,
+            next_cluster_id: 0,
+            tracked_clusters: Vec::new(),
+            event_buffer: Vec::new(),
         }
     }
 }
 
 impl EveSmlmCandidatePlugin {
+    fn reset_tracking_state(&mut self) {
+        self.frame_counter = 0;
+        self.next_cluster_id = 0;
+        self.tracked_clusters.clear();
+        self.event_buffer.clear();
+        self.findings.clear();
+        self.findings_generation = self.findings_generation.wrapping_add(1);
+    }
+
+    fn append_findings(&mut self, clusters: &[EveCluster]) {
+        if clusters.is_empty() {
+            return;
+        }
+
+        let method = self.settings.finding_method;
+        self.findings.extend(
+            clusters
+                .iter()
+                .cloned()
+                .map(|cluster| CandidateFinding { cluster, method }),
+        );
+        self.findings_generation = self.findings_generation.wrapping_add(1);
+    }
+
+    fn collect_analysis_events(
+        &mut self,
+        frame: &PluginFrame<'_>,
+        event_store: &EventStoreHandle<'_>,
+    ) -> (Vec<FfiCdEvent>, u64, u64, bool) {
+        let mut analysis_events = std::mem::take(&mut self.event_buffer);
+        let mut analysis_window_start = frame.window_start_us();
+        let analysis_window_end = frame.window_end_us();
+        let temporal_enabled = self.settings.lookback_us > 0 && event_store.frame_count() > 0;
+
+        analysis_events.clear();
+        if temporal_enabled {
+            let buffered_start = analysis_window_end.saturating_sub(self.settings.lookback_us);
+            analysis_window_start = buffered_start.max(event_store.oldest_timestamp_us());
+            event_store.collect_events_in_range(
+                analysis_window_start,
+                analysis_window_end,
+                &mut analysis_events,
+            );
+        }
+
+        if analysis_events.is_empty() {
+            analysis_events.extend_from_slice(frame.events());
+            analysis_window_start = frame.window_start_us();
+        }
+
+        (
+            analysis_events,
+            analysis_window_start,
+            analysis_window_end,
+            temporal_enabled,
+        )
+    }
+
     fn analyze_frame(
         &mut self,
         frame: &PluginFrame<'_>,
         raw_events: &[FfiCdEvent],
+        analysis_window_start_us: u64,
+        analysis_window_end_us: u64,
+        temporal_enabled: bool,
         output: &mut HostOutput<'_>,
     ) -> EveCandidates {
         if raw_events.is_empty() {
+            self.current_event_datasets = CandidateEventDatasets {
+                sensor_dims: Some((frame.width(), frame.height())),
+                frame_window_start_us: analysis_window_start_us,
+                frame_window_end_us: analysis_window_end_us,
+                ..CandidateEventDatasets::default()
+            };
             self.last_candidate_count = 0;
+            self.last_complete_visible_count = 0;
+            self.last_provisional_count = 0;
             self.last_event_count = 0;
-            self.last_status = "Raw events are unavailable for this preview frame.".into();
+            self.last_status = if temporal_enabled {
+                "No retained raw events are available in the requested temporal lookback.".into()
+            } else {
+                "Raw events are unavailable for this preview frame.".into()
+            };
             Self::warning(
                 output,
                 AnalysisSeverity::Info,
@@ -171,18 +313,26 @@ impl EveSmlmCandidatePlugin {
             .collect();
         self.last_event_count = filtered_events.len();
         if filtered_events.is_empty() {
+            self.current_event_datasets = CandidateEventDatasets {
+                sensor_dims: Some((frame.width(), frame.height())),
+                frame_window_start_us: analysis_window_start_us,
+                frame_window_end_us: analysis_window_end_us,
+                ..CandidateEventDatasets::default()
+            };
             self.last_candidate_count = 0;
+            self.last_complete_visible_count = 0;
+            self.last_provisional_count = 0;
             self.last_status = "No events passed the configured polarity filter.".into();
             return EveCandidates {
                 clusters: Vec::new(),
-                frame_window_start_us: frame.window_start_us(),
-                frame_window_end_us: frame.window_end_us(),
+                frame_window_start_us: analysis_window_start_us,
+                frame_window_end_us: analysis_window_end_us,
                 n_events_processed: 0,
                 finding_method: self.settings.finding_method,
             };
         }
 
-        let cluster_indices = match self.settings.finding_method {
+        let mut cluster_indices = match self.settings.finding_method {
             CandidateFindingMethod::Dbscan => dbscan::cluster_event_indices(
                 &filtered_events,
                 self.settings.epsilon_px,
@@ -207,44 +357,264 @@ impl EveSmlmCandidatePlugin {
             }
         };
 
-        let mut clusters = clusters_from_indices(&filtered_events, cluster_indices);
-        clusters.sort_by_key(|cluster| std::cmp::Reverse(cluster.event_count()));
-        if clusters.len() > self.settings.max_candidates {
-            clusters.truncate(self.settings.max_candidates);
+        cluster_indices.sort_by_key(|indices| std::cmp::Reverse(indices.len()));
+        if cluster_indices.len() > self.settings.max_candidates {
+            cluster_indices.truncate(self.settings.max_candidates);
         }
 
-        self.last_candidate_count = clusters.len();
-        self.last_status = format!(
-            "{} candidates from {} events using {}.",
-            self.last_candidate_count,
-            self.last_event_count,
-            self.settings.finding_method.label()
+        let detected_clusters = clusters_from_indices(
+            &filtered_events,
+            cluster_indices.clone(),
+            self.settings.finding_method,
+        );
+        let (visible_clusters, published_clusters) =
+            self.update_tracked_clusters(detected_clusters, temporal_enabled);
+        self.append_findings(&published_clusters);
+
+        self.current_event_datasets = build_candidate_event_datasets(
+            (frame.width(), frame.height()),
+            analysis_window_start_us,
+            analysis_window_end_us,
+            &filtered_events,
+            &cluster_indices,
+            &visible_clusters,
         );
 
-        if self.settings.show_overlay && !clusters.is_empty() {
-            let pixels: Vec<FfiPixel> = clusters
-                .iter()
-                .map(|cluster| FfiPixel {
-                    x: cluster.centroid_x.round().max(0.0) as u16,
-                    y: cluster.centroid_y.round().max(0.0) as u16,
-                })
-                .collect();
-            output.add_highlight_pixels(&pixels, OVERLAY_COLOR);
-        }
+        self.last_candidate_count = published_clusters.len();
+        self.last_complete_visible_count = visible_clusters
+            .iter()
+            .filter(|cluster| cluster.complete)
+            .count();
+        self.last_provisional_count = visible_clusters
+            .len()
+            .saturating_sub(self.last_complete_visible_count);
+
+        let window_span_us = analysis_window_end_us.saturating_sub(analysis_window_start_us);
+        let boundary_summary = if self.settings.show_boundaries && !visible_clusters.is_empty() {
+            format!(
+                " Showing {} for {} visible clusters.",
+                boundary_label(self.settings.finding_method),
+                visible_clusters.len()
+            )
+        } else {
+            String::new()
+        };
+        self.last_status = if temporal_enabled {
+            format!(
+                "{} published, {} complete visible, {} provisional from {} events using {} over {} us.{}",
+                self.last_candidate_count,
+                self.last_complete_visible_count,
+                self.last_provisional_count,
+                self.last_event_count,
+                self.settings.finding_method.label(),
+                window_span_us,
+                boundary_summary
+            )
+        } else {
+            format!(
+                "{} published from {} events using {} in the current frame.{}",
+                self.last_candidate_count,
+                self.last_event_count,
+                self.settings.finding_method.label(),
+                boundary_summary
+            )
+        };
+
+        self.render_cluster_overlay(frame, &visible_clusters, output);
 
         EveCandidates {
-            clusters,
-            frame_window_start_us: frame.window_start_us(),
-            frame_window_end_us: frame.window_end_us(),
+            clusters: published_clusters,
+            frame_window_start_us: analysis_window_start_us,
+            frame_window_end_us: analysis_window_end_us,
             n_events_processed: filtered_events.len(),
             finding_method: self.settings.finding_method,
         }
     }
 
+    fn update_tracked_clusters(
+        &mut self,
+        mut detected_clusters: Vec<EveCluster>,
+        temporal_enabled: bool,
+    ) -> (Vec<EveCluster>, Vec<EveCluster>) {
+        self.frame_counter = self.frame_counter.wrapping_add(1);
+        let stable_frames = self.settings.stable_frames.max(1);
+        let retention_frames = stable_frames.saturating_mul(2).max(1);
+        let matching_radius = self.settings.epsilon_px.max(0.5);
+
+        let mut candidate_pairs = Vec::new();
+        for (detected_index, cluster) in detected_clusters.iter().enumerate() {
+            for (tracked_index, tracked) in self.tracked_clusters.iter().enumerate() {
+                let dx = cluster.centroid_x - tracked.centroid_x;
+                let dy = cluster.centroid_y - tracked.centroid_y;
+                let distance = (dx * dx + dy * dy).sqrt();
+                if distance <= matching_radius {
+                    candidate_pairs.push((distance, detected_index, tracked_index));
+                }
+            }
+        }
+        candidate_pairs.sort_by(|left, right| left.0.total_cmp(&right.0));
+
+        let mut detected_to_tracked = vec![None; detected_clusters.len()];
+        let mut tracked_taken = vec![false; self.tracked_clusters.len()];
+        for (_, detected_index, tracked_index) in candidate_pairs {
+            if detected_to_tracked[detected_index].is_none() && !tracked_taken[tracked_index] {
+                detected_to_tracked[detected_index] = Some(tracked_index);
+                tracked_taken[tracked_index] = true;
+            }
+        }
+
+        for (detected_index, cluster) in detected_clusters.iter_mut().enumerate() {
+            if let Some(tracked_index) = detected_to_tracked[detected_index] {
+                let tracked = &mut self.tracked_clusters[tracked_index];
+                let current_count = cluster.event_count();
+                tracked.centroid_x = cluster.centroid_x;
+                tracked.centroid_y = cluster.centroid_y;
+                tracked.last_seen_frame = self.frame_counter;
+
+                if current_count > tracked.event_count {
+                    tracked.event_count = current_count;
+                    tracked.last_grown_frame = self.frame_counter;
+                    tracked.frames_since_growth = 0;
+                    tracked.cluster = cluster.clone();
+                    if temporal_enabled {
+                        tracked.complete = false;
+                    }
+                } else {
+                    tracked.frames_since_growth = tracked.frames_since_growth.saturating_add(1);
+                    if current_count == tracked.event_count {
+                        tracked.cluster = cluster.clone();
+                    }
+                }
+
+                if !temporal_enabled || tracked.frames_since_growth >= stable_frames {
+                    tracked.complete = true;
+                }
+
+                tracked.cluster.cluster_id = tracked.id;
+                tracked.cluster.complete = tracked.complete;
+                cluster.cluster_id = tracked.id;
+                cluster.complete = tracked.complete;
+            } else {
+                let cluster_id = self.next_cluster_id;
+                self.next_cluster_id = self.next_cluster_id.wrapping_add(1);
+                cluster.cluster_id = cluster_id;
+                cluster.complete = !temporal_enabled;
+                self.tracked_clusters.push(TrackedCluster {
+                    id: cluster_id,
+                    centroid_x: cluster.centroid_x,
+                    centroid_y: cluster.centroid_y,
+                    event_count: cluster.event_count(),
+                    last_seen_frame: self.frame_counter,
+                    last_grown_frame: self.frame_counter,
+                    frames_since_growth: 0,
+                    complete: cluster.complete,
+                    emitted: false,
+                    cluster: cluster.clone(),
+                });
+            }
+        }
+
+        for tracked in &mut self.tracked_clusters {
+            if tracked.last_seen_frame != self.frame_counter {
+                tracked.frames_since_growth = tracked.frames_since_growth.saturating_add(1);
+                if temporal_enabled && tracked.frames_since_growth >= stable_frames {
+                    tracked.complete = true;
+                }
+            }
+            if !temporal_enabled {
+                tracked.complete = true;
+            }
+            tracked.cluster.cluster_id = tracked.id;
+            tracked.cluster.complete = tracked.complete;
+        }
+
+        let mut published_clusters = Vec::new();
+        for tracked in &mut self.tracked_clusters {
+            if tracked.complete && !tracked.emitted {
+                tracked.emitted = true;
+                let mut cluster = tracked.cluster.clone();
+                cluster.cluster_id = tracked.id;
+                cluster.complete = true;
+                published_clusters.push(cluster);
+            }
+        }
+
+        self.tracked_clusters.retain(|tracked| {
+            self.frame_counter.saturating_sub(tracked.last_seen_frame) as usize <= retention_frames
+        });
+
+        (detected_clusters, published_clusters)
+    }
+
+    fn render_cluster_overlay(
+        &self,
+        frame: &PluginFrame<'_>,
+        visible_clusters: &[EveCluster],
+        output: &mut HostOutput<'_>,
+    ) {
+        let overlay_clusters: Vec<&EveCluster> = visible_clusters
+            .iter()
+            .filter(|cluster| cluster.complete || self.settings.show_provisional)
+            .collect();
+
+        if self.settings.show_boundaries && !overlay_clusters.is_empty() {
+            let (complete_pixels, provisional_pixels) =
+                boundary_pixels(&overlay_clusters, frame.width(), frame.height());
+            if !complete_pixels.is_empty() {
+                output.add_highlight_pixels(&complete_pixels, COMPLETE_BOUNDARY_COLOR);
+            }
+            if !provisional_pixels.is_empty() {
+                output.add_highlight_pixels(&provisional_pixels, PROVISIONAL_BOUNDARY_COLOR);
+            }
+        }
+
+        if self.settings.show_overlay && !overlay_clusters.is_empty() {
+            let stable_ids: Vec<String> = overlay_clusters
+                .iter()
+                .map(|cluster| cluster.cluster_id.to_string())
+                .collect();
+            let markers: Vec<FfiMarkerOverlayItem> = overlay_clusters
+                .iter()
+                .zip(stable_ids.iter())
+                .map(|(cluster, stable_id)| FfiMarkerOverlayItem {
+                    x: cluster.centroid_x as f32,
+                    y: cluster.centroid_y as f32,
+                    shape: FfiMarkerShape::FilledCircle,
+                    size: 4.0,
+                    color: FfiColorRgba::from_rgba(if cluster.complete {
+                        COMPLETE_MARKER_COLOR
+                    } else {
+                        PROVISIONAL_MARKER_COLOR
+                    }),
+                    timestamp_us: cluster
+                        .events
+                        .last()
+                        .map(|event| event.timestamp)
+                        .unwrap_or(frame.window_end_us()),
+                    has_timestamp: !cluster.events.is_empty(),
+                    stable_id: stable_id.as_str().into(),
+                    source_dataset_id: FfiString::empty(),
+                    source_row_id: FfiString::empty(),
+                })
+                .collect();
+            output.add_marker_overlay(
+                &markers,
+                Some(ACCEPTED_EVENTS_DATASET_ID),
+                Some(ACCEPTED_EVENTS_LAYER_ID),
+                Some(self.name()),
+            );
+        }
+    }
+
     pub fn reset(&mut self) {
+        self.reset_tracking_state();
+        self.current_event_datasets = CandidateEventDatasets::default();
         self.last_candidate_count = 0;
+        self.last_complete_visible_count = 0;
+        self.last_provisional_count = 0;
         self.last_event_count = 0;
         self.last_status = "Waiting for the next preview frame.".into();
+        self.dataset_generation = self.dataset_generation.wrapping_add(1);
     }
 
     fn parse_usize(value: Value) -> Option<usize> {
@@ -289,15 +659,32 @@ impl Plugin for EveSmlmCandidatePlugin {
         frame: &PluginFrame<'_>,
         output: &mut HostOutput<'_>,
         context: &mut HostContext<'_>,
-        _event_store: &EventStoreHandle<'_>,
+        event_store: &EventStoreHandle<'_>,
     ) {
-        let candidates = self.analyze_frame(frame, frame.events(), output);
+        let (analysis_events, analysis_window_start_us, analysis_window_end_us, temporal_enabled) =
+            self.collect_analysis_events(frame, event_store);
+        let candidates = self.analyze_frame(
+            frame,
+            &analysis_events,
+            analysis_window_start_us,
+            analysis_window_end_us,
+            temporal_enabled,
+            output,
+        );
+        self.event_buffer = analysis_events;
+        self.dataset_generation = self.dataset_generation.wrapping_add(1);
         if let Err(err) = context.publish(CTX_EVE_CANDIDATES, &candidates) {
             Self::warning(
                 output,
                 AnalysisSeverity::Warning,
                 &format!("Publishing EVE candidates failed: {err}"),
             );
+        }
+    }
+
+    fn capabilities(&self) -> PluginCapabilities {
+        PluginCapabilities {
+            retained_event_history: self.settings.lookback_us > 0,
         }
     }
 
@@ -374,9 +761,58 @@ impl Plugin for EveSmlmCandidatePlugin {
                     ],
                 },
                 SettingsSection {
+                    label: "Temporal aggregation".into(),
+                    description: Some(
+                        "Optionally cluster across retained event history and only publish clusters once they stop growing."
+                            .into(),
+                    ),
+                    default_open: false,
+                    items: vec![
+                        SettingItem {
+                            key: "lookback_us".into(),
+                            label: "Lookback".into(),
+                            tooltip: Some(
+                                "How far back in retained event history to gather events before clustering. Set to 0 for single-frame behavior."
+                                    .into(),
+                            ),
+                            kind: SettingKind::I64Slider {
+                                min: 0,
+                                max: 500_000,
+                                default: i64::try_from(self.settings.lookback_us).unwrap_or(66_000),
+                                suffix: Some(" us".into()),
+                            },
+                        },
+                        SettingItem {
+                            key: "stable_frames".into(),
+                            label: "Stable frames".into(),
+                            tooltip: Some(
+                                "How many consecutive frames without cluster growth are required before a cluster is published to fitting."
+                                    .into(),
+                            ),
+                            kind: SettingKind::I64Slider {
+                                min: 1,
+                                max: 8,
+                                default: i64::try_from(self.settings.stable_frames).unwrap_or(2),
+                                suffix: Some(" frames".into()),
+                            },
+                        },
+                        SettingItem {
+                            key: "show_provisional".into(),
+                            label: "Show provisional".into(),
+                            tooltip: Some(
+                                "Show still-growing clusters in the preview overlay and boundary layer."
+                                    .into(),
+                            ),
+                            kind: SettingKind::Bool {
+                                default: self.settings.show_provisional,
+                            },
+                        },
+                    ],
+                },
+                SettingsSection {
                     label: "Refinement".into(),
                     description: Some(
-                        "Frame-based mode and eigenfeature filtering use these thresholds to reject broad or anisotropic clusters."
+                        "Frame-based mode, eigenfeature filtering, and preview overlays use these thresholds and display controls."
                             .into(),
                     ),
                     default_open: false,
@@ -427,10 +863,24 @@ impl Plugin for EveSmlmCandidatePlugin {
                         },
                         SettingItem {
                             key: "show_overlay".into(),
-                            label: "Show overlay".into(),
-                            tooltip: Some("Highlight candidate centroids on the preview.".into()),
+                            label: "Show centroids".into(),
+                            tooltip: Some(
+                                "Draw clickable centroid markers that link into the accepted candidate-events dataset."
+                                    .into(),
+                            ),
                             kind: SettingKind::Bool {
                                 default: self.settings.show_overlay,
+                            },
+                        },
+                        SettingItem {
+                            key: "show_boundaries".into(),
+                            label: "Show boundaries".into(),
+                            tooltip: Some(
+                                "Draw 2-sigma eigenfeature ellipses or bounding boxes around visible clusters."
+                                    .into(),
+                            ),
+                            kind: SettingKind::Bool {
+                                default: self.settings.show_boundaries,
                             },
                         },
                     ],
@@ -445,71 +895,99 @@ impl Plugin for EveSmlmCandidatePlugin {
             "polarity" => Some(json!(self.settings.polarity.index())),
             "epsilon_px" => Some(json!(self.settings.epsilon_px)),
             "min_events" => Some(json!(self.settings.min_events)),
+            "lookback_us" => Some(json!(self.settings.lookback_us)),
+            "stable_frames" => Some(json!(self.settings.stable_frames)),
             "max_spatial_extent_px" => Some(json!(self.settings.max_spatial_extent_px)),
             "min_isotropy" => Some(json!(self.settings.min_isotropy)),
             "threshold_factor" => Some(json!(self.settings.threshold_factor)),
             "fit_radius_px" => Some(json!(self.settings.fit_radius_px)),
             "max_candidates" => Some(json!(self.settings.max_candidates)),
             "show_overlay" => Some(json!(self.settings.show_overlay)),
+            "show_boundaries" => Some(json!(self.settings.show_boundaries)),
+            "show_provisional" => Some(json!(self.settings.show_provisional)),
             _ => None,
         }
     }
 
     fn set_setting(&mut self, key: &str, value: Value) -> Result<(), String> {
+        let mut reset_tracking = false;
         match key {
             "finding_method" => {
                 let Some(value) = Self::parse_usize(value) else {
                     return Err("finding_method must be an integer".into());
                 };
                 self.settings.finding_method = CandidateFindingMethod::from_index(value);
+                reset_tracking = true;
             }
             "polarity" => {
                 let Some(value) = Self::parse_usize(value) else {
                     return Err("polarity must be an integer".into());
                 };
                 self.settings.polarity = PolarityMode::from_index(value);
+                reset_tracking = true;
             }
             "epsilon_px" => {
                 let Some(value) = value.as_f64() else {
                     return Err("epsilon_px must be numeric".into());
                 };
                 self.settings.epsilon_px = value.clamp(1.0, 10.0);
+                reset_tracking = true;
             }
             "min_events" => {
                 let Some(value) = Self::parse_usize(value) else {
                     return Err("min_events must be an integer".into());
                 };
                 self.settings.min_events = value.clamp(1, 64);
+                reset_tracking = true;
+            }
+            "lookback_us" => {
+                let Some(value) = value.as_u64() else {
+                    return Err("lookback_us must be an integer".into());
+                };
+                self.settings.lookback_us = value.min(500_000);
+                reset_tracking = true;
+            }
+            "stable_frames" => {
+                let Some(value) = Self::parse_usize(value) else {
+                    return Err("stable_frames must be an integer".into());
+                };
+                self.settings.stable_frames = value.clamp(1, 8);
+                reset_tracking = true;
             }
             "max_spatial_extent_px" => {
                 let Some(value) = value.as_f64() else {
                     return Err("max_spatial_extent_px must be numeric".into());
                 };
                 self.settings.max_spatial_extent_px = value.clamp(1.0, 20.0);
+                reset_tracking = true;
             }
             "min_isotropy" => {
                 let Some(value) = value.as_f64() else {
                     return Err("min_isotropy must be numeric".into());
                 };
                 self.settings.min_isotropy = value.clamp(0.0, 1.0);
+                reset_tracking = true;
             }
             "threshold_factor" => {
                 let Some(value) = value.as_f64() else {
                     return Err("threshold_factor must be numeric".into());
                 };
                 self.settings.threshold_factor = value.clamp(0.5, 6.0);
+                reset_tracking = true;
             }
             "fit_radius_px" => {
                 let Some(value) = Self::parse_usize(value) else {
                     return Err("fit_radius_px must be an integer".into());
                 };
                 self.settings.fit_radius_px = value.clamp(1, 16);
+                reset_tracking = true;
             }
             "max_candidates" => {
                 let Some(value) = Self::parse_usize(value) else {
                     return Err("max_candidates must be an integer".into());
                 };
                 self.settings.max_candidates = value.clamp(1, 2048);
+                reset_tracking = true;
             }
             "show_overlay" => {
                 let Some(value) = value.as_bool() else {
@@ -517,14 +995,30 @@ impl Plugin for EveSmlmCandidatePlugin {
                 };
                 self.settings.show_overlay = value;
             }
+            "show_boundaries" => {
+                let Some(value) = value.as_bool() else {
+                    return Err("show_boundaries must be a boolean".into());
+                };
+                self.settings.show_boundaries = value;
+            }
+            "show_provisional" => {
+                let Some(value) = value.as_bool() else {
+                    return Err("show_provisional must be a boolean".into());
+                };
+                self.settings.show_provisional = value;
+            }
             _ => return Err(format!("unknown setting: {key}")),
+        }
+
+        if reset_tracking {
+            self.reset_tracking_state();
         }
 
         Ok(())
     }
 
     fn status_entries(&self) -> Vec<StatusEntry> {
-        vec![
+        let mut entries = vec![
             StatusEntry::Text(self.last_status.clone()),
             StatusEntry::LabeledValue {
                 label: "Events".into(),
@@ -532,8 +1026,18 @@ impl Plugin for EveSmlmCandidatePlugin {
                 color: None,
             },
             StatusEntry::LabeledValue {
-                label: "Candidates".into(),
+                label: "Published".into(),
                 value: self.last_candidate_count.to_string(),
+                color: None,
+            },
+            StatusEntry::LabeledValue {
+                label: "Complete".into(),
+                value: self.last_complete_visible_count.to_string(),
+                color: None,
+            },
+            StatusEntry::LabeledValue {
+                label: "Provisional".into(),
+                value: self.last_provisional_count.to_string(),
                 color: None,
             },
             StatusEntry::LabeledValue {
@@ -541,7 +1045,489 @@ impl Plugin for EveSmlmCandidatePlugin {
                 value: self.settings.finding_method.label().into(),
                 color: None,
             },
-        ]
+        ];
+        if self.settings.lookback_us > 0 {
+            entries.push(StatusEntry::LabeledValue {
+                label: "Lookback".into(),
+                value: format!("{} us", self.settings.lookback_us),
+                color: None,
+            });
+        }
+        entries
+    }
+
+    fn host_views(&self) -> HostViewRegistry {
+        candidate_event_registry(&self.current_event_datasets)
+    }
+
+    fn host_view_dataset(&self, dataset_id: &str) -> Option<Vec<u8>> {
+        let dataset = match dataset_id {
+            ACCEPTED_EVENTS_DATASET_ID => {
+                candidate_events_dataset(&self.current_event_datasets.accepted)
+            }
+            REJECTED_EVENTS_DATASET_ID => {
+                candidate_events_dataset(&self.current_event_datasets.rejected)
+            }
+            _ => return None,
+        };
+        serde_json::to_vec(&dataset).ok()
+    }
+
+    fn host_view_dataset_generation(&self, dataset_id: &str) -> u64 {
+        match dataset_id {
+            ACCEPTED_EVENTS_DATASET_ID | REJECTED_EVENTS_DATASET_ID => self.dataset_generation,
+            _ => 0,
+        }
+    }
+}
+
+fn boundary_label(method: CandidateFindingMethod) -> &'static str {
+    match method {
+        CandidateFindingMethod::FrameBased => "bounding boxes",
+        CandidateFindingMethod::Dbscan | CandidateFindingMethod::Eigenfeature => {
+            "2-sigma eigenfeature ellipses"
+        }
+    }
+}
+
+fn boundary_pixels(
+    clusters: &[&EveCluster],
+    width: u16,
+    height: u16,
+) -> (Vec<FfiPixel>, Vec<FfiPixel>) {
+    let mut complete = HashSet::new();
+    let mut provisional = HashSet::new();
+
+    for cluster in clusters {
+        let target = if cluster.complete {
+            &mut complete
+        } else {
+            &mut provisional
+        };
+        rasterize_cluster_boundary(
+            cluster.boundary.as_ref(),
+            width,
+            height,
+            !cluster.complete,
+            target,
+        );
+    }
+
+    let to_pixels = |points: HashSet<(u16, u16)>| {
+        let mut pixels: Vec<_> = points.into_iter().map(|(x, y)| FfiPixel { x, y }).collect();
+        pixels.sort_by_key(|pixel| (pixel.y, pixel.x));
+        pixels
+    };
+
+    (to_pixels(complete), to_pixels(provisional))
+}
+
+fn rasterize_cluster_boundary(
+    boundary: Option<&ClusterBoundary>,
+    width: u16,
+    height: u16,
+    dashed: bool,
+    out: &mut HashSet<(u16, u16)>,
+) {
+    let Some(boundary) = boundary else {
+        return;
+    };
+
+    match boundary {
+        ClusterBoundary::BoundingBox {
+            x_min,
+            x_max,
+            y_min,
+            y_max,
+        } => {
+            for (step, x) in (*x_min..=*x_max).enumerate() {
+                if !dashed || step % 2 == 0 {
+                    push_boundary_pixel(out, width, height, x as f64, f64::from(*y_min));
+                    push_boundary_pixel(out, width, height, x as f64, f64::from(*y_max));
+                }
+            }
+            for (step, y) in (*y_min..=*y_max).enumerate() {
+                if !dashed || step % 2 == 0 {
+                    push_boundary_pixel(out, width, height, f64::from(*x_min), y as f64);
+                    push_boundary_pixel(out, width, height, f64::from(*x_max), y as f64);
+                }
+            }
+        }
+        ClusterBoundary::Ellipse {
+            cx,
+            cy,
+            semi_major,
+            semi_minor,
+            angle_rad,
+        } => {
+            let steps = ((semi_major.max(*semi_minor) * 10.0).ceil() as usize).clamp(24, 240);
+            let cos_angle = angle_rad.cos();
+            let sin_angle = angle_rad.sin();
+            for step in 0..=steps {
+                if dashed && step % 2 == 1 {
+                    continue;
+                }
+                let theta = std::f64::consts::TAU * step as f64 / steps as f64;
+                let ellipse_x = semi_major * theta.cos();
+                let ellipse_y = semi_minor * theta.sin();
+                let rotated_x = ellipse_x * cos_angle - ellipse_y * sin_angle;
+                let rotated_y = ellipse_x * sin_angle + ellipse_y * cos_angle;
+                push_boundary_pixel(out, width, height, cx + rotated_x, cy + rotated_y);
+            }
+        }
+    }
+}
+
+fn push_boundary_pixel(out: &mut HashSet<(u16, u16)>, width: u16, height: u16, x: f64, y: f64) {
+    let x = x.round();
+    let y = y.round();
+    if x < 0.0 || y < 0.0 {
+        return;
+    }
+
+    let x = x as u16;
+    let y = y as u16;
+    if x < width && y < height {
+        out.insert((x, y));
+    }
+}
+
+fn candidate_event_registry(datasets: &CandidateEventDatasets) -> HostViewRegistry {
+    HostViewRegistry {
+        datasets: vec![
+            HostDatasetDescriptor {
+                id: ACCEPTED_EVENTS_DATASET_ID.into(),
+                title: "Accepted EVE events".into(),
+                kind: HostDatasetKind::TableV1(candidate_events_schema(
+                    datasets,
+                    ACCEPTED_EVENTS_LAYER_ID,
+                    "accepted candidate events",
+                    "cluster_id",
+                )),
+                empty_message: "No accepted candidate events in the current analysis window."
+                    .into(),
+                display: Some(candidate_event_display_metadata(
+                    "Accepted candidate events",
+                    ACCEPTED_EVENTS_COLOR,
+                )),
+                relations: vec![HostDatasetRelation {
+                    target_dataset_id: "augur.evesmlm.current_localizations".into(),
+                    via_column: "cluster_id".into(),
+                    target_column: "cluster_id".into(),
+                }],
+            },
+            HostDatasetDescriptor {
+                id: REJECTED_EVENTS_DATASET_ID.into(),
+                title: "Rejected EVE events".into(),
+                kind: HostDatasetKind::TableV1(candidate_events_schema(
+                    datasets,
+                    REJECTED_EVENTS_LAYER_ID,
+                    "rejected candidate events",
+                    "event_id",
+                )),
+                empty_message: "No rejected candidate events in the current analysis window."
+                    .into(),
+                display: Some(candidate_event_display_metadata(
+                    "Rejected candidate events",
+                    REJECTED_EVENTS_COLOR,
+                )),
+                relations: Vec::new(),
+            },
+        ],
+        views: vec![
+            HostViewDescriptor {
+                id: ACCEPTED_EVENTS_COMPACT_VIEW_ID.into(),
+                title: "Accepted Events".into(),
+                dataset_id: ACCEPTED_EVENTS_DATASET_ID.into(),
+                placement: HostViewPlacement::AnalysisPanel,
+                kind: HostViewKind::CompactTable,
+            },
+            HostViewDescriptor {
+                id: REJECTED_EVENTS_COMPACT_VIEW_ID.into(),
+                title: "Rejected Events".into(),
+                dataset_id: REJECTED_EVENTS_DATASET_ID.into(),
+                placement: HostViewPlacement::AnalysisPanel,
+                kind: HostViewKind::CompactTable,
+            },
+            HostViewDescriptor {
+                id: ACCEPTED_EVENTS_TABLE_VIEW_ID.into(),
+                title: "Accepted Events".into(),
+                dataset_id: ACCEPTED_EVENTS_DATASET_ID.into(),
+                placement: HostViewPlacement::Window,
+                kind: HostViewKind::TableWindow,
+            },
+            HostViewDescriptor {
+                id: REJECTED_EVENTS_TABLE_VIEW_ID.into(),
+                title: "Rejected Events".into(),
+                dataset_id: REJECTED_EVENTS_DATASET_ID.into(),
+                placement: HostViewPlacement::Window,
+                kind: HostViewKind::TableWindow,
+            },
+            HostViewDescriptor {
+                id: ACCEPTED_EVENTS_3D_VIEW_ID.into(),
+                title: "Accepted Events 3D".into(),
+                dataset_id: ACCEPTED_EVENTS_DATASET_ID.into(),
+                placement: HostViewPlacement::Window,
+                kind: HostViewKind::Scatter3dFromTable {
+                    x_column: "x_px".into(),
+                    y_column: "y_px".into(),
+                    z_column: "timestamp_us".into(),
+                },
+            },
+            HostViewDescriptor {
+                id: REJECTED_EVENTS_3D_VIEW_ID.into(),
+                title: "Rejected Events 3D".into(),
+                dataset_id: REJECTED_EVENTS_DATASET_ID.into(),
+                placement: HostViewPlacement::Window,
+                kind: HostViewKind::Scatter3dFromTable {
+                    x_column: "x_px".into(),
+                    y_column: "y_px".into(),
+                    z_column: "timestamp_us".into(),
+                },
+            },
+        ],
+        actions: Vec::new(),
+    }
+}
+
+fn candidate_event_display_metadata(
+    layer_title: &str,
+    color: [u8; 4],
+) -> HostDatasetDisplayMetadata {
+    HostDatasetDisplayMetadata {
+        layer_title: Some(layer_title.into()),
+        default_visibility: Some(true),
+        default_color: Some(color),
+        default_marker_shape: Some(HostMarkerShape::Point),
+        default_size: Some(2.5),
+    }
+}
+
+fn candidate_events_schema(
+    datasets: &CandidateEventDatasets,
+    layer_id: &str,
+    semantic_label: &str,
+    row_id_column: &str,
+) -> TableSchema {
+    TableSchema {
+        columns: vec![
+            TableColumn {
+                id: "event_id".into(),
+                title: "Event ID".into(),
+                value_type: TableValueType::U64,
+            },
+            TableColumn {
+                id: "timestamp_us".into(),
+                title: "Timestamp (us)".into(),
+                value_type: TableValueType::U64,
+            },
+            TableColumn {
+                id: "x_px".into(),
+                title: "X (px)".into(),
+                value_type: TableValueType::F64,
+            },
+            TableColumn {
+                id: "y_px".into(),
+                title: "Y (px)".into(),
+                value_type: TableValueType::F64,
+            },
+            TableColumn {
+                id: "polarity".into(),
+                title: "Polarity".into(),
+                value_type: TableValueType::Bool,
+            },
+            TableColumn {
+                id: "cluster_id".into(),
+                title: "Cluster".into(),
+                value_type: TableValueType::String,
+            },
+        ],
+        coordinate_space_2d: datasets
+            .sensor_dims
+            .map(|(width, height)| TableCoordinateSpace2d {
+                x_column: "x_px".into(),
+                y_column: "y_px".into(),
+                x_min: 0.0,
+                x_max: f64::from(width),
+                y_min: 0.0,
+                y_max: f64::from(height),
+            }),
+        coordinate_space_3d: datasets
+            .sensor_dims
+            .map(|(width, height)| TableCoordinateSpace3d {
+                x_column: "x_px".into(),
+                y_column: "y_px".into(),
+                z_column: "timestamp_us".into(),
+                x_min: 0.0,
+                x_max: f64::from(width),
+                y_min: 0.0,
+                y_max: f64::from(height),
+                z_min: datasets.frame_window_start_us as f64,
+                z_max: datasets
+                    .frame_window_end_us
+                    .max(datasets.frame_window_start_us) as f64,
+            }),
+        row_id_column: Some(row_id_column.into()),
+        time_column: Some("timestamp_us".into()),
+        layer_id: Some(layer_id.into()),
+        semantic_label: Some(semantic_label.into()),
+        provenance: Some(TableRowProvenance {
+            anchor_time_column: Some("timestamp_us".into()),
+            span_start_column: Some("timestamp_us".into()),
+            span_end_column: Some("timestamp_us".into()),
+            anchor_frame_column: None,
+        }),
+        column_display: vec![
+            TableColumnDisplayEntry {
+                column_id: "event_id".into(),
+                display: TableColumnDisplayMetadata {
+                    format: Some(TableColumnDisplayFormat::Identifier),
+                    width_priority: Some(TableColumnWidthPriority::Low),
+                    hide_in_compact: true,
+                    label: None,
+                    headline: false,
+                },
+            },
+            TableColumnDisplayEntry {
+                column_id: "timestamp_us".into(),
+                display: TableColumnDisplayMetadata {
+                    format: Some(TableColumnDisplayFormat::TimestampMicros),
+                    width_priority: Some(TableColumnWidthPriority::Medium),
+                    hide_in_compact: false,
+                    label: Some("Time".into()),
+                    headline: false,
+                },
+            },
+            TableColumnDisplayEntry {
+                column_id: "x_px".into(),
+                display: TableColumnDisplayMetadata {
+                    format: Some(TableColumnDisplayFormat::FixedPrecision { digits: 1 }),
+                    width_priority: Some(TableColumnWidthPriority::Low),
+                    hide_in_compact: false,
+                    label: Some("X".into()),
+                    headline: false,
+                },
+            },
+            TableColumnDisplayEntry {
+                column_id: "y_px".into(),
+                display: TableColumnDisplayMetadata {
+                    format: Some(TableColumnDisplayFormat::FixedPrecision { digits: 1 }),
+                    width_priority: Some(TableColumnWidthPriority::Low),
+                    hide_in_compact: false,
+                    label: Some("Y".into()),
+                    headline: false,
+                },
+            },
+            TableColumnDisplayEntry {
+                column_id: "polarity".into(),
+                display: TableColumnDisplayMetadata {
+                    format: Some(TableColumnDisplayFormat::Category),
+                    width_priority: Some(TableColumnWidthPriority::Low),
+                    hide_in_compact: false,
+                    label: Some("Polarity".into()),
+                    headline: false,
+                },
+            },
+            TableColumnDisplayEntry {
+                column_id: "cluster_id".into(),
+                display: TableColumnDisplayMetadata {
+                    format: Some(TableColumnDisplayFormat::Category),
+                    width_priority: Some(TableColumnWidthPriority::Medium),
+                    hide_in_compact: false,
+                    label: Some("Cluster".into()),
+                    headline: row_id_column == "cluster_id",
+                },
+            },
+        ],
+    }
+}
+
+fn candidate_events_dataset(rows: &[CandidateEventRow]) -> TableDatasetV1 {
+    TableDatasetV1::new(vec![
+        TableColumnData {
+            column_id: "event_id".into(),
+            values: TableColumnValues::U64(rows.iter().map(|row| row.event_id).collect()),
+        },
+        TableColumnData {
+            column_id: "timestamp_us".into(),
+            values: TableColumnValues::U64(rows.iter().map(|row| row.timestamp_us).collect()),
+        },
+        TableColumnData {
+            column_id: "x_px".into(),
+            values: TableColumnValues::F64(rows.iter().map(|row| row.x_px).collect()),
+        },
+        TableColumnData {
+            column_id: "y_px".into(),
+            values: TableColumnValues::F64(rows.iter().map(|row| row.y_px).collect()),
+        },
+        TableColumnData {
+            column_id: "polarity".into(),
+            values: TableColumnValues::Bool(rows.iter().map(|row| row.polarity).collect()),
+        },
+        TableColumnData {
+            column_id: "cluster_id".into(),
+            values: TableColumnValues::String(
+                rows.iter().map(|row| row.cluster_id.clone()).collect(),
+            ),
+        },
+    ])
+    .expect("candidate event columns must stay aligned")
+}
+
+fn candidate_event_row_id(event: &EveEvent, occurrence: u32) -> u64 {
+    event.timestamp
+        ^ u64::from(event.x).rotate_left(11)
+        ^ u64::from(event.y).rotate_left(23)
+        ^ u64::from(event.polarity as u8).rotate_left(37)
+        ^ u64::from(occurrence).rotate_left(47)
+}
+
+fn build_candidate_event_datasets(
+    sensor_dims: (u16, u16),
+    frame_window_start_us: u64,
+    frame_window_end_us: u64,
+    events: &[EveEvent],
+    cluster_indices: &[Vec<usize>],
+    visible_clusters: &[EveCluster],
+) -> CandidateEventDatasets {
+    let mut cluster_by_event = vec![None; events.len()];
+    for (cluster, indices) in visible_clusters.iter().zip(cluster_indices.iter()) {
+        for &event_index in indices {
+            if let Some(slot) = cluster_by_event.get_mut(event_index) {
+                *slot = Some(cluster.cluster_id.to_string());
+            }
+        }
+    }
+
+    let mut accepted = Vec::new();
+    let mut rejected = Vec::new();
+    let mut seen_occurrences = HashMap::new();
+    for (event_index, event) in events.iter().enumerate() {
+        let occurrence = seen_occurrences
+            .entry((event.timestamp, event.x, event.y, event.polarity))
+            .or_insert(0u32);
+        let row = CandidateEventRow {
+            event_id: candidate_event_row_id(event, *occurrence),
+            x_px: f64::from(event.x),
+            y_px: f64::from(event.y),
+            timestamp_us: event.timestamp,
+            polarity: event.polarity,
+            cluster_id: cluster_by_event[event_index].clone().unwrap_or_default(),
+        };
+        *occurrence = occurrence.saturating_add(1);
+        if cluster_by_event[event_index].is_some() {
+            accepted.push(row);
+        } else {
+            rejected.push(row);
+        }
+    }
+
+    CandidateEventDatasets {
+        accepted,
+        rejected,
+        sensor_dims: Some(sensor_dims),
+        frame_window_start_us,
+        frame_window_end_us,
     }
 }
 
@@ -555,7 +1541,46 @@ fn empty_candidates(frame: &PluginFrame<'_>, method: CandidateFindingMethod) -> 
     }
 }
 
-fn clusters_from_indices(events: &[EveEvent], cluster_indices: Vec<Vec<usize>>) -> Vec<EveCluster> {
+#[allow(clippy::too_many_arguments)]
+fn cluster_boundary_for_indices(
+    events: &[EveEvent],
+    indices: &[usize],
+    centroid_x: f64,
+    centroid_y: f64,
+    x_min: u16,
+    x_max: u16,
+    y_min: u16,
+    y_max: u16,
+    method: CandidateFindingMethod,
+) -> ClusterBoundary {
+    if matches!(
+        method,
+        CandidateFindingMethod::Dbscan | CandidateFindingMethod::Eigenfeature
+    ) {
+        if let Some(info) = eigenfeature::cluster_eigen_info(events, indices) {
+            return ClusterBoundary::Ellipse {
+                cx: centroid_x,
+                cy: centroid_y,
+                semi_major: (2.0 * info.lambda_1.max(0.0).sqrt()).max(1.0),
+                semi_minor: (2.0 * info.lambda_2.max(0.0).sqrt()).max(1.0),
+                angle_rad: info.angle_rad,
+            };
+        }
+    }
+
+    ClusterBoundary::BoundingBox {
+        x_min,
+        x_max,
+        y_min,
+        y_max,
+    }
+}
+
+fn clusters_from_indices(
+    events: &[EveEvent],
+    cluster_indices: Vec<Vec<usize>>,
+    method: CandidateFindingMethod,
+) -> Vec<EveCluster> {
     cluster_indices
         .into_iter()
         .filter_map(|indices| {
@@ -572,7 +1597,7 @@ fn clusters_from_indices(events: &[EveEvent], cluster_indices: Vec<Vec<usize>>) 
             let mut y_min = u16::MAX;
             let mut y_max = 0;
 
-            for index in indices {
+            for &index in &indices {
                 let event = events[index];
                 cluster_events.push(event);
                 sum_x += f64::from(event.x);
@@ -597,15 +1622,24 @@ fn clusters_from_indices(events: &[EveEvent], cluster_indices: Vec<Vec<usize>>) 
                 .collect();
             histogram_entries.sort_by_key(|entry| (entry.1, entry.0));
 
+            let centroid_x = sum_x / count;
+            let centroid_y = sum_y / count;
+            let boundary = cluster_boundary_for_indices(
+                events, &indices, centroid_x, centroid_y, x_min, x_max, y_min, y_max, method,
+            );
+
             Some(EveCluster {
+                cluster_id: 0,
                 pixel_histogram: histogram_entries,
                 events: cluster_events,
-                centroid_x: sum_x / count,
-                centroid_y: sum_y / count,
+                centroid_x,
+                centroid_y,
                 x_min,
                 x_max,
                 y_min,
                 y_max,
+                complete: false,
+                boundary: Some(boundary),
             })
         })
         .collect()
@@ -871,7 +1905,11 @@ mod tests {
             event(10, 11, true, 4),
         ];
 
-        let clusters = clusters_from_indices(&events, vec![vec![0, 1, 2, 3]]);
+        let clusters = clusters_from_indices(
+            &events,
+            vec![vec![0, 1, 2, 3]],
+            CandidateFindingMethod::Dbscan,
+        );
         assert_eq!(clusters.len(), 1);
         let cluster = &clusters[0];
         assert_eq!(cluster.event_count(), 4);
@@ -880,6 +1918,7 @@ mod tests {
         assert_eq!(cluster.pixel_histogram.len(), 3);
         assert!((cluster.centroid_x - 10.25).abs() < 1e-6);
         assert!((cluster.centroid_y - 10.25).abs() < 1e-6);
+        assert!(cluster.boundary.is_some());
     }
 
     #[test]
@@ -892,7 +1931,7 @@ mod tests {
         };
 
         let image = build_analysis_image(&frame.into_plugin_frame(), &events);
-        let index = 1usize * 6 + 2usize;
+        let index = 6usize + 2usize;
         assert_eq!(image[index], 20.0);
     }
 
@@ -907,6 +1946,139 @@ mod tests {
         assert_eq!(maxima.len(), 2);
         assert!(maxima.iter().any(|(x, y, _)| (*x, *y) == (1, 1)));
         assert!(maxima.iter().any(|(x, y, _)| (*x, *y) == (3, 3)));
+    }
+
+    #[test]
+    fn candidate_event_datasets_split_accepted_and_rejected_events() {
+        let events = vec![
+            event(10, 10, true, 101),
+            event(11, 10, true, 102),
+            event(12, 10, false, 103),
+            event(30, 20, true, 104),
+        ];
+        let visible_clusters = vec![EveCluster {
+            cluster_id: 42,
+            pixel_histogram: vec![(10, 10, 1, 0), (12, 10, 0, 1)],
+            events: vec![events[0], events[2]],
+            centroid_x: 11.0,
+            centroid_y: 10.0,
+            x_min: 10,
+            x_max: 12,
+            y_min: 10,
+            y_max: 10,
+            complete: false,
+            boundary: Some(ClusterBoundary::BoundingBox {
+                x_min: 10,
+                x_max: 12,
+                y_min: 10,
+                y_max: 10,
+            }),
+        }];
+
+        let datasets = build_candidate_event_datasets(
+            (32, 24),
+            100,
+            101,
+            &events,
+            &[vec![0, 2]],
+            &visible_clusters,
+        );
+        assert_eq!(datasets.accepted.len(), 2);
+        assert_eq!(datasets.rejected.len(), 2);
+        assert_eq!(datasets.accepted[0].cluster_id, "42");
+        assert_eq!(datasets.rejected[0].cluster_id, "");
+    }
+
+    #[test]
+    fn candidate_event_registry_exposes_table_and_3d_views() {
+        let registry = candidate_event_registry(&CandidateEventDatasets {
+            accepted: Vec::new(),
+            rejected: Vec::new(),
+            sensor_dims: Some((128, 64)),
+            frame_window_start_us: 10,
+            frame_window_end_us: 20,
+        });
+        assert_eq!(registry.datasets.len(), 2);
+        assert_eq!(registry.views.len(), 6);
+        assert_eq!(registry.views[0].id, ACCEPTED_EVENTS_COMPACT_VIEW_ID);
+        assert_eq!(registry.views[0].title, "Accepted Events");
+        assert!(matches!(registry.views[0].kind, HostViewKind::CompactTable));
+        assert_eq!(registry.views[2].id, ACCEPTED_EVENTS_TABLE_VIEW_ID);
+        assert_eq!(registry.views[2].title, "Accepted Events");
+        assert!(matches!(registry.views[2].kind, HostViewKind::TableWindow));
+        assert_eq!(registry.views[4].id, ACCEPTED_EVENTS_3D_VIEW_ID);
+        let schema = match &registry.datasets[0].kind {
+            HostDatasetKind::TableV1(schema) => schema,
+            other => panic!("unexpected dataset kind: {other:?}"),
+        };
+        assert_eq!(schema.row_id_column.as_deref(), Some("cluster_id"));
+        let cluster_column = schema.column("cluster_id").expect("cluster id column");
+        assert_eq!(cluster_column.value_type, TableValueType::String);
+        assert_eq!(
+            schema
+                .column_display("cluster_id")
+                .map(|display| display.headline),
+            Some(true)
+        );
+        assert_eq!(
+            schema
+                .coordinate_space_3d
+                .as_ref()
+                .map(|space| space.z_column.as_str()),
+            Some("timestamp_us")
+        );
+        let rejected_schema = match &registry.datasets[1].kind {
+            HostDatasetKind::TableV1(schema) => schema,
+            other => panic!("unexpected dataset kind: {other:?}"),
+        };
+        assert_eq!(rejected_schema.row_id_column.as_deref(), Some("event_id"));
+    }
+
+    #[test]
+    fn temporal_tracking_waits_for_stable_frames_before_publishing() {
+        let mut plugin = EveSmlmCandidatePlugin::default();
+        plugin.settings.stable_frames = 2;
+
+        let make_cluster = || EveCluster {
+            cluster_id: 0,
+            pixel_histogram: vec![(10, 10, 3, 0), (11, 10, 2, 0)],
+            events: vec![
+                event(10, 10, true, 1),
+                event(10, 10, true, 2),
+                event(10, 10, true, 3),
+                event(11, 10, true, 4),
+                event(11, 10, true, 5),
+            ],
+            centroid_x: 10.4,
+            centroid_y: 10.0,
+            x_min: 10,
+            x_max: 11,
+            y_min: 10,
+            y_max: 10,
+            complete: false,
+            boundary: Some(ClusterBoundary::BoundingBox {
+                x_min: 10,
+                x_max: 11,
+                y_min: 10,
+                y_max: 10,
+            }),
+        };
+
+        let (visible, published) = plugin.update_tracked_clusters(vec![make_cluster()], true);
+        assert_eq!(visible.len(), 1);
+        assert!(!visible[0].complete);
+        assert!(published.is_empty());
+
+        let (visible, published) = plugin.update_tracked_clusters(vec![make_cluster()], true);
+        assert_eq!(visible.len(), 1);
+        assert!(!visible[0].complete);
+        assert!(published.is_empty());
+
+        let (visible, published) = plugin.update_tracked_clusters(vec![make_cluster()], true);
+        assert_eq!(visible.len(), 1);
+        assert!(visible[0].complete);
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].cluster_id, visible[0].cluster_id);
     }
 
     struct TestFrame {
@@ -924,6 +2096,7 @@ mod tests {
                 events: augur_plugin_api::FfiSlice::from_slice(
                     &[] as &[augur_plugin_api::FfiCdEvent]
                 ),
+                external_triggers: augur_plugin_api::FfiSlice::default(),
                 window_start_us: self.window_start_us,
                 window_end_us: self.window_start_us + 1,
             }));

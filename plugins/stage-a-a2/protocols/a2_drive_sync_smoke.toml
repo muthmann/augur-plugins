@@ -1,0 +1,37 @@
+# A2 production capture, prepared 2026-09-06.
+# Camera trigger cable must use J24 (digital phase-zero sync), not ACMP output.
+# No online PD-amplitude or comparator-threshold qualification.
+# mean_u remains the GEOMETRIC pedestal in the A2 contract.
+# To match A1 cycle-mean targets, mean_u = target / cosh(depth_a/2), rounded to 0.001.
+# Exact observed flux/depth/t50 are determined from each concurrent PDQ offline.
+# Both polarities of the narrow J24 pulse refer to phase zero; falling is NOT optical OFF.
+name = "a2-drive-sync-smoke"
+timing_reference = "drive_sync"
+trigger_validation = "offline_review"
+
+[[point]]
+label = "floor_pre"
+role = "floor_pre_shutter_closed"
+acquisition_mode = "dark"
+duration_s = 5.0
+settle_s = 2.0
+pause_before = true
+
+[[point]]
+label = "sync_light"
+role = "commissioning"
+acquisition_mode = "stepped"
+mean_u = 0.293
+depth_a = 0.45
+half_period_s = 1.0
+transitions_per_polarity = 10
+settle_s = 3.0
+pause_before = true
+
+[[point]]
+label = "floor_post"
+role = "floor_post_shutter_closed"
+acquisition_mode = "dark"
+duration_s = 5.0
+settle_s = 2.0
+pause_before = true

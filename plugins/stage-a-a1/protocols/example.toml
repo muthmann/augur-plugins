@@ -1,0 +1,93 @@
+# Stage-A A1 recording protocol — a worked example to copy.
+#
+# Point the A1 plugin's "Protocol file" setting at a file like this and press
+# "Run the protocol". Every point is recorded with the parameters written here,
+# so the survey is reproducible from this file alone: nothing is taken from
+# whatever the modulation plugin happens to have armed.
+#
+# Three axes, all named for every point:
+#
+#   mean_u        the normalized cycle-mean lobe point ū — the brightness (I_k)
+#                 axis. 1.0 is the top of the Pockels lobe; the achievable
+#                 maximum shrinks as the depth grows, and the modulation plugin
+#                 shows the current limit next to each control.
+#   frequency_hz  the modulation frequency.
+#   depth_a       the optical depth a = ln(I_max / I_min).
+#
+# Each axis takes either
+#   an explicit list        depth_a      = [0.5, 1.0, 2.0]
+#   a single value          mean_u       = 0.5
+#   or a generated range    frequency_hz = { min = 1.0, max = 100.0, points = 5 }
+#                           frequency_hz = { min = 1.0, max = 100.0, points = 5, spacing = "log" }
+#
+# "linear" is the default spacing; use "log" for anything read per decade —
+# a Bode ladder is not read per hertz.
+#
+# A block records the full product of its three axes. Points run mean_u
+# outermost, then frequency_hz, then depth_a, because that settles the
+# expensive axis least often: moving the brightness makes the sensor re-adapt,
+# a new frequency has to be confirmed against the phase-0 trigger, and changing
+# the depth is the cheap innermost step.
+#
+# One modulation lease is held for the whole file, so nothing can move the
+# drive underneath the run, and the operator's own settings are handed back at
+# the end. A point whose drive the modulation plugin refuses — usually a
+# mean_u/depth_a pair that would run off the top of the lobe — is skipped and
+# named in the status line rather than stopping the survey.
+
+name = "a1-example-survey"
+version = "2026-08-13"
+
+# Applied to every block that does not override them.
+[defaults]
+duration_s = 10   # seconds of camera + photodiode per recording (1..=3600)
+settle_s   = 2.0  # dwell after retargeting, before recording starts (0..=60)
+
+
+# ---------------------------------------------------------------------------
+# 1. One q_p(a) curve at a single frequency and brightness.
+#    The everyday depth sweep, written down.
+# ---------------------------------------------------------------------------
+[[block]]
+name         = "depth-curve-10Hz"
+mean_u       = 0.5
+frequency_hz = 10.0
+depth_a      = { min = 0.2, max = 2.0, points = 7 }
+
+
+# ---------------------------------------------------------------------------
+# 2. The same depth held across a frequency ladder, at two brightnesses.
+#    Log-spaced, so the ladder is read per decade.
+#    Longer recordings: the low frequencies need several cycles.
+# ---------------------------------------------------------------------------
+[[block]]
+name         = "frequency-ladder"
+mean_u       = [0.3, 0.6]
+frequency_hz = { min = 1.0, max = 200.0, points = 6, spacing = "log" }
+depth_a      = 0.8
+duration_s   = 20
+settle_s     = 3.0
+
+
+# ---------------------------------------------------------------------------
+# 3. A small q_p(a, f) surface at one brightness — 3 × 4 = 12 recordings.
+#    Watch the totals here: the product grows fast, and the plugin reports how
+#    many recordings and roughly how long the whole file will take before the
+#    first one starts.
+# ---------------------------------------------------------------------------
+[[block]]
+name         = "surface"
+mean_u       = 0.5
+frequency_hz = { min = 5.0, max = 500.0, points = 3, spacing = "log" }
+depth_a      = { min = 0.4, max = 1.6, points = 4 }
+
+
+# ---------------------------------------------------------------------------
+# 4. Sweeping the brightness itself at a fixed (f, a) — the I_k axis.
+#    Ascending, so the sensor adapts in one direction only.
+# ---------------------------------------------------------------------------
+[[block]]
+name         = "brightness-series"
+mean_u       = { min = 0.1, max = 0.7, points = 4 }
+frequency_hz = 50.0
+depth_a      = 0.6

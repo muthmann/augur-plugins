@@ -1,0 +1,14 @@
+id = "stage-a.a3"
+name = "Stage-A A3 Threshold"
+version = "0.3.0"
+description = "Automatic slow contrast protocols with synchronized RAW/PDQ, measurement folders and offline-review metadata."
+domain = "stage-a"
+library = "augur_plugin_stage_a_a3"
+phase = "raw_events"
+min_augur_version = "2.0.2"
+host_commands = [
+  "start_recording",
+  "stop_recording",
+  "apply_camera_configuration",
+  "restore_camera_configuration",
+]

@@ -1,0 +1,13 @@
+# A1 beleuchteter Smoke-Test — separat nach Lamp-off, vor dem Hauptlauf
+# VOR START: Strahl kontrolliert freigeben; ATTO647-Fluoreszenz muss Kamera und
+# Emissions-PD hinter Fluoreszenzfilter und 50:50-Strahlteiler erreichen.
+# A1 Depth a source auf Photodiode measured stellen; dieselbe gemessene
+# Lamp-off-Darkreferenz, Optik, Probe, ROI, Maske, Biases und PD-Last beibehalten.
+# Stop: kein frisches measured_a, falsche Frequenz/Trigger, ADC-Clipping, fehlender
+# positiver Dark-Headroom, PD-SNR < 10 oder Fehler in RAW/PDQ/Sensor-Sidecars.
+# Der Punkt ist identisch zu einem Hauptgitterpunkt: mean_u=0.30, f=100 Hz, a=0.45.
+# Er qualifiziert den Fluoreszenzpfad; er misst keine transmittierte Anregung.
+#
+# Umfang: 1 Recordings, ~1 min reine Aufnahmezeit (inkl. 11 s Overhead je Recording)
+camera_profile,label,mean_u,frequency_hz,depth_a,duration_s,settle_s,role
+A1-bias-v1-monitoring,illuminated_smoke,0.30,100,0.45,20,8,

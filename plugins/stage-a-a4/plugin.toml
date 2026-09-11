@@ -1,0 +1,14 @@
+id = "stage-a.a4"
+name = "Stage-A A4 Background"
+version = "0.2.1"
+description = "Matched constant-light background reference with automatic photodiode capture and preserved camera settings; legacy threshold surveys remain available."
+domain = "stage-a"
+library = "augur_plugin_stage_a_a4"
+phase = "raw_events"
+min_augur_version = "2.2.0"
+host_commands = [
+  "start_recording",
+  "stop_recording",
+  "apply_camera_configuration",
+  "restore_camera_configuration",
+]

@@ -1,0 +1,19 @@
+[package]
+name = "stage-a-sine-acquisition"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Stage-A A1 workflow orchestrator and pure minimum-depth analysis core"
+
+[dependencies]
+augur-plugin-api.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+stage-a-plugin-contract = { path = "../stage-a-plugin-contract" }
+stage-a-universal-runner = { path = "../stage-a-universal-runner" }
+toml = "0.8"
+
+[lints.rust]
+unsafe_code = "forbid"
